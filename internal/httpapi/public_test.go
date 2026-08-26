@@ -184,6 +184,39 @@ func TestPublicControlledErrors(t *testing.T) {
 	}
 }
 
+func TestServiceObserverTracksRejectionAndInflightLifecycle(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &recordingObserver{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: backgroundClient(), key: key, poolState: domain.PoolSaturated, observer: observer,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	events := observer.Events()
+	if len(events) != 1 || events[0].Status != http.StatusTooManyRequests || events[0].Reason != "gateway_overloaded" {
+		t.Fatalf("rejection events = %+v", events)
+	}
+
+	observer = &recordingObserver{}
+	handler, _ = newFixture(t, fixtureOptions{client: enabledClient(), key: key, observer: observer})
+	request = httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if got := observer.ClientDeltas(); !equalInts(got, []int{1, -1}) {
+		t.Fatalf("client inflight deltas = %v", got)
+	}
+	if got := observer.BackendDeltas(); !equalInts(got, []int{1, -1}) {
+		t.Fatalf("backend inflight deltas = %v", got)
+	}
+	events = observer.Events()
+	if len(events) != 1 || events[0].Status != http.StatusOK || events[0].Client != "client" || events[0].Backend != "gpu" {
+		t.Fatalf("completion events = %+v", events)
+	}
+}
+
 type fixtureOptions struct {
 	client     domain.Client
 	key        domain.APIKey
@@ -191,6 +224,7 @@ type fixtureOptions struct {
 	poolState  domain.PoolState
 	unhealthy  bool
 	extraPools bool
+	observer   gateway.Observer
 }
 
 func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStub) {
@@ -228,7 +262,8 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 		Registry: reg, HMACSecret: []byte(strings.Repeat("s", 32)),
 		Limiter: admission.NewLimiter(), Runtime: runtime,
 		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: forwarder,
-		Now: func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
+		Observer: options.observer,
+		Now:      func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
 	})
 	handler := httpapi.NewPublicHandler(service, 1024*1024, func() (string, error) { return "fixed-gateway-id", nil })
 	return handler, runtime
@@ -279,6 +314,61 @@ type blockingForwarder struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type recordingObserver struct {
+	mu            sync.Mutex
+	events        []gateway.RequestEvent
+	clientDeltas  []int
+	backendDeltas []int
+}
+
+func (o *recordingObserver) ClientInflight(_ gateway.InflightEvent, delta int) {
+	o.mu.Lock()
+	o.clientDeltas = append(o.clientDeltas, delta)
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) BackendInflight(_ gateway.InflightEvent, delta int) {
+	o.mu.Lock()
+	o.backendDeltas = append(o.backendDeltas, delta)
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) Complete(event gateway.RequestEvent) {
+	o.mu.Lock()
+	o.events = append(o.events, event)
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) Events() []gateway.RequestEvent {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]gateway.RequestEvent(nil), o.events...)
+}
+
+func (o *recordingObserver) ClientDeltas() []int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int(nil), o.clientDeltas...)
+}
+
+func (o *recordingObserver) BackendDeltas() []int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int(nil), o.backendDeltas...)
+}
+
+func equalInts(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func newBlockingForwarder() *blockingForwarder {

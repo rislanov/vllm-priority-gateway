@@ -43,6 +43,7 @@ type Dependencies struct {
 	Router     *routing.Router
 	Forwarder  Forwarder
 	Usage      UsageRecorder
+	Observer   Observer
 	Now        func() time.Time
 	LookupEnv  func(string) (string, bool)
 }
@@ -55,6 +56,7 @@ type Service struct {
 	router     *routing.Router
 	forwarder  Forwarder
 	usage      UsageRecorder
+	observer   Observer
 	now        func() time.Time
 	lookupEnv  func(string) (string, bool)
 }
@@ -75,7 +77,8 @@ func New(dependencies Dependencies) *Service {
 	return &Service{
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
 		limiter: limiter, runtime: dependencies.Runtime, router: dependencies.Router,
-		forwarder: dependencies.Forwarder, usage: dependencies.Usage, now: now, lookupEnv: lookupEnv,
+		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
+		now: now, lookupEnv: lookupEnv,
 	}
 }
 
@@ -115,15 +118,37 @@ func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, 
 	return models, nil
 }
 
-func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (proxy.Result, *APIError) {
+func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (result proxy.Result, apiErr *APIError) {
+	started := time.Now()
+	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
+	defer func() {
+		event.Duration = time.Since(started)
+		event.TTFT = result.FirstByte
+		event.Disconnect = result.Cancelled
+		event.RetryCount = result.RetryCount
+		if apiErr != nil {
+			event.Status = apiErr.HTTPStatus
+			event.Reason = apiErr.Code
+		} else {
+			event.Status = result.Status
+		}
+		if s.observer != nil {
+			s.observer.Complete(event)
+		}
+	}()
+
 	client, _, authErr := s.authenticate(request.APIKey)
 	if authErr != nil {
 		return proxy.Result{}, authErr
 	}
+	event.Client = client.Name
+	event.PriorityClass = client.PriorityClass
+	event.VLLMPriority = client.VLLMPriority
 	payload, publicModel, parseErr := rewritePayload(request.Body)
 	if parseErr != nil {
 		return proxy.Result{}, invalidRequest(parseErr.Error())
 	}
+	event.Model = publicModel
 	snapshot := s.registry.Snapshot()
 	pool, exists := snapshot.PoolsByName[publicModel]
 	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
@@ -135,6 +160,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	}
 	now := s.now().UTC()
 	poolRuntime := s.runtime.PoolSnapshot(pool.ID, now)
+	event.PoolState = poolRuntime.State
 	if poolRuntime.State == domain.PoolUnavailable {
 		return proxy.Result{}, backendUnavailable()
 	}
@@ -144,6 +170,11 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		return proxy.Result{}, overloaded()
 	}
 	defer lease.Release()
+	inflight := InflightEvent{Client: client.Name, Model: publicModel, PriorityClass: client.PriorityClass}
+	if s.observer != nil {
+		s.observer.ClientInflight(inflight, 1)
+		defer s.observer.ClientInflight(inflight, -1)
+	}
 
 	selectTarget := func(exclude map[int64]struct{}) (proxy.Target, error) {
 		candidates := make([]routing.Candidate, 0, len(snapshot.BackendsByPool[pool.ID]))
@@ -171,8 +202,18 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if !ok {
 		return proxy.Result{}, backendUnavailable()
 	}
+	currentInflight := inflight
+	currentInflight.Backend = target.Backend.Name
+	event.Backend = target.Backend.Name
+	event.BackendPressure = s.runtime.Snapshot(target.Backend.ID, now).Pressure
+	if s.observer != nil {
+		s.observer.BackendInflight(currentInflight, 1)
+	}
 	defer func() {
 		if currentRelease != nil {
+			if s.observer != nil {
+				s.observer.BackendInflight(currentInflight, -1)
+			}
 			currentRelease()
 		}
 	}()
@@ -185,6 +226,9 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		RequestID: request.RequestID, Priority: client.VLLMPriority, Target: target,
 	}
 	proxyRequest.SelectAlternate = func(exclude map[int64]struct{}) (proxy.Target, error) {
+		if s.observer != nil {
+			s.observer.BackendInflight(currentInflight, -1)
+		}
 		currentRelease()
 		currentRelease = nil
 		alternate, selectErr := selectTarget(exclude)
@@ -196,9 +240,15 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 			return proxy.Target{}, routing.ErrNoBackend
 		}
 		currentRelease = release
+		currentInflight.Backend = alternate.Backend.Name
+		event.Backend = alternate.Backend.Name
+		event.BackendPressure = s.runtime.Snapshot(alternate.Backend.ID, now).Pressure
+		if s.observer != nil {
+			s.observer.BackendInflight(currentInflight, 1)
+		}
 		return alternate, nil
 	}
-	result := s.forwarder.Forward(ctx, writer, proxyRequest)
+	result = s.forwarder.Forward(ctx, writer, proxyRequest)
 	if result.Err != nil && result.BytesSent == 0 {
 		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
 			return result, nil
