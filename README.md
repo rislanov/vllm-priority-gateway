@@ -28,7 +28,13 @@ OpenAI client
 
 SQLite owns durable configuration. Immutable indexed registry snapshots, health/pressure state, admission leases, and gateway in-flight counts live in memory. Fake vLLM and the load generator are separate commands in the same Go module.
 
-## Features
+## Documentation
+
+- [Technical specification (English)](docs/technical-specification.md) — complete MVP and Production V1 requirements translated from the original project brief.
+- [Real-GPU test plan](docs/real-gpu-testing.md) — hardware validation procedure for vLLM compatibility, cancellation, priority, pressure, and recovery.
+- [Acceptance evidence](docs/acceptance-evidence.md) — mapping from MVP acceptance criteria to automated or manual evidence.
+
+## Implemented in the MVP
 
 - OpenAI-compatible `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, and `POST /v1/responses`.
 - High-entropy client keys stored as an HMAC-SHA-256 digest, never as plaintext.
@@ -48,7 +54,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 - One or more reachable vLLM endpoints, or the bundled fake server.
 - `curl` for the examples; `jq` is useful for Admin API and validation commands.
 
-## Quick start
+## Quick start (local development)
 
 ```bash
 export LLMGW_ADMIN_USERNAME=operator
@@ -88,7 +94,7 @@ Common optional variables:
 
 Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
 
-## Initial configuration
+## Usage: bootstrap and first request
 
 The Admin UI is the simplest bootstrap path. Create resources in this order:
 
@@ -116,6 +122,22 @@ curl -sS -u "$LLMGW_ADMIN_USERNAME:$LLMGW_ADMIN_PASSWORD" \
 ```
 
 Every committed mutation increments the SQLite configuration revision, publishes a new registry snapshot, and reconciles backend monitor workers.
+
+After creating the API key, export the one-time secret and verify the client path:
+
+```bash
+export LLMGW_CLIENT_KEY='llmgw_copy-the-one-time-value-here'
+
+curl -sS http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
+
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+For routine operation, watch `/metrics`, drain a backend before maintenance, and resume it after the backend is healthy. `/readyz` confirms that the process, database, and registry are ready; it deliberately remains HTTP 200 when inference capacity is zero. Require `backendAvailability > 0` or make an authenticated inference-path probe before sending client traffic. The gateway reloads committed Admin changes without a process restart.
 
 ## Admin UI and API
 
@@ -248,7 +270,13 @@ go build ./cmd/...
 
 The SQLite driver is pure Go, so local development and Linux cross-compilation do not need Xcode command-line C tooling or CGO.
 
-## Linux amd64 build
+## Deployment
+
+The MVP is a single-replica service. Run exactly one gateway process against its local SQLite state directory. Put client and Admin traffic behind a trusted TLS reverse proxy and keep vLLM backends on a private network.
+
+The reverse proxy must terminate TLS, disable response buffering for streaming routes, use read/write timeouts longer than the longest permitted generation, propagate client disconnects, and avoid retrying inference `POST` requests. Expose only `/v1/*` to client networks. Restrict `/admin/*`, `/metrics`, `/healthz`, and `/readyz` to an operator or monitoring network; metrics contain configured client, model, pool, and backend labels.
+
+### Native Linux x86-64
 
 ```bash
 make build-linux-amd64
@@ -261,20 +289,108 @@ This produces static `gateway-linux-amd64`, `fake-vllm-linux-amd64`, and `loadge
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/gateway-linux-amd64 ./cmd/gateway
 ```
 
-## Docker
+Copy the gateway to the Linux host and create a dedicated service account and state directory:
 
 ```bash
+sudo useradd --system --home-dir /var/lib/llmgw --shell /usr/sbin/nologin llmgw
+sudo install -o root -g root -m 0755 dist/gateway-linux-amd64 /usr/local/bin/llmgw
+sudo install -d -o llmgw -g llmgw -m 0750 /var/lib/llmgw
+sudo install -d -o root -g llmgw -m 0750 /etc/llmgw
+```
+
+Generate separate random values for the Admin password and HMAC secret, save them in an approved secret store, then create `/etc/llmgw/llmgw.env`. Never deploy the placeholders below. Protect the file with `root:llmgw` ownership and mode `0640`:
+
+```dotenv
+LLMGW_LISTEN_ADDRESS=127.0.0.1:8080
+LLMGW_DATABASE_PATH=/var/lib/llmgw/llmgw.db
+LLMGW_ADMIN_USERNAME=operator
+LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-bytes
+LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+```
+
+```bash
+sudo chown root:llmgw /etc/llmgw/llmgw.env
+sudo chmod 0640 /etc/llmgw/llmgw.env
+```
+
+Install `/etc/systemd/system/llmgw.service`:
+
+```ini
+[Unit]
+Description=Lightweight vLLM Priority Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmgw
+Group=llmgw
+EnvironmentFile=/etc/llmgw/llmgw.env
+ExecStart=/usr/local/bin/llmgw
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/llmgw
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start the service and verify process/registry readiness:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now llmgw
+sudo systemctl status llmgw
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz | jq
+```
+
+After bootstrapping a pool, backend, client, and key, require inference capacity and make an authenticated client-path check before enabling proxy traffic:
+
+```bash
+curl -fsS http://127.0.0.1:8080/readyz | jq -e '.backendAvailability > 0'
+curl -fsS http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
+```
+
+SQLite runs in WAL mode. Do not copy only `llmgw.db` while the gateway is running: committed data may still be in `llmgw.db-wal`. Use a quiesced backup of the complete state directory, for example:
+
+```bash
+sudo systemctl stop llmgw
+sudo tar -C /var/lib/llmgw -czf /secure-backups/llmgw-state.tgz .
+sudo systemctl start llmgw
+```
+
+Keep `/etc/llmgw/llmgw.env` out of source control and escrow it securely with the state backup. Losing or changing `LLMGW_API_KEY_HMAC_SECRET` immediately invalidates every existing client key; the MVP has no dual-secret migration path. HMAC-secret rotation therefore requires a planned cutover that regenerates and redistributes every client key. Test restore into an isolated instance and verify Admin login, configuration, `backendAvailability`, and an authenticated `/v1/models` request before relying on a backup.
+
+### Docker
+
+```bash
+umask 077
+export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
+# Persist both values in an approved secret store before starting the container.
+
 docker build --platform linux/amd64 -t vllm-priority-gateway:local .
 docker volume create llmgw-data
-docker run --rm -p 8080:8080 -v llmgw-data:/data \
+docker run -d --name llmgw --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 -v llmgw-data:/data \
   -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD='replace-with-at-least-16-bytes' \
-  -e LLMGW_API_KEY_HMAC_SECRET="$LLMGW_API_KEY_HMAC_SECRET" \
+  -e LLMGW_ADMIN_PASSWORD \
+  -e LLMGW_API_KEY_HMAC_SECRET \
   vllm-priority-gateway:local
+
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz | jq
 ```
 
 The runtime image is `scratch`, contains only CA certificates and the static gateway, and runs as numeric UID/GID `65532`.
 The image initializes `/data` with that ownership, so a fresh named or anonymous volume is writable. For a Linux bind mount, create the directory and grant UID/GID `65532` write access before starting the container; Docker Desktop for macOS applies its own host-file sharing rules.
+Treat `llmgw-data` and the exact HMAC secret as one recoverable state set. Stop the container before snapshotting or restoring the complete volume, restart it afterward, and perform the same restore verification described for the native deployment. Privileged Docker users can inspect container environment variables; use the deployment platform's secret injection mechanism when stronger isolation is required.
 
 With a running Docker daemon, exercise the exact image, fresh-volume, non-root, SQLite, and health path with:
 
@@ -299,15 +415,24 @@ Tests cover domain validation, key security, SQLite migrations and CRUD, registr
 
 Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for compatibility, cancellation, queue pressure, priority isolation, and hysteretic recovery runs against actual vLLM GPUs. Fake-backend tests prove gateway mechanics but cannot prove GPU scheduler behavior.
 
-## Limitations
+## Not implemented in the MVP
 
 - One gateway replica; concurrency leases and backend runtime state are process-local.
-- Static backend configuration and SQLite persistence only.
+- Operator-managed backend registration and SQLite persistence only; there is no automatic service discovery.
 - No distributed rate limits, token budgets, billing, circuit breaker, autoscaling, discovery, prefix-aware routing, or GPU/NVML scheduling.
 - Priority admission rejects new lower-priority requests; it does not preempt an already admitted generation.
 - Basic auth is the MVP management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external or future responsibilities.
 - Capacity hints are persisted for forward compatibility but do not yet weight routing.
+- Automated fake-backend acceptance is complete, but real-vLLM GPU sign-off remains required before production use.
 
-## Production evolution
+## Remaining work for Production V1
 
-The package boundaries allow SQLite to be replaced with PostgreSQL, local leases with a distributed store, and static backend configuration with discovery. A production revision should add multi-replica configuration revisions, OIDC/RBAC, audit logging, secret-manager integration, circuit breaking, capacity-aware and affinity-aware routing, distributed budgets, OpenTelemetry, and controlled failure policy for its coordination store.
+The package boundaries allow SQLite to be replaced with PostgreSQL, local leases with a distributed store, and static backend configuration with discovery. Production V1 still needs:
+
+- Real-GPU validation and calibrated pressure/admission thresholds for the selected models and hardware.
+- Multi-replica gateway HA with coordinated configuration revisions and distributed concurrency/rate/token budgets.
+- PostgreSQL for durable configuration and a defined degraded-mode policy for the distributed coordination store.
+- Request-failure/`5xx` circuit breaking with open/half-open recovery probes, orchestrated drain-aware rolling shutdown, capacity-aware routing, and soft session affinity.
+- OIDC-based Admin authentication, RBAC, audit logging, secret-manager integration, and managed TLS/network policy.
+- OpenTelemetry traces, production dashboards and alerts, configuration migration/versioning, and Kubernetes deployment/discovery where required.
+- Load, failure, upgrade, backup/restore, and security validation against the Production V1 acceptance criteria in the technical specification.
