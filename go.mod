@@ -7,6 +7,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.70.1
+	golang.org/x/net v0.58.0
 	modernc.org/sqlite v1.57.0
 )
 

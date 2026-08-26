@@ -1,0 +1,23 @@
+{{define "content"}}
+<section class="page-heading">
+  <div><h1>Gateway overview</h1><p>Real-time status of model pools and inference backends.</p></div>
+  <button class="button secondary" type="button" data-refresh>Refresh status</button>
+</section>
+<section class="summary" aria-label="Gateway summary">
+  <div><span>Readiness</span><strong class="state-healthy">{{if .View.Degraded}}Degraded{{else}}Ready{{end}}</strong></div>
+  <div><span>Pools</span><strong>{{len .View.Pools}}</strong></div>
+  <div><span>Backends</span><strong>{{len .View.Backends}}</strong></div>
+</section>
+<section>
+  <h2>Pools</h2>
+  <div class="table-wrap"><table><thead><tr><th>Pool</th><th>State</th><th>Pressure</th><th>Available</th></tr></thead><tbody>
+  {{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong><small>{{.UpstreamModelName}}</small></td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.BestBackendPressure}}</td><td class="mono">{{.Runtime.AvailableBackends}}</td></tr>{{else}}<tr><td colspan="4" class="empty">No model pools configured.</td></tr>{{end}}
+  </tbody></table></div>
+</section>
+<section>
+  <h2>Backends</h2>
+  <div class="table-wrap"><table><thead><tr><th>Backend</th><th>State</th><th>Running</th><th>Waiting</th><th>KV cache</th><th>Pressure</th></tr></thead><tbody>
+  {{range .View.Backends}}<tr><td><strong>{{.Name}}</strong><small>{{.ModelPool}}</small></td><td class="{{stateClass .Runtime.State}}">{{if .Draining}}draining{{else}}{{.Runtime.State}}{{end}}</td><td class="mono">{{decimal .Runtime.Running}}</td><td class="mono">{{decimal .Runtime.Waiting}}</td><td class="mono">{{percent .Runtime.KVCacheUsage}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td></tr>{{else}}<tr><td colspan="6" class="empty">No backends configured.</td></tr>{{end}}
+  </tbody></table></div>
+</section>
+{{end}}

@@ -1,0 +1,28 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · vLLM Priority Gateway</title>
+  <link rel="stylesheet" href="/admin/static/app.css">
+  <script defer src="/admin/static/app.js"></script>
+</head>
+<body{{if eq .Active "Dashboard"}} data-dashboard{{end}}>
+  <header class="app-header">
+    <a class="brand" href="/admin">vLLM <span>Priority Gateway</span></a>
+    <nav aria-label="Admin navigation">
+      <a href="/admin"{{if eq .Active "Dashboard"}} aria-current="page"{{end}}>Dashboard</a>
+      <a href="/admin/clients"{{if eq .Active "Clients"}} aria-current="page"{{end}}>Clients</a>
+      <a href="/admin/keys"{{if eq .Active "API Keys"}} aria-current="page"{{end}}>API Keys</a>
+      <a href="/admin/backends"{{if eq .Active "Backends"}} aria-current="page"{{end}}>Backends</a>
+    </nav>
+    <span class="ready"><i></i>{{if .View.Degraded}}Degraded{{else}}Ready{{end}}</span>
+  </header>
+  <main>
+    {{if .Error}}<div class="notice error" role="alert">{{.Error}}</div>{{end}}
+    {{if .View.Degraded}}<div class="notice error" role="alert">Configuration reload degraded: {{.View.Degraded}}</div>{{end}}
+    {{template "content" .}}
+  </main>
+  <footer>Configuration revision <span class="mono">{{.View.Revision}}</span> · Times are shown in UTC</footer>
+</body>
+</html>{{end}}

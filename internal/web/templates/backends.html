@@ -1,0 +1,26 @@
+{{define "content"}}
+<section class="page-heading"><div><h1>Backends</h1><p>Manage model mappings, endpoints, and routing state.</p></div></section>
+<div class="table-wrap"><table><thead><tr><th>Name</th><th>Model pool</th><th>URL</th><th>State</th><th>Pressure</th><th>Enabled</th><th>Draining</th><th>Actions</th></tr></thead><tbody>
+{{range .View.Backends}}<tr><td><strong>{{.Name}}</strong></td><td>{{.ModelPool}}</td><td class="mono url">{{.BaseURL}}</td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td><td>{{if .Enabled}}Yes{{else}}No{{end}}</td><td>{{if .Draining}}Yes{{else}}No{{end}}</td><td><form method="post" action="/admin/backends" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">{{if .Draining}}<button class="button secondary small" name="action" value="resume" type="submit">Resume</button>{{else}}<button class="button secondary small" name="action" value="drain" type="submit" data-confirm="Drain this backend? Existing streams will continue.">Drain</button>{{end}}</form></td></tr>{{else}}<tr><td colspan="8" class="empty">No backends configured.</td></tr>{{end}}
+</tbody></table></div>
+<div class="editor-columns">
+<section class="editor"><h2>Create model pool</h2><form method="post" action="/admin/backends" class="form-grid">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create_pool">
+  <div><label for="public-model">Public model name</label><input id="public-model" name="public_model_name" required></div>
+  <div><label for="upstream-model">Upstream model name</label><input id="upstream-model" name="upstream_model_name" required></div>
+  <label class="check" for="pool-enabled"><input id="pool-enabled" name="enabled" type="checkbox" checked>Enabled</label>
+  <div class="form-actions"><button class="button primary" type="submit">Create pool</button></div>
+</form></section>
+<section class="editor"><h2>Create backend</h2><form method="post" action="/admin/backends" class="form-grid">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create_backend">
+  <div><label for="backend-name">Name</label><input id="backend-name" name="name" required></div>
+  <div><label for="backend-pool">Model pool</label><select id="backend-pool" name="model_pool_id" required>{{range .View.Pools}}<option value="{{.ID}}">{{.PublicModelName}}</option>{{end}}</select></div>
+  <div class="wide"><label for="backend-url">URL</label><input id="backend-url" name="base_url" type="url" placeholder="http://127.0.0.1:8000" required></div>
+  <div><label for="capacity-hint">Capacity hint</label><input id="capacity-hint" name="capacity_hint" type="number" min="0.01" step="0.01" value="1" required></div>
+  <div><label for="running-soft-limit">Running soft limit</label><input id="running-soft-limit" name="running_soft_limit" type="number" min="0.01" step="0.01" value="16" required></div>
+  <div class="wide"><label for="upstream-key-env">Upstream API key environment variable</label><input id="upstream-key-env" name="upstream_api_key_env" autocomplete="off"></div>
+  <label class="check" for="backend-enabled"><input id="backend-enabled" name="enabled" type="checkbox" checked>Enabled</label>
+  <div class="form-actions"><button class="button primary" type="submit">Create backend</button></div>
+</form></section>
+</div>
+{{end}}

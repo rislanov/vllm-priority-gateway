@@ -1,0 +1,13 @@
+{{define "content"}}
+<section class="page-heading"><div><h1>API Keys</h1><p>Generate client credentials and revoke access immediately.</p></div></section>
+{{if .Secret}}<section id="one-time-secret" class="secret" role="status"><div><h2>API key created</h2><p>Copy this key now. It will not be shown again.</p></div><code data-secret>{{.Secret}}</code><button class="button primary" type="button" data-copy>Copy key</button></section>{{end}}
+<div class="table-wrap"><table><thead><tr><th>Prefix</th><th>Client</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+{{range .View.Keys}}<tr><td class="mono">{{.Prefix}}…</td><td>{{.Client}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02 15:04"}}</td><td>{{timeValue .ExpiresAt}}</td><td>{{timeValue .LastUsedAt}}</td><td class="state-{{.Status}}">{{.Status}}</td><td>{{if eq .Status "active"}}<form method="post" action="/admin/keys" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="revoke"><input type="hidden" name="key_id" value="{{.ID}}"><button class="button danger small" type="submit" data-confirm="Revoke this API key?">Revoke</button></form>{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="7" class="empty">No API keys generated.</td></tr>{{end}}
+</tbody></table></div>
+<section class="editor compact"><h2>Generate API key</h2><form method="post" action="/admin/keys" class="form-grid">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create">
+  <div><label for="key-client">Client</label><select id="key-client" name="client_id" required>{{range .View.Clients}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></div>
+  <div><label for="key-expiry">Expiry (optional)</label><input id="key-expiry" name="expires_at" type="date"></div>
+  <div class="form-actions"><button class="button primary" type="submit">Generate API key</button></div>
+</form></section>
+{{end}}
