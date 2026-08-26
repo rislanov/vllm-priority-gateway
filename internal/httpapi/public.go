@@ -96,6 +96,16 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 		h.completePublic(started, event)
 		return
 	}
+	client, authErr := h.service.ValidateAPIKey(rawKey)
+	if authErr != nil {
+		writeGatewayError(writer, authErr)
+		event.Status, event.Reason = authErr.HTTPStatus, authErr.Code
+		h.completePublic(started, event)
+		return
+	}
+	event.Client = client.Name
+	event.PriorityClass = client.PriorityClass
+	event.VLLMPriority = client.VLLMPriority
 	request.Body = http.MaxBytesReader(writer, request.Body, h.bodyLimit)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -114,7 +124,7 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 	}
 }
 
-func (h *PublicHandler) unsupported(writer http.ResponseWriter, _ *http.Request) {
+func (h *PublicHandler) unsupported(writer http.ResponseWriter, request *http.Request) {
 	started := time.Now()
 	requestID, ok := h.begin(writer)
 	if !ok {
@@ -123,7 +133,10 @@ func (h *PublicHandler) unsupported(writer http.ResponseWriter, _ *http.Request)
 	}
 	apiError := unsupportedEndpoint()
 	writeGatewayError(writer, apiError)
-	h.completePublic(started, gateway.RequestEvent{RequestID: requestID, Status: apiError.HTTPStatus, Reason: apiError.Code})
+	h.completePublic(started, gateway.RequestEvent{
+		RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id")),
+		Status: apiError.HTTPStatus, Reason: apiError.Code,
+	})
 }
 
 func (h *PublicHandler) completePublic(started time.Time, event gateway.RequestEvent) {

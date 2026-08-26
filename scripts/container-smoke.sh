@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-image="llmgw-container-smoke"
+image="llmgw-container-smoke-$$"
 container="llmgw-container-smoke-$$"
 volume="llmgw-container-smoke-$$"
 

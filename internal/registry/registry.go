@@ -60,10 +60,39 @@ func (r *Registry) Reload(ctx context.Context) error {
 		if snapshot.Revision <= current.Revision {
 			return nil
 		}
-		if r.current.CompareAndSwap(current, &snapshot) {
+		candidate := mergeKeyRuntimeState(snapshot, current)
+		if r.current.CompareAndSwap(current, &candidate) {
 			return nil
 		}
 	}
+}
+
+func mergeKeyRuntimeState(candidate Snapshot, current *Snapshot) Snapshot {
+	currentByID := make(map[int64]domain.APIKey)
+	for _, candidates := range current.KeyCandidates {
+		for _, key := range candidates {
+			currentByID[key.ID] = key
+		}
+	}
+	merged := candidate
+	merged.KeyCandidates = make(map[string][]domain.APIKey, len(candidate.KeyCandidates))
+	for prefix, candidates := range candidate.KeyCandidates {
+		copied := append([]domain.APIKey(nil), candidates...)
+		for index := range copied {
+			state, exists := currentByID[copied[index].ID]
+			if !exists {
+				continue
+			}
+			if copied[index].RevokedAt == nil && state.RevokedAt != nil {
+				copied[index].RevokedAt = state.RevokedAt
+			}
+			if state.LastUsedAt != nil && (copied[index].LastUsedAt == nil || state.LastUsedAt.After(*copied[index].LastUsedAt)) {
+				copied[index].LastUsedAt = state.LastUsedAt
+			}
+		}
+		merged.KeyCandidates[prefix] = copied
+	}
+	return merged
 }
 
 // MarkKeyRevoked immediately publishes a fail-closed view after durable

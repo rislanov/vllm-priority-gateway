@@ -92,6 +92,65 @@ func TestMarkKeyRevokedPublishesFailClosedOverlay(t *testing.T) {
 	}
 }
 
+func TestConcurrentReloadPreservesFailClosedRevocationOverlay(t *testing.T) {
+	loader := &staleKeyReloadLoader{
+		key:           domain.APIKey{ID: 7, ClientID: 1, Prefix: "llmgw_abcd"},
+		reloadStarted: make(chan struct{}),
+		releaseReload: make(chan struct{}),
+	}
+	reg := registry.New(loader)
+	if err := reg.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- reg.Reload(context.Background()) }()
+	<-loader.reloadStarted
+	revokedAt := time.Unix(1_700_000_000, 0).UTC()
+	if !reg.MarkKeyRevoked(loader.key.ID, revokedAt) {
+		t.Fatal("key was not found")
+	}
+	close(loader.releaseReload)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := reg.Snapshot()
+	key := snapshot.KeyCandidates[loader.key.Prefix][0]
+	if snapshot.Revision != 2 || key.RevokedAt == nil || !key.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("stale reload replaced fail-closed overlay: revision=%d key=%+v", snapshot.Revision, key)
+	}
+}
+
+func TestConcurrentReloadPreservesLatestUsageOverlay(t *testing.T) {
+	loader := &staleKeyReloadLoader{
+		key:           domain.APIKey{ID: 7, ClientID: 1, Prefix: "llmgw_abcd"},
+		reloadStarted: make(chan struct{}),
+		releaseReload: make(chan struct{}),
+	}
+	reg := registry.New(loader)
+	if err := reg.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- reg.Reload(context.Background()) }()
+	<-loader.reloadStarted
+	usedAt := time.Unix(1_700_000_100, 0).UTC()
+	if !reg.MarkKeyUsed(loader.key.ID, usedAt) {
+		t.Fatal("key was not found")
+	}
+	close(loader.releaseReload)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	key := reg.Snapshot().KeyCandidates[loader.key.Prefix][0]
+	if key.LastUsedAt == nil || !key.LastUsedAt.Equal(usedAt) {
+		t.Fatalf("stale reload replaced latest usage overlay: %+v", key)
+	}
+}
+
 func TestMarkKeyUsedPublishesRuntimeTimestampWithoutRevisionChange(t *testing.T) {
 	loader := &sequenceLoader{results: []loadResult{{data: registry.Data{
 		Revision: 3,
@@ -128,6 +187,13 @@ type overlappingLoader struct {
 	releaseFirst chan struct{}
 }
 
+type staleKeyReloadLoader struct {
+	calls         atomic.Int64
+	key           domain.APIKey
+	reloadStarted chan struct{}
+	releaseReload chan struct{}
+}
+
 func (l *overlappingLoader) LoadSnapshot(context.Context) (registry.Data, error) {
 	if l.calls.Add(1) == 1 {
 		close(l.firstStarted)
@@ -135,6 +201,19 @@ func (l *overlappingLoader) LoadSnapshot(context.Context) (registry.Data, error)
 		return registry.Data{Revision: 1}, nil
 	}
 	return registry.Data{Revision: 2}, nil
+}
+
+func (l *staleKeyReloadLoader) LoadSnapshot(context.Context) (registry.Data, error) {
+	revision := l.calls.Add(1)
+	if revision == 2 {
+		close(l.reloadStarted)
+		<-l.releaseReload
+	}
+	return registry.Data{
+		Revision: revision,
+		Clients:  []domain.Client{{ID: 1, Name: "client", Enabled: true}},
+		Keys:     []domain.APIKey{l.key},
+	}, nil
 }
 
 func (l *sequenceLoader) LoadSnapshot(context.Context) (registry.Data, error) {

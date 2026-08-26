@@ -78,6 +78,20 @@ func TestLoadRejectsInvalidThresholdOrder(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNonFiniteKVThresholds(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "-Inf"} {
+		for _, variable := range []string{"LLMGW_KV_SOFT_LIMIT", "LLMGW_KV_HARD_LIMIT"} {
+			t.Run(variable+"="+value, func(t *testing.T) {
+				env := validEnvironment()
+				env[variable] = value
+				if _, err := config.Load(lookup(env)); err == nil {
+					t.Fatal("Load() unexpectedly accepted a non-finite KV threshold")
+				}
+			})
+		}
+	}
+}
+
 func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	env := validEnvironment()
 	env["LLMGW_LISTEN_ADDRESS"] = "127.0.0.1:9090"

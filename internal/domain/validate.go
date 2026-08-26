@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const MaxPublicModelNameBytes = 256
+
 func (c *Client) Validate() error {
 	c.Name = strings.TrimSpace(c.Name)
 	if c.Name == "" {
@@ -30,6 +32,9 @@ func (p *ModelPool) Validate() error {
 	p.UpstreamModelName = strings.TrimSpace(p.UpstreamModelName)
 	if p.PublicModelName == "" {
 		return errors.New("public model name is required")
+	}
+	if len(p.PublicModelName) > MaxPublicModelNameBytes {
+		return fmt.Errorf("public model name must not exceed %d bytes", MaxPublicModelNameBytes)
 	}
 	if p.UpstreamModelName == "" {
 		return errors.New("upstream model name is required")

@@ -96,8 +96,9 @@ Generate enough low-priority work to exceed physical capacity:
 
 ```bash
 ./dist/loadgen-linux-amd64 -url "$GATEWAY" -key "$BACKGROUND_KEY" -model gpu-test \
-  -parallelism 64 -requests 1000 -prompt-size 2048 -max-tokens 512 -stream -json > /tmp/background-load.json &
+  -parallelism 64 -requests 100000 -prompt-size 2048 -max-tokens 512 -stream -json > /tmp/background-load.json &
 LOAD_PID=$!
+printf '%s\n' "$LOAD_PID" > /tmp/llmgw-background-load.pid
 
 for i in $(seq 1 30); do
   date -u +%FT%TZ
@@ -106,7 +107,8 @@ for i in $(seq 1 30); do
   sleep 1
 done | tee /tmp/queue-pressure-evidence.txt
 
-wait "$LOAD_PID"
+kill -0 "$LOAD_PID"
+printf 'background load remains active as PID %s for sections 5 and 6\n' "$LOAD_PID"
 ```
 
 With two backends, repeat after applying load directly to only vLLM A. Pass criteria: waiting requests and pressure rise on A; new gateway requests prefer the lower-pressure B; stale, unhealthy, or draining endpoints receive no new work.
@@ -116,6 +118,9 @@ With two backends, repeat after applying load directly to only vLLM A. Pass crit
 Run the fixed seeded mix while background traffic already fills the queue:
 
 ```bash
+LOAD_PID="$(cat /tmp/llmgw-background-load.pid)"
+kill -0 "$LOAD_PID"
+
 ./dist/loadgen-linux-amd64 -url "$GATEWAY" -model gpu-test \
   -parallelism 64 -requests 2000 -prompt-size 1024 -max-tokens 256 -stream -seed 42 \
   -class-keys "critical=$CRITICAL_KEY,high=$HIGH_KEY,normal=$NORMAL_KEY,background=$BACKGROUND_KEY" \
@@ -126,16 +131,71 @@ curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_
 
 Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
 
-## 6. Hysteresis and recovery
+## 6. Hysteresis, recovery, and health transitions
 
-During the load from section 4, poll status once per second. Stop the generator, then continue polling for at least 15 seconds:
+Keep the section 4 background generator active for the first phase. Record the sustained state, stop it with a timestamp, and then observe recovery continuously:
 
 ```bash
-for i in $(seq 1 20); do
+LOAD_PID="$(cat /tmp/llmgw-background-load.pid)"
+kill -0 "$LOAD_PID"
+
+poll_status() {
+  date -u +%FT%TZ
   curl -sS -u "$ADMIN_USER:$ADMIN_PASSWORD" "$GATEWAY/admin/api/status" \
     | jq -c '[.pools[]|{model:.publicModelName,state:.runtime.State,pressure:.runtime.BestBackendPressure}]'
+}
+
+for i in $(seq 1 5); do
+  poll_status
+  sleep 1
+done | tee /tmp/hysteresis-sustained.jsonl
+
+date -u +%FT%TZ | tee /tmp/background-load-stopped-at.txt
+kill "$LOAD_PID"
+wait "$LOAD_PID" || true
+rm -f /tmp/llmgw-background-load.pid
+
+for i in $(seq 1 20); do
+  poll_status
   sleep 1
 done | tee /tmp/hysteresis-recovery.jsonl
+```
+
+After the pool has returned to normal, create a spike shorter than the configured three-second enter window and confirm that it does not promote the pool:
+
+```bash
+./dist/loadgen-linux-amd64 -url "$GATEWAY" -key "$BACKGROUND_KEY" -model gpu-test \
+  -parallelism 64 -requests 100000 -prompt-size 2048 -max-tokens 512 -stream >/tmp/short-spike.log &
+SPIKE_PID=$!
+date -u +%FT%TZ | tee /tmp/short-spike-started-at.txt
+sleep 2
+kill "$SPIKE_PID"
+wait "$SPIKE_PID" || true
+date -u +%FT%TZ | tee /tmp/short-spike-stopped-at.txt
+
+for i in $(seq 1 8); do
+  poll_status
+  sleep 1
+done | tee /tmp/hysteresis-short-spike.jsonl
+```
+
+Finally, exercise the configured health failure and consecutive-success recovery counts with no load running. Set `VLLM_A_PID` to the actual server process, or substitute the equivalent controlled stop/start operation for your process manager:
+
+```bash
+: "${VLLM_A_PID:?set VLLM_A_PID to the vLLM A server process}"
+date -u +%FT%TZ | tee /tmp/vllm-a-paused-at.txt
+kill -STOP "$VLLM_A_PID"
+for i in $(seq 1 8); do
+  poll_status
+  sleep 1
+done | tee /tmp/health-failure.jsonl
+
+date -u +%FT%TZ | tee /tmp/vllm-a-resumed-at.txt
+kill -CONT "$VLLM_A_PID"
+for i in $(seq 1 8); do
+  poll_status
+  sleep 1
+done | tee /tmp/health-recovery.jsonl
 ```
 
 Pass criteria:

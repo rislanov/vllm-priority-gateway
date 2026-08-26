@@ -66,6 +66,9 @@ func NewWorker(backend domain.Backend, options Options) (*Worker, error) {
 	if options.HTTPClient == nil {
 		options.HTTPClient = http.DefaultClient
 	}
+	client := *options.HTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	options.HTTPClient = &client
 	return &Worker{
 		backend: backend,
 		options: options,

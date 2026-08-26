@@ -162,6 +162,78 @@ func TestRunLetsActiveStreamFinishInsideGracePeriod(t *testing.T) {
 	_ = database.Close()
 }
 
+func TestRunForceClosesActiveStreamAfterGracePeriod(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{Tokens: []string{"one", "two", "three"}, TokenDelay: 500 * time.Millisecond})
+	upstream := httptest.NewServer(fake.Handler())
+	defer upstream.Close()
+	databasePath := filepath.Join(t.TempDir(), "gateway.db")
+	secret := strings.Repeat("h", 32)
+	clientKey := seedGatewayDatabase(t, databasePath, upstream.URL, []byte(secret))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	environment := validEnvironment(databasePath)
+	environment["LLMGW_HEALTH_INTERVAL"] = "10ms"
+	environment["LLMGW_METRICS_INTERVAL"] = "10ms"
+	environment["LLMGW_UNHEALTHY_AFTER"] = "1"
+	environment["LLMGW_RECOVERY_AFTER"] = "1"
+	environment["LLMGW_SHUTDOWN_GRACE_PERIOD"] = "30ms"
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, mapLookup(environment), listener, &bytes.Buffer{}, &bytes.Buffer{}) }()
+
+	baseURL := "http://" + listener.Addr().String()
+	client := &http.Client{Timeout: 2 * time.Second}
+	var response *http.Response
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		request, _ := http.NewRequest(http.MethodPost, baseURL+"/v1/completions", strings.NewReader(`{"model":"qwen","stream":true}`))
+		request.Header.Set("Authorization", "Bearer "+clientKey)
+		response, err = client.Do(request)
+		if err == nil && response.StatusCode == http.StatusOK {
+			break
+		}
+		if response != nil {
+			response.Body.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stream did not start: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	reader := bufio.NewReader(response.Body)
+	first, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(first, "one") {
+		t.Fatalf("first stream frame = %q err=%v", first, err)
+	}
+	cancel()
+	_, _ = io.ReadAll(reader)
+	response.Body.Close()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "graceful HTTP shutdown") {
+			t.Fatalf("run error = %v, want forced shutdown error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not force-close after grace period")
+	}
+	deadline = time.Now().Add(time.Second)
+	for fake.Snapshot().ActiveRequests != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snapshot := fake.Snapshot(); snapshot.ActiveRequests != 0 {
+		t.Fatalf("forced shutdown left upstream request active: %+v", snapshot)
+	}
+	database, err := store.Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatalf("database remained locked after forced shutdown: %v", err)
+	}
+	_ = database.Close()
+}
+
 func TestRunRejectsMissingHMACSecretBeforeServing(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

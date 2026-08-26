@@ -17,8 +17,6 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
 )
 
-const maxPublicModelNameBytes = 256
-
 type SnapshotProvider interface {
 	Snapshot() *registry.Snapshot
 }
@@ -124,6 +122,14 @@ func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, 
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].PublicModelName < models[j].PublicModelName })
 	return models, client, nil
+}
+
+// ValidateAPIKey authenticates a key without recording usage. Public HTTP
+// handlers use it before reading a potentially large request body; Forward
+// authenticates again after the read so revocations during upload fail closed.
+func (s *Service) ValidateAPIKey(rawKey string) (domain.Client, *APIError) {
+	client, _, apiErr := s.validateAPIKey(rawKey)
+	return client, apiErr
 }
 
 // CompletePublic records public outcomes that do not enter the forwarding
@@ -275,6 +281,17 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 }
 
 func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIError) {
+	client, matched, apiErr := s.validateAPIKey(raw)
+	if apiErr != nil {
+		return domain.Client{}, domain.APIKey{}, apiErr
+	}
+	if s.usage != nil {
+		s.usage.Record(matched.ID, s.now().UTC())
+	}
+	return client, matched, nil
+}
+
+func (s *Service) validateAPIKey(raw string) (domain.Client, domain.APIKey, *APIError) {
 	if len(raw) < 12 || !strings.HasPrefix(raw, "llmgw_") {
 		return domain.Client{}, domain.APIKey{}, invalidAPIKey()
 	}
@@ -296,9 +313,6 @@ func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIEr
 	client, exists := snapshot.Clients[matched.ClientID]
 	if !exists || !client.Enabled {
 		return domain.Client{}, domain.APIKey{}, invalidAPIKey()
-	}
-	if s.usage != nil {
-		s.usage.Record(matched.ID, now)
 	}
 	return client, matched, nil
 }
@@ -327,7 +341,7 @@ func rewritePayload(body []byte) ([]byte, string, error) {
 	if err := json.Unmarshal(encodedModel, &model); err != nil || strings.TrimSpace(model) == "" {
 		return nil, "", errors.New("model must be a non-empty string")
 	}
-	if len(model) > maxPublicModelNameBytes {
+	if len(model) > domain.MaxPublicModelNameBytes {
 		return nil, "", errors.New("model must not exceed 256 bytes")
 	}
 	delete(payload, "priority")

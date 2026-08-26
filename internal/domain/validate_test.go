@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -66,5 +67,15 @@ func TestModelPoolValidateRequiresBothNames(t *testing.T) {
 		if err := pool.Validate(); err == nil {
 			t.Fatalf("Validate(%+v) unexpectedly succeeded", pool)
 		}
+	}
+}
+
+func TestModelPoolValidateRejectsUnusablePublicName(t *testing.T) {
+	pool := domain.ModelPool{
+		PublicModelName:   strings.Repeat("x", domain.MaxPublicModelNameBytes+1),
+		UpstreamModelName: "upstream",
+	}
+	if err := pool.Validate(); err == nil {
+		t.Fatal("Validate() accepted a public model name that requests cannot encode")
 	}
 }

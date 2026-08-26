@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,26 @@ func TestPublicAuthenticationCasesUseSameUnauthorizedEnvelope(t *testing.T) {
 			}
 			assertErrorCode(t, response.Body.Bytes(), "invalid_api_key")
 		})
+	}
+}
+
+func TestInvalidAPIKeyIsRejectedBeforeReadingRequestBody(t *testing.T) {
+	_, key := testKey(t)
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key})
+	body := &readTrackingBody{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", nil)
+	request.Body = body
+	request.ContentLength = -1
+	request.Header.Set("Authorization", "Bearer llmgw_unknown_unknown_unknown_unknown_unknown")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if body.reads != 0 {
+		t.Fatalf("invalid API key caused %d body reads", body.reads)
 	}
 }
 
@@ -267,6 +288,7 @@ func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/v1/models", nil),
 	}
 	requests[1].Header.Set("Authorization", "Bearer "+raw)
+	requests[1].Header.Set("X-Request-Id", "unsupported-parent")
 	requests[2].Header.Set("Authorization", "Bearer "+raw)
 	requests[3].Header.Set("Authorization", "Bearer "+raw)
 	for _, request := range requests {
@@ -286,7 +308,21 @@ func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
 	if events[3].Client != "client" || events[3].PriorityClass != domain.PriorityHigh {
 		t.Fatalf("models event lacks client policy: %+v", events[3])
 	}
+	if events[1].ParentRequestID != "unsupported-parent" {
+		t.Fatalf("unsupported event parent request ID = %q", events[1].ParentRequestID)
+	}
 }
+
+type readTrackingBody struct {
+	reads int
+}
+
+func (b *readTrackingBody) Read([]byte) (int, error) {
+	b.reads++
+	return 0, errors.New("request body must not be read before authentication")
+}
+
+func (*readTrackingBody) Close() error { return nil }
 
 func TestServicePreservesCommittedUpstreamStatusOnBodyFailure(t *testing.T) {
 	raw, key := testKey(t)

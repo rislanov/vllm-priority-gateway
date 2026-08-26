@@ -201,7 +201,9 @@ func (c Config) validate() error {
 	if !finitePositive(c.QueueSoftLimit) {
 		return errors.New("queue soft limit must be positive")
 	}
-	if c.KVSoftLimit < 0 || c.KVHardLimit > 1 || c.KVSoftLimit >= c.KVHardLimit {
+	if math.IsNaN(c.KVSoftLimit) || math.IsInf(c.KVSoftLimit, 0) ||
+		math.IsNaN(c.KVHardLimit) || math.IsInf(c.KVHardLimit, 0) ||
+		c.KVSoftLimit < 0 || c.KVHardLimit > 1 || c.KVSoftLimit >= c.KVHardLimit {
 		return errors.New("KV limits must satisfy 0 <= soft < hard <= 1")
 	}
 	if !(c.BusyRecoveryThreshold < c.BusyThreshold && c.BusyThreshold < c.SaturatedRecoveryThreshold && c.SaturatedRecoveryThreshold < c.SaturatedThreshold && c.SaturatedThreshold < c.EmergencyRecoveryThreshold && c.EmergencyRecoveryThreshold < c.EmergencyThreshold) {

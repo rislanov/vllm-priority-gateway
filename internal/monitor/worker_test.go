@@ -109,6 +109,37 @@ func TestWorkerMetricsPressureAndStaleness(t *testing.T) {
 	}
 }
 
+func TestWorkerDoesNotFollowHealthOrMetricsRedirects(t *testing.T) {
+	var redirectedRequests atomic.Int64
+	sink := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		redirectedRequests.Add(1)
+		if request.URL.Path == "/metrics" {
+			_, _ = writer.Write([]byte("vllm:num_requests_running 0\nvllm:num_requests_waiting 0\nvllm:gpu_cache_usage_perc 0\n"))
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer sink.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, sink.URL+request.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	worker, err := monitor.NewWorker(testBackend(redirector.URL, 1, 1), monitorOptions(redirector.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.PollHealth(context.Background(), time.Now()) {
+		t.Fatal("redirected health response was accepted")
+	}
+	if err := worker.PollMetrics(context.Background(), time.Now()); err == nil {
+		t.Fatal("redirected metrics response was accepted")
+	}
+	if got := redirectedRequests.Load(); got != 0 {
+		t.Fatalf("monitor followed %d redirect(s) outside the backend boundary", got)
+	}
+}
+
 func TestWorkerDrainingOverridesPressureState(t *testing.T) {
 	fake := fakevllm.New()
 	server := httptest.NewServer(fake.Handler())
