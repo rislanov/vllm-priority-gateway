@@ -75,6 +75,21 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 	}
 }
 
+func TestClientEditPagePrefillsExistingPolicy(t *testing.T) {
+	handler := newWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/clients?edit=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, expected := range []string{"Edit client: payments", `value="payments"`, `value="-100"`, `value="24"`, `value="1" checked`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("edit page missing %q: %s", expected, body)
+		}
+	}
+}
+
 func newWebFixture(t *testing.T) http.Handler {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))

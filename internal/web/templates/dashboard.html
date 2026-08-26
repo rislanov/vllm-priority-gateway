@@ -7,6 +7,7 @@
   <div><span>Readiness</span><strong class="state-healthy">{{if .View.Degraded}}Degraded{{else}}Ready{{end}}</strong></div>
   <div><span>Pools</span><strong>{{len .View.Pools}}</strong></div>
   <div><span>Backends</span><strong>{{len .View.Backends}}</strong></div>
+  <div><span>Total running</span><strong class="mono">{{totalRunning .View.Backends}}</strong></div>
 </section>
 <section>
   <h2>Pools</h2>

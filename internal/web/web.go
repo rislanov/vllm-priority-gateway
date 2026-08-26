@@ -20,12 +20,13 @@ type Handler struct {
 }
 
 type pageData struct {
-	Title  string
-	Active string
-	CSRF   string
-	View   httpapi.AdminView
-	Secret string
-	Error  string
+	Title      string
+	Active     string
+	CSRF       string
+	View       httpapi.AdminView
+	EditClient *httpapi.AdminClient
+	Secret     string
+	Error      string
 }
 
 func New(service *httpapi.AdminService) (http.Handler, error) {
@@ -33,10 +34,17 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 		return nil, fmt.Errorf("admin web service is required")
 	}
 	functions := template.FuncMap{
-		"join":       strings.Join,
-		"timeValue":  timeValue,
-		"percent":    func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
-		"decimal":    func(value float64) string { return fmt.Sprintf("%.2f", value) },
+		"join":      strings.Join,
+		"timeValue": timeValue,
+		"percent":   func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
+		"decimal":   func(value float64) string { return fmt.Sprintf("%.2f", value) },
+		"totalRunning": func(backends []httpapi.AdminBackend) string {
+			var total float64
+			for _, backend := range backends {
+				total += backend.Runtime.Running
+			}
+			return fmt.Sprintf("%.0f", total)
+		},
 		"stateClass": func(value any) string { return "state-" + strings.ToLower(fmt.Sprint(value)) },
 		"hasPool": func(ids []int64, id int64) bool {
 			for _, candidate := range ids {
@@ -108,6 +116,17 @@ func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
+	}
+	if rawID := request.URL.Query().Get("edit"); rawID != "" {
+		if id, err := positiveID(rawID); err == nil {
+			for _, client := range h.service.View().Clients {
+				if client.ID == id {
+					copy := client
+					data.EditClient = &copy
+					break
+				}
+			}
+		}
 	}
 	status := http.StatusOK
 	if data.Error != "" {

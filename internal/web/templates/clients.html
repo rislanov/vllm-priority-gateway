@@ -1,14 +1,26 @@
 {{define "content"}}
-<section class="page-heading"><div><h1>Clients</h1><p>Control priority, concurrency, and explicit model access.</p></div></section>
+<section class="page-heading"><div><h1>Clients</h1><p>Control priority, concurrency, and explicit model access.</p></div><a class="button primary" href="/admin/clients#create-client">Create client</a></section>
 <div class="table-wrap"><table><thead><tr><th>Name</th><th>Class</th><th>vLLM priority</th><th>Max concurrency</th><th>Models</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-{{range .View.Clients}}<tr><td><strong>{{.Name}}</strong></td><td>{{.PriorityClass}}</td><td class="mono">{{.VLLMPriority}}</td><td class="mono">{{.MaxConcurrency}}</td><td>{{join .Models ", "}}</td><td class="{{if .Enabled}}state-healthy{{else}}state-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</td><td>
+{{range .View.Clients}}<tr><td><strong>{{.Name}}</strong></td><td>{{.PriorityClass}}</td><td class="mono">{{.VLLMPriority}}</td><td class="mono">{{.MaxConcurrency}}</td><td>{{join .Models ", "}}</td><td class="{{if .Enabled}}state-healthy{{else}}state-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</td><td><div class="row-actions"><a class="button secondary small" href="/admin/clients?edit={{.ID}}#client-editor">Edit</a>
   <form method="post" action="/admin/clients" class="row-actions">
     <input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="update"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="name" value="{{.Name}}"><input type="hidden" name="priority_class" value="{{.PriorityClass}}"><input type="hidden" name="vllm_priority" value="{{.VLLMPriority}}"><input type="hidden" name="max_concurrency" value="{{.MaxConcurrency}}">{{range .ModelPoolIDs}}<input type="hidden" name="model_pool_id" value="{{.}}">{{end}}{{if not .Enabled}}<input type="hidden" name="enabled" value="on">{{end}}
     <button class="button secondary small" type="submit" data-confirm="Change enabled state for this client?">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
-  </form>
+  </form></div>
 </td></tr>{{else}}<tr><td colspan="7" class="empty">No clients configured.</td></tr>{{end}}
 </tbody></table></div>
-<section class="editor"><h2>Create client</h2><form method="post" action="/admin/clients" class="form-grid">
+{{if .EditClient}}
+{{$client := .EditClient}}<section id="client-editor" class="editor"><h2>Edit client: {{$client.Name}}</h2><form method="post" action="/admin/clients" class="form-grid">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="update"><input type="hidden" name="id" value="{{$client.ID}}">
+  <div><label for="edit-client-name">Name</label><input id="edit-client-name" name="name" value="{{$client.Name}}" required autocomplete="off"></div>
+  <div><label for="edit-priority-class">Priority class</label><select id="edit-priority-class" name="priority_class"><option{{if eq $client.PriorityClass "critical"}} selected{{end}}>critical</option><option{{if eq $client.PriorityClass "high"}} selected{{end}}>high</option><option{{if eq $client.PriorityClass "normal"}} selected{{end}}>normal</option><option{{if eq $client.PriorityClass "background"}} selected{{end}}>background</option></select></div>
+  <div><label for="edit-vllm-priority">vLLM priority</label><input id="edit-vllm-priority" name="vllm_priority" type="number" value="{{$client.VLLMPriority}}" required></div>
+  <div><label for="edit-max-concurrency">Max concurrency</label><input id="edit-max-concurrency" name="max_concurrency" type="number" min="0" value="{{$client.MaxConcurrency}}" required></div>
+  <fieldset><legend>Model access</legend>{{range .View.Pools}}<label class="check" for="edit-client-pool-{{.ID}}"><input id="edit-client-pool-{{.ID}}" name="model_pool_id" type="checkbox" value="{{.ID}}"{{if hasPool $client.ModelPoolIDs .ID}} checked{{end}}>{{.PublicModelName}}</label>{{end}}</fieldset>
+  <label class="check" for="edit-client-enabled"><input id="edit-client-enabled" name="enabled" type="checkbox"{{if $client.Enabled}} checked{{end}}>Enabled</label>
+  <div class="form-actions"><a class="button secondary" href="/admin/clients">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
+</form></section>
+{{else}}
+<section id="create-client" class="editor"><h2>Create client</h2><form method="post" action="/admin/clients" class="form-grid">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create">
   <div><label for="client-name">Name</label><input id="client-name" name="name" required autocomplete="off"></div>
   <div><label for="priority-class">Priority class</label><select id="priority-class" name="priority_class"><option>critical</option><option>high</option><option selected>normal</option><option>background</option></select></div>
@@ -18,4 +30,5 @@
   <label class="check" for="client-enabled"><input id="client-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create client</button></div>
 </form></section>
+{{end}}
 {{end}}

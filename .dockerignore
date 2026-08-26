@@ -1,0 +1,8 @@
+.git
+.tools
+.worktrees
+data
+dist
+*.db
+*.out
+.DS_Store
