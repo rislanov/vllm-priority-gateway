@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -161,6 +162,85 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	}
 }
 
+func TestRevocationPublishesAfterRequestCancellation(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)}
+	wrapper := &cancellingStore{SQLite: database}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: wrapper, Registry: registryValue, Runtime: runtime,
+		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := service.CreateClient(context.Background(), httpapi.ClientInput{
+		Name: "revoked-client", Enabled: true, PriorityClass: domain.PriorityHigh, VLLMPriority: -10, MaxConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := service.CreateKey(context.Background(), client.ID, httpapi.KeyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	wrapper.cancel = cancel
+	if err := service.RevokeKey(ctx, key.ID); err != nil {
+		t.Fatalf("RevokeKey() after committed cancellation = %v", err)
+	}
+	candidates := registryValue.Snapshot().KeyCandidates[key.Prefix]
+	if len(candidates) != 1 || candidates[0].RevokedAt == nil {
+		t.Fatalf("revocation was not published: %+v", candidates)
+	}
+}
+
+func TestRevocationRemainsFailClosedWhenReloadFails(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	failingRegistry := &reloadFailureRegistry{Registry: registryValue}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Registry: failingRegistry,
+		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
+		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := service.CreateClient(context.Background(), httpapi.ClientInput{
+		Name: "revoked-client", Enabled: true, PriorityClass: domain.PriorityHigh, VLLMPriority: -10, MaxConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := service.CreateKey(context.Background(), client.ID, httpapi.KeyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingRegistry.fail = true
+	if err := service.RevokeKey(context.Background(), key.ID); err == nil {
+		t.Fatal("expected degraded reload error")
+	}
+	candidates := registryValue.Snapshot().KeyCandidates[key.Prefix]
+	if len(candidates) != 1 || candidates[0].RevokedAt == nil {
+		t.Fatalf("revoked key remained active after reload failure: %+v", candidates)
+	}
+}
+
 const (
 	adminUser     = "operator"
 	adminPassword = "correct horse battery staple"
@@ -261,6 +341,31 @@ type adminRuntimeStub struct {
 	mu         sync.Mutex
 	reconciles int
 	values     map[int64]domain.BackendRuntime
+}
+
+type cancellingStore struct {
+	*store.SQLite
+	cancel context.CancelFunc
+}
+
+type reloadFailureRegistry struct {
+	*registry.Registry
+	fail bool
+}
+
+func (r *reloadFailureRegistry) Reload(ctx context.Context) error {
+	if r.fail {
+		return errors.New("forced reload failure")
+	}
+	return r.Registry.Reload(ctx)
+}
+
+func (s *cancellingStore) RevokeAPIKey(ctx context.Context, id int64) error {
+	err := s.SQLite.RevokeAPIKey(ctx, id)
+	if err == nil && s.cancel != nil {
+		s.cancel()
+	}
+	return err
 }
 
 func (r *adminRuntimeStub) Reconcile(backends []domain.Backend) error {

@@ -146,6 +146,47 @@ func TestForwardDoesNotRetryHTTPErrorResponse(t *testing.T) {
 	}
 }
 
+func TestForwardDoesNotFollowUpstreamRedirects(t *testing.T) {
+	var redirected atomic.Int64
+	destination := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		redirected.Add(1)
+		if authorization := request.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("upstream credential crossed redirect boundary: %q", authorization)
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, destination.URL+"/captured", http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	writer := newObservingWriter()
+	result := proxy.New(origin.Client()).Forward(context.Background(), writer, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{Backend: backend(1, origin.URL), UpstreamAPIKey: "configured-secret"},
+	})
+	if result.Err != nil || result.Status != http.StatusTemporaryRedirect || redirected.Load() != 0 {
+		t.Fatalf("result=%+v redirected=%d", result, redirected.Load())
+	}
+}
+
+func TestForwardCommitsUpstreamErrorStatusBeforeReadingBody(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{HTTPStatus: http.StatusServiceUnavailable, ResetMode: fakevllm.ResetBeforeBody})
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+
+	writer := newObservingWriter()
+	result := proxy.New(server.Client()).Forward(context.Background(), writer, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{Backend: backend(1, server.URL)},
+	})
+	if result.Status != http.StatusServiceUnavailable || writer.status != http.StatusServiceUnavailable {
+		t.Fatalf("result=%+v downstream_status=%d", result, writer.status)
+	}
+}
+
 func backend(id int64, baseURL string) domain.Backend {
 	return domain.Backend{ID: id, Name: "backend", BaseURL: baseURL, Enabled: true, CapacityHint: 1, RunningSoftLimit: 1}
 }

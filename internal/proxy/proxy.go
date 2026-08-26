@@ -32,13 +32,14 @@ type Request struct {
 }
 
 type Result struct {
-	BackendID  int64
-	Status     int
-	BytesSent  int64
-	FirstByte  time.Duration
-	RetryCount int
-	Cancelled  bool
-	Err        error
+	BackendID       int64
+	Status          int
+	BytesSent       int64
+	FirstByte       time.Duration
+	RetryCount      int
+	ResponseStarted bool
+	Cancelled       bool
+	Err             error
 }
 
 type Proxy struct {
@@ -49,7 +50,11 @@ func New(client *http.Client) *Proxy {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &Proxy{client: client}
+	noRedirects := *client
+	noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Proxy{client: &noRedirects}
 }
 
 func (p *Proxy) Forward(ctx context.Context, downstream http.ResponseWriter, request Request) Result {
@@ -104,6 +109,17 @@ func (p *Proxy) forwardOnce(
 	}
 	defer response.Body.Close()
 	result.Status = response.StatusCode
+	commit := func() {
+		if !result.ResponseStarted {
+			CopyResponseHeaders(downstream.Header(), response.Header)
+			downstream.WriteHeader(response.StatusCode)
+			result.FirstByte = time.Since(started)
+			result.ResponseStarted = true
+		}
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		commit()
+	}
 
 	buffer := make([]byte, 32<<10)
 	count, readErr := response.Body.Read(buffer)
@@ -117,13 +133,6 @@ func (p *Proxy) forwardOnce(
 		return result, response.StatusCode >= 200 && response.StatusCode < 300
 	}
 
-	commit := func() {
-		if result.FirstByte == 0 {
-			CopyResponseHeaders(downstream.Header(), response.Header)
-			downstream.WriteHeader(response.StatusCode)
-			result.FirstByte = time.Since(started)
-		}
-	}
 	if count == 0 && errors.Is(readErr, io.EOF) {
 		commit()
 		return result, false

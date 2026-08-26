@@ -67,3 +67,38 @@ func TestManagerInflightReleaseIsIdempotent(t *testing.T) {
 		t.Fatalf("inflight after release = %d", got)
 	}
 }
+
+func TestManagerAdvancesPoolHysteresisWithoutSnapshotReads(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{Running: 32, Waiting: 4, KVCacheUsage: 1})
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	options := monitorOptions(server.Client())
+	options.HealthInterval = 5 * time.Millisecond
+	options.MetricsInterval = 5 * time.Millisecond
+	options.RecoveryAfter = 1
+	options.EWMAWindow = time.Millisecond
+	options.PoolThresholds.EnterWindow = 30 * time.Millisecond
+	manager := monitor.NewManager(ctx, options)
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 9)}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		runtime := manager.Snapshot(1, time.Now())
+		if runtime.Healthy && runtime.MetricsFresh && runtime.Pressure >= 1.4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend did not become pressured: %+v", runtime)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(options.PoolThresholds.EnterWindow + 3*options.MetricsInterval)
+	if state := manager.PoolSnapshot(9, time.Now()).State; state != domain.PoolEmergency {
+		t.Fatalf("first pool read after sustained pressure = %s, want emergency", state)
+	}
+}

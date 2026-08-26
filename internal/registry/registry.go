@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
@@ -40,6 +41,7 @@ type Registry struct {
 func New(loader Loader) *Registry {
 	registry := &Registry{loader: loader}
 	empty := newSnapshot()
+	empty.Revision = -1
 	registry.current.Store(&empty)
 	return registry
 }
@@ -53,8 +55,43 @@ func (r *Registry) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.current.Store(&snapshot)
-	return nil
+	for {
+		current := r.current.Load()
+		if snapshot.Revision <= current.Revision {
+			return nil
+		}
+		if r.current.CompareAndSwap(current, &snapshot) {
+			return nil
+		}
+	}
+}
+
+// MarkKeyRevoked immediately publishes a fail-closed view after durable
+// revocation, before a complete database snapshot is reloaded.
+func (r *Registry) MarkKeyRevoked(id int64, at time.Time) bool {
+	for {
+		current := r.current.Load()
+		updated := *current
+		updated.KeyCandidates = make(map[string][]domain.APIKey, len(current.KeyCandidates))
+		found := false
+		for prefix, candidates := range current.KeyCandidates {
+			copied := append([]domain.APIKey(nil), candidates...)
+			for index := range copied {
+				if copied[index].ID == id {
+					value := at.UTC()
+					copied[index].RevokedAt = &value
+					found = true
+				}
+			}
+			updated.KeyCandidates[prefix] = copied
+		}
+		if !found {
+			return false
+		}
+		if r.current.CompareAndSwap(current, &updated) {
+			return true
+		}
+	}
 }
 
 func (r *Registry) Snapshot() *Snapshot {

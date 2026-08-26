@@ -19,21 +19,28 @@ type managedWorker struct {
 }
 
 type Manager struct {
-	ctx     context.Context
-	options Options
+	ctx          context.Context
+	cancel       context.CancelFunc
+	observerDone chan struct{}
+	options      Options
 
 	mu          sync.Mutex
 	workers     map[int64]*managedWorker
 	poolMachine map[int64]*pressure.PoolMachine
+	poolRuntime map[int64]domain.PoolRuntime
 	nextGen     uint64
 	shutdown    bool
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
-	return &Manager{
-		ctx: ctx, options: options, workers: make(map[int64]*managedWorker),
-		poolMachine: make(map[int64]*pressure.PoolMachine),
+	managerCtx, cancel := context.WithCancel(ctx)
+	manager := &Manager{
+		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
+		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
+		poolRuntime: make(map[int64]domain.PoolRuntime),
 	}
+	go manager.runPoolObserver()
+	return manager
 }
 
 func (m *Manager) Reconcile(backends []domain.Backend) error {
@@ -85,6 +92,7 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 	}
 	m.mu.Unlock()
 	waitWorkers(stopped)
+	m.observePools(time.Now())
 	return nil
 }
 
@@ -101,6 +109,53 @@ func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime 
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	runtime, exists := m.poolRuntime[poolID]
+	if !exists {
+		return domain.PoolRuntime{PoolID: poolID, State: domain.PoolUnavailable}
+	}
+	return runtime
+}
+
+func (m *Manager) runPoolObserver() {
+	defer close(m.observerDone)
+	interval := m.options.MetricsInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case at := <-ticker.C:
+			m.observePools(at)
+		case <-m.ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *Manager) observePools(at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shutdown {
+		return
+	}
+	active := make(map[int64]struct{})
+	for _, managed := range m.workers {
+		active[managed.worker.Backend().ModelPoolID] = struct{}{}
+	}
+	for poolID := range m.poolMachine {
+		if _, exists := active[poolID]; !exists {
+			delete(m.poolMachine, poolID)
+			delete(m.poolRuntime, poolID)
+		}
+	}
+	for poolID := range active {
+		m.poolRuntime[poolID] = m.observePoolLocked(poolID, at)
+	}
+}
+
+func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRuntime {
 	best := math.Inf(1)
 	available := 0
 	allWaiting := true
@@ -176,6 +231,7 @@ func (m *Manager) Shutdown() {
 		return
 	}
 	m.shutdown = true
+	m.cancel()
 	workers := make([]*managedWorker, 0, len(m.workers))
 	for _, managed := range m.workers {
 		managed.cancel()
@@ -184,6 +240,7 @@ func (m *Manager) Shutdown() {
 	m.workers = make(map[int64]*managedWorker)
 	m.mu.Unlock()
 	waitWorkers(workers)
+	<-m.observerDone
 }
 
 func waitWorkers(workers []*managedWorker) {

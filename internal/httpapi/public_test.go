@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -217,6 +218,46 @@ func TestServiceObserverTracksRejectionAndInflightLifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &recordingObserver{}
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, observer: observer})
+
+	for _, model := range []string{"attacker-model-one", strings.Repeat("x", 4096)} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":`+strconv.Quote(model)+`}`))
+		request.Header.Set("Authorization", "Bearer "+raw)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+		}
+	}
+	for _, event := range observer.Events() {
+		if event.Model != "" {
+			t.Fatalf("attacker-controlled model reached observability: %q", event.Model)
+		}
+	}
+}
+
+func TestServicePreservesCommittedUpstreamStatusOnBodyFailure(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &recordingObserver{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, observer: observer, forwarder: committedErrorForwarder{},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "upstream_error") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	events := observer.Events()
+	if len(events) != 1 || events[0].Status != http.StatusServiceUnavailable {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 type fixtureOptions struct {
 	client     domain.Client
 	key        domain.APIKey
@@ -292,6 +333,16 @@ func (r *runtimeStub) IncrementInflight(int64) (func(), bool) {
 type capturingForwarder struct {
 	mu      sync.Mutex
 	request proxy.Request
+}
+
+type committedErrorForwarder struct{}
+
+func (committedErrorForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	writer.WriteHeader(http.StatusServiceUnavailable)
+	return proxy.Result{
+		BackendID: request.Target.Backend.ID, Status: http.StatusServiceUnavailable,
+		ResponseStarted: true, Err: io.ErrUnexpectedEOF,
+	}
 }
 
 func (f *capturingForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {

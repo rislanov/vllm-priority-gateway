@@ -148,12 +148,12 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if parseErr != nil {
 		return proxy.Result{}, invalidRequest(parseErr.Error())
 	}
-	event.Model = publicModel
 	snapshot := s.registry.Snapshot()
 	pool, exists := snapshot.PoolsByName[publicModel]
 	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 		return proxy.Result{}, modelNotAllowed()
 	}
+	event.Model = pool.PublicModelName
 	payload, err := replaceModel(payload, pool.UpstreamModelName)
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
@@ -249,7 +249,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		return alternate, nil
 	}
 	result = s.forwarder.Forward(ctx, writer, proxyRequest)
-	if result.Err != nil && result.BytesSent == 0 {
+	if result.Err != nil && !result.ResponseStarted {
 		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
 			return result, nil
 		}

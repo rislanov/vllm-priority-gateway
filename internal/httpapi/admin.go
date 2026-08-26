@@ -39,6 +39,10 @@ type AdminRegistry interface {
 	Snapshot() *registry.Snapshot
 }
 
+type keyRevocationOverlay interface {
+	MarkKeyRevoked(id int64, at time.Time) bool
+}
+
 type AdminRuntime interface {
 	Reconcile([]domain.Backend) error
 	Snapshot(int64, time.Time) domain.BackendRuntime
@@ -290,6 +294,9 @@ func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
 	if err := s.store.RevokeAPIKey(ctx, id); err != nil {
 		return err
 	}
+	if overlay, ok := s.registry.(keyRevocationOverlay); ok {
+		overlay.MarkKeyRevoked(id, s.now().UTC())
+	}
 	return s.publish(ctx)
 }
 
@@ -348,7 +355,9 @@ func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, drainin
 }
 
 func (s *AdminService) publish(ctx context.Context) error {
-	if err := s.registry.Reload(ctx); err != nil {
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.registry.Reload(publishCtx); err != nil {
 		s.setDegraded(err)
 		return fmt.Errorf("publish configuration: %w", err)
 	}
