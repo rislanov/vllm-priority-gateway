@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -63,15 +64,26 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/admin/keys" {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
 	document, err := html.Parse(strings.NewReader(response.Body.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !hasAttr(document, "id", "one-time-secret") || !strings.Contains(response.Body.String(), "llmgw_") {
 		t.Fatalf("one-time secret region missing: %s", response.Body.String())
+	}
+	secret := regexp.MustCompile(`llmgw_[A-Za-z0-9_-]{43}`).FindString(response.Body.String())
+	if secret == "" {
+		t.Fatalf("complete one-time secret missing: %s", response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
+	if strings.Contains(response.Body.String(), `id="one-time-secret"`) || strings.Contains(response.Body.String(), secret) {
+		t.Fatalf("one-time secret survived refresh: %s", response.Body.String())
 	}
 }
 

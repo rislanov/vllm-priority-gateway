@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -17,6 +18,13 @@ type Handler struct {
 	service   *httpapi.AdminService
 	templates map[string]*template.Template
 	static    http.Handler
+	secretMu  sync.Mutex
+	secrets   map[string]secretFlash
+}
+
+type secretFlash struct {
+	value     string
+	expiresAt time.Time
 }
 
 type pageData struct {
@@ -68,7 +76,7 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{service: service, templates: templates, static: http.FileServer(http.FS(staticFS))}, nil
+	return &Handler{service: service, templates: templates, static: http.FileServer(http.FS(staticFS)), secrets: make(map[string]secretFlash)}, nil
 }
 
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -160,19 +168,48 @@ func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
 				if data.Error == "" {
 					created, createErr := h.service.CreateKey(request.Context(), id, input)
 					data.Error = errorText(createErr)
-					data.Secret = created.Secret
+					if createErr == nil {
+						h.putSecret(httpapi.AdminCSRFToken(request), created.Secret)
+						http.Redirect(writer, request, "/admin/keys", http.StatusSeeOther)
+						return
+					}
 				}
 			}
 		}
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
+	} else {
+		data.Secret = h.takeSecret(httpapi.AdminCSRFToken(request))
 	}
 	status := http.StatusOK
 	if data.Error != "" {
 		status = http.StatusBadRequest
 	}
 	h.render(writer, request, "keys", data, status)
+}
+
+func (h *Handler) putSecret(session, secret string) {
+	now := time.Now()
+	h.secretMu.Lock()
+	for key, flash := range h.secrets {
+		if !flash.expiresAt.After(now) {
+			delete(h.secrets, key)
+		}
+	}
+	h.secrets[session] = secretFlash{value: secret, expiresAt: now.Add(5 * time.Minute)}
+	h.secretMu.Unlock()
+}
+
+func (h *Handler) takeSecret(session string) string {
+	h.secretMu.Lock()
+	flash, exists := h.secrets[session]
+	delete(h.secrets, session)
+	h.secretMu.Unlock()
+	if !exists || !flash.expiresAt.After(time.Now()) {
+		return ""
+	}
+	return flash.value
 }
 
 func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {

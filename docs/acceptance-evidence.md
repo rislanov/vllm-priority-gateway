@@ -9,19 +9,20 @@ This document maps the source specification's MVP acceptance criteria to repeata
 | Unknown and revoked API keys return `401`; a valid key is accepted | `TestAuthenticationAndModelAccessAcceptance`, `TestPublicAuthenticationCasesUseSameUnauthorizedEnvelope` |
 | Plaintext API keys are absent from SQLite, WAL, and SHM files | `TestAdminAuthenticationCSRFCRUDAndOneTimeSecret`, `TestSQLiteNeverReceivesPlaintextKey` |
 | A client sees only explicitly allowed models; forbidden models are rejected | `TestAuthenticationAndModelAccessAcceptance`, `TestModelsListsOnlyExplicitEnabledAccess` |
-| Chat Completions, Completions, and Responses are forwarded | `TestSupportedOpenAIRoutesAcceptance` |
+| Chat Completions, Completions, and Responses are forwarded in ordinary and streaming modes | `TestSupportedOpenAIRoutesAcceptance` |
 | 100 requests select pressure `0.3` rather than `1.1` | `TestRoutingUsesLeastPressureAndHealthRecovery` |
 | Failed backends leave routing and recovered backends return | `TestRoutingUsesLeastPressureAndHealthRecovery`, `TestWorkerHealthFailureAndRecoveryCounts` |
 | Lower-priority traffic is shed before high/critical traffic | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestEffectiveLimitUsesPriorityPolicy` |
 | Client priority escalation is removed and server policy is applied | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestForwardRewritesModelAndClientControlledPriority` |
 | SSE bytes are flushed without whole-response buffering | `TestStreamingCancellationAndLeaseLifetime`, `TestStreamingIsByteExactAndRetryStopsAfterFirstByte` |
 | A downstream disconnect cancels upstream work and releases leases | `TestStreamingCancellationAndLeaseLifetime`, `TestForwardCancellationStopsUpstream` |
-| A short spike is ignored and overload recovery is hysteretic | `TestAdmissionPriorityAndHysteresisAcceptance`, all `TestPoolMachine*` tests |
+| A short spike is ignored, sustained overload advances without request polling, and recovery is hysteretic | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestManagerAdvancesPoolHysteresisWithoutSnapshotReads`, all `TestPoolMachine*` tests |
 | A transport failure retries once before response bytes, never after streaming starts | `TestStreamingIsByteExactAndRetryStopsAfterFirstByte`, `TestForwardRetriesOneAlternateBeforeFirstByte`, `TestForwardDoesNotRetryAfterStreamStarts` |
-| Admin auth, CSRF, CRUD publication, drain/resume, and one-time key display work | `TestAdminAuthenticationCSRFCRUDAndOneTimeSecret`, `TestAdminSecurityRequiresBasicAuthAndMatchingCSRF`, `TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce` |
+| Admin auth, CSRF, CRUD publication, backend edit/enable/disable/drain/resume, live key usage, and one-time key display work | `TestAdminAuthenticationCSRFCRUDAndOneTimeSecret`, `TestBackendEditPageAndEnableToggle`, `TestAdminSecurityRequiresBasicAuthAndMatchingCSRF`, `TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce` |
 | Metrics use bounded labels; completion logs contain policy/result fields without body or secret data | `TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels`, `TestStructuredLoggerWritesSafeCompletionRecord` |
-| Shutdown is graceful and backend monitor workers do not leak | `TestRunServesHealthAndShutsDownGracefully`, integration harness cleanup checks |
-| Fake-backend latency is measured and the optional engineering budget is enforced | `TestPerformanceSmoke` |
+| Shutdown lets an active stream finish inside the grace period; backend monitor workers and SQLite are released | `TestRunLetsActiveStreamFinishInsideGracePeriod`, `TestRunServesHealthAndShutsDownGracefully`, integration harness cleanup checks |
+| Gateway-added fake-backend latency is measured against a warmed direct baseline and the optional engineering budget is enforced | `TestPerformanceSmoke` |
+| Seeded mixed traffic is proportionally apportioned; successful latency and outcomes are available per class | `TestSmallTrafficMixDoesNotAlwaysFavorLeadingClasses`, `TestRunReportsSuccessfulLatencyAndOutcomesByClass` |
 
 ## Commands
 
@@ -46,6 +47,12 @@ Build and inspect the Linux x86-64 delivery artifacts:
 ```bash
 make build-linux-amd64
 file dist/*-linux-amd64
+```
+
+With a running Docker daemon, verify the non-root scratch image against a fresh writable volume:
+
+```bash
+make container-smoke
 ```
 
 ## Real-GPU evidence

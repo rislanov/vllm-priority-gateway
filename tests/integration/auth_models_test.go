@@ -62,14 +62,20 @@ func TestSupportedOpenAIRoutesAcceptance(t *testing.T) {
 	_, key := h.createClient("route-client", domain.PriorityHigh, -10, 4, poolID)
 
 	for _, path := range []string{"/v1/chat/completions", "/v1/completions", "/v1/responses"} {
-		t.Run(path, func(t *testing.T) {
-			response, payload := h.public(http.MethodPost, path, key, postBody("qwen", false))
-			if response.StatusCode != http.StatusOK {
-				t.Fatalf("%s = %d %s", path, response.StatusCode, payload)
-			}
-		})
+		for _, stream := range []bool{false, true} {
+			name := path + map[bool]string{false: "/ordinary", true: "/stream"}[stream]
+			t.Run(name, func(t *testing.T) {
+				response, payload := h.public(http.MethodPost, path, key, postBody("qwen", stream))
+				if response.StatusCode != http.StatusOK {
+					t.Fatalf("%s = %d %s", path, response.StatusCode, payload)
+				}
+				if stream && (!strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream") || !strings.HasSuffix(string(payload), "data: [DONE]\n\n")) {
+					t.Fatalf("%s stream headers=%v body=%q", path, response.Header, payload)
+				}
+			})
+		}
 	}
-	if requests := fake.Snapshot().Requests; len(requests) != 3 {
-		t.Fatalf("upstream requests = %d, want 3", len(requests))
+	if requests := fake.Snapshot().Requests; len(requests) != 6 {
+		t.Fatalf("upstream requests = %d, want 6", len(requests))
 	}
 }

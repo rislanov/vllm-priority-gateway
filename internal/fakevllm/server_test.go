@@ -89,7 +89,7 @@ func TestOrdinaryCompletionRecordsObservableRequest(t *testing.T) {
 
 func TestStreamingFlushesFramesWithDelay(t *testing.T) {
 	fake := fakevllm.New()
-	fake.SetState(fakevllm.State{TokenDelay: 75 * time.Millisecond, Tokens: []string{"one", "two"}})
+	fake.SetState(fakevllm.State{TokenDelay: 500 * time.Millisecond, Tokens: []string{"one", "two"}})
 	server := httptest.NewServer(fake.Handler())
 	defer server.Close()
 	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"upstream","stream":true}`))
@@ -107,7 +107,7 @@ func TestStreamingFlushesFramesWithDelay(t *testing.T) {
 	if !strings.HasPrefix(first, "data: ") || !strings.Contains(first, "one") {
 		t.Fatalf("first frame = %q", first)
 	}
-	if firstAt >= 60*time.Millisecond {
+	if firstAt >= 250*time.Millisecond {
 		t.Fatalf("first frame took %s; response appears buffered", firstAt)
 	}
 	rest, err := io.ReadAll(reader)

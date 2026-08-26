@@ -6,6 +6,8 @@ Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, st
 
 The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
 
+Status: the implementation and deterministic acceptance suite are code-complete. Real-vLLM scheduling, cancellation, and threshold calibration still require the documented GPU sign-off before production use.
+
 ## Architecture
 
 ```text
@@ -213,7 +215,7 @@ go run ./cmd/loadgen -- \
   -mix critical=10,high=20,normal=40,background=30 -json
 ```
 
-The report separates successes, intentional `429` overload responses, `5xx`, other HTTP failures, and transport failures, plus nearest-rank p50/p95/p99 TTFT and total latency. A transport failure returns a non-zero process status; expected `429` responses do not.
+The report separates successes, intentional `429` overload responses, `5xx`, other HTTP failures, and transport failures. TTFT and latency percentiles include successful generations only and are reported both in aggregate and by priority class, so fast rejections cannot make inference latency look better. A transport failure returns a non-zero process status; expected `429` responses do not.
 
 ## Metrics and logging
 
@@ -263,7 +265,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/gateway-linux-a
 
 ```bash
 docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker run --rm -p 8080:8080 -v "$PWD/data:/data" \
+docker volume create llmgw-data
+docker run --rm -p 8080:8080 -v llmgw-data:/data \
   -e LLMGW_ADMIN_USERNAME=operator \
   -e LLMGW_ADMIN_PASSWORD='replace-with-at-least-16-bytes' \
   -e LLMGW_API_KEY_HMAC_SECRET="$LLMGW_API_KEY_HMAC_SECRET" \
@@ -271,6 +274,13 @@ docker run --rm -p 8080:8080 -v "$PWD/data:/data" \
 ```
 
 The runtime image is `scratch`, contains only CA certificates and the static gateway, and runs as numeric UID/GID `65532`.
+The image initializes `/data` with that ownership, so a fresh named or anonymous volume is writable. For a Linux bind mount, create the directory and grant UID/GID `65532` write access before starting the container; Docker Desktop for macOS applies its own host-file sharing rules.
+
+With a running Docker daemon, exercise the exact image, fresh-volume, non-root, SQLite, and health path with:
+
+```bash
+make container-smoke
+```
 
 ## Testing
 
@@ -280,6 +290,7 @@ make test-race
 make vet
 make build
 make build-linux-amd64
+make container-smoke  # requires a running Docker daemon
 ```
 
 Tests cover domain validation, key security, SQLite migrations and CRUD, registry snapshots, pressure/EWMA/hysteresis, admission, routing, monitoring, fake-vLLM controls, proxy streaming/cancellation/retry, public and Admin HTTP contracts, UI semantics, telemetry, process lifecycle, load statistics, and black-box acceptance behavior.

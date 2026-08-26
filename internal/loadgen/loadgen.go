@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,18 @@ type Config struct {
 }
 
 type Result struct {
+	Total             int                                  `json:"total"`
+	Successes         int                                  `json:"successes"`
+	Overloaded        int                                  `json:"overloaded"`
+	ServerErrors      int                                  `json:"serverErrors"`
+	Failures          int                                  `json:"failures"`
+	TransportFailures int                                  `json:"transportFailures"`
+	TTFT              DurationSummary                      `json:"ttft"`
+	Latency           DurationSummary                      `json:"latency"`
+	ByClass           map[domain.PriorityClass]ClassResult `json:"byClass,omitempty"`
+}
+
+type ClassResult struct {
 	Total             int             `json:"total"`
 	Successes         int             `json:"successes"`
 	Overloaded        int             `json:"overloaded"`
@@ -89,6 +102,7 @@ type identity struct {
 }
 
 type observation struct {
+	class   domain.PriorityClass
 	status  int
 	ttft    time.Duration
 	latency time.Duration
@@ -137,31 +151,64 @@ func Run(ctx context.Context, config Config) (Result, error) {
 		close(observations)
 	}()
 
-	var result Result
+	result := Result{ByClass: make(map[domain.PriorityClass]ClassResult)}
 	var ttft, latency []time.Duration
+	classTTFT := make(map[domain.PriorityClass][]time.Duration)
+	classLatency := make(map[domain.PriorityClass][]time.Duration)
 	for observation := range observations {
 		result.Total++
+		classResult := result.ByClass[observation.class]
+		if observation.class.Valid() {
+			classResult.Total++
+		}
 		if observation.err != nil {
 			result.TransportFailures++
+			if observation.class.Valid() {
+				classResult.TransportFailures++
+				result.ByClass[observation.class] = classResult
+			}
 			continue
 		}
 		switch {
 		case observation.status >= 200 && observation.status < 300:
 			result.Successes++
+			if observation.class.Valid() {
+				classResult.Successes++
+			}
+			if observation.ttft > 0 {
+				ttft = append(ttft, observation.ttft)
+				if observation.class.Valid() {
+					classTTFT[observation.class] = append(classTTFT[observation.class], observation.ttft)
+				}
+			}
+			latency = append(latency, observation.latency)
+			if observation.class.Valid() {
+				classLatency[observation.class] = append(classLatency[observation.class], observation.latency)
+			}
 		case observation.status == http.StatusTooManyRequests:
 			result.Overloaded++
+			classResult.Overloaded++
 		case observation.status >= 500:
 			result.ServerErrors++
+			classResult.ServerErrors++
 		default:
 			result.Failures++
+			classResult.Failures++
 		}
-		if observation.ttft > 0 {
-			ttft = append(ttft, observation.ttft)
+		if observation.class.Valid() {
+			result.ByClass[observation.class] = classResult
 		}
-		latency = append(latency, observation.latency)
 	}
 	result.TTFT = Summarize(ttft)
 	result.Latency = Summarize(latency)
+	for class, classResult := range result.ByClass {
+		classResult.TTFT = Summarize(classTTFT[class])
+		classResult.Latency = Summarize(classLatency[class])
+		result.ByClass[class] = classResult
+	}
+	if len(result.ByClass) == 0 {
+		result.ByClass = nil
+	}
 	if result.TransportFailures > 0 {
 		return result, fmt.Errorf("%d request(s) failed at the transport layer", result.TransportFailures)
 	}
@@ -172,20 +219,44 @@ func Run(ctx context.Context, config Config) (Result, error) {
 }
 
 func identitySequence(config Config) []identity {
-	weighted := make([]identity, 0)
+	random := rand.New(rand.NewPCG(config.Seed, config.Seed^0x9e3779b97f4a7c15))
+	totalWeight := 0
 	for _, class := range priorityOrder {
-		for range config.Mix[class] {
-			weighted = append(weighted, identity{class: class, key: config.Keys[class]})
+		totalWeight += config.Mix[class]
+	}
+	if totalWeight == 0 {
+		sequence := make([]identity, config.Requests)
+		for index := range sequence {
+			sequence[index] = identity{key: config.Key}
+		}
+		return sequence
+	}
+	type remainder struct {
+		class domain.PriorityClass
+		value int
+	}
+	counts := make(map[domain.PriorityClass]int, len(priorityOrder))
+	remainders := make([]remainder, 0, len(priorityOrder))
+	assigned := 0
+	for _, class := range priorityOrder {
+		product := config.Requests * config.Mix[class]
+		counts[class] = product / totalWeight
+		assigned += counts[class]
+		if config.Mix[class] > 0 {
+			remainders = append(remainders, remainder{class: class, value: product % totalWeight})
 		}
 	}
-	if len(weighted) == 0 {
-		weighted = append(weighted, identity{key: config.Key})
+	random.Shuffle(len(remainders), func(i, j int) { remainders[i], remainders[j] = remainders[j], remainders[i] })
+	sort.SliceStable(remainders, func(i, j int) bool { return remainders[i].value > remainders[j].value })
+	for index := 0; index < config.Requests-assigned; index++ {
+		counts[remainders[index].class]++
 	}
-	sequence := make([]identity, config.Requests)
-	for index := range sequence {
-		sequence[index] = weighted[index%len(weighted)]
+	sequence := make([]identity, 0, config.Requests)
+	for _, class := range priorityOrder {
+		for range counts[class] {
+			sequence = append(sequence, identity{class: class, key: config.Keys[class]})
+		}
 	}
-	random := rand.New(rand.NewPCG(config.Seed, config.Seed^0x9e3779b97f4a7c15))
 	random.Shuffle(len(sequence), func(i, j int) { sequence[i], sequence[j] = sequence[j], sequence[i] })
 	return sequence
 }
@@ -196,19 +267,19 @@ func execute(ctx context.Context, config Config, identity identity) observation 
 		"max_tokens": config.MaxTokens, "stream": config.Stream,
 	})
 	if err != nil {
-		return observation{err: err}
+		return observation{class: identity.class, err: err}
 	}
 	endpoint := strings.TrimRight(config.URL, "/") + "/v1/completions"
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return observation{err: err}
+		return observation{class: identity.class, err: err}
 	}
 	request.Header.Set("Authorization", "Bearer "+identity.key)
 	request.Header.Set("Content-Type", "application/json")
 	started := time.Now()
 	response, err := config.HTTPClient.Do(request)
 	if err != nil {
-		return observation{err: err}
+		return observation{class: identity.class, err: err}
 	}
 	defer response.Body.Close()
 	buffer := make([]byte, 32<<10)
@@ -220,10 +291,10 @@ func execute(ctx context.Context, config Config, identity identity) observation 
 		}
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
-				return observation{err: readErr}
+				return observation{class: identity.class, err: readErr}
 			}
 			break
 		}
 	}
-	return observation{status: response.StatusCode, ttft: firstByte, latency: time.Since(started)}
+	return observation{class: identity.class, status: response.StatusCode, ttft: firstByte, latency: time.Since(started)}
 }

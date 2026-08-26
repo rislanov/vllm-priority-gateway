@@ -13,5 +13,15 @@
     await navigator.clipboard.writeText(secret.textContent.trim());
     copy.textContent = 'Copied';
   });
-  if (document.body.hasAttribute('data-dashboard')) window.setTimeout(() => window.location.reload(), 15000);
+  if (document.body.hasAttribute('data-dashboard')) {
+    const autoRefresh = () => {
+      const focused = document.activeElement && document.activeElement !== document.body;
+      if (document.visibilityState === 'visible' && !focused) {
+        window.location.reload();
+        return;
+      }
+      window.setTimeout(autoRefresh, 15000);
+    };
+    window.setTimeout(autoRefresh, 15000);
+  }
 })();

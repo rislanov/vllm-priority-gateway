@@ -17,6 +17,8 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
 )
 
+const maxPublicModelNameBytes = 256
+
 type SnapshotProvider interface {
 	Snapshot() *registry.Snapshot
 }
@@ -324,6 +326,9 @@ func rewritePayload(body []byte) ([]byte, string, error) {
 	var model string
 	if err := json.Unmarshal(encodedModel, &model); err != nil || strings.TrimSpace(model) == "" {
 		return nil, "", errors.New("model must be a non-empty string")
+	}
+	if len(model) > maxPublicModelNameBytes {
+		return nil, "", errors.New("model must not exceed 256 bytes")
 	}
 	delete(payload, "priority")
 	returnBody, err := json.Marshal(payload)

@@ -1,8 +1,10 @@
 package integration_test
 
 import (
+	"math"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
@@ -11,10 +13,15 @@ import (
 func TestRoutingUsesLeastPressureAndHealthRecovery(t *testing.T) {
 	h := newHarness(t)
 	poolID := h.createPool("qwen")
-	fakeA, backendA := h.addFake(poolID, "gpu-a", fakevllm.State{})
+	fakeA, backendA := h.addFake(poolID, "gpu-a", fakevllm.State{Running: 32})
 	fakeB, backendB := h.addFake(poolID, "gpu-b", fakevllm.State{Waiting: 4})
 	h.waitBackend(backendA, eligible)
 	h.waitBackend(backendB, eligible)
+	pressureA := h.manager.Snapshot(backendA, time.Now()).Pressure
+	pressureB := h.manager.Snapshot(backendB, time.Now()).Pressure
+	if math.Abs(pressureA-.3) > .01 || math.Abs(pressureB-1.1) > .01 {
+		t.Fatalf("acceptance pressures A=%.3f B=%.3f", pressureA, pressureB)
+	}
 	_, key := h.createClient("router-client", domain.PriorityHigh, -10, 16, poolID)
 
 	for index := 0; index < 100; index++ {

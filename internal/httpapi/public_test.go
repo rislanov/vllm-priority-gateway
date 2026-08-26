@@ -160,6 +160,7 @@ func TestPublicControlledErrors(t *testing.T) {
 		wantCode   string
 	}{
 		{name: "malformed JSON", method: http.MethodPost, path: "/v1/completions", body: `{`, options: fixtureOptions{client: enabledClient(), key: key}, wantStatus: 400, wantCode: "invalid_request_error"},
+		{name: "model name too long", method: http.MethodPost, path: "/v1/completions", body: `{"model":"` + strings.Repeat("x", 257) + `"}`, options: fixtureOptions{client: enabledClient(), key: key}, wantStatus: 400, wantCode: "invalid_request_error"},
 		{name: "forbidden model", method: http.MethodPost, path: "/v1/completions", body: `{"model":"forbidden"}`, options: fixtureOptions{client: enabledClient(), key: key}, wantStatus: 403, wantCode: "model_not_allowed"},
 		{name: "unsupported endpoint", method: http.MethodPost, path: "/v1/embeddings", body: `{}`, options: fixtureOptions{client: enabledClient(), key: key}, wantStatus: 404, wantCode: "unsupported_endpoint"},
 		{name: "no backend", method: http.MethodPost, path: "/v1/completions", body: `{"model":"public-model"}`, options: fixtureOptions{client: enabledClient(), key: key, unhealthy: true}, wantStatus: 503, wantCode: "backend_unavailable"},
@@ -238,7 +239,7 @@ func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
 	observer := &recordingObserver{}
 	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, observer: observer})
 
-	for _, model := range []string{"attacker-model-one", strings.Repeat("x", 4096)} {
+	for _, model := range []string{"attacker-model-one", strings.Repeat("x", 128)} {
 		request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":`+strconv.Quote(model)+`}`))
 		request.Header.Set("Authorization", "Bearer "+raw)
 		response := httptest.NewRecorder()

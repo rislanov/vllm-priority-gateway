@@ -57,9 +57,21 @@ curl -sS "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $HIGH_KEY" \
 curl -sS "$GATEWAY/v1/responses" -H "Authorization: Bearer $HIGH_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpu-test","input":"Count from one to five.","max_output_tokens":32}' | jq .
+
+curl -N "$GATEWAY/v1/completions" -H "Authorization: Bearer $HIGH_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpu-test","prompt":"Count from one to five.","max_tokens":32,"stream":true}'
+
+curl -N "$GATEWAY/v1/chat/completions" -H "Authorization: Bearer $HIGH_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpu-test","messages":[{"role":"user","content":"Count from one to five."}],"max_tokens":32,"stream":true}'
+
+curl -N "$GATEWAY/v1/responses" -H "Authorization: Bearer $HIGH_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpu-test","input":"Count from one to five.","max_output_tokens":32,"stream":true}'
 ```
 
-Pass criteria: all routes return a valid upstream response; gateway logs use the public model and record a backend; vLLM receives the configured upstream model and gateway-generated request ID.
+Pass criteria: ordinary and streaming variants of all routes return a valid upstream response; every stream delivers its first event before generation completes and ends cleanly; gateway logs use the public model and record a backend; vLLM receives the configured upstream model and gateway-generated request ID.
 
 ## 3. Streaming cancellation
 
@@ -112,7 +124,7 @@ Run the fixed seeded mix while background traffic already fills the queue:
 curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds)'
 ```
 
-Also submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
+Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
 
 ## 6. Hysteresis and recovery
 

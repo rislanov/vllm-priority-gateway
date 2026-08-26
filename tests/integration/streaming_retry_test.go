@@ -16,7 +16,7 @@ func TestStreamingCancellationAndLeaseLifetime(t *testing.T) {
 	h := newHarness(t)
 	poolID := h.createPool("qwen")
 	fake, backendID := h.addFake(poolID, "gpu-a", fakevllm.State{
-		TTFT: 20 * time.Millisecond, TokenDelay: 100 * time.Millisecond, Tokens: []string{"one", "two", "three"},
+		TTFT: 20 * time.Millisecond, TokenDelay: time.Second, Tokens: []string{"one", "two", "three"},
 	})
 	h.waitBackend(backendID, eligible)
 	_, key := h.createClient("stream-client", domain.PriorityHigh, -10, 1, poolID)
@@ -38,7 +38,7 @@ func TestStreamingCancellationAndLeaseLifetime(t *testing.T) {
 	if err != nil || count == 0 {
 		t.Fatalf("first stream read = %d, %v", count, err)
 	}
-	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("first frame was buffered for %s", elapsed)
 	}
 	if !strings.Contains(string(buffer[:count]), `"content":"one"`) {
