@@ -140,6 +140,116 @@ func TestForwardRewritesModelAndClientControlledPriority(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityPrefersRendezvousBackendAndStripsHeader(t *testing.T) {
+	raw, key := testKey(t)
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	request.Header.Set(gateway.SessionAffinityHeader, "alpha")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	captured := forwarder.Request()
+	if captured.Target.Backend.ID != 22 {
+		t.Fatalf("backend = %d, want rendezvous backend 22", captured.Target.Backend.ID)
+	}
+	if got := captured.Headers.Get(gateway.SessionAffinityHeader); got != "" {
+		t.Fatalf("session affinity header reached upstream: %q", got)
+	}
+}
+
+func TestRequestWithoutSessionAffinityUsesLeastPressure(t *testing.T) {
+	raw, key := testKey(t)
+	for _, sessionID := range []string{"", "   \t"} {
+		t.Run(strconv.Quote(sessionID), func(t *testing.T) {
+			forwarder := &capturingForwarder{}
+			handler, _ := newFixture(t, fixtureOptions{
+				client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+			request.Header.Set("Authorization", "Bearer "+raw)
+			if sessionID != "" {
+				request.Header.Set(gateway.SessionAffinityHeader, sessionID)
+			}
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+			if got := forwarder.Request().Target.Backend.ID; got != 20 {
+				t.Fatalf("backend = %d, want least-pressure backend 20", got)
+			}
+		})
+	}
+}
+
+func TestSessionAffinityKeyIncludesClientAndPoolIdentity(t *testing.T) {
+	tests := []struct {
+		name          string
+		clientID      int64
+		poolID        int64
+		wantBackendID int64
+	}{
+		{name: "client one pool ten", clientID: 1, poolID: 10, wantBackendID: 22},
+		{name: "client two pool ten", clientID: 2, poolID: 10, wantBackendID: 21},
+		{name: "client one pool eleven", clientID: 1, poolID: 11, wantBackendID: 20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, key := testKey(t)
+			client := enabledClient()
+			client.ID = tt.clientID
+			key.ClientID = tt.clientID
+			forwarder := &capturingForwarder{}
+			handler, _ := newFixture(t, fixtureOptions{
+				client: client, key: key, poolID: tt.poolID, forwarder: forwarder, sessionAffinityBackends: true,
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+			request.Header.Set("Authorization", "Bearer "+raw)
+			request.Header.Set(gateway.SessionAffinityHeader, "session-1")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+			if got := forwarder.Request().Target.Backend.ID; got != tt.wantBackendID {
+				t.Fatalf("backend = %d, want %d", got, tt.wantBackendID)
+			}
+		})
+	}
+}
+
+func TestSessionAffinityRejectsOversizedIdentifier(t *testing.T) {
+	raw, key := testKey(t)
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, forwarder: forwarder})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	request.Header.Set(gateway.SessionAffinityHeader, strings.Repeat("s", gateway.MaxSessionAffinityIDBytes+1))
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	assertErrorCode(t, response.Body.Bytes(), "invalid_request_error")
+	if forwarder.Calls() != 0 {
+		t.Fatalf("oversized session identifier was forwarded %d time(s)", forwarder.Calls())
+	}
+}
+
 func TestConcurrencyLeaseSpansWholeForwardLifecycle(t *testing.T) {
 	raw, key := testKey(t)
 	client := enabledClient()
@@ -344,24 +454,51 @@ func TestServicePreservesCommittedUpstreamStatusOnBodyFailure(t *testing.T) {
 }
 
 type fixtureOptions struct {
-	client     domain.Client
-	key        domain.APIKey
-	forwarder  gateway.Forwarder
-	poolState  domain.PoolState
-	unhealthy  bool
-	extraPools bool
-	observer   gateway.Observer
-	retryAfter time.Duration
+	client                  domain.Client
+	key                     domain.APIKey
+	forwarder               gateway.Forwarder
+	poolState               domain.PoolState
+	unhealthy               bool
+	extraPools              bool
+	poolID                  int64
+	sessionAffinityBackends bool
+	observer                gateway.Observer
+	retryAfter              time.Duration
 }
 
 func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStub) {
 	t.Helper()
-	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	poolID := options.poolID
+	if poolID == 0 {
+		poolID = 10
+	}
+	pool := domain.ModelPool{ID: poolID, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
 	backend := domain.Backend{ID: 20, ModelPoolID: pool.ID, Name: "gpu", BaseURL: "http://backend.invalid", Enabled: true, CapacityHint: 1, RunningSoftLimit: 8}
 	data := registry.Data{
 		Revision: 1, Clients: []domain.Client{options.client}, Keys: []domain.APIKey{options.key},
 		Pools: []domain.ModelPool{pool}, Access: []domain.ClientModelAccess{{ClientID: options.client.ID, ModelPoolID: pool.ID, Enabled: true}},
 		Backends: []domain.Backend{backend},
+	}
+	backendRuntimes := map[int64]domain.BackendRuntime{
+		backend.ID: {
+			BackendID: backend.ID, Healthy: !options.unhealthy, MetricsFresh: !options.unhealthy,
+			State: domain.BackendHealthy, Pressure: .3,
+		},
+	}
+	if options.sessionAffinityBackends {
+		data.Backends[0].Name = "gpu-20"
+		backendRuntimes[20] = domain.BackendRuntime{BackendID: 20, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: .2}
+		for _, id := range []int64{21, 22} {
+			value := backend
+			value.ID = id
+			value.Name = "gpu-" + strconv.FormatInt(id, 10)
+			data.Backends = append(data.Backends, value)
+			pressure := .2
+			if id == 22 {
+				pressure = .8
+			}
+			backendRuntimes[id] = domain.BackendRuntime{BackendID: id, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: pressure}
+		}
 	}
 	if options.extraPools {
 		data.Pools = append(data.Pools,
@@ -378,9 +515,7 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 	if state == "" {
 		state = domain.PoolNormal
 	}
-	runtime := &runtimeStub{pool: domain.PoolRuntime{PoolID: pool.ID, State: state, AvailableBackends: 1}, runtime: domain.BackendRuntime{
-		BackendID: backend.ID, Healthy: !options.unhealthy, MetricsFresh: !options.unhealthy, State: domain.BackendHealthy, Pressure: .3,
-	}}
+	runtime := &runtimeStub{pool: domain.PoolRuntime{PoolID: pool.ID, State: state, AvailableBackends: len(data.Backends)}, runtimes: backendRuntimes}
 	forwarder := options.forwarder
 	if forwarder == nil {
 		forwarder = &capturingForwarder{}
@@ -388,7 +523,7 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 	service := gateway.New(gateway.Dependencies{
 		Registry: reg, HMACSecret: []byte(strings.Repeat("s", 32)),
 		Limiter: admission.NewLimiter(), Runtime: runtime,
-		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: forwarder,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
 		Observer:   options.observer,
 		RetryAfter: options.retryAfter,
 		Now:        func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
@@ -402,19 +537,37 @@ type staticLoader struct{ data registry.Data }
 func (l staticLoader) LoadSnapshot(context.Context) (registry.Data, error) { return l.data, nil }
 
 type runtimeStub struct {
-	mu      sync.Mutex
-	pool    domain.PoolRuntime
-	runtime domain.BackendRuntime
+	mu       sync.Mutex
+	pool     domain.PoolRuntime
+	runtimes map[int64]domain.BackendRuntime
 }
 
 func (r *runtimeStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime { return r.pool }
-func (r *runtimeStub) Snapshot(int64, time.Time) domain.BackendRuntime  { return r.runtime }
-func (r *runtimeStub) IncrementInflight(int64) (func(), bool) {
+func (r *runtimeStub) Snapshot(backendID int64, _ time.Time) domain.BackendRuntime {
 	r.mu.Lock()
-	r.runtime.GatewayInflight++
+	defer r.mu.Unlock()
+	return r.runtimes[backendID]
+}
+func (r *runtimeStub) IncrementInflight(backendID int64) (func(), bool) {
+	r.mu.Lock()
+	runtime, exists := r.runtimes[backendID]
+	if !exists {
+		r.mu.Unlock()
+		return nil, false
+	}
+	runtime.GatewayInflight++
+	r.runtimes[backendID] = runtime
 	r.mu.Unlock()
 	var once sync.Once
-	return func() { once.Do(func() { r.mu.Lock(); r.runtime.GatewayInflight--; r.mu.Unlock() }) }, true
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			value := r.runtimes[backendID]
+			value.GatewayInflight--
+			r.runtimes[backendID] = value
+			r.mu.Unlock()
+		})
+	}, true
 }
 
 type capturingForwarder struct {
@@ -446,6 +599,15 @@ func (f *capturingForwarder) Request() proxy.Request {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.request
+}
+
+func (f *capturingForwarder) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.request.Method == "" {
+		return 0
+	}
+	return 1
 }
 
 type blockingForwarder struct {

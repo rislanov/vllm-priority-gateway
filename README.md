@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, static pool of vLLM OpenAI-compatible servers. It authenticates clients, enforces centrally configured priority and concurrency policy, routes to the least-pressured healthy backend, and sheds lower-priority traffic before critical traffic when inference capacity is scarce.
+Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, static pool of vLLM OpenAI-compatible servers. It authenticates clients, enforces centrally configured priority and concurrency policy, combines soft session affinity with live-pressure routing, and sheds lower-priority traffic before critical traffic when inference capacity is scarce.
 
 The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
 
@@ -16,7 +16,7 @@ OpenAI client
     ▼
 ┌──────────────────────────────────────────────────────────┐
 │ Go gateway                                               │
-│ auth → model access → admission → least-pressure routing │
+│ auth → model access → admission → affinity/live routing │
 │ streaming proxy │ monitor workers │ Admin API/UI         │
 │ Prometheus      │ JSON logs       │ SQLite registry      │
 └───────────────────────────┬──────────────────────────────┘
@@ -42,6 +42,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 - Public-to-upstream model rewriting and static multi-backend model pools.
 - Independent health and Prometheus scraping with EWMA pressure and hysteretic pool states.
 - Priority-aware admission, bounded `429` errors, least-pressure routing, draining exclusion, and one conservative pre-first-byte retry.
+- Soft session affinity through `X-LLM-Session-Id`: rendezvous hashing improves prefix-cache locality while live pressure, health, freshness, drain state, and retry exclusions retain precedence.
 - Immediate response streaming, downstream cancellation propagation, Prometheus telemetry, and safe JSON completion logs.
 - Basic-authenticated, CSRF-protected JSON Admin API and embedded server-rendered Admin UI.
 - Deterministic fake vLLM controls and repeatable mixed-priority load generation.
@@ -90,6 +91,7 @@ Common optional variables:
 | `LLMGW_EWMA_WINDOW` | `4s` |
 | `LLMGW_OVERLOAD_ENTER_WINDOW` / `LLMGW_OVERLOAD_RECOVERY_WINDOW` | `3s` / `10s` |
 | `LLMGW_REQUEST_BODY_LIMIT` | `16777216` |
+| `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` | `1.0` |
 | `LLMGW_SHUTDOWN_GRACE_PERIOD` | `30s` |
 
 Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
@@ -133,6 +135,7 @@ curl -sS http://127.0.0.1:8080/v1/models \
 
 curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  -H 'X-LLM-Session-Id: coding-agent-run-8f0d' \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
@@ -184,6 +187,14 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 Clients cannot raise their own priority: the gateway removes an inbound `X-Vllm-Priority` header and JSON `priority`, rewrites the model, and applies policy from SQLite. Unsupported `/v1/*` routes and gateway failures use an OpenAI-shaped error envelope.
+
+### Soft session affinity and KV cache locality
+
+Send the same opaque `X-LLM-Session-Id` value on consecutive requests from one agent or conversation. The gateway rendezvous-hashes the authenticated client ID, model-pool ID, and session ID, so unrelated clients or models do not share an affinity key. The rendezvous winner is computed over backends that are enabled, non-draining, healthy, metrics-fresh, have their configured upstream secret, and are not excluded by a retry. If that winner's pressure is below `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` (default `1.0`), it is preferred; otherwise the request falls back to normal least-pressure routing.
+
+The identifier is trimmed, must be at most 256 bytes, is never logged or used as a metrics label, and is stripped before the request reaches vLLM. Omitting it preserves the original least-pressure behavior. Use stable opaque IDs rather than prompts or user data.
+
+This is locality-aware routing, not a distributed KV block index: the gateway does not inspect cached token blocks, cache hits, eviction, or prefix contents. vLLM KV-cache utilization remains an aggregate pressure input. Rendezvous hashing minimizes remapping when the eligible backend set changes: an ineligible winner rehashes to the next eligible backend, while overload deliberately switches to least-pressure routing. Either case can move a session and warm a different replica.
 
 ## vLLM setup flags
 
@@ -254,6 +265,7 @@ The gateway writes one JSON record per completed inference request to stderr. Re
 - Admin credentials come only from required environment variables and are compared in constant time.
 - State-changing Admin requests require double-submit CSRF protection; cookies are `HttpOnly` and `SameSite=Strict`.
 - The gateway strips client authorization and hop-by-hop headers before proxying. An upstream authorization header is constructed only from the named gateway environment variable.
+- Session-affinity IDs are bounded, excluded from logs and metric labels, and removed before upstream forwarding.
 - Keep vLLM endpoints on a private network. The gateway is the client-facing policy boundary.
 - Terminate TLS and apply network allowlists at a trusted reverse proxy. The MVP does not implement TLS, OIDC, RBAC, or an audit log.
 
@@ -306,6 +318,7 @@ LLMGW_DATABASE_PATH=/var/lib/llmgw/llmgw.db
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+LLMGW_SESSION_AFFINITY_MAX_PRESSURE=1.0
 ```
 
 ```bash
@@ -409,7 +422,7 @@ make build-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
-Tests cover domain validation, key security, SQLite migrations and CRUD, registry snapshots, pressure/EWMA/hysteresis, admission, routing, monitoring, fake-vLLM controls, proxy streaming/cancellation/retry, public and Admin HTTP contracts, UI semantics, telemetry, process lifecycle, load statistics, and black-box acceptance behavior.
+Tests cover domain validation, key security, SQLite migrations and CRUD, registry snapshots, pressure/EWMA/hysteresis, admission, least-pressure and rendezvous routing, session-affinity fallback/exclusion/header handling, monitoring, fake-vLLM controls, proxy streaming/cancellation/retry, public and Admin HTTP contracts, UI semantics, telemetry, process lifecycle, load statistics, and black-box acceptance behavior.
 
 ## Real-GPU validation
 
@@ -419,7 +432,7 @@ Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for compatibility,
 
 - One gateway replica; concurrency leases and backend runtime state are process-local.
 - Operator-managed backend registration and SQLite persistence only; there is no automatic service discovery.
-- No distributed rate limits, token budgets, billing, circuit breaker, autoscaling, discovery, prefix-aware routing, or GPU/NVML scheduling.
+- No distributed rate limits, token budgets, billing, circuit breaker, autoscaling, discovery, KV-block/prefix-index routing, or GPU/NVML scheduling. Soft session affinity is implemented without inspecting cache contents.
 - Priority admission rejects new lower-priority requests; it does not preempt an already admitted generation.
 - Basic auth is the MVP management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external or future responsibilities.
 - Capacity hints are persisted for forward compatibility but do not yet weight routing.
@@ -432,7 +445,7 @@ The package boundaries allow SQLite to be replaced with PostgreSQL, local leases
 - Real-GPU validation and calibrated pressure/admission thresholds for the selected models and hardware.
 - Multi-replica gateway HA with coordinated configuration revisions and distributed concurrency/rate/token budgets.
 - PostgreSQL for durable configuration and a defined degraded-mode policy for the distributed coordination store.
-- Request-failure/`5xx` circuit breaking with open/half-open recovery probes, orchestrated drain-aware rolling shutdown, capacity-aware routing, and soft session affinity.
+- Request-failure/`5xx` circuit breaking with open/half-open recovery probes, orchestrated drain-aware rolling shutdown, capacity-aware routing, and optional KV-block/prefix-aware routing beyond the current soft affinity.
 - OIDC-based Admin authentication, RBAC, audit logging, secret-manager integration, and managed TLS/network policy.
 - OpenTelemetry traces, production dashboards and alerts, configuration migration/versioning, and Kubernetes deployment/discovery where required.
 - Load, failure, upgrade, backup/restore, and security validation against the Production V1 acceptance criteria in the technical specification.

@@ -1683,6 +1683,8 @@ takes precedence over static weight.
 
 # 43. Production Soft Session Affinity
 
+> **Current implementation status:** this capability is already delivered. `X-LLM-Session-Id` is limited to 256 bytes and is combined with the authenticated client ID and model-pool ID for deterministic rendezvous hashing. The winner is computed after the ordinary eligibility filters, matching the routing order below; an ineligible backend is therefore removed before rendezvous hashing. When the eligible winner's live pressure is at or above `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` (default `1.0`), routing falls back to the least-pressured eligible backend. The header is not forwarded upstream, logged, or used as a metric label. This does not implement a KV block index or inspect cached prefixes.
+
 Cache locality is useful for LLMs.
 
 If consecutive requests from the same agent session are routed to different vLLM replicas each time, some of the benefit of the prefix cache may be lost.

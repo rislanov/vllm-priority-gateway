@@ -39,6 +39,7 @@ type Config struct {
 	RequestBodyLimit           int64
 	RetryAfter                 time.Duration
 	RoutingPressureEpsilon     float64
+	SessionAffinityMaxPressure float64
 	DialTimeout                time.Duration
 	TLSHandshakeTimeout        time.Duration
 	ResponseHeaderTimeout      time.Duration
@@ -71,6 +72,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		RequestBodyLimit:           16 << 20,
 		RetryAfter:                 2 * time.Second,
 		RoutingPressureEpsilon:     .02,
+		SessionAffinityMaxPressure: 1.00,
 		DialTimeout:                3 * time.Second,
 		TLSHandshakeTimeout:        3 * time.Second,
 		ResponseHeaderTimeout:      30 * time.Second,
@@ -150,6 +152,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	if cfg.RoutingPressureEpsilon, err = floatValue(lookup, "LLMGW_ROUTING_PRESSURE_EPSILON", cfg.RoutingPressureEpsilon); err != nil {
 		return Config{}, err
 	}
+	if cfg.SessionAffinityMaxPressure, err = floatValue(lookup, "LLMGW_SESSION_AFFINITY_MAX_PRESSURE", cfg.SessionAffinityMaxPressure); err != nil {
+		return Config{}, err
+	}
 	if cfg.DialTimeout, err = durationValue(lookup, "LLMGW_DIAL_TIMEOUT", cfg.DialTimeout); err != nil {
 		return Config{}, err
 	}
@@ -214,6 +219,9 @@ func (c Config) validate() error {
 	}
 	if c.RoutingPressureEpsilon < 0 || math.IsNaN(c.RoutingPressureEpsilon) || math.IsInf(c.RoutingPressureEpsilon, 0) {
 		return errors.New("routing pressure epsilon must be finite and non-negative")
+	}
+	if !finitePositive(c.SessionAffinityMaxPressure) {
+		return errors.New("session affinity max pressure must be finite and positive")
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,11 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
+)
+
+const (
+	SessionAffinityHeader     = "X-LLM-Session-Id"
+	MaxSessionAffinityIDBytes = 256
 )
 
 type SnapshotProvider interface {
@@ -163,6 +169,10 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if authErr != nil {
 		return proxy.Result{}, authErr
 	}
+	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
+	if len(sessionID) > MaxSessionAffinityIDBytes {
+		return proxy.Result{}, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
+	}
 	event.Client = client.Name
 	event.PriorityClass = client.PriorityClass
 	event.VLLMPriority = client.VLLMPriority
@@ -176,6 +186,10 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		return proxy.Result{}, modelNotAllowed()
 	}
 	event.Model = pool.PublicModelName
+	affinityKey := ""
+	if sessionID != "" {
+		affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
+	}
 	payload, err := replaceModel(payload, pool.UpstreamModelName)
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
@@ -199,16 +213,25 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	}
 
 	selectTarget := func(exclude map[int64]struct{}) (proxy.Target, error) {
-		candidates := make([]routing.Candidate, 0, len(snapshot.BackendsByPool[pool.ID]))
-		for _, backend := range snapshot.BackendsByPool[pool.ID] {
-			runtime := s.runtime.Snapshot(backend.ID, now)
+		currentSnapshot := s.registry.Snapshot()
+		currentPool, poolExists := currentSnapshot.PoolsByID[pool.ID]
+		currentClient, clientExists := currentSnapshot.Clients[client.ID]
+		if !poolExists || !currentPool.Enabled || currentPool.PublicModelName != pool.PublicModelName ||
+			currentPool.UpstreamModelName != pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
+			!currentSnapshot.Access[client.ID][pool.ID] {
+			return proxy.Target{}, routing.ErrNoBackend
+		}
+		selectionTime := s.now().UTC()
+		candidates := make([]routing.Candidate, 0, len(currentSnapshot.BackendsByPool[pool.ID]))
+		for _, backend := range currentSnapshot.BackendsByPool[pool.ID] {
+			runtime := s.runtime.Snapshot(backend.ID, selectionTime)
 			_, secretOK := s.upstreamSecret(backend)
 			candidates = append(candidates, routing.Candidate{
 				Backend: backend, Pressure: runtime.Pressure, GatewayInflight: runtime.GatewayInflight,
 				Eligible: runtime.Healthy && runtime.MetricsFresh && secretOK,
 			})
 		}
-		candidate, err := s.router.Select(candidates, exclude)
+		candidate, err := s.router.SelectWithSessionAffinity(candidates, exclude, affinityKey)
 		if err != nil {
 			return proxy.Target{}, err
 		}
@@ -227,7 +250,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	currentInflight := inflight
 	currentInflight.Backend = target.Backend.Name
 	event.Backend = target.Backend.Name
-	event.BackendPressure = s.runtime.Snapshot(target.Backend.ID, now).Pressure
+	event.BackendPressure = s.runtime.Snapshot(target.Backend.ID, s.now().UTC()).Pressure
 	if s.observer != nil {
 		s.observer.BackendInflight(currentInflight, 1)
 	}
@@ -242,6 +265,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 
 	headers := request.Headers.Clone()
 	headers.Del("X-Vllm-Priority")
+	headers.Del(SessionAffinityHeader)
 	headers.Del("Authorization")
 	proxyRequest := proxy.Request{
 		Method: request.Method, Path: request.Path, Headers: headers, Body: payload,
@@ -264,7 +288,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		currentRelease = release
 		currentInflight.Backend = alternate.Backend.Name
 		event.Backend = alternate.Backend.Name
-		event.BackendPressure = s.runtime.Snapshot(alternate.Backend.ID, now).Pressure
+		event.BackendPressure = s.runtime.Snapshot(alternate.Backend.ID, s.now().UTC()).Pressure
 		if s.observer != nil {
 			s.observer.BackendInflight(currentInflight, 1)
 		}

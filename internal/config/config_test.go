@@ -47,6 +47,9 @@ func TestLoadUsesMVPDefaults(t *testing.T) {
 	if cfg.RequestBodyLimit != 16<<20 || cfg.RetryAfter != 2*time.Second {
 		t.Fatalf("HTTP defaults = %+v", cfg)
 	}
+	if cfg.SessionAffinityMaxPressure != 1 {
+		t.Fatalf("SessionAffinityMaxPressure = %v, want 1", cfg.SessionAffinityMaxPressure)
+	}
 }
 
 func TestLoadRejectsMissingOrWeakSecrets(t *testing.T) {
@@ -97,12 +100,25 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	env["LLMGW_LISTEN_ADDRESS"] = "127.0.0.1:9090"
 	env["LLMGW_HEALTH_INTERVAL"] = "750ms"
 	env["LLMGW_REQUEST_BODY_LIMIT"] = "2097152"
+	env["LLMGW_SESSION_AFFINITY_MAX_PRESSURE"] = "0.85"
 
 	cfg, err := config.Load(lookup(env))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.ListenAddress != "127.0.0.1:9090" || cfg.HealthInterval != 750*time.Millisecond || cfg.RequestBodyLimit != 2<<20 {
+	if cfg.ListenAddress != "127.0.0.1:9090" || cfg.HealthInterval != 750*time.Millisecond || cfg.RequestBodyLimit != 2<<20 || cfg.SessionAffinityMaxPressure != .85 {
 		t.Fatalf("overrides not applied: %+v", cfg)
+	}
+}
+
+func TestLoadRejectsInvalidSessionAffinityMaxPressure(t *testing.T) {
+	for _, value := range []string{"0", "-0.1", "NaN", "+Inf"} {
+		t.Run(value, func(t *testing.T) {
+			env := validEnvironment()
+			env["LLMGW_SESSION_AFFINITY_MAX_PRESSURE"] = value
+			if _, err := config.Load(lookup(env)); err == nil {
+				t.Fatalf("Load() accepted session affinity max pressure %q", value)
+			}
+		})
 	}
 }

@@ -89,7 +89,11 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	defer usage.Close()
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Limiter: admission.NewLimiter(),
-		Runtime: manager, Router: routing.New(cfg.RoutingPressureEpsilon, routing.NewRandomSource(time.Now().UnixNano())),
+		Runtime: manager, Router: routing.NewWithSessionAffinity(
+			cfg.RoutingPressureEpsilon,
+			cfg.SessionAffinityMaxPressure,
+			routing.NewRandomSource(time.Now().UnixNano()),
+		),
 		Forwarder: proxy.New(upstreamClient), Usage: usage,
 		Observer: observability.Multi(metrics, observability.NewLogger(logger)), LookupEnv: getenv,
 		RetryAfter: cfg.RetryAfter,

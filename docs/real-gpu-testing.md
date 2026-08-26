@@ -113,6 +113,23 @@ printf 'background load remains active as PID %s for sections 5 and 6\n' "$LOAD_
 
 With two backends, repeat after applying load directly to only vLLM A. Pass criteria: waiting requests and pressure rise on A; new gateway requests prefer the lower-pressure B; stale, unhealthy, or draining endpoints receive no new work.
 
+### Soft session affinity and cache locality
+
+With two healthy backends below the configured affinity pressure ceiling, send a sequence that reuses one session ID:
+
+```bash
+for i in $(seq 1 20); do
+  curl -sS "$GATEWAY/v1/chat/completions" \
+    -H "Authorization: Bearer $HIGH_KEY" \
+    -H 'X-LLM-Session-Id: gpu-affinity-check-1' \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"gpu-test","messages":[{"role":"user","content":"Continue the same technical discussion."}],"max_tokens":16}' \
+    >/dev/null
+done
+```
+
+Inspect the gateway completion logs and both vLLM request logs. Pass criteria: all requests select the same backend while it stays eligible and below `LLMGW_SESSION_AFFINITY_MAX_PRESSURE`. To prove that the header is stripped, place a controlled header-capturing reverse proxy between the gateway and vLLM for this run; absence from ordinary vLLM logs is not evidence because vLLM does not normally log arbitrary request headers. Then raise load on that preferred backend above the ceiling, drain it, or make its metrics stale and repeat the request. The session must move to an eligible backend without a client error; overload uses least-pressure fallback, while other eligibility changes recompute rendezvous hashing over the remaining set. Removing the header must restore ordinary least-pressure selection. Record per-backend KV utilization and TTFT as evidence of locality impact; this experiment validates routing behavior but does not claim block-level cache awareness.
+
 ## 5. Priority isolation
 
 Run the fixed seeded mix while background traffic already fills the queue:
