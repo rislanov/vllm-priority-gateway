@@ -185,6 +185,21 @@ func TestPublicControlledErrors(t *testing.T) {
 	}
 }
 
+func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
+	raw, key := testKey(t)
+	handler, _ := newFixture(t, fixtureOptions{
+		client: backgroundClient(), key: key, poolState: domain.PoolSaturated,
+		retryAfter: 6500 * time.Millisecond,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "7" {
+		t.Fatalf("status=%d Retry-After=%q", response.Code, response.Header().Get("Retry-After"))
+	}
+}
+
 func TestServiceObserverTracksRejectionAndInflightLifecycle(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -239,6 +254,39 @@ func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
 	}
 }
 
+func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &recordingObserver{}
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, observer: observer})
+
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/v1/models", nil),
+		httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{}`)),
+		httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(strings.Repeat("x", 1024*1024+1))),
+		httptest.NewRequest(http.MethodGet, "/v1/models", nil),
+	}
+	requests[1].Header.Set("Authorization", "Bearer "+raw)
+	requests[2].Header.Set("Authorization", "Bearer "+raw)
+	requests[3].Header.Set("Authorization", "Bearer "+raw)
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+	}
+	events := observer.Events()
+	if len(events) != 4 {
+		t.Fatalf("events = %+v", events)
+	}
+	wantStatuses := []int{http.StatusUnauthorized, http.StatusNotFound, http.StatusBadRequest, http.StatusOK}
+	for index, want := range wantStatuses {
+		if events[index].Status != want {
+			t.Fatalf("event %d = %+v, want status %d", index, events[index], want)
+		}
+	}
+	if events[3].Client != "client" || events[3].PriorityClass != domain.PriorityHigh {
+		t.Fatalf("models event lacks client policy: %+v", events[3])
+	}
+}
+
 func TestServicePreservesCommittedUpstreamStatusOnBodyFailure(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -266,6 +314,7 @@ type fixtureOptions struct {
 	unhealthy  bool
 	extraPools bool
 	observer   gateway.Observer
+	retryAfter time.Duration
 }
 
 func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStub) {
@@ -303,8 +352,9 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 		Registry: reg, HMACSecret: []byte(strings.Repeat("s", 32)),
 		Limiter: admission.NewLimiter(), Runtime: runtime,
 		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: forwarder,
-		Observer: options.observer,
-		Now:      func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
+		Observer:   options.observer,
+		RetryAfter: options.retryAfter,
+		Now:        func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
 	})
 	handler := httpapi.NewPublicHandler(service, 1024*1024, func() (string, error) { return "fixed-gateway-id", nil })
 	return handler, runtime

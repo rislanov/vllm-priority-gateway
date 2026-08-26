@@ -92,6 +92,26 @@ func TestMarkKeyRevokedPublishesFailClosedOverlay(t *testing.T) {
 	}
 }
 
+func TestMarkKeyUsedPublishesRuntimeTimestampWithoutRevisionChange(t *testing.T) {
+	loader := &sequenceLoader{results: []loadResult{{data: registry.Data{
+		Revision: 3,
+		Clients:  []domain.Client{{ID: 1, Name: "client", Enabled: true}},
+		Keys:     []domain.APIKey{{ID: 7, ClientID: 1, Prefix: "llmgw_abcd"}},
+	}}}}
+	reg := registry.New(loader)
+	if err := reg.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	usedAt := time.Unix(1_700_000_100, 0).UTC()
+	if !reg.MarkKeyUsed(7, usedAt) {
+		t.Fatal("key was not found")
+	}
+	key := reg.Snapshot().KeyCandidates["llmgw_abcd"][0]
+	if key.LastUsedAt == nil || !key.LastUsedAt.Equal(usedAt) || reg.Snapshot().Revision != 3 {
+		t.Fatalf("usage snapshot = %+v", reg.Snapshot())
+	}
+}
+
 type loadResult struct {
 	data registry.Data
 	err  error

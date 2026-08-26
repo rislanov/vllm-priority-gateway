@@ -20,13 +20,14 @@ type Handler struct {
 }
 
 type pageData struct {
-	Title      string
-	Active     string
-	CSRF       string
-	View       httpapi.AdminView
-	EditClient *httpapi.AdminClient
-	Secret     string
-	Error      string
+	Title       string
+	Active      string
+	CSRF        string
+	View        httpapi.AdminView
+	EditClient  *httpapi.AdminClient
+	EditBackend *httpapi.AdminBackend
+	Secret      string
+	Error       string
 }
 
 func New(service *httpapi.AdminService) (http.Handler, error) {
@@ -219,6 +220,17 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
+	}
+	if rawID := request.URL.Query().Get("edit"); rawID != "" {
+		if id, err := positiveID(rawID); err == nil {
+			for _, backend := range h.service.View().Backends {
+				if backend.ID == id {
+					copy := backend
+					data.EditBackend = &copy
+					break
+				}
+			}
+		}
 	}
 	status := http.StatusOK
 	if data.Error != "" {

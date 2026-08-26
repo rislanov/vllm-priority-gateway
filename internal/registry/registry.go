@@ -69,6 +69,22 @@ func (r *Registry) Reload(ctx context.Context) error {
 // MarkKeyRevoked immediately publishes a fail-closed view after durable
 // revocation, before a complete database snapshot is reloaded.
 func (r *Registry) MarkKeyRevoked(id int64, at time.Time) bool {
+	return r.updateKey(id, func(key *domain.APIKey) {
+		value := at.UTC()
+		key.RevokedAt = &value
+	})
+}
+
+// MarkKeyUsed updates the non-policy usage projection without changing the
+// durable configuration revision.
+func (r *Registry) MarkKeyUsed(id int64, at time.Time) bool {
+	return r.updateKey(id, func(key *domain.APIKey) {
+		value := at.UTC()
+		key.LastUsedAt = &value
+	})
+}
+
+func (r *Registry) updateKey(id int64, update func(*domain.APIKey)) bool {
 	for {
 		current := r.current.Load()
 		updated := *current
@@ -78,8 +94,7 @@ func (r *Registry) MarkKeyRevoked(id int64, at time.Time) bool {
 			copied := append([]domain.APIKey(nil), candidates...)
 			for index := range copied {
 				if copied[index].ID == id {
-					value := at.UTC()
-					copied[index].RevokedAt = &value
+					update(&copied[index])
 					found = true
 				}
 			}

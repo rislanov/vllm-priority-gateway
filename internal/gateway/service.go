@@ -46,6 +46,7 @@ type Dependencies struct {
 	Observer   Observer
 	Now        func() time.Time
 	LookupEnv  func(string) (string, bool)
+	RetryAfter time.Duration
 }
 
 type Service struct {
@@ -59,6 +60,7 @@ type Service struct {
 	observer   Observer
 	now        func() time.Time
 	lookupEnv  func(string) (string, bool)
+	retryAfter time.Duration
 }
 
 func New(dependencies Dependencies) *Service {
@@ -74,11 +76,15 @@ func New(dependencies Dependencies) *Service {
 	if limiter == nil {
 		limiter = admission.NewLimiter()
 	}
+	retryAfter := dependencies.RetryAfter
+	if retryAfter <= 0 {
+		retryAfter = 2 * time.Second
+	}
 	return &Service{
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
 		limiter: limiter, runtime: dependencies.Runtime, router: dependencies.Router,
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
-		now: now, lookupEnv: lookupEnv,
+		now: now, lookupEnv: lookupEnv, retryAfter: retryAfter,
 	}
 }
 
@@ -100,10 +106,10 @@ type ForwardRequest struct {
 	ParentRequestID string
 }
 
-func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, *APIError) {
+func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, domain.Client, *APIError) {
 	client, _, authErr := s.authenticate(rawKey)
 	if authErr != nil {
-		return nil, authErr
+		return nil, domain.Client{}, authErr
 	}
 	snapshot := s.registry.Snapshot()
 	access := snapshot.Access[client.ID]
@@ -115,7 +121,15 @@ func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, 
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].PublicModelName < models[j].PublicModelName })
-	return models, nil
+	return models, client, nil
+}
+
+// CompletePublic records public outcomes that do not enter the forwarding
+// lifecycle, such as model listing and request-envelope rejection.
+func (s *Service) CompletePublic(event RequestEvent) {
+	if s.observer != nil {
+		s.observer.Complete(event)
+	}
 }
 
 func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (result proxy.Result, apiErr *APIError) {
@@ -162,12 +176,12 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	poolRuntime := s.runtime.PoolSnapshot(pool.ID, now)
 	event.PoolState = poolRuntime.State
 	if poolRuntime.State == domain.PoolUnavailable {
-		return proxy.Result{}, backendUnavailable()
+		return proxy.Result{}, backendUnavailable(s.retryAfter)
 	}
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
 	lease, ok := s.limiter.Acquire(client.ID, limit)
 	if !ok {
-		return proxy.Result{}, overloaded()
+		return proxy.Result{}, overloaded(s.retryAfter)
 	}
 	defer lease.Release()
 	inflight := InflightEvent{Client: client.Name, Model: publicModel, PriorityClass: client.PriorityClass}
@@ -196,11 +210,11 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 
 	target, err := selectTarget(nil)
 	if err != nil {
-		return proxy.Result{}, backendUnavailable()
+		return proxy.Result{}, backendUnavailable(s.retryAfter)
 	}
 	currentRelease, ok := s.runtime.IncrementInflight(target.Backend.ID)
 	if !ok {
-		return proxy.Result{}, backendUnavailable()
+		return proxy.Result{}, backendUnavailable(s.retryAfter)
 	}
 	currentInflight := inflight
 	currentInflight.Backend = target.Backend.Name
@@ -344,12 +358,12 @@ func modelNotAllowed() *APIError {
 	return &APIError{HTTPStatus: http.StatusForbidden, Message: "The requested model is not available to this client", Type: "invalid_request_error", Code: "model_not_allowed"}
 }
 
-func overloaded() *APIError {
-	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: 2 * time.Second}
+func overloaded(retryAfter time.Duration) *APIError {
+	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: retryAfter}
 }
 
-func backendUnavailable() *APIError {
-	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: 2 * time.Second}
+func backendUnavailable(retryAfter time.Duration) *APIError {
+	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter}
 }
 
 func upstreamError() *APIError {

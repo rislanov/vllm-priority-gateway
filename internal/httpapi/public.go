@@ -38,20 +38,33 @@ func (h *PublicHandler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 }
 
 func (h *PublicHandler) models(writer http.ResponseWriter, request *http.Request) {
+	started := time.Now()
 	requestID, ok := h.begin(writer)
 	if !ok {
+		h.completePublic(started, gateway.RequestEvent{Status: http.StatusInternalServerError, Reason: "internal_error"})
 		return
 	}
+	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
-		writeGatewayError(writer, &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"})
+		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+		writeGatewayError(writer, apiError)
+		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		h.completePublic(started, event)
 		return
 	}
-	models, gatewayError := h.service.Models(request.Context(), rawKey)
+	models, client, gatewayError := h.service.Models(request.Context(), rawKey)
 	if gatewayError != nil {
 		writeGatewayError(writer, gatewayError)
+		event.Status, event.Reason = gatewayError.HTTPStatus, gatewayError.Code
+		h.completePublic(started, event)
 		return
 	}
+	event.Client = client.Name
+	event.PriorityClass = client.PriorityClass
+	event.VLLMPriority = client.VLLMPriority
+	event.Status = http.StatusOK
+	defer h.completePublic(started, event)
 	type model struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -68,19 +81,28 @@ func (h *PublicHandler) models(writer http.ResponseWriter, request *http.Request
 }
 
 func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Request) {
+	started := time.Now()
 	requestID, ok := h.begin(writer)
 	if !ok {
+		h.completePublic(started, gateway.RequestEvent{Status: http.StatusInternalServerError, Reason: "internal_error"})
 		return
 	}
+	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
-		writeGatewayError(writer, &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"})
+		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+		writeGatewayError(writer, apiError)
+		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		h.completePublic(started, event)
 		return
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, h.bodyLimit)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
-		writeGatewayError(writer, invalidRequest("Request body is invalid or exceeds the configured limit"))
+		apiError := invalidRequest("Request body is invalid or exceeds the configured limit")
+		writeGatewayError(writer, apiError)
+		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		h.completePublic(started, event)
 		return
 	}
 	_, gatewayError := h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
@@ -93,10 +115,20 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 }
 
 func (h *PublicHandler) unsupported(writer http.ResponseWriter, _ *http.Request) {
-	if _, ok := h.begin(writer); !ok {
+	started := time.Now()
+	requestID, ok := h.begin(writer)
+	if !ok {
+		h.completePublic(started, gateway.RequestEvent{Status: http.StatusInternalServerError, Reason: "internal_error"})
 		return
 	}
-	writeGatewayError(writer, unsupportedEndpoint())
+	apiError := unsupportedEndpoint()
+	writeGatewayError(writer, apiError)
+	h.completePublic(started, gateway.RequestEvent{RequestID: requestID, Status: apiError.HTTPStatus, Reason: apiError.Code})
+}
+
+func (h *PublicHandler) completePublic(started time.Time, event gateway.RequestEvent) {
+	event.Duration = time.Since(started)
+	h.service.CompletePublic(event)
 }
 
 func (h *PublicHandler) begin(writer http.ResponseWriter) (string, bool) {

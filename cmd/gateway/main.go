@@ -85,13 +85,14 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	metrics := observability.NewMetrics()
-	usage := newUsageRecorder(ctx, database)
+	usage := newUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
 	defer usage.Close()
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Limiter: admission.NewLimiter(),
 		Runtime: manager, Router: routing.New(cfg.RoutingPressureEpsilon, routing.NewRandomSource(time.Now().UnixNano())),
 		Forwarder: proxy.New(upstreamClient), Usage: usage,
 		Observer: observability.Multi(metrics, observability.NewLogger(logger)), LookupEnv: getenv,
+		RetryAfter: cfg.RetryAfter,
 	})
 	publicHandler := httpapi.NewPublicHandler(service, cfg.RequestBodyLimit, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
@@ -210,6 +211,23 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 
 type keyUsageStore interface {
 	TouchKeyLastUsed(context.Context, int64, time.Time) error
+}
+
+type keyUsageProjection interface {
+	MarkKeyUsed(int64, time.Time) bool
+}
+
+type projectedKeyUsageStore struct {
+	destination keyUsageStore
+	projection  keyUsageProjection
+}
+
+func (s projectedKeyUsageStore) TouchKeyLastUsed(ctx context.Context, keyID int64, usedAt time.Time) error {
+	if err := s.destination.TouchKeyLastUsed(ctx, keyID, usedAt); err != nil {
+		return err
+	}
+	s.projection.MarkKeyUsed(keyID, usedAt)
+	return nil
 }
 
 type usageEvent struct {

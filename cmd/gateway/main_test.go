@@ -11,6 +11,19 @@ import (
 	"time"
 )
 
+func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
+	destination := &keyUsageStoreStub{}
+	projection := &keyUsageRegistryStub{}
+	usedAt := time.Unix(1_700_000_000, 0).UTC()
+	writer := projectedKeyUsageStore{destination: destination, projection: projection}
+	if err := writer.TouchKeyLastUsed(context.Background(), 7, usedAt); err != nil {
+		t.Fatal(err)
+	}
+	if destination.keyID != 7 || !destination.usedAt.Equal(usedAt) || projection.keyID != 7 || !projection.usedAt.Equal(usedAt) {
+		t.Fatalf("destination=%+v projection=%+v", destination, projection)
+	}
+}
+
 func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -82,4 +95,24 @@ func mapLookup(values map[string]string) func(string) (string, bool) {
 		value, ok := values[key]
 		return value, ok
 	}
+}
+
+type keyUsageStoreStub struct {
+	keyID  int64
+	usedAt time.Time
+}
+
+func (s *keyUsageStoreStub) TouchKeyLastUsed(_ context.Context, keyID int64, usedAt time.Time) error {
+	s.keyID, s.usedAt = keyID, usedAt
+	return nil
+}
+
+type keyUsageRegistryStub struct {
+	keyID  int64
+	usedAt time.Time
+}
+
+func (s *keyUsageRegistryStub) MarkKeyUsed(keyID int64, usedAt time.Time) bool {
+	s.keyID, s.usedAt = keyID, usedAt
+	return true
 }

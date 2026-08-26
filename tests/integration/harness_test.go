@@ -57,6 +57,17 @@ type harness struct {
 	upstreams    []*httptest.Server
 }
 
+type harnessUsage struct {
+	database *store.SQLite
+	registry *registry.Registry
+}
+
+func (u harnessUsage) Record(keyID int64, usedAt time.Time) {
+	if u.database.TouchKeyLastUsed(context.Background(), keyID, usedAt) == nil {
+		u.registry.MarkKeyUsed(keyID, usedAt)
+	}
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,7 +97,7 @@ func newHarness(t *testing.T) *harness {
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: hmacSecret, Limiter: admission.NewLimiter(), Runtime: manager,
 		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: proxy.New(client), Observer: metrics,
-		LookupEnv: os.LookupEnv,
+		Usage: harnessUsage{database: database, registry: registryValue}, LookupEnv: os.LookupEnv,
 	})
 	publicHandler := httpapi.NewPublicHandler(service, 1<<20, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{

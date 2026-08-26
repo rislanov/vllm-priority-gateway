@@ -90,6 +90,32 @@ func TestClientEditPagePrefillsExistingPolicy(t *testing.T) {
 	}
 }
 
+func TestBackendEditPageAndEnableToggle(t *testing.T) {
+	handler := newWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	for _, expected := range []string{
+		"Edit backend: gpu-a", `value="gpu-a"`, `value="http://127.0.0.1:9001"`,
+		`value="16"`, `href="/admin/backends?edit=1#backend-editor"`, ">Disable<",
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("backend edit page missing %q: %s", expected, response.Body.String())
+		}
+	}
+
+	form := "action=update_backend&id=1&model_pool_id=1&name=gpu-a&base_url=http%3A%2F%2F127.0.0.1%3A9001&capacity_hint=1&running_soft_limit=16"
+	request := httptest.NewRequest(http.MethodPost, "/admin/backends", strings.NewReader(form))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Enable</button>") {
+		t.Fatalf("disable response = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func newWebFixture(t *testing.T) http.Handler {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))

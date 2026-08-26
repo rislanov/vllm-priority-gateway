@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
@@ -47,6 +48,20 @@ func TestAdminAuthenticationCSRFCRUDAndOneTimeSecret(t *testing.T) {
 	if !strings.HasPrefix(apiSecret, "llmgw_") {
 		t.Fatalf("created API key = %q", apiSecret)
 	}
+	modelsResponse, modelsBody := h.public(http.MethodGet, "/v1/models", apiSecret, "")
+	if modelsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated models = %d %s", modelsResponse.StatusCode, modelsBody)
+	}
+	eventually(t, time.Second, func() bool {
+		status := h.adminObject(http.MethodGet, "/admin/api/status", nil, http.StatusOK)
+		for _, value := range status["keys"].([]any) {
+			key := value.(map[string]any)
+			if key["lastUsedAt"] != nil {
+				return true
+			}
+		}
+		return false
+	})
 
 	for _, path := range []string{"/admin", "/admin/clients", "/admin/keys", "/admin/backends"} {
 		request, _ := http.NewRequest(http.MethodGet, h.server.URL+path, nil)
