@@ -253,7 +253,7 @@ func (m *Manager) AcquireBackend(backendID int64, at time.Time) (func(domain.Inf
 	var once sync.Once
 	return func(outcome domain.InferenceOutcome) {
 		once.Do(func() {
-			completeCircuit(outcome)
+			completeCircuit(outcome, time.Now())
 			managed.worker.incrementInflight(-1)
 		})
 	}, true

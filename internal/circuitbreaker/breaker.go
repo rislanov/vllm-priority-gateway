@@ -24,12 +24,14 @@ type Snapshot struct {
 }
 
 type Breaker struct {
-	mu             sync.Mutex
-	options        Options
-	state          domain.CircuitState
-	failures       []time.Time
-	openedAt       time.Time
-	probesInFlight int
+	mu                sync.Mutex
+	options           Options
+	state             domain.CircuitState
+	generation        uint64
+	failures          []time.Time
+	openedAt          time.Time
+	probesInFlight    int
+	halfOpenSucceeded bool
 }
 
 func New(options Options) (*Breaker, error) {
@@ -48,24 +50,24 @@ func New(options Options) (*Breaker, error) {
 	return &Breaker{options: options, state: domain.CircuitClosed}, nil
 }
 
-func (b *Breaker) Acquire(now time.Time) (complete func(domain.InferenceOutcome), ok bool) {
+func (b *Breaker) Acquire(now time.Time) (complete func(domain.InferenceOutcome, time.Time), ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	b.transitionOpenToHalfOpen(now)
 	if b.state == domain.CircuitClosed {
 		b.pruneFailures(now)
-		return b.completion(now, false), true
+		return b.completion(b.generation, false), true
 	}
 	if b.state != domain.CircuitHalfOpen {
 		return nil, false
 	}
 
-	if b.probesInFlight >= b.options.HalfOpenMaxProbes {
+	if b.halfOpenSucceeded || b.probesInFlight >= b.options.HalfOpenMaxProbes {
 		return nil, false
 	}
 	b.probesInFlight++
-	return b.completion(now, true), true
+	return b.completion(b.generation, true), true
 }
 
 func (b *Breaker) Snapshot(now time.Time) Snapshot {
@@ -88,39 +90,41 @@ func (b *Breaker) Snapshot(now time.Time) Snapshot {
 	case domain.CircuitOpen:
 		snapshot.RetryAt = b.openedAt.Add(b.options.OpenCooldown)
 	case domain.CircuitHalfOpen:
-		snapshot.Available = b.probesInFlight < b.options.HalfOpenMaxProbes
+		snapshot.Available = !b.halfOpenSucceeded && b.probesInFlight < b.options.HalfOpenMaxProbes
 	}
 	return snapshot
 }
 
-func (b *Breaker) completion(now time.Time, probe bool) func(domain.InferenceOutcome) {
+func (b *Breaker) completion(generation uint64, probe bool) func(domain.InferenceOutcome, time.Time) {
 	var once sync.Once
-	return func(outcome domain.InferenceOutcome) {
+	return func(outcome domain.InferenceOutcome, completedAt time.Time) {
 		once.Do(func() {
-			b.complete(now, probe, outcome)
+			b.complete(generation, probe, outcome, completedAt)
 		})
 	}
 }
 
-func (b *Breaker) complete(now time.Time, probe bool, outcome domain.InferenceOutcome) {
+func (b *Breaker) complete(generation uint64, probe bool, outcome domain.InferenceOutcome, completedAt time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if generation != b.generation {
+		return
+	}
 	if probe {
-		b.completeProbe(now, outcome)
+		b.completeProbe(completedAt, outcome)
 		return
 	}
 	if b.state != domain.CircuitClosed || outcome != domain.InferenceFailure {
 		return
 	}
-	openedAt := b.recordFailure(now)
+	openedAt := b.recordFailure(completedAt)
 	if len(b.failures) >= b.options.FailureThreshold {
-		b.state = domain.CircuitOpen
-		b.openedAt = openedAt
+		b.enterOpen(openedAt)
 	}
 }
 
-func (b *Breaker) completeProbe(now time.Time, outcome domain.InferenceOutcome) {
+func (b *Breaker) completeProbe(completedAt time.Time, outcome domain.InferenceOutcome) {
 	if b.state != domain.CircuitHalfOpen {
 		return
 	}
@@ -129,15 +133,13 @@ func (b *Breaker) completeProbe(now time.Time, outcome domain.InferenceOutcome) 
 	}
 	switch outcome {
 	case domain.InferenceSuccess:
-		b.state = domain.CircuitClosed
-		b.failures = nil
-		b.openedAt = time.Time{}
-		b.probesInFlight = 0
+		b.halfOpenSucceeded = true
 	case domain.InferenceFailure:
-		openedAt := b.recordFailure(now)
-		b.state = domain.CircuitOpen
-		b.openedAt = openedAt
-		b.probesInFlight = 0
+		b.enterOpen(b.recordFailure(completedAt))
+		return
+	}
+	if b.halfOpenSucceeded && b.probesInFlight == 0 {
+		b.enterClosed()
 	}
 }
 
@@ -146,7 +148,27 @@ func (b *Breaker) transitionOpenToHalfOpen(now time.Time) {
 		return
 	}
 	b.state = domain.CircuitHalfOpen
+	b.generation++
 	b.openedAt = time.Time{}
+	b.probesInFlight = 0
+	b.halfOpenSucceeded = false
+}
+
+func (b *Breaker) enterOpen(openedAt time.Time) {
+	b.state = domain.CircuitOpen
+	b.generation++
+	b.openedAt = openedAt
+	b.probesInFlight = 0
+	b.halfOpenSucceeded = false
+}
+
+func (b *Breaker) enterClosed() {
+	b.state = domain.CircuitClosed
+	b.generation++
+	b.failures = nil
+	b.openedAt = time.Time{}
+	b.probesInFlight = 0
+	b.halfOpenSucceeded = false
 }
 
 func (b *Breaker) recordFailure(failedAt time.Time) time.Time {

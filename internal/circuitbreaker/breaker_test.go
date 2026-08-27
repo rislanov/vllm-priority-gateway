@@ -40,7 +40,7 @@ func acquireAndComplete(t *testing.T, b *Breaker, now time.Time, outcome domain.
 	if !ok {
 		t.Fatalf("Acquire(%s) unexpectedly rejected", now)
 	}
-	complete(outcome)
+	complete(outcome, now)
 }
 
 func trip(t *testing.T, b *Breaker) {
@@ -86,7 +86,7 @@ func TestBreakerCooldownAllowsOnlyOneHalfOpenProbe(t *testing.T) {
 		t.Fatal("Acquire() allowed a second half-open probe")
 	}
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitHalfOpen, 3, time.Time{}, 1, false)
-	complete(domain.InferenceNeutral)
+	complete(domain.InferenceNeutral, base.Add(7*time.Second))
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitHalfOpen, 3, time.Time{}, 0, true)
 }
 
@@ -133,7 +133,7 @@ func TestBreakerHalfOpenAllowsConfiguredProbeCapacity(t *testing.T) {
 	}
 	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 2, false)
 
-	first(domain.InferenceNeutral)
+	first(domain.InferenceNeutral, retryAt)
 	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 1, true)
 }
 
@@ -144,7 +144,7 @@ func TestBreakerHalfOpenSuccessClosesAndFailureReopens(t *testing.T) {
 	if !ok {
 		t.Fatal("Acquire() rejected the half-open probe")
 	}
-	complete(domain.InferenceSuccess)
+	complete(domain.InferenceSuccess, base.Add(7*time.Second))
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitClosed, 0, time.Time{}, 0, true)
 
 	b = newTestBreaker(t)
@@ -153,7 +153,7 @@ func TestBreakerHalfOpenSuccessClosesAndFailureReopens(t *testing.T) {
 	if !ok {
 		t.Fatal("Acquire() rejected the half-open probe")
 	}
-	complete(domain.InferenceFailure)
+	complete(domain.InferenceFailure, base.Add(7*time.Second))
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitOpen, 4, base.Add(12*time.Second), 0, false)
 }
 
@@ -164,7 +164,7 @@ func TestBreakerNeutralOutcomeReleasesProbeWithoutHealing(t *testing.T) {
 	if !ok {
 		t.Fatal("Acquire() rejected the half-open probe")
 	}
-	complete(domain.InferenceNeutral)
+	complete(domain.InferenceNeutral, base.Add(7*time.Second))
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitHalfOpen, 3, time.Time{}, 0, true)
 
 	if next, ok := b.Acquire(base.Add(7 * time.Second)); !ok || next == nil {
@@ -180,8 +180,8 @@ func TestBreakerCompletionIsIdempotent(t *testing.T) {
 	if !ok {
 		t.Fatal("Acquire() rejected the half-open probe")
 	}
-	complete(domain.InferenceFailure)
-	complete(domain.InferenceFailure)
+	complete(domain.InferenceFailure, base.Add(7*time.Second))
+	complete(domain.InferenceFailure, base.Add(8*time.Second))
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitOpen, 4, base.Add(12*time.Second), 0, false)
 }
 
@@ -200,11 +200,173 @@ func TestBreakerKeepsOnlyRollingFailuresWhenCompletionsArriveOutOfOrder(t *testi
 		t.Fatal("Acquire() rejected the third request")
 	}
 
-	completeAtTwenty(domain.InferenceFailure)
-	completeAtTwentyOne(domain.InferenceFailure)
-	completeAtZero(domain.InferenceFailure)
+	completeAtTwenty(domain.InferenceFailure, base.Add(20*time.Second))
+	completeAtTwentyOne(domain.InferenceFailure, base.Add(21*time.Second))
+	completeAtZero(domain.InferenceFailure, base)
 
 	assertSnapshot(t, b.Snapshot(base.Add(21*time.Second)), domain.CircuitClosed, 2, time.Time{}, 0, true)
+}
+
+func TestBreakerUsesCompletionTimeForDelayedClosedFailures(t *testing.T) {
+	b := newTestBreaker(t)
+	first, ok := b.Acquire(base)
+	if !ok {
+		t.Fatal("Acquire() rejected the first delayed request")
+	}
+	second, ok := b.Acquire(base.Add(time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the second delayed request")
+	}
+
+	first(domain.InferenceFailure, base.Add(20*time.Second))
+	second(domain.InferenceFailure, base.Add(21*time.Second))
+	complete, ok := b.Acquire(base.Add(22 * time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the third request")
+	}
+	complete(domain.InferenceFailure, base.Add(22*time.Second))
+
+	assertSnapshot(t, b.Snapshot(base.Add(22*time.Second)), domain.CircuitOpen, 3, base.Add(27*time.Second), 0, false)
+}
+
+func TestBreakerUsesCompletionTimeForDelayedHalfOpenFailure(t *testing.T) {
+	b := newTestBreaker(t)
+	trip(t, b)
+	probe, ok := b.Acquire(base.Add(7 * time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the half-open probe")
+	}
+
+	probe(domain.InferenceFailure, base.Add(30*time.Second))
+
+	assertSnapshot(t, b.Snapshot(base.Add(34*time.Second)), domain.CircuitOpen, 1, base.Add(35*time.Second), 0, false)
+}
+
+func TestBreakerHalfOpenSuccessWaitsForOutstandingFailure(t *testing.T) {
+	b, retryAt := newConcurrentHalfOpenBreaker(t)
+	first, second := acquireHalfOpenPair(t, b, retryAt)
+
+	first(domain.InferenceSuccess, retryAt.Add(time.Second))
+	assertSnapshot(t, b.Snapshot(retryAt.Add(time.Second)), domain.CircuitHalfOpen, 3, time.Time{}, 1, false)
+	if third, ok := b.Acquire(retryAt.Add(time.Second)); ok || third != nil {
+		t.Fatal("Acquire() admitted a new probe while a successful generation was draining")
+	}
+
+	second(domain.InferenceFailure, retryAt.Add(2*time.Second))
+	first(domain.InferenceFailure, retryAt.Add(3*time.Second))
+	assertSnapshot(t, b.Snapshot(retryAt.Add(2*time.Second)), domain.CircuitOpen, 4, retryAt.Add(7*time.Second), 0, false)
+}
+
+func TestBreakerHalfOpenStaleSuccessCannotHealLaterGeneration(t *testing.T) {
+	b, retryAt := newConcurrentHalfOpenBreaker(t)
+	failed, staleSuccess := acquireHalfOpenPair(t, b, retryAt)
+
+	failed(domain.InferenceFailure, retryAt.Add(time.Second))
+	nextRetryAt := retryAt.Add(6 * time.Second)
+	current, ok := b.Acquire(nextRetryAt)
+	if !ok {
+		t.Fatal("Acquire() rejected a probe in the next half-open generation")
+	}
+	staleSuccess(domain.InferenceSuccess, nextRetryAt)
+	assertSnapshot(t, b.Snapshot(nextRetryAt), domain.CircuitHalfOpen, 4, time.Time{}, 1, true)
+
+	current(domain.InferenceFailure, nextRetryAt.Add(time.Second))
+	assertSnapshot(t, b.Snapshot(nextRetryAt.Add(time.Second)), domain.CircuitOpen, 2, nextRetryAt.Add(6*time.Second), 0, false)
+}
+
+func TestBreakerHalfOpenSuccessAndNeutralOrdering(t *testing.T) {
+	tests := []struct {
+		name          string
+		firstOutcome  domain.InferenceOutcome
+		secondOutcome domain.InferenceOutcome
+		afterFirst    Snapshot
+		afterSecond   Snapshot
+	}{
+		{
+			name:          "success then neutral closes after drain",
+			firstOutcome:  domain.InferenceSuccess,
+			secondOutcome: domain.InferenceNeutral,
+			afterFirst:    Snapshot{State: domain.CircuitHalfOpen, FailureCount: 3, ProbesInFlight: 1, Available: false},
+			afterSecond:   Snapshot{State: domain.CircuitClosed, Available: true},
+		},
+		{
+			name:          "neutral then success closes",
+			firstOutcome:  domain.InferenceNeutral,
+			secondOutcome: domain.InferenceSuccess,
+			afterFirst:    Snapshot{State: domain.CircuitHalfOpen, FailureCount: 3, ProbesInFlight: 1, Available: true},
+			afterSecond:   Snapshot{State: domain.CircuitClosed, Available: true},
+		},
+		{
+			name:          "all neutral remains available",
+			firstOutcome:  domain.InferenceNeutral,
+			secondOutcome: domain.InferenceNeutral,
+			afterFirst:    Snapshot{State: domain.CircuitHalfOpen, FailureCount: 3, ProbesInFlight: 1, Available: true},
+			afterSecond:   Snapshot{State: domain.CircuitHalfOpen, FailureCount: 3, Available: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, retryAt := newConcurrentHalfOpenBreaker(t)
+			first, second := acquireHalfOpenPair(t, b, retryAt)
+
+			first(tt.firstOutcome, retryAt.Add(time.Second))
+			assertSnapshotValue(t, b.Snapshot(retryAt.Add(time.Second)), tt.afterFirst)
+			second(tt.secondOutcome, retryAt.Add(2*time.Second))
+			assertSnapshotValue(t, b.Snapshot(retryAt.Add(2*time.Second)), tt.afterSecond)
+		})
+	}
+}
+
+func TestBreakerIgnoresStaleClosedFailureAfterRecovery(t *testing.T) {
+	b := newTestBreaker(t)
+	staleFailure, ok := b.Acquire(base)
+	if !ok {
+		t.Fatal("Acquire() rejected the delayed closed request")
+	}
+	trip(t, b)
+	probe, ok := b.Acquire(base.Add(7 * time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the half-open recovery probe")
+	}
+	probe(domain.InferenceSuccess, base.Add(7*time.Second))
+
+	staleFailure(domain.InferenceFailure, base.Add(8*time.Second))
+
+	assertSnapshot(t, b.Snapshot(base.Add(8*time.Second)), domain.CircuitClosed, 0, time.Time{}, 0, true)
+}
+
+func newConcurrentHalfOpenBreaker(t *testing.T) (*Breaker, time.Time) {
+	t.Helper()
+	options := testOptions()
+	options.HalfOpenMaxProbes = 2
+	b, err := New(options)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	trip(t, b)
+	return b, base.Add(7 * time.Second)
+}
+
+func acquireHalfOpenPair(t *testing.T, b *Breaker, at time.Time) (
+	func(domain.InferenceOutcome, time.Time),
+	func(domain.InferenceOutcome, time.Time),
+) {
+	t.Helper()
+	first, ok := b.Acquire(at)
+	if !ok {
+		t.Fatal("Acquire() rejected the first half-open probe")
+	}
+	second, ok := b.Acquire(at)
+	if !ok {
+		t.Fatal("Acquire() rejected the second half-open probe")
+	}
+	return first, second
+}
+
+func assertSnapshotValue(t *testing.T, got, want Snapshot) {
+	t.Helper()
+	assertSnapshot(t, got, want.State, want.FailureCount, want.RetryAt, want.ProbesInFlight, want.Available)
 }
 
 func TestOptionsRejectInvalidValues(t *testing.T) {

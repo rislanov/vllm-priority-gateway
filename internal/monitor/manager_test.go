@@ -268,6 +268,43 @@ func TestManagerAcquireBackendTracksInflightAndCircuitOutcome(t *testing.T) {
 	}
 }
 
+func TestManagerTimestampsBackendOutcomeAtCompletion(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	acquiredAt := time.Now().Add(-time.Hour)
+	first, ok := manager.AcquireBackend(1, acquiredAt)
+	if !ok {
+		t.Fatal("AcquireBackend() rejected the first delayed request")
+	}
+	second, ok := manager.AcquireBackend(1, acquiredAt)
+	if !ok {
+		t.Fatal("AcquireBackend() rejected the second delayed request")
+	}
+	beforeCompletion := time.Now()
+	first(domain.InferenceFailure)
+	second(domain.InferenceFailure)
+	afterCompletion := time.Now()
+
+	snapshot := manager.Snapshot(1, afterCompletion)
+	if snapshot.CircuitState != domain.CircuitOpen || snapshot.CircuitFailures != 2 || snapshot.GatewayInflight != 0 {
+		t.Fatalf("snapshot after delayed completions = %+v", snapshot)
+	}
+	lowerRetryAt := beforeCompletion.Add(5 * time.Second)
+	upperRetryAt := afterCompletion.Add(5 * time.Second)
+	if snapshot.CircuitRetryAt.Before(lowerRetryAt) || snapshot.CircuitRetryAt.After(upperRetryAt) {
+		t.Fatalf("circuit retry at = %s, want completion-time range [%s, %s]", snapshot.CircuitRetryAt, lowerRetryAt, upperRetryAt)
+	}
+}
+
 func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
 	fake := fakevllm.New()
 	server := httptest.NewServer(fake.Handler())
@@ -280,44 +317,51 @@ func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	base := time.Now()
-	completeBackend(t, manager, 1, base, domain.InferenceFailure)
-	completeBackend(t, manager, 1, base.Add(time.Second), domain.InferenceFailure)
-	open := manager.Snapshot(1, base.Add(time.Second))
-	if open.CircuitState != domain.CircuitOpen || open.CircuitAvailable || !open.CircuitRetryAt.Equal(base.Add(6*time.Second)) {
+	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	open := manager.Snapshot(1, time.Now())
+	if open.CircuitState != domain.CircuitOpen || open.CircuitAvailable || open.CircuitRetryAt.IsZero() {
 		t.Fatalf("open snapshot = %+v", open)
 	}
-	if complete, ok := manager.AcquireBackend(1, base.Add(5*time.Second)); ok || complete != nil {
+	if complete, ok := manager.AcquireBackend(1, open.CircuitRetryAt.Add(-time.Nanosecond)); ok || complete != nil {
 		t.Fatal("AcquireBackend() admitted a request before cooldown")
 	}
 
-	probe, ok := manager.AcquireBackend(1, base.Add(6*time.Second))
+	probe, ok := manager.AcquireBackend(1, open.CircuitRetryAt)
 	if !ok || probe == nil {
 		t.Fatal("AcquireBackend() rejected the half-open probe")
 	}
-	halfOpen := manager.Snapshot(1, base.Add(6*time.Second))
+	halfOpen := manager.Snapshot(1, open.CircuitRetryAt)
 	if halfOpen.CircuitState != domain.CircuitHalfOpen || halfOpen.CircuitAvailable || halfOpen.CircuitProbesInFlight != 1 || halfOpen.GatewayInflight != 1 {
 		t.Fatalf("half-open snapshot = %+v", halfOpen)
 	}
-	if complete, ok := manager.AcquireBackend(1, base.Add(6*time.Second)); ok || complete != nil {
+	if complete, ok := manager.AcquireBackend(1, open.CircuitRetryAt); ok || complete != nil {
 		t.Fatal("AcquireBackend() admitted a second half-open probe")
 	}
 	probe(domain.InferenceSuccess)
-	closed := manager.Snapshot(1, base.Add(6*time.Second))
+	closed := manager.Snapshot(1, open.CircuitRetryAt)
 	if closed.CircuitState != domain.CircuitClosed || !closed.CircuitAvailable || closed.CircuitFailures != 0 || closed.GatewayInflight != 0 {
 		t.Fatalf("closed snapshot = %+v", closed)
 	}
 
-	completeBackend(t, manager, 1, base.Add(7*time.Second), domain.InferenceFailure)
-	completeBackend(t, manager, 1, base.Add(8*time.Second), domain.InferenceFailure)
-	probe, ok = manager.AcquireBackend(1, base.Add(13*time.Second))
+	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	secondOpen := manager.Snapshot(1, time.Now())
+	probe, ok = manager.AcquireBackend(1, secondOpen.CircuitRetryAt)
 	if !ok || probe == nil {
 		t.Fatal("AcquireBackend() rejected the second half-open probe")
 	}
+	beforeFailure := time.Now()
 	probe(domain.InferenceFailure)
-	reopened := manager.Snapshot(1, base.Add(13*time.Second))
-	if reopened.CircuitState != domain.CircuitOpen || reopened.CircuitAvailable || !reopened.CircuitRetryAt.Equal(base.Add(18*time.Second)) || reopened.GatewayInflight != 0 {
+	afterFailure := time.Now()
+	reopened := manager.Snapshot(1, afterFailure)
+	if reopened.CircuitState != domain.CircuitOpen || reopened.CircuitAvailable || reopened.GatewayInflight != 0 {
 		t.Fatalf("reopened snapshot = %+v", reopened)
+	}
+	lowerRetryAt := beforeFailure.Add(5 * time.Second)
+	upperRetryAt := afterFailure.Add(5 * time.Second)
+	if reopened.CircuitRetryAt.Before(lowerRetryAt) || reopened.CircuitRetryAt.After(upperRetryAt) {
+		t.Fatalf("reopened retry at = %s, want completion-time range [%s, %s]", reopened.CircuitRetryAt, lowerRetryAt, upperRetryAt)
 	}
 }
 
