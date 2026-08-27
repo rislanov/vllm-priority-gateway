@@ -332,6 +332,52 @@ func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	}
 }
 
+func TestInferenceReadinessHandlerStatusAndJSONContract(t *testing.T) {
+	tests := []struct {
+		name       string
+		readiness  gateway.InferenceReadiness
+		wantStatus int
+	}{
+		{
+			name: "ready", readiness: gateway.InferenceReadiness{
+				Status: "ready", Revision: 8, PoolAvailability: 2, BackendAvailability: 3,
+			}, wantStatus: http.StatusOK,
+		},
+		{
+			name: "unavailable", readiness: gateway.InferenceReadiness{
+				Status: "unavailable", Revision: 9, PoolAvailability: 0, BackendAvailability: 0,
+			}, wantStatus: http.StatusServiceUnavailable,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := httpapi.NewInferenceReadinessHandler(readinessProviderStub{readiness: tt.readiness})
+			request := httptest.NewRequest(http.MethodGet, "/inference-readyz", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != tt.wantStatus {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body) != 4 || body["status"] != tt.readiness.Status ||
+				body["revision"] != float64(tt.readiness.Revision) ||
+				body["poolAvailability"] != float64(tt.readiness.PoolAvailability) ||
+				body["backendAvailability"] != float64(tt.readiness.BackendAvailability) {
+				t.Fatalf("readiness JSON = %#v", body)
+			}
+		})
+	}
+}
+
+type readinessProviderStub struct {
+	readiness gateway.InferenceReadiness
+}
+
+func (s readinessProviderStub) InferenceReadiness() gateway.InferenceReadiness { return s.readiness }
+
 func TestServiceObserverTracksRejectionAndInflightLifecycle(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -537,12 +583,32 @@ type staticLoader struct{ data registry.Data }
 func (l staticLoader) LoadSnapshot(context.Context) (registry.Data, error) { return l.data, nil }
 
 type runtimeStub struct {
-	mu       sync.Mutex
-	pool     domain.PoolRuntime
-	runtimes map[int64]domain.BackendRuntime
+	mu           sync.Mutex
+	pool         domain.PoolRuntime
+	runtimes     map[int64]domain.BackendRuntime
+	poolInflight int
 }
 
 func (r *runtimeStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime { return r.pool }
+func (r *runtimeStub) AcquirePool(_ int64, maximum int) (func(), bool) {
+	r.mu.Lock()
+	if maximum > 0 && r.poolInflight >= maximum {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.poolInflight++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.poolInflight > 0 {
+				r.poolInflight--
+			}
+			r.mu.Unlock()
+		})
+	}, true
+}
 func (r *runtimeStub) Snapshot(backendID int64, _ time.Time) domain.BackendRuntime {
 	r.mu.Lock()
 	defer r.mu.Unlock()

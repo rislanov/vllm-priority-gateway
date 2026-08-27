@@ -3,6 +3,8 @@ package monitor_test
 import (
 	"context"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,202 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/monitor"
 )
+
+func TestManagerAcquirePoolEnforcesPositiveLimitAndTracksUnlimited(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(nil))
+	defer manager.Shutdown()
+
+	releaseFirst, ok := manager.AcquirePool(9, 2)
+	if !ok {
+		t.Fatal("first limited pool lease was rejected")
+	}
+	releaseSecond, ok := manager.AcquirePool(9, 2)
+	if !ok {
+		t.Fatal("second limited pool lease was rejected")
+	}
+	if release, acquired := manager.AcquirePool(9, 2); acquired || release != nil {
+		t.Fatal("third limited pool lease was admitted at limit 2")
+	}
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 2 {
+		t.Fatalf("limited pool gateway inflight = %d, want 2", got)
+	}
+	releaseFirst()
+	if release, acquired := manager.AcquirePool(9, 2); !acquired || release == nil {
+		t.Fatal("pool lease was not admitted after a release")
+	} else {
+		release()
+	}
+	releaseSecond()
+
+	unlimited := make([]func(), 0, 3)
+	for range 3 {
+		release, acquired := manager.AcquirePool(10, 0)
+		if !acquired || release == nil {
+			t.Fatal("unlimited pool lease was rejected")
+		}
+		unlimited = append(unlimited, release)
+	}
+	if got := manager.PoolSnapshot(10, time.Now()).GatewayInflight; got != 3 {
+		t.Fatalf("unlimited pool gateway inflight = %d, want 3", got)
+	}
+	for _, release := range unlimited {
+		release()
+	}
+	if got := manager.PoolSnapshot(10, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("unlimited pool gateway inflight after release = %d, want 0", got)
+	}
+}
+
+func TestManagerPoolReleaseIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(nil))
+	defer manager.Shutdown()
+
+	release, ok := manager.AcquirePool(9, 1)
+	if !ok {
+		t.Fatal("pool lease was rejected")
+	}
+	release()
+	release()
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("pool gateway inflight after duplicate release = %d, want 0", got)
+	}
+}
+
+func TestManagerAcquirePoolIsAtomicUnderConcurrency(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(nil))
+	defer manager.Shutdown()
+
+	start := make(chan struct{})
+	releaseAll := make(chan struct{})
+	var acquired atomic.Int64
+	var workers sync.WaitGroup
+	for range 64 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			release, ok := manager.AcquirePool(9, 2)
+			if !ok {
+				return
+			}
+			acquired.Add(1)
+			<-releaseAll
+			release()
+		}()
+	}
+	close(start)
+	deadline := time.Now().Add(time.Second)
+	for acquired.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := acquired.Load(); got != 2 {
+		close(releaseAll)
+		workers.Wait()
+		t.Fatalf("concurrent acquisitions = %d, want exactly 2", got)
+	}
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 2 {
+		close(releaseAll)
+		workers.Wait()
+		t.Fatalf("concurrent pool gateway inflight = %d, want 2", got)
+	}
+	close(releaseAll)
+	workers.Wait()
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("pool gateway inflight after concurrent releases = %d, want 0", got)
+	}
+}
+
+func TestManagerPoolLeaseSurvivesReconcileRemoval(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 9)}); err != nil {
+		t.Fatal(err)
+	}
+	release, ok := manager.AcquirePool(9, 1)
+	if !ok {
+		t.Fatal("pool lease was rejected")
+	}
+	if err := manager.Reconcile(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 1 {
+		t.Fatalf("pool gateway inflight after reconcile removal = %d, want 1", got)
+	}
+	if another, acquired := manager.AcquirePool(9, 1); acquired || another != nil {
+		t.Fatal("reconcile removal bypassed the active pool limit")
+	}
+	release()
+	if got := manager.PoolSnapshot(9, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("pool gateway inflight after removal release = %d, want 0", got)
+	}
+}
+
+func TestManagerPoolSnapshotAggregatesWaitingAndCircuitAvailability(t *testing.T) {
+	fakeA := fakevllm.New()
+	fakeA.SetState(fakevllm.State{Waiting: 2})
+	serverA := httptest.NewServer(fakeA.Handler())
+	defer serverA.Close()
+	fakeB := fakevllm.New()
+	fakeB.SetState(fakevllm.State{Waiting: 3})
+	serverB := httptest.NewServer(fakeB.Handler())
+	defer serverB.Close()
+	fakeDraining := fakevllm.New()
+	fakeDraining.SetState(fakevllm.State{Waiting: 7})
+	serverDraining := httptest.NewServer(fakeDraining.Handler())
+	defer serverDraining.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	options := monitorOptions(serverA.Client())
+	options.HealthInterval = 5 * time.Millisecond
+	options.MetricsInterval = 5 * time.Millisecond
+	options.RecoveryAfter = 1
+	manager := monitor.NewManager(ctx, options)
+	defer manager.Shutdown()
+	draining := testBackend(serverDraining.URL, 3, 9)
+	draining.Draining = true
+	if err := manager.Reconcile([]domain.Backend{
+		testBackend(serverA.URL, 1, 9),
+		testBackend(serverB.URL, 2, 9),
+		draining,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	waitPoolRuntime(t, manager, 9, func(runtime domain.PoolRuntime) bool {
+		return runtime.AvailableBackends == 2 && runtime.TotalWaiting == 5
+	})
+	base := time.Now()
+	completeBackend(t, manager, 1, base, domain.InferenceFailure)
+	completeBackend(t, manager, 1, base.Add(time.Millisecond), domain.InferenceFailure)
+	waitPoolRuntime(t, manager, 9, func(runtime domain.PoolRuntime) bool {
+		return runtime.AvailableBackends == 1 && runtime.TotalWaiting == 5
+	})
+}
+
+func waitPoolRuntime(t *testing.T, manager *monitor.Manager, poolID int64, ready func(domain.PoolRuntime) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime := manager.PoolSnapshot(poolID, time.Now())
+		if ready(runtime) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("pool runtime did not reach expected state: %+v", manager.PoolSnapshot(poolID, time.Now()))
+}
 
 func TestManagerReconcileStartsKeepsAndStopsWorkers(t *testing.T) {
 	fake := fakevllm.New()

@@ -133,6 +133,8 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 			"status": "ready", "revision": view.Revision, "backendAvailability": availableBackends(view),
 		})
 	})
+	inferenceReadinessHandler := httpapi.NewInferenceReadinessHandler(service)
+	router.Get("/inference-readyz", inferenceReadinessHandler.ServeHTTP)
 	router.Handle("/metrics", metrics.Handler())
 	router.Handle("/v1", publicHandler)
 	router.Handle("/v1/*", publicHandler)
@@ -195,17 +197,28 @@ func availableBackends(view httpapi.AdminView) int {
 	return count
 }
 
+type runtimeMetrics interface {
+	PoolSnapshot(int64, time.Time) domain.PoolRuntime
+	Snapshot(int64, time.Time) domain.BackendRuntime
+}
+
+func publishRuntimeMetrics(metrics *observability.Metrics, snapshot *registry.Snapshot, runtime runtimeMetrics, at time.Time) {
+	for _, pool := range snapshot.PoolsByID {
+		metrics.SetPool(pool.PublicModelName, runtime.PoolSnapshot(pool.ID, at))
+	}
+	for _, backend := range snapshot.BackendsByID {
+		pool := snapshot.PoolsByID[backend.ModelPoolID]
+		metrics.SetBackend(pool.PublicModelName, backend.Name, runtime.Snapshot(backend.ID, at))
+	}
+}
+
 func updateBackendMetrics(ctx context.Context, metrics *observability.Metrics, registryValue *registry.Registry, manager *monitor.Manager, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case at := <-ticker.C:
-			snapshot := registryValue.Snapshot()
-			for _, backend := range snapshot.BackendsByID {
-				pool := snapshot.PoolsByID[backend.ModelPoolID]
-				metrics.SetBackend(pool.PublicModelName, backend.Name, manager.Snapshot(backend.ID, at))
-			}
+			publishRuntimeMetrics(metrics, registryValue.Snapshot(), manager, at)
 		case <-ctx.Done():
 			return
 		}

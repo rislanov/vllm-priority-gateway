@@ -17,7 +17,11 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
+	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
+	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
+	"github.com/rislanov/vllm-priority-gateway/internal/web"
 )
 
 func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
@@ -32,6 +36,108 @@ func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
 		t.Fatalf("destination=%+v projection=%+v", destination, projection)
 	}
 }
+
+func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
+	metrics := observability.NewMetrics()
+	snapshot := &registry.Snapshot{
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-a", Enabled: true},
+		},
+	}
+	runtime := runtimeMetricsStub{
+		pool: domain.PoolRuntime{PoolID: 10, GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1},
+		backend: domain.BackendRuntime{
+			BackendID: 20, CircuitState: domain.CircuitOpen, CircuitFailures: 5,
+		},
+	}
+	publishRuntimeMetrics(metrics, snapshot, runtime, time.Unix(1_700_000_000, 0))
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text := response.Body.String()
+	for _, sample := range []string{
+		`llmgw_backend_circuit_state{backend="gpu-a",model="qwen"} 1`,
+		`llmgw_backend_circuit_failures{backend="gpu-a",model="qwen"} 5`,
+		`llmgw_pool_gateway_inflight{model="qwen"} 4`,
+		`llmgw_pool_waiting_requests{model="qwen"} 6`,
+		`llmgw_pool_available_backends{model="qwen"} 1`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("published metrics missing %q:\n%s", sample, text)
+		}
+	}
+}
+
+func TestAdminDashboardRendersPoolSafetyAndCircuitRuntime(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	pool, err := database.CreatePool(context.Background(), store.CreatePoolParams{
+		PublicModelName: "qwen", UpstreamModelName: "fake-model", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateBackend(context.Background(), store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://gpu-a.invalid", Enabled: true,
+		CapacityHint: 1, RunningSoftLimit: 16,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := runtimeMetricsStub{
+		pool: domain.PoolRuntime{
+			PoolID: pool.ID, State: domain.PoolBusy, GatewayInflight: 37,
+			TotalWaiting: 41.5, AvailableBackends: 2,
+		},
+		backend: domain.BackendRuntime{
+			State: domain.BackendHealthy, Healthy: true, MetricsFresh: true,
+			CircuitState: domain.CircuitHalfOpen, CircuitAvailable: true,
+		},
+	}
+	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Registry: registryValue, Runtime: runtime,
+		HMACSecret: []byte(strings.Repeat("h", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := web.New(adminService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d body=%s", response.Code, response.Body.String())
+	}
+	text := response.Body.String()
+	for _, fragment := range []string{
+		"Gateway inflight", "Waiting", "Available", ">37<", ">41.50<", ">2<", "Circuit", "half_open",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("dashboard missing server-rendered %q:\n%s", fragment, text)
+		}
+	}
+}
+
+type runtimeMetricsStub struct {
+	pool    domain.PoolRuntime
+	backend domain.BackendRuntime
+}
+
+func (s runtimeMetricsStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime { return s.pool }
+func (s runtimeMetricsStub) Snapshot(int64, time.Time) domain.BackendRuntime  { return s.backend }
+func (runtimeMetricsStub) Reconcile([]domain.Backend) error                   { return nil }
 
 func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -79,6 +185,24 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	readyResponse.Body.Close()
 	if readyResponse.StatusCode != http.StatusOK || readiness.Status != "ready" || readiness.Revision != 0 || readiness.BackendAvailability != 0 {
 		t.Fatalf("readiness = %d %+v", readyResponse.StatusCode, readiness)
+	}
+	inferenceResponse, err := client.Get("http://" + listener.Addr().String() + "/inference-readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inferenceReadiness struct {
+		Status              string `json:"status"`
+		Revision            int64  `json:"revision"`
+		PoolAvailability    int    `json:"poolAvailability"`
+		BackendAvailability int    `json:"backendAvailability"`
+	}
+	if err := json.NewDecoder(inferenceResponse.Body).Decode(&inferenceReadiness); err != nil {
+		t.Fatal(err)
+	}
+	inferenceResponse.Body.Close()
+	if inferenceResponse.StatusCode != http.StatusServiceUnavailable || inferenceReadiness.Status != "unavailable" ||
+		inferenceReadiness.Revision != 0 || inferenceReadiness.PoolAvailability != 0 || inferenceReadiness.BackendAvailability != 0 {
+		t.Fatalf("inference readiness = %d %+v", inferenceResponse.StatusCode, inferenceReadiness)
 	}
 
 	cancel()

@@ -30,6 +30,7 @@ type SnapshotProvider interface {
 
 type Runtime interface {
 	PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime
+	AcquirePool(poolID int64, maximum int) (release func(), ok bool)
 	Snapshot(backendID int64, at time.Time) domain.BackendRuntime
 	AcquireBackend(backendID int64, at time.Time) (complete func(domain.InferenceOutcome), ok bool)
 }
@@ -111,6 +112,44 @@ type ForwardRequest struct {
 	APIKey          string
 	RequestID       string
 	ParentRequestID string
+}
+
+type InferenceReadiness struct {
+	Status              string `json:"status"`
+	Revision            int64  `json:"revision"`
+	PoolAvailability    int    `json:"poolAvailability"`
+	BackendAvailability int    `json:"backendAvailability"`
+}
+
+func (s *Service) InferenceReadiness() InferenceReadiness {
+	snapshot := s.registry.Snapshot()
+	readiness := InferenceReadiness{Status: "unavailable", Revision: snapshot.Revision}
+	at := s.now().UTC()
+	for _, pool := range snapshot.PoolsByID {
+		if !pool.Enabled {
+			continue
+		}
+		poolAvailable := false
+		for _, backend := range snapshot.BackendsByPool[pool.ID] {
+			if !backend.Enabled || backend.Draining {
+				continue
+			}
+			runtime := s.runtime.Snapshot(backend.ID, at)
+			_, secretAvailable := s.upstreamSecret(backend)
+			if !runtime.Healthy || !runtime.MetricsFresh || !runtime.CircuitAvailable || !secretAvailable {
+				continue
+			}
+			readiness.BackendAvailability++
+			poolAvailable = true
+		}
+		if poolAvailable {
+			readiness.PoolAvailability++
+		}
+	}
+	if readiness.PoolAvailability > 0 || readiness.BackendAvailability > 0 {
+		readiness.Status = "ready"
+	}
+	return readiness
 }
 
 func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, domain.Client, *APIError) {
@@ -201,6 +240,14 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if poolRuntime.State == domain.PoolUnavailable {
 		return proxy.Result{}, backendUnavailable(s.retryAfter)
 	}
+	if pool.MaxWaiting > 0 && poolRuntime.TotalWaiting >= float64(pool.MaxWaiting) {
+		return proxy.Result{}, overloaded(s.retryAfter)
+	}
+	releasePool, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
+	if !ok {
+		return proxy.Result{}, overloaded(s.retryAfter)
+	}
+	defer releasePool()
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
 	lease, ok := s.limiter.Acquire(client.ID, limit)
 	if !ok {

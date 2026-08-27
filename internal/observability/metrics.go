@@ -12,21 +12,26 @@ import (
 
 // Metrics owns an isolated Prometheus registry and implements gateway.Observer.
 type Metrics struct {
-	registry         *prometheus.Registry
-	requests         *prometheus.CounterVec
-	requestsInflight *prometheus.GaugeVec
-	rejected         *prometheus.CounterVec
-	clientInflight   *prometheus.GaugeVec
-	backendInflight  *prometheus.GaugeVec
-	backendPressure  *prometheus.GaugeVec
-	backendRunning   *prometheus.GaugeVec
-	backendWaiting   *prometheus.GaugeVec
-	backendKV        *prometheus.GaugeVec
-	duration         *prometheus.HistogramVec
-	ttft             *prometheus.HistogramVec
-	disconnects      *prometheus.CounterVec
-	backendFailures  *prometheus.CounterVec
-	retries          *prometheus.CounterVec
+	registry               *prometheus.Registry
+	requests               *prometheus.CounterVec
+	requestsInflight       *prometheus.GaugeVec
+	rejected               *prometheus.CounterVec
+	clientInflight         *prometheus.GaugeVec
+	backendInflight        *prometheus.GaugeVec
+	backendPressure        *prometheus.GaugeVec
+	backendRunning         *prometheus.GaugeVec
+	backendWaiting         *prometheus.GaugeVec
+	backendKV              *prometheus.GaugeVec
+	backendCircuitState    *prometheus.GaugeVec
+	backendCircuitFailures *prometheus.GaugeVec
+	poolGatewayInflight    *prometheus.GaugeVec
+	poolWaiting            *prometheus.GaugeVec
+	poolAvailableBackends  *prometheus.GaugeVec
+	duration               *prometheus.HistogramVec
+	ttft                   *prometheus.HistogramVec
+	disconnects            *prometheus.CounterVec
+	backendFailures        *prometheus.CounterVec
+	retries                *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -40,6 +45,11 @@ func NewMetrics() *Metrics {
 	m.backendRunning = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_running_requests", Help: "Running requests reported by vLLM."}, []string{"model", "backend"})
 	m.backendWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_waiting_requests", Help: "Waiting requests reported by vLLM."}, []string{"model", "backend"})
 	m.backendKV = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_kv_cache_usage", Help: "KV cache utilization reported by vLLM."}, []string{"model", "backend"})
+	m.backendCircuitState = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_circuit_state", Help: "Backend circuit state (closed=0, open=1, half_open=2)."}, []string{"model", "backend"})
+	m.backendCircuitFailures = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_circuit_failures", Help: "Qualifying failures retained by the backend circuit."}, []string{"model", "backend"})
+	m.poolGatewayInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_gateway_inflight", Help: "Gateway requests currently holding a pool lease."}, []string{"model"})
+	m.poolWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_waiting_requests", Help: "Aggregate waiting requests reported by healthy, metrics-fresh, non-draining pool backends."}, []string{"model"})
+	m.poolAvailableBackends = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_available_backends", Help: "Backends currently available to accept inference traffic."}, []string{"model"})
 	m.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_request_duration_seconds", Help: "End-to-end public request duration.", Buckets: prometheus.DefBuckets}, []string{"model", "backend", "priority_class", "status_class"})
 	m.ttft = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_ttft_seconds", Help: "Time to first upstream response byte.", Buckets: prometheus.DefBuckets}, []string{"model", "backend", "priority_class"})
 	m.disconnects = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_stream_disconnects_total", Help: "Streaming requests cancelled by a disconnected downstream."}, []string{"model", "backend", "priority_class"})
@@ -48,7 +58,8 @@ func NewMetrics() *Metrics {
 	m.registry.MustRegister(
 		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight,
 		m.backendPressure, m.backendRunning, m.backendWaiting, m.backendKV, m.duration,
-		m.ttft, m.disconnects, m.backendFailures, m.retries,
+		m.backendCircuitState, m.backendCircuitFailures, m.poolGatewayInflight, m.poolWaiting,
+		m.poolAvailableBackends, m.ttft, m.disconnects, m.backendFailures, m.retries,
 	)
 	return m
 }
@@ -100,6 +111,26 @@ func (m *Metrics) SetBackend(model, backend string, runtime domain.BackendRuntim
 	m.backendRunning.WithLabelValues(labels...).Set(runtime.Running)
 	m.backendWaiting.WithLabelValues(labels...).Set(runtime.Waiting)
 	m.backendKV.WithLabelValues(labels...).Set(runtime.KVCacheUsage)
+	m.backendCircuitState.WithLabelValues(labels...).Set(circuitStateValue(runtime.CircuitState))
+	m.backendCircuitFailures.WithLabelValues(labels...).Set(float64(runtime.CircuitFailures))
+}
+
+func (m *Metrics) SetPool(model string, runtime domain.PoolRuntime) {
+	label := value(model)
+	m.poolGatewayInflight.WithLabelValues(label).Set(float64(runtime.GatewayInflight))
+	m.poolWaiting.WithLabelValues(label).Set(runtime.TotalWaiting)
+	m.poolAvailableBackends.WithLabelValues(label).Set(float64(runtime.AvailableBackends))
+}
+
+func circuitStateValue(state domain.CircuitState) float64 {
+	switch state {
+	case domain.CircuitOpen:
+		return 1
+	case domain.CircuitHalfOpen:
+		return 2
+	default:
+		return 0
+	}
 }
 
 func value(input string) string {

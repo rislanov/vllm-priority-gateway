@@ -302,10 +302,34 @@ type recordingRuntime struct {
 	snapshotTimes      []time.Time
 	rejectAcquisitions map[int64]int
 	events             []string
+	poolInflight       map[int64]int
 }
 
 func (r *recordingRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
 	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal, AvailableBackends: len(r.values)}
+}
+
+func (r *recordingRuntime) AcquirePool(poolID int64, maximum int) (func(), bool) {
+	r.mu.Lock()
+	if r.poolInflight == nil {
+		r.poolInflight = make(map[int64]int)
+	}
+	if maximum > 0 && r.poolInflight[poolID] >= maximum {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.poolInflight[poolID]++
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.poolInflight[poolID] > 0 {
+				r.poolInflight[poolID]--
+			}
+			r.mu.Unlock()
+		})
+	}, true
 }
 
 func (r *recordingRuntime) Snapshot(backendID int64, at time.Time) domain.BackendRuntime {

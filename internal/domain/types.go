@@ -137,4 +137,6 @@ type PoolRuntime struct {
 	BestBackendPressure float64
 	AvailableBackends   int
 	AllBackendsWaiting  bool
+	GatewayInflight     int
+	TotalWaiting        float64
 }

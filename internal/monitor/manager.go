@@ -26,12 +26,13 @@ type Manager struct {
 	observerDone chan struct{}
 	options      Options
 
-	mu          sync.Mutex
-	workers     map[int64]*managedWorker
-	poolMachine map[int64]*pressure.PoolMachine
-	poolRuntime map[int64]domain.PoolRuntime
-	nextGen     uint64
-	shutdown    bool
+	mu           sync.Mutex
+	workers      map[int64]*managedWorker
+	poolMachine  map[int64]*pressure.PoolMachine
+	poolRuntime  map[int64]domain.PoolRuntime
+	poolInflight map[int64]int
+	nextGen      uint64
+	shutdown     bool
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
@@ -45,7 +46,7 @@ func NewManager(ctx context.Context, options Options) *Manager {
 	manager := &Manager{
 		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
 		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
-		poolRuntime: make(map[int64]domain.PoolRuntime),
+		poolRuntime: make(map[int64]domain.PoolRuntime), poolInflight: make(map[int64]int),
 	}
 	go manager.runPoolObserver()
 	return manager
@@ -125,9 +126,33 @@ func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
 	defer m.mu.Unlock()
 	runtime, exists := m.poolRuntime[poolID]
 	if !exists {
-		return domain.PoolRuntime{PoolID: poolID, State: domain.PoolUnavailable}
+		runtime = domain.PoolRuntime{PoolID: poolID, State: domain.PoolUnavailable}
 	}
+	runtime.GatewayInflight = m.poolInflight[poolID]
 	return runtime
+}
+
+func (m *Manager) AcquirePool(poolID int64, maximum int) (func(), bool) {
+	m.mu.Lock()
+	if maximum < 0 || maximum > 0 && m.poolInflight[poolID] >= maximum {
+		m.mu.Unlock()
+		return nil, false
+	}
+	m.poolInflight[poolID]++
+	m.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			if current := m.poolInflight[poolID]; current > 1 {
+				m.poolInflight[poolID] = current - 1
+			} else {
+				delete(m.poolInflight, poolID)
+			}
+			m.mu.Unlock()
+		})
+	}, true
 }
 
 func (m *Manager) runPoolObserver() {
@@ -173,6 +198,7 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 	best := math.Inf(1)
 	available := 0
 	allWaiting := true
+	totalWaiting := float64(0)
 	for _, managed := range m.workers {
 		if managed.worker.Backend().ModelPoolID != poolID {
 			continue
@@ -181,6 +207,7 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 		if !snapshot.Healthy || !snapshot.MetricsFresh || managed.worker.Backend().Draining {
 			continue
 		}
+		totalWaiting += snapshot.Waiting
 		if !snapshot.CircuitAvailable {
 			continue
 		}
@@ -205,6 +232,7 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 	return domain.PoolRuntime{
 		PoolID: poolID, State: state, BestBackendPressure: best,
 		AvailableBackends: available, AllBackendsWaiting: allWaiting,
+		GatewayInflight: m.poolInflight[poolID], TotalWaiting: totalWaiting,
 	}
 }
 
