@@ -234,18 +234,10 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
 	}
-	now := s.now().UTC()
-	poolRuntime := s.runtime.PoolSnapshot(pool.ID, now)
+	poolRuntime, releasePool, poolErr := s.acquirePool(client.ID, pool)
 	event.PoolState = poolRuntime.State
-	if poolRuntime.State == domain.PoolUnavailable {
-		return proxy.Result{}, backendUnavailable(s.retryAfter)
-	}
-	if pool.MaxWaiting > 0 && poolRuntime.TotalWaiting >= float64(pool.MaxWaiting) {
-		return proxy.Result{}, overloaded(s.retryAfter)
-	}
-	releasePool, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
-	if !ok {
-		return proxy.Result{}, overloaded(s.retryAfter)
+	if poolErr != nil {
+		return proxy.Result{}, poolErr
 	}
 	defer releasePool()
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
@@ -340,6 +332,48 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		return result, upstreamError()
 	}
 	return result, nil
+}
+
+func (s *Service) acquirePool(clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
+	for {
+		before := s.registry.Snapshot()
+		pool, valid := currentAdmissionPool(before, clientID, original)
+		if !valid {
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+		}
+		runtime := s.runtime.PoolSnapshot(pool.ID, s.now().UTC())
+		if runtime.State == domain.PoolUnavailable {
+			return runtime, nil, backendUnavailable(s.retryAfter)
+		}
+		if pool.MaxWaiting > 0 && runtime.TotalWaiting >= float64(pool.MaxWaiting) {
+			return runtime, nil, overloaded(s.retryAfter)
+		}
+		release, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
+		if !ok {
+			return runtime, nil, overloaded(s.retryAfter)
+		}
+
+		after := s.registry.Snapshot()
+		validatedPool, stillValid := currentAdmissionPool(after, clientID, original)
+		if !stillValid {
+			release()
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+		}
+		if after.Revision != before.Revision || validatedPool != pool {
+			release()
+			continue
+		}
+		return runtime, release, nil
+	}
+}
+
+func currentAdmissionPool(snapshot *registry.Snapshot, clientID int64, original domain.ModelPool) (domain.ModelPool, bool) {
+	pool, poolExists := snapshot.PoolsByID[original.ID]
+	client, clientExists := snapshot.Clients[clientID]
+	valid := poolExists && pool.Enabled && pool.PublicModelName == original.PublicModelName &&
+		pool.UpstreamModelName == original.UpstreamModelName && clientExists && client.Enabled &&
+		snapshot.Access[clientID][pool.ID]
+	return pool, valid
 }
 
 func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIError) {

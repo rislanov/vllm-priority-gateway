@@ -3,6 +3,7 @@ package observability
 import (
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,10 +33,38 @@ type Metrics struct {
 	disconnects            *prometheus.CounterVec
 	backendFailures        *prometheus.CounterVec
 	retries                *prometheus.CounterVec
+	runtimeMu              sync.Mutex
+	runtimeTopologyKnown   bool
+	knownPoolLabels        map[string]struct{}
+	knownBackendLabels     map[backendMetricLabels]struct{}
+	backendInflightValues  map[backendMetricLabels]int
+}
+
+type backendMetricLabels struct {
+	model   string
+	backend string
+}
+
+// PoolRuntimeMetric is one current-topology pool runtime sample.
+type PoolRuntimeMetric struct {
+	Model   string
+	Runtime domain.PoolRuntime
+}
+
+// BackendRuntimeMetric is one current-topology backend runtime sample.
+type BackendRuntimeMetric struct {
+	Model   string
+	Backend string
+	Runtime domain.BackendRuntime
 }
 
 func NewMetrics() *Metrics {
-	m := &Metrics{registry: prometheus.NewRegistry()}
+	m := &Metrics{
+		registry:              prometheus.NewRegistry(),
+		knownPoolLabels:       make(map[string]struct{}),
+		knownBackendLabels:    make(map[backendMetricLabels]struct{}),
+		backendInflightValues: make(map[backendMetricLabels]int),
+	}
 	m.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_requests_total", Help: "Completed public inference requests."}, []string{"client", "model", "priority_class", "status_class"})
 	m.requestsInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_requests_inflight", Help: "Public inference requests admitted and currently in flight."}, []string{"model", "priority_class"})
 	m.rejected = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_requests_rejected_total", Help: "Requests rejected by the gateway."}, []string{"client", "model", "priority_class", "reason"})
@@ -75,7 +104,24 @@ func (m *Metrics) ClientInflight(event gateway.InflightEvent, delta int) {
 }
 
 func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
-	m.backendInflight.WithLabelValues(value(event.Model), value(event.Backend)).Add(float64(delta))
+	labels := backendMetricLabels{model: value(event.Model), backend: value(event.Backend)}
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+
+	inflight := m.backendInflightValues[labels] + delta
+	if inflight <= 0 {
+		delete(m.backendInflightValues, labels)
+		inflight = 0
+	} else {
+		m.backendInflightValues[labels] = inflight
+	}
+	if m.runtimeTopologyKnown {
+		if _, current := m.knownBackendLabels[labels]; !current {
+			m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
+			return
+		}
+	}
+	m.backendInflight.WithLabelValues(labels.model, labels.backend).Set(float64(inflight))
 }
 
 func (m *Metrics) Complete(event gateway.RequestEvent) {
@@ -106,6 +152,12 @@ func (m *Metrics) Complete(event gateway.RequestEvent) {
 }
 
 func (m *Metrics) SetBackend(model, backend string, runtime domain.BackendRuntime) {
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+	m.setBackend(model, backend, runtime)
+}
+
+func (m *Metrics) setBackend(model, backend string, runtime domain.BackendRuntime) {
 	labels := []string{value(model), value(backend)}
 	m.backendPressure.WithLabelValues(labels...).Set(runtime.Pressure)
 	m.backendRunning.WithLabelValues(labels...).Set(runtime.Running)
@@ -116,10 +168,77 @@ func (m *Metrics) SetBackend(model, backend string, runtime domain.BackendRuntim
 }
 
 func (m *Metrics) SetPool(model string, runtime domain.PoolRuntime) {
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+	m.setPool(model, runtime)
+}
+
+func (m *Metrics) setPool(model string, runtime domain.PoolRuntime) {
 	label := value(model)
 	m.poolGatewayInflight.WithLabelValues(label).Set(float64(runtime.GatewayInflight))
 	m.poolWaiting.WithLabelValues(label).Set(runtime.TotalWaiting)
 	m.poolAvailableBackends.WithLabelValues(label).Set(float64(runtime.AvailableBackends))
+}
+
+// PublishRuntime replaces the bounded current-topology gauge label set and
+// publishes its latest samples atomically with respect to inflight updates.
+// Historical counters and histograms are intentionally left untouched.
+func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric) {
+	currentPools := make(map[string]struct{}, len(pools))
+	currentBackends := make(map[backendMetricLabels]struct{}, len(backends))
+	for _, pool := range pools {
+		currentPools[value(pool.Model)] = struct{}{}
+	}
+	for _, backend := range backends {
+		currentBackends[backendMetricLabels{
+			model: value(backend.Model), backend: value(backend.Backend),
+		}] = struct{}{}
+	}
+
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+
+	for labels := range m.knownPoolLabels {
+		if _, current := currentPools[labels]; current {
+			continue
+		}
+		m.poolGatewayInflight.DeleteLabelValues(labels)
+		m.poolWaiting.DeleteLabelValues(labels)
+		m.poolAvailableBackends.DeleteLabelValues(labels)
+	}
+	for labels := range m.knownBackendLabels {
+		if _, current := currentBackends[labels]; current {
+			continue
+		}
+		m.deleteBackendRuntimeLabels(labels)
+	}
+	for labels := range m.backendInflightValues {
+		if _, current := currentBackends[labels]; !current {
+			m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
+		}
+	}
+
+	m.runtimeTopologyKnown = true
+	m.knownPoolLabels = currentPools
+	m.knownBackendLabels = currentBackends
+	for _, pool := range pools {
+		m.setPool(pool.Model, pool.Runtime)
+	}
+	for _, backend := range backends {
+		m.setBackend(backend.Model, backend.Backend, backend.Runtime)
+		labels := backendMetricLabels{model: value(backend.Model), backend: value(backend.Backend)}
+		m.backendInflight.WithLabelValues(labels.model, labels.backend).Set(float64(m.backendInflightValues[labels]))
+	}
+}
+
+func (m *Metrics) deleteBackendRuntimeLabels(labels backendMetricLabels) {
+	m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
+	m.backendPressure.DeleteLabelValues(labels.model, labels.backend)
+	m.backendRunning.DeleteLabelValues(labels.model, labels.backend)
+	m.backendWaiting.DeleteLabelValues(labels.model, labels.backend)
+	m.backendKV.DeleteLabelValues(labels.model, labels.backend)
+	m.backendCircuitState.DeleteLabelValues(labels.model, labels.backend)
+	m.backendCircuitFailures.DeleteLabelValues(labels.model, labels.backend)
 }
 
 func circuitStateValue(state domain.CircuitState) float64 {

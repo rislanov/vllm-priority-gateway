@@ -63,6 +63,61 @@ func TestServicePoolMaxWaitingRejectsBeforePoolAndClientAcquisition(t *testing.T
 	}
 }
 
+func TestServiceRevalidatesMaxGatewayInflightAfterConcurrentPoolUpdate(t *testing.T) {
+	updatedPool := domain.ModelPool{
+		ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true,
+		MaxGatewayInflight: 1,
+	}
+	service, request, runtime := newPoolService(t, poolServiceOptions{
+		priority: domain.PriorityHigh, forwarder: &poolCompletionForwarder{},
+		publishPoolOnSnapshot: &updatedPool,
+	})
+	heldRelease, ok := runtime.AcquirePool(updatedPool.ID, 0)
+	if !ok {
+		t.Fatal("failed to establish existing pool lease")
+	}
+
+	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" {
+		heldRelease()
+		t.Fatalf("concurrent max-inflight update API error = %+v, want pool-safety 429", apiErr)
+	}
+	if got := runtime.PoolAcquisitions(); got != 2 {
+		heldRelease()
+		t.Fatalf("pool acquisitions = %d, want existing plus one provisional lease", got)
+	}
+	if got := runtime.PoolInflight(); got != 1 {
+		heldRelease()
+		t.Fatalf("pool inflight after stale provisional release = %d, want existing lease only", got)
+	}
+	heldRelease()
+	if got := runtime.PoolInflight(); got != 0 {
+		t.Fatalf("pool inflight after existing lease release = %d, want 0", got)
+	}
+}
+
+func TestServiceRevalidatesMaxWaitingAfterConcurrentPoolUpdate(t *testing.T) {
+	updatedPool := domain.ModelPool{
+		ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true,
+		MaxWaiting: 1,
+	}
+	service, request, runtime := newPoolService(t, poolServiceOptions{
+		totalWaiting: 1, priority: domain.PriorityHigh, forwarder: &poolCompletionForwarder{},
+		publishPoolOnSnapshot: &updatedPool,
+	})
+
+	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" {
+		t.Fatalf("concurrent max-waiting update API error = %+v, want pool-safety 429", apiErr)
+	}
+	if got := runtime.PoolAcquisitions(); got != 1 {
+		t.Fatalf("pool acquisitions = %d, want one provisional lease before revalidation", got)
+	}
+	if got := runtime.PoolInflight(); got != 0 {
+		t.Fatalf("pool inflight after stale provisional release = %d, want 0", got)
+	}
+}
+
 func TestServiceZeroPoolLimitsAreUnlimitedButCounted(t *testing.T) {
 	forwarder := newPoolBlockingForwarder()
 	service, request, runtime := newPoolService(t, poolServiceOptions{
@@ -328,14 +383,15 @@ func TestServiceInferenceReadinessMatrix(t *testing.T) {
 }
 
 type poolServiceOptions struct {
-	maximum        int
-	maxWaiting     int
-	totalWaiting   float64
-	priority       domain.PriorityClass
-	maxConcurrency int
-	forwarder      gateway.Forwarder
-	runtime        *poolRuntimeStub
-	backends       []domain.Backend
+	maximum               int
+	maxWaiting            int
+	totalWaiting          float64
+	priority              domain.PriorityClass
+	maxConcurrency        int
+	forwarder             gateway.Forwarder
+	runtime               *poolRuntimeStub
+	backends              []domain.Backend
+	publishPoolOnSnapshot *domain.ModelPool
 }
 
 func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service, gateway.ForwardRequest, *poolRuntimeStub) {
@@ -374,6 +430,14 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 			PoolID: pool.ID, State: domain.PoolNormal, AvailableBackends: len(backends), TotalWaiting: options.totalWaiting,
 		}, backendRuntimes)
 	}
+	if options.publishPoolOnSnapshot != nil {
+		updatedPool := *options.publishPoolOnSnapshot
+		runtime.SetPoolSnapshotHook(func() {
+			updated := testSnapshot(client, key, updatedPool, backends)
+			updated.Revision = 2
+			provider.Set(updated)
+		})
+	}
 	forwarder := options.forwarder
 	if forwarder == nil {
 		forwarder = &poolCompletionForwarder{}
@@ -395,6 +459,7 @@ type poolRuntimeStub struct {
 	backends         map[int64]domain.BackendRuntime
 	poolInflight     int
 	poolAcquisitions int
+	poolSnapshotHook func()
 }
 
 func newPoolRuntime(pool domain.PoolRuntime, backends []domain.BackendRuntime) *poolRuntimeStub {
@@ -407,10 +472,21 @@ func newPoolRuntime(pool domain.PoolRuntime, backends []domain.BackendRuntime) *
 
 func (r *poolRuntimeStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	value := r.pool
 	value.GatewayInflight = r.poolInflight
+	hook := r.poolSnapshotHook
+	r.poolSnapshotHook = nil
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return value
+}
+
+func (r *poolRuntimeStub) SetPoolSnapshotHook(hook func()) {
+	r.mu.Lock()
+	r.poolSnapshotHook = hook
+	r.mu.Unlock()
 }
 
 func (r *poolRuntimeStub) AcquirePool(_ int64, maximum int) (func(), bool) {

@@ -17,6 +17,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
+	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
@@ -67,6 +68,96 @@ func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
 	} {
 		if !strings.Contains(text, sample) {
 			t.Fatalf("published metrics missing %q:\n%s", sample, text)
+		}
+	}
+}
+
+func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.T) {
+	metrics := observability.NewMetrics()
+	first := &registry.Snapshot{
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen-old", Enabled: true},
+			11: {ID: 11, PublicModelName: "removed-pool", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-old", Enabled: true},
+			21: {ID: 21, ModelPoolID: 11, Name: "removed-gpu", Enabled: true},
+		},
+	}
+	runtime := runtimeMetricsMapStub{
+		pools: map[int64]domain.PoolRuntime{
+			10: {PoolID: 10, GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1},
+			11: {PoolID: 11, GatewayInflight: 2, TotalWaiting: 8},
+		},
+		backends: map[int64]domain.BackendRuntime{
+			20: {BackendID: 20, Pressure: .4, Running: 3, Waiting: 1, KVCacheUsage: .7, CircuitState: domain.CircuitOpen, CircuitFailures: 5},
+			21: {BackendID: 21, CircuitState: domain.CircuitOpen, CircuitFailures: 2},
+		},
+	}
+	at := time.Unix(1_700_000_000, 0)
+	publishRuntimeMetrics(metrics, first, runtime, at)
+	oldInflight := gateway.InflightEvent{Model: "qwen-old", Backend: "gpu-old"}
+	metrics.BackendInflight(oldInflight, 1)
+	metrics.Complete(gateway.RequestEvent{
+		Client: "client-a", Model: "qwen-old", Backend: "gpu-old",
+		PriorityClass: domain.PriorityHigh, Status: http.StatusOK, Duration: time.Second,
+	})
+
+	second := &registry.Snapshot{
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen-new", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-new", Enabled: true},
+		},
+	}
+	runtime.pools[10] = domain.PoolRuntime{PoolID: 10, GatewayInflight: 1, TotalWaiting: 2, AvailableBackends: 1}
+	runtime.backends[20] = domain.BackendRuntime{
+		BackendID: 20, Pressure: .2, Running: 1, KVCacheUsage: .5,
+		CircuitState: domain.CircuitHalfOpen, CircuitFailures: 1,
+	}
+	publishRuntimeMetrics(metrics, second, runtime, at.Add(time.Second))
+	metrics.BackendInflight(oldInflight, -1)
+	newInflight := gateway.InflightEvent{Model: "qwen-new", Backend: "gpu-new"}
+	metrics.BackendInflight(newInflight, 1)
+	metrics.BackendInflight(newInflight, -1)
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text := response.Body.String()
+	for _, stale := range []string{
+		`llmgw_backend_requests_inflight{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_pressure{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_running_requests{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_waiting_requests{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_kv_cache_usage{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_circuit_state{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_circuit_failures{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_pool_gateway_inflight{model="qwen-old"}`,
+		`llmgw_pool_waiting_requests{model="qwen-old"}`,
+		`llmgw_pool_available_backends{model="qwen-old"}`,
+		`llmgw_backend_circuit_state{backend="removed-gpu",model="removed-pool"}`,
+		`llmgw_pool_gateway_inflight{model="removed-pool"}`,
+	} {
+		if strings.Contains(text, stale) {
+			t.Fatalf("stale topology sample %q survived rename/removal:\n%s", stale, text)
+		}
+	}
+	for _, current := range []string{
+		`llmgw_backend_requests_inflight{backend="gpu-new",model="qwen-new"} 0`,
+		`llmgw_backend_pressure{backend="gpu-new",model="qwen-new"} 0.2`,
+		`llmgw_backend_running_requests{backend="gpu-new",model="qwen-new"} 1`,
+		`llmgw_backend_waiting_requests{backend="gpu-new",model="qwen-new"} 0`,
+		`llmgw_backend_kv_cache_usage{backend="gpu-new",model="qwen-new"} 0.5`,
+		`llmgw_backend_circuit_state{backend="gpu-new",model="qwen-new"} 2`,
+		`llmgw_backend_circuit_failures{backend="gpu-new",model="qwen-new"} 1`,
+		`llmgw_pool_gateway_inflight{model="qwen-new"} 1`,
+		`llmgw_pool_waiting_requests{model="qwen-new"} 2`,
+		`llmgw_pool_available_backends{model="qwen-new"} 1`,
+		`llmgw_requests_total{client="client-a",model="qwen-old",priority_class="high",status_class="2xx"} 1`,
+	} {
+		if !strings.Contains(text, current) {
+			t.Fatalf("current or historical sample %q missing after reconciliation:\n%s", current, text)
 		}
 	}
 }
@@ -138,6 +229,19 @@ type runtimeMetricsStub struct {
 func (s runtimeMetricsStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime { return s.pool }
 func (s runtimeMetricsStub) Snapshot(int64, time.Time) domain.BackendRuntime  { return s.backend }
 func (runtimeMetricsStub) Reconcile([]domain.Backend) error                   { return nil }
+
+type runtimeMetricsMapStub struct {
+	pools    map[int64]domain.PoolRuntime
+	backends map[int64]domain.BackendRuntime
+}
+
+func (s runtimeMetricsMapStub) PoolSnapshot(id int64, _ time.Time) domain.PoolRuntime {
+	return s.pools[id]
+}
+
+func (s runtimeMetricsMapStub) Snapshot(id int64, _ time.Time) domain.BackendRuntime {
+	return s.backends[id]
+}
 
 func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

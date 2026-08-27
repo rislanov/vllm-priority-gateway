@@ -203,13 +203,20 @@ type runtimeMetrics interface {
 }
 
 func publishRuntimeMetrics(metrics *observability.Metrics, snapshot *registry.Snapshot, runtime runtimeMetrics, at time.Time) {
+	pools := make([]observability.PoolRuntimeMetric, 0, len(snapshot.PoolsByID))
 	for _, pool := range snapshot.PoolsByID {
-		metrics.SetPool(pool.PublicModelName, runtime.PoolSnapshot(pool.ID, at))
+		pools = append(pools, observability.PoolRuntimeMetric{
+			Model: pool.PublicModelName, Runtime: runtime.PoolSnapshot(pool.ID, at),
+		})
 	}
+	backends := make([]observability.BackendRuntimeMetric, 0, len(snapshot.BackendsByID))
 	for _, backend := range snapshot.BackendsByID {
 		pool := snapshot.PoolsByID[backend.ModelPoolID]
-		metrics.SetBackend(pool.PublicModelName, backend.Name, runtime.Snapshot(backend.ID, at))
+		backends = append(backends, observability.BackendRuntimeMetric{
+			Model: pool.PublicModelName, Backend: backend.Name, Runtime: runtime.Snapshot(backend.ID, at),
+		})
 	}
+	metrics.PublishRuntime(pools, backends)
 }
 
 func updateBackendMetrics(ctx context.Context, metrics *observability.Metrics, registryValue *registry.Registry, manager *monitor.Manager, interval time.Duration) {
