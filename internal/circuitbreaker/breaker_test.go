@@ -103,6 +103,40 @@ func TestSnapshotTransitionsExpiredOpenCircuitToHalfOpenBeforeAcquire(t *testing
 	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 1, false)
 }
 
+func TestSnapshotExpiresClosedFailuresWithoutAcquire(t *testing.T) {
+	b := newTestBreaker(t)
+	acquireAndComplete(t, b, base, domain.InferenceFailure)
+
+	assertSnapshot(t, b.Snapshot(base.Add(11*time.Second)), domain.CircuitClosed, 0, time.Time{}, 0, true)
+}
+
+func TestBreakerHalfOpenAllowsConfiguredProbeCapacity(t *testing.T) {
+	options := testOptions()
+	options.HalfOpenMaxProbes = 2
+	b, err := New(options)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	trip(t, b)
+	retryAt := base.Add(7 * time.Second)
+
+	first, ok := b.Acquire(retryAt)
+	if !ok || first == nil {
+		t.Fatal("Acquire() rejected the first half-open probe")
+	}
+	second, ok := b.Acquire(retryAt)
+	if !ok || second == nil {
+		t.Fatal("Acquire() rejected the second half-open probe")
+	}
+	if third, ok := b.Acquire(retryAt); ok || third != nil {
+		t.Fatal("Acquire() allowed a third half-open probe")
+	}
+	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 2, false)
+
+	first(domain.InferenceNeutral)
+	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 1, true)
+}
+
 func TestBreakerHalfOpenSuccessClosesAndFailureReopens(t *testing.T) {
 	b := newTestBreaker(t)
 	trip(t, b)

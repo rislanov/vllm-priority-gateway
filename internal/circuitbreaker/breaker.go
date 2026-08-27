@@ -73,6 +73,9 @@ func (b *Breaker) Snapshot(now time.Time) Snapshot {
 	defer b.mu.Unlock()
 
 	b.transitionOpenToHalfOpen(now)
+	if b.state == domain.CircuitClosed {
+		b.pruneFailures(now)
+	}
 
 	snapshot := Snapshot{
 		State:          b.state,
