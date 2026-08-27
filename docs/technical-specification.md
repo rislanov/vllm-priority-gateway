@@ -353,7 +353,9 @@ MaxGatewayInflight
 MaxWaiting
 ```
 
-The persisted safety fields are non-negative integers. `0` means disabled/unlimited. SQLite schema migration version 2 adds both columns with `NOT NULL DEFAULT 0` checks while preserving version-1 rows.
+The persisted safety fields are non-negative integers. `0` means disabled/unlimited. SQLite schema migration version 2 adds both columns with `NOT NULL DEFAULT 0` checks while preserving version-1 rows. Each missing migration runs transactionally and records its version only after success. Before migration, the gateway rejects `PRAGMA user_version` values newer than its latest embedded migration (currently version 2) without changing the recorded version, schema, or data.
+
+There is no automatic down migration. Because version 2 is additive, its pool columns physically survive a rollback to a pre-pool-safety binary only when that binary accepts the database's recorded schema version; that binary ignores the columns and does not enforce `MaxGatewayInflight` or `MaxWaiting`. An older binary whose supported migration set is behind the recorded version rejects the database. Operators must restore a compatible quiesced backup rather than manually lowering `user_version`, which could make a later binary replay an already-present additive migration.
 
 ---
 
@@ -1100,6 +1102,8 @@ llmgw_pool_waiting_requests
 llmgw_pool_available_backends
 ```
 
+`llmgw_backend_circuit_state` uses the bounded numeric encoding `unmanaged/unknown=-1`, `closed=0`, `open=1`, and `half_open=2`. The negative value distinguishes a configured backend that has no managed runtime worker yet from an explicitly closed managed circuit.
+
 Labels:
 
 ```text
@@ -1793,7 +1797,7 @@ LLMGW_CIRCUIT_OPEN_COOLDOWN=15s
 LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES=1
 ```
 
-In `closed`, qualifying failure timestamps are retained only inside the rolling window. A successful closed-state request does not clear that retained history; timestamps age out with the window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity; a probe success closes and clears failures, a probe failure reopens immediately, and a neutral result only releases its probe slot.
+In `closed`, qualifying failure timestamps are retained only inside the rolling window. Outcomes are timestamped when the attempt completes, so a delayed failure is placed in the correct window and an open/reopen cooldown begins at the actual failure time. A successful closed-state request does not clear retained history; timestamps age out with the window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity. With multiple probes configured, the first success remains pending until all already-admitted probes in that circuit generation finish: any failure reopens immediately regardless of callback order, all-success or success-plus-neutral completion closes and clears failures, and neutral-only completion merely releases capacity. Results from an older circuit generation cannot heal or penalize a later state.
 
 Outcome precedence is explicit: connection/DNS/TLS/response-header failures, upstream HTTP `5xx`, and upstream response-body read failures are failures. A completed upstream response below `500`, including `4xx` and `429`, is success because the endpoint responded. Downstream cancellation or write failure is neutral and neither penalizes nor heals. An HTTP `5xx` is forwarded without retry; the existing single retry applies only to a transport failure before downstream response bytes.
 

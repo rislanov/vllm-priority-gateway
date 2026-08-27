@@ -6,7 +6,7 @@ Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, st
 
 The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
 
-Status: the implementation and deterministic acceptance suite are code-complete. An opt-in real-vLLM black-box suite automates production smoke, priority isolation and pool safety, drain, circuit-breaker recovery, and hysteretic recovery checks. Threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
+Status: the implementation and deterministic acceptance suite are code-complete. The opt-in real-vLLM black-box smoke, priority/pool-safety, and circuit-resilience modes passed locally on Apple M4 with vLLM-Metal on 2026-08-27. That is non-CUDA development evidence; threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
 
 ## Architecture
 
@@ -152,7 +152,9 @@ For routine operation, watch `/metrics`, drain a backend before maintenance, and
 
 Each managed backend has a process-local inference circuit. Five qualifying failures inside the rolling 30-second window open it for 15 seconds; after cooldown, one half-open probe may run. A completed response below HTTP 500, including `4xx` and `429`, is a success: it closes and clears a half-open circuit, but in closed state it does not erase retained failures, which age out of the rolling window. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against it. Downstream cancellation/write failure is neutral. An upstream `5xx` is forwarded and is not retried; only the existing pre-first-byte transport retry remains.
 
-`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by SQLite schema migration version 2; reopening a current database is a no-op.
+`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by additive SQLite schema migration version 2; reopening a current database is a no-op.
+
+The gateway rejects a database whose `PRAGMA user_version` is newer than its latest embedded migration (currently version 2) before accepting or modifying it. Rollback is not a schema downgrade: the additive pool columns physically survive use by a pre-pool-safety binary only when that binary accepts the recorded schema version, and such a binary ignores the columns and does not enforce either limit. If the target binary does not support the recorded version, it rejects the database. Do not lower `user_version` by hand; restore a compatible quiesced backup instead.
 
 Circuit availability contributes to `/inference-readyz`, but transient pool congestion does not: removing a gateway from service cannot create GPU capacity. `/readyz` remains independent so operators retain Admin access during a total inference outage. Circuit and pool leases are in memory and correct only for the documented single gateway replica.
 
@@ -266,7 +268,7 @@ The report separates successes, intentional `429` overload responses, `5xx`, oth
 
 ## Metrics and logging
 
-`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Labels are bounded to configured model/backend names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
+`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`unmanaged/unknown=-1`, `closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Labels are bounded to configured model/backend names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
 
 The gateway writes one JSON record per completed inference request to stderr. Records include correlation IDs, client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies and authorization headers are never logged.
 
@@ -537,7 +539,7 @@ Tests cover domain validation, key security, SQLite migrations and CRUD, registr
 
 ## Real-GPU validation
 
-Run `make test-real-vllm` with `LLMGW_E2E_MODE=smoke`, `priority`, or `resilience` and the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md). The modes cover production-safe inference readiness/streaming, intentional priority and pool-safety saturation, and isolated real-vLLM circuit recovery respectively. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for broader compatibility, cancellation, routing, and hardware-calibration evidence. Fake-backend tests prove gateway mechanics but cannot prove the scheduler behavior of a selected real model/hardware combination.
+Run `make test-real-vllm` with `LLMGW_E2E_MODE=smoke`, `priority`, or `resilience` and the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md). The modes cover production-safe inference readiness/streaming, intentional priority and pool-safety saturation, and isolated real-vLLM circuit recovery respectively. All three passed on the recorded 2026-08-27 Apple M4/vLLM-Metal development topology; see [`docs/acceptance-evidence.md`](docs/acceptance-evidence.md) for the exact durable summary and its raw-log limitation. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for broader compatibility, cancellation, routing, and target hardware calibration. Fake-backend and Apple Silicon results prove gateway mechanics but cannot sign off the scheduler behavior or thresholds of a selected CUDA model/hardware combination.
 
 ## Not implemented in the MVP
 

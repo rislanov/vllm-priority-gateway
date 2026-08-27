@@ -181,6 +181,81 @@ func TestSQLiteMigrationRollsBackWhenSecondStatementFails(t *testing.T) {
 	}
 }
 
+func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	db, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("create current database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close current database: %v", err)
+	}
+
+	futureDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open future database: %v", err)
+	}
+	if _, err := futureDB.Exec(`
+		INSERT INTO model_pools (
+			public_model_name, upstream_model_name, enabled,
+			max_gateway_inflight, max_waiting, created_at, updated_at
+		) VALUES (
+			'future-public', 'future-upstream', 1,
+			17, 9, '2026-08-27T00:00:00Z', '2026-08-27T00:00:00Z'
+		);
+		CREATE TABLE future_schema_marker (value TEXT NOT NULL);
+		INSERT INTO future_schema_marker (value) VALUES ('preserve-me');
+		PRAGMA user_version = 3;`); err != nil {
+		futureDB.Close()
+		t.Fatalf("prepare future database: %v", err)
+	}
+	if err := futureDB.Close(); err != nil {
+		t.Fatalf("close future database: %v", err)
+	}
+
+	if opened, err := store.Open(context.Background(), path); err == nil {
+		opened.Close()
+		t.Fatal("Open() succeeded for future schema version 3")
+	} else if !strings.Contains(err.Error(), "SQLite schema version 3 is newer than supported version 2") {
+		t.Fatalf("Open() error = %v, want future schema rejection", err)
+	}
+
+	inspectDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open rejected future database: %v", err)
+	}
+	defer inspectDB.Close()
+
+	var version int
+	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read rejected user_version: %v", err)
+	}
+	if version != 3 {
+		t.Fatalf("rejected user_version = %d, want 3", version)
+	}
+
+	var publicModelName, upstreamModelName, marker string
+	var maxGatewayInflight, maxWaiting int
+	if err := inspectDB.QueryRow(`
+		SELECT public_model_name, upstream_model_name, max_gateway_inflight, max_waiting
+		FROM model_pools WHERE public_model_name = 'future-public'`).Scan(
+		&publicModelName, &upstreamModelName, &maxGatewayInflight, &maxWaiting,
+	); err != nil {
+		t.Fatalf("read pool from rejected future database: %v", err)
+	}
+	if publicModelName != "future-public" || upstreamModelName != "future-upstream" ||
+		maxGatewayInflight != 17 || maxWaiting != 9 {
+		t.Fatalf("future pool after rejection = (%q, %q, %d, %d)",
+			publicModelName, upstreamModelName, maxGatewayInflight, maxWaiting)
+	}
+	if err := inspectDB.QueryRow("SELECT value FROM future_schema_marker").Scan(&marker); err != nil {
+		t.Fatalf("read future schema marker after rejection: %v", err)
+	}
+	if marker != "preserve-me" {
+		t.Fatalf("future schema marker after rejection = %q, want preserve-me", marker)
+	}
+}
+
 func TestSQLiteMigratesLegacyVersionZeroDatabaseWithExistingTables(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.db")
 	createLegacyPoolDatabase(t, path, 0)

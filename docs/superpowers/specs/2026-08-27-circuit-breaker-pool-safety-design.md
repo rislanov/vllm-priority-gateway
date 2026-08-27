@@ -1,7 +1,7 @@
 # Circuit Breaker, Pool Safety, and Inference Readiness Design
 
-**Date:** 2026-08-27  
-**Status:** Approved for implementation by the user's instruction to proceed without clarification  
+**Date:** 2026-08-27
+**Status:** Approved for implementation by the user's instruction to proceed without clarification
 **Scope:** Single-replica gateway resilience; no distributed coordination or endpoint retry-policy expansion
 
 ## Objective

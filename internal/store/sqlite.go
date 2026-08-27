@@ -89,6 +89,10 @@ func (s *SQLite) Migrate(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&currentVersion); err != nil {
 		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
+	latestVersion := migrations[len(migrations)-1].version
+	if currentVersion > latestVersion {
+		return fmt.Errorf("SQLite schema version %d is newer than supported version %d", currentVersion, latestVersion)
+	}
 	for _, migration := range migrations {
 		if migration.version <= currentVersion {
 			continue

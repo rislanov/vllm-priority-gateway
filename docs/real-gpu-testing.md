@@ -4,6 +4,12 @@ This procedure validates behavior that the deterministic fake backend cannot pro
 
 The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
 
+## Recorded non-target development evidence
+
+On 2026-08-27 all three automated modes passed locally at gateway commit `6b7a29b` on a MacBook Air `Mac16,13` (Apple M4, 24 GB) using vLLM `0.28.0+cpu`, vLLM-Metal `0.3.0.dev20260827104907`, and two loopback `Qwen/Qwen3-0.6B` nodes with `max-num-seqs=1`. Smoke observed two healthy/fresh backends and `360.398334ms` first byte. The four-client × four-request, 768-token priority profile observed `GatewayInflight=16`, `TotalWaiting=14`, every backend waiting, Critical rejection at temporary `MaxGatewayInflight=1`, exact pool restoration, and recovery to `busy` in `4.290394292s` and `normal` in `6.727045209s`. With circuit threshold/count `3` and cooldown `3s`, resilience opened at exactly three injected failures, made inference readiness HTTP 503, recovered through a `156.983875ms` half-open streaming probe to closed/readiness HTTP 200, and restored the exact captured pool/backend state.
+
+The representative non-secret commands and full durable summary are in [acceptance-evidence.md](acceptance-evidence.md). Raw gateway, vLLM, and terminal process logs were ephemeral and were not retained. Docker container smoke was not run because the daemon was unavailable. This Apple Silicon/vLLM-Metal result does not replace any step below: all three modes, the broader checks, and threshold/TTFT calibration remain pending on the selected CUDA host and production model.
+
 ## 1. Prerequisites
 
 - Two GPUs or two independently reachable vLLM serving groups are preferred. One GPU is enough for compatibility, cancellation, and priority tests.
@@ -243,7 +249,7 @@ LLMGW_E2E_MODE=resilience make test-real-vllm
 
 Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires a loopback gateway URL, captures the target URL, all sibling drain states, all backend update fields, and both pool limits, and attempts to restore every captured value. Cleanup reports all failed updates and continues trying later resources; a resource whose update fails may remain mutated and must be restored manually. The loopback fault proxy faults only supported inference routes. Do not run this mode against production traffic.
 
-Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open → half_open → closed`, `/readyz` remaining HTTP 200, `/inference-readyz` changing `200 → 503 → 200`, and the five Prometheus families `llmgw_backend_circuit_state`, `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Also retain the complete recovery stream timing and the cleanup status. Do not claim this gate until the real-vLLM command has actually run.
+Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open → half_open → closed`, `/readyz` remaining HTTP 200, `/inference-readyz` changing `200 → 503 → 200`, and the five Prometheus families `llmgw_backend_circuit_state`, `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Also retain the complete recovery stream timing and the cleanup status. Do not claim a target-host gate until its real-vLLM command has actually run and its required artifacts have been retained.
 
 ## 8. Evidence to retain
 
