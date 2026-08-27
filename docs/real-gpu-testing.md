@@ -2,6 +2,8 @@
 
 This procedure validates behavior that the deterministic fake backend cannot prove: current OpenAI API compatibility, upstream cancellation on a real engine, queue metrics under GPU contention, vLLM priority scheduling, and gateway hysteretic recovery.
 
+The priority-isolation and recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run that suite first; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
+
 ## 1. Prerequisites
 
 - Two GPUs or two independently reachable vLLM serving groups are preferred. One GPU is enough for compatibility, cancellation, and priority tests.
@@ -131,6 +133,14 @@ done
 Inspect the gateway completion logs and both vLLM request logs. Pass criteria: all requests select the same backend while it stays eligible and below `LLMGW_SESSION_AFFINITY_MAX_PRESSURE`. To prove that the header is stripped, place a controlled header-capturing reverse proxy between the gateway and vLLM for this run; absence from ordinary vLLM logs is not evidence because vLLM does not normally log arbitrary request headers. Then raise load on that preferred backend above the ceiling, drain it, or make its metrics stale and repeat the request. The session must move to an eligible backend without a client error; overload uses least-pressure fallback, while other eligibility changes recompute rendezvous hashing over the remaining set. Removing the header must restore ordinary least-pressure selection. Record per-backend KV utilization and TTFT as evidence of locality impact; this experiment validates routing behavior but does not claim block-level cache awareness.
 
 ## 5. Priority isolation
+
+The recommended repeatable gate is:
+
+```bash
+LLMGW_E2E_MODE=priority make test-real-vllm
+```
+
+Configure all required identities and tuning variables as described in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). The automated test covers three independent Low probes, body/header priority spoofing, session-affinity bypass resistance, High/Critical continuity while saturated, optional one-backend drain, and hysteretic recovery. The manual mixed-load run below remains useful for longer percentile and capacity-calibration evidence.
 
 Run the fixed seeded mix while background traffic already fills the queue:
 

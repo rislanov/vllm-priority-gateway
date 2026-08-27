@@ -6,7 +6,7 @@ Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, st
 
 The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
 
-Status: the implementation and deterministic acceptance suite are code-complete. Real-vLLM scheduling, cancellation, and threshold calibration still require the documented GPU sign-off before production use.
+Status: the implementation and deterministic acceptance suite are code-complete. An opt-in real-vLLM black-box suite now automates production smoke, priority isolation, drain, and hysteretic recovery checks. Threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
 
 ## Architecture
 
@@ -32,6 +32,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 
 - [Technical specification (English)](docs/technical-specification.md) — complete MVP and Production V1 requirements translated from the original project brief.
 - [Real-GPU test plan](docs/real-gpu-testing.md) — hardware validation procedure for vLLM compatibility, cancellation, priority, pressure, and recovery.
+- [Automated real-vLLM priority E2E](docs/real-vllm-priority-e2e.md) — reproducible Mac M4/Linux setup and opt-in smoke, saturation, drain, and recovery suite.
 - [Acceptance evidence](docs/acceptance-evidence.md) — mapping from MVP acceptance criteria to automated or manual evidence.
 
 ## Implemented in the MVP
@@ -370,6 +371,99 @@ curl -fsS http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
 ```
 
+### Post-deployment production verification
+
+The two checks above are necessary but not sufficient: `/readyz` deliberately remains HTTP 200 when inference capacity is zero, and `/v1/models` proves authorization/configuration without proving that a model can generate. Before enabling client traffic after a new deployment, restart, configuration change, or restore, run the following from an operator network against the same ingress path clients will use.
+
+Set the public model and gateway URL without placing credentials in shell history or source control:
+
+```bash
+export LLMGW_VERIFY_URL='https://gateway.example.internal'
+export LLMGW_VERIFY_MODEL='qwen'
+export LLMGW_VERIFY_EXPECTED_BACKENDS=2
+export LLMGW_VERIFY_REQUEST_ID="deployment-verify-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# Inject LLMGW_ADMIN_USERNAME, LLMGW_ADMIN_PASSWORD, and LLMGW_CLIENT_KEY
+# from the deployment secret mechanism.
+```
+
+1. Verify liveness, a loaded registry revision, and non-zero inference capacity:
+
+```bash
+curl -fsS "$LLMGW_VERIFY_URL/healthz" | jq -e '.status == "alive"'
+curl -fsS "$LLMGW_VERIFY_URL/readyz" \
+  | jq -e --argjson expected "$LLMGW_VERIFY_EXPECTED_BACKENDS" \
+      '.status == "ready" and .revision > 0 and .backendAvailability >= $expected'
+```
+
+2. Verify that enabled, non-draining backends are healthy and their vLLM metrics are fresh:
+
+The manual command prompts for the Admin password so it is not exposed in the process argument list. Do not append the password to `--user`.
+
+```bash
+curl -fsS --user "$LLMGW_ADMIN_USERNAME" \
+  "$LLMGW_VERIFY_URL/admin/api/status" \
+  | jq -e --argjson expected "$LLMGW_VERIFY_EXPECTED_BACKENDS" '
+      [.backends[] | select(.enabled and (.draining | not))] as $eligible
+      | ($eligible | length) >= $expected
+        and all($eligible[]; .runtime.Healthy and .runtime.MetricsFresh)
+        and any(.pools[]; .enabled and .runtime.AvailableBackends >= $expected)'
+```
+
+3. Verify model visibility and one complete streaming inference. Consuming the entire stream confirms the first-byte path, continued streaming, and the terminal `[DONE]` event:
+
+```bash
+curl -fsS "$LLMGW_VERIFY_URL/v1/models" \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  | jq -e --arg model "$LLMGW_VERIFY_MODEL" 'any(.data[]; .id == $model)'
+
+curl -fsS -N "$LLMGW_VERIFY_URL/v1/completions" \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  -H "X-Request-Id: $LLMGW_VERIFY_REQUEST_ID" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$LLMGW_VERIFY_MODEL\",\"prompt\":\"Production verification.\",\"max_tokens\":4,\"stream\":true}" \
+  | awk '{ sub(/\r$/, ""); if ($0 == "data: [DONE]") done=1 } END { exit(done ? 0 : 1) }'
+```
+
+4. Verify telemetry and correlate the probe with a successful completion log:
+
+```bash
+(
+  set -e
+  LLMGW_VERIFY_METRICS="$(curl -fsS "$LLMGW_VERIFY_URL/metrics")"
+  for family in llmgw_requests_total llmgw_backend_pressure llmgw_backend_running_requests; do
+    printf '%s\n' "$LLMGW_VERIFY_METRICS" | grep -qE "^(# HELP )?$family([ {])"
+  done
+
+  ssh gateway-host "sudo journalctl -u llmgw --since='-5 minutes' -o cat" \
+    | jq -Rse --arg request_id "$LLMGW_VERIFY_REQUEST_ID" '
+      [split("\n")[] | fromjson?
+       | select(.msg == "request completed"
+           and .parentRequestId == $request_id
+           and .status == 200
+           and (.backend // "") != "")]
+      | if length > 0 then .
+        else error("no successful completion log for the verification request")
+        end'
+)
+```
+
+The example reads logs over SSH from the systemd gateway host. If the shell is already on that host, replace the `ssh ...` command with `sudo journalctl -u llmgw --since '-5 minutes' -o cat`. With centralized logging, query the same exact `parentRequestId`, require `status=200`, and require a non-empty `backend` field. The `jq` expression exits non-zero if no matching completion exists.
+
+For a repeatable assertion-based version, run the safe E2E smoke test from an operator workstation:
+
+```bash
+LLMGW_E2E_MODE=smoke \
+LLMGW_E2E_GATEWAY_URL="$LLMGW_VERIFY_URL" \
+LLMGW_E2E_ADMIN_USERNAME="$LLMGW_ADMIN_USERNAME" \
+LLMGW_E2E_ADMIN_PASSWORD="$LLMGW_ADMIN_PASSWORD" \
+LLMGW_E2E_MODEL="$LLMGW_VERIFY_MODEL" \
+LLMGW_E2E_HIGH_KEY="$LLMGW_CLIENT_KEY" \
+LLMGW_E2E_EXPECTED_BACKENDS="$LLMGW_VERIFY_EXPECTED_BACKENDS" \
+go test -count=1 -v -timeout 2m ./tests/e2e -run TestProductionSmoke
+```
+
+Pass criteria: all commands exit zero; Admin status shows the expected healthy/fresh capacity; the stream reaches `[DONE]`; Prometheus exposes gateway/backend series; and the matching completion log records status `200` and a selected backend. Do not run the intentional saturation test against live production traffic. Follow [the real-vLLM priority E2E runbook](docs/real-vllm-priority-e2e.md) only in an isolated environment or an approved capacity-test window.
+
 SQLite runs in WAL mode. Do not copy only `llmgw.db` while the gateway is running: committed data may still be in `llmgw.db-wal`. Use a quiesced backup of the complete state directory, for example:
 
 ```bash
@@ -419,6 +513,7 @@ make test-race
 make vet
 make build
 make build-linux-amd64
+make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
@@ -426,7 +521,7 @@ Tests cover domain validation, key security, SQLite migrations and CRUD, registr
 
 ## Real-GPU validation
 
-Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for compatibility, cancellation, queue pressure, priority isolation, and hysteretic recovery runs against actual vLLM GPUs. Fake-backend tests prove gateway mechanics but cannot prove GPU scheduler behavior.
+Run `make test-real-vllm` with the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md) for automated production smoke, priority isolation, optional drain, and hysteretic recovery. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for the broader compatibility, cancellation, routing, and hardware-calibration evidence. Fake-backend tests prove gateway mechanics but cannot prove the scheduler behavior of a selected real model/hardware combination.
 
 ## Not implemented in the MVP
 
@@ -436,7 +531,7 @@ Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for compatibility,
 - Priority admission rejects new lower-priority requests; it does not preempt an already admitted generation.
 - Basic auth is the MVP management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external or future responsibilities.
 - Capacity hints are persisted for forward compatibility but do not yet weight routing.
-- Automated fake-backend acceptance is complete, but real-vLLM GPU sign-off remains required before production use.
+- Automated fake-backend acceptance and the opt-in real-vLLM test harness are complete, but the real-vLLM suite and threshold calibration must still pass on the selected production model/GPU combination before production use.
 
 ## Remaining work for Production V1
 
