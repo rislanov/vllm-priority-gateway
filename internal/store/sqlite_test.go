@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,83 @@ func TestSQLiteMigratesVersionOnePoolSafetyDefaults(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() reopened database error = %v", err)
+	}
+}
+
+func TestSQLiteMigrationRollsBackWhenSecondStatementFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	createLegacyPoolDatabase(t, path, 1)
+
+	legacyDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacyDB.Exec(`
+		ALTER TABLE model_pools ADD COLUMN max_waiting INTEGER NOT NULL DEFAULT 0 CHECK (max_waiting >= 0);
+		UPDATE model_pools SET max_waiting = 23;`); err != nil {
+		legacyDB.Close()
+		t.Fatalf("prepare conflicting v1 schema: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close conflicting v1 database: %v", err)
+	}
+
+	if db, err := store.Open(context.Background(), path); err == nil {
+		db.Close()
+		t.Fatal("Open() succeeded despite duplicate max_waiting column")
+	} else if !strings.Contains(err.Error(), "duplicate column name: max_waiting") {
+		t.Fatalf("Open() error = %v, want duplicate max_waiting failure from second ALTER", err)
+	}
+
+	inspectDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open database after failed migration: %v", err)
+	}
+	defer inspectDB.Close()
+
+	var version int
+	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version after failed migration: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("user_version after failed migration = %d, want 1", version)
+	}
+
+	rows, err := inspectDB.Query("PRAGMA table_info(model_pools)")
+	if err != nil {
+		t.Fatalf("inspect model_pools schema: %v", err)
+	}
+	defer rows.Close()
+	var hasMaxGatewayInflight, hasMaxWaiting bool
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan model_pools column: %v", err)
+		}
+		hasMaxGatewayInflight = hasMaxGatewayInflight || name == "max_gateway_inflight"
+		hasMaxWaiting = hasMaxWaiting || name == "max_waiting"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate model_pools schema: %v", err)
+	}
+	if hasMaxGatewayInflight {
+		t.Fatal("max_gateway_inflight persisted despite migration rollback")
+	}
+	if !hasMaxWaiting {
+		t.Fatal("pre-existing max_waiting column was lost after migration rollback")
+	}
+
+	var publicModelName, upstreamModelName string
+	var maxWaiting int
+	if err := inspectDB.QueryRow(`
+		SELECT public_model_name, upstream_model_name, max_waiting
+		FROM model_pools`).Scan(&publicModelName, &upstreamModelName, &maxWaiting); err != nil {
+		t.Fatalf("read legacy pool after failed migration: %v", err)
+	}
+	if publicModelName != "legacy-public" || upstreamModelName != "legacy-upstream" || maxWaiting != 23 {
+		t.Fatalf("legacy pool after failed migration = (%q, %q, %d)", publicModelName, upstreamModelName, maxWaiting)
 	}
 }
 
