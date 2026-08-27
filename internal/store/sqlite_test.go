@@ -3,9 +3,11 @@ package store_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -53,6 +55,78 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("database permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestSQLiteMigrationUpgrade(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	initial, err := os.ReadFile("migrations/001_initial.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(001_initial.sql) error = %v", err)
+	}
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := legacy.ExecContext(ctx, string(initial)); err != nil {
+		t.Fatalf("apply legacy migration error = %v", err)
+	}
+	if _, err := legacy.ExecContext(ctx, `
+		INSERT INTO clients (
+			name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"legacy-client", 1, "normal", 0, 1, "2026-08-27T12:00:00Z", "2026-08-27T12:00:00Z",
+	); err != nil {
+		t.Fatalf("seed legacy client error = %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("legacy Close() error = %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		db, err := store.Open(ctx, path)
+		if err != nil {
+			t.Fatalf("Open() attempt %d error = %v", attempt, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close() attempt %d error = %v", attempt, err)
+		}
+	}
+
+	upgraded, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(upgraded) error = %v", err)
+	}
+	defer upgraded.Close()
+	rows, err := upgraded.QueryContext(ctx, `SELECT filename FROM schema_migrations ORDER BY filename`)
+	if err != nil {
+		t.Fatalf("query schema_migrations error = %v", err)
+	}
+	defer rows.Close()
+	var filenames []string
+	for rows.Next() {
+		var filename string
+		if err := rows.Scan(&filename); err != nil {
+			t.Fatalf("scan migration filename error = %v", err)
+		}
+		filenames = append(filenames, filename)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration filenames error = %v", err)
+	}
+	wantFilenames := []string{"001_initial.sql", "002_usage_analytics.sql"}
+	if !reflect.DeepEqual(filenames, wantFilenames) {
+		t.Fatalf("migration filenames = %v, want %v", filenames, wantFilenames)
+	}
+
+	var legacyClients int
+	if err := upgraded.QueryRowContext(ctx, `SELECT COUNT(*) FROM clients WHERE name = ?`, "legacy-client").Scan(&legacyClients); err != nil {
+		t.Fatalf("query legacy client error = %v", err)
+	}
+	if legacyClients != 1 {
+		t.Fatalf("legacy client count = %d, want 1", legacyClients)
 	}
 }
 

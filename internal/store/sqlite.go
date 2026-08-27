@@ -6,9 +6,11 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,20 +79,60 @@ func (s *SQLite) Close() error {
 }
 
 func (s *SQLite) Migrate(ctx context.Context) error {
-	contents, err := migrationFiles.ReadFile("migrations/001_initial.sql")
+	paths, err := fs.Glob(migrationFiles, "migrations/*.sql")
 	if err != nil {
-		return fmt.Errorf("read embedded migration: %w", err)
+		return fmt.Errorf("list embedded migrations: %w", err)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		if err := s.applyMigration(ctx, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SQLite) applyMigration(ctx context.Context, path string) error {
+	contents, err := migrationFiles.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read embedded migration %q: %w", path, err)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin migration: %w", err)
+		return fmt.Errorf("begin migration %q: %w", path, err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			filename TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
+	}
+
+	filename := filepath.Base(path)
+	var applied bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE filename = ?)`, filename,
+	).Scan(&applied); err != nil {
+		return fmt.Errorf("check migration %q: %w", filename, err)
+	}
+	if applied {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration check %q: %w", filename, err)
+		}
+		return nil
+	}
 	if _, err := tx.ExecContext(ctx, string(contents)); err != nil {
-		return fmt.Errorf("apply initial migration: %w", err)
+		return fmt.Errorf("apply migration %q: %w", filename, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_migrations (filename, applied_at) VALUES (?, ?)`, filename, timestamp(s.now()),
+	); err != nil {
+		return fmt.Errorf("record migration %q: %w", filename, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migration: %w", err)
+		return fmt.Errorf("commit migration %q: %w", filename, err)
 	}
 	return nil
 }
