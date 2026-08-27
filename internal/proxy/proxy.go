@@ -132,7 +132,7 @@ func (p *Proxy) forwardOnce(
 		if ctx.Err() != nil {
 			result.Err = ctx.Err()
 			result.Cancelled = true
-			return result, false, domain.InferenceNeutral
+			return result, false, interruptedOutcome(response.StatusCode, nil, true)
 		}
 		return result, response.StatusCode >= 200 && response.StatusCode < 300, domain.InferenceFailure
 	}
@@ -152,7 +152,7 @@ func (p *Proxy) forwardOnce(
 			}
 			result.Err = writeErr
 			result.Cancelled = ctx.Err() != nil
-			return result, false, domain.InferenceNeutral
+			return result, false, interruptedOutcome(response.StatusCode, readErr, result.Cancelled)
 		}
 	}
 	if readErr != nil {
@@ -160,7 +160,7 @@ func (p *Proxy) forwardOnce(
 			result.Err = readErr
 			result.Cancelled = ctx.Err() != nil
 			if result.Cancelled {
-				return result, false, domain.InferenceNeutral
+				return result, false, interruptedOutcome(response.StatusCode, nil, true)
 			}
 			return result, false, domain.InferenceFailure
 		}
@@ -179,7 +179,7 @@ func (p *Proxy) forwardOnce(
 				}
 				result.Err = writeErr
 				result.Cancelled = ctx.Err() != nil
-				return result, false, domain.InferenceNeutral
+				return result, false, interruptedOutcome(response.StatusCode, readErr, result.Cancelled)
 			}
 		}
 		if readErr != nil {
@@ -187,7 +187,7 @@ func (p *Proxy) forwardOnce(
 				result.Err = readErr
 				result.Cancelled = ctx.Err() != nil
 				if result.Cancelled {
-					return result, false, domain.InferenceNeutral
+					return result, false, interruptedOutcome(response.StatusCode, nil, true)
 				}
 				return result, false, domain.InferenceFailure
 			}
@@ -201,6 +201,13 @@ func completedOutcome(status int) domain.InferenceOutcome {
 		return domain.InferenceFailure
 	}
 	return domain.InferenceSuccess
+}
+
+func interruptedOutcome(status int, readErr error, cancelled bool) domain.InferenceOutcome {
+	if status >= http.StatusInternalServerError || (!cancelled && readErr != nil && !errors.Is(readErr, io.EOF)) {
+		return domain.InferenceFailure
+	}
+	return domain.InferenceNeutral
 }
 
 func flush(writer http.ResponseWriter) {

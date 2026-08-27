@@ -172,6 +172,101 @@ func TestForwardClassifiesUpstream5xxAsFailureWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestForwardClassifies5xxWriteFailureAsFailureWithoutRetry(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{HTTPStatus: http.StatusServiceUnavailable, HTTPBody: `{"error":"busy"}`})
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+
+	var outcomes []domain.InferenceOutcome
+	var selections atomic.Int64
+	result := proxy.New(server.Client()).Forward(context.Background(), &writeFailWriter{header: make(http.Header)}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, server.URL),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, nil
+		},
+	})
+	if !errors.Is(result.Err, errDownstreamWrite) || result.Status != http.StatusServiceUnavailable || !result.ResponseStarted || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
+	}
+}
+
+func TestForwardClassifies5xxCancellationAfterHeadersAsFailureWithoutRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       contextReadBody{ctx: request.Context()},
+		}, nil
+	})}
+	writer := newHeaderSignalWriter()
+	outcomes := make(chan domain.InferenceOutcome, 1)
+	var selections atomic.Int64
+	finished := make(chan proxy.Result, 1)
+	go func() {
+		finished <- proxy.New(client).Forward(ctx, writer, proxy.Request{
+			Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+			Target: proxy.Target{
+				Backend:  backend(1, "http://backend.invalid"),
+				Complete: func(outcome domain.InferenceOutcome) { outcomes <- outcome },
+			},
+			SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+				selections.Add(1)
+				return proxy.Target{}, nil
+			},
+		})
+	}()
+	select {
+	case <-writer.headerWritten:
+	case <-time.After(time.Second):
+		t.Fatal("upstream 503 headers were not committed")
+	}
+	cancel()
+	result := <-finished
+	if !result.Cancelled || !errors.Is(result.Err, context.Canceled) || result.Status != http.StatusServiceUnavailable || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 {
+		t.Fatalf("alternate selections = %d, want 0", selections.Load())
+	}
+	if outcome := <-outcomes; outcome != domain.InferenceFailure {
+		t.Fatalf("outcome = %q, want failure", outcome)
+	}
+}
+
+func TestForwardClassifiesBodyReadFailureBeforeDownstreamWriteFailureAsFailure(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       partialReadFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	result := proxy.New(client).Forward(context.Background(), &writeFailWriter{header: make(http.Header)}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+	})
+	if !errors.Is(result.Err, errDownstreamWrite) || !result.ResponseStarted || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("outcomes = %v, want [failure]", outcomes)
+	}
+}
+
 func TestForwardClassifiesCompleted4xxAsSuccess(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{HTTPStatus: http.StatusTooManyRequests, HTTPBody: `{"error":"rate limited"}`})
@@ -407,6 +502,45 @@ type readFailBody struct{}
 func (readFailBody) Read([]byte) (int, error) { return 0, errUpstreamRead }
 
 func (readFailBody) Close() error { return nil }
+
+type partialReadFailBody struct{}
+
+func (partialReadFailBody) Read(destination []byte) (int, error) {
+	return copy(destination, "partial"), errUpstreamRead
+}
+
+func (partialReadFailBody) Close() error { return nil }
+
+type contextReadBody struct {
+	ctx context.Context
+}
+
+func (b contextReadBody) Read([]byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (contextReadBody) Close() error { return nil }
+
+type headerSignalWriter struct {
+	header        http.Header
+	status        int
+	headerWritten chan struct{}
+	once          sync.Once
+}
+
+func newHeaderSignalWriter() *headerSignalWriter {
+	return &headerSignalWriter{header: make(http.Header), headerWritten: make(chan struct{})}
+}
+
+func (w *headerSignalWriter) Header() http.Header { return w.header }
+
+func (w *headerSignalWriter) WriteHeader(status int) {
+	w.status = status
+	w.once.Do(func() { close(w.headerWritten) })
+}
+
+func (*headerSignalWriter) Write(data []byte) (int, error) { return len(data), nil }
 
 type writeFailWriter struct {
 	header http.Header
