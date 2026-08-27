@@ -3,7 +3,9 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -12,6 +14,270 @@ import (
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 )
+
+func TestAnalyticsRangeFiltersAggregatesAndPartialCache(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	to := from.Add(15 * time.Minute)
+	input10, input20, input7 := int64(10), int64(20), int64(7)
+	output2, output3, output1 := int64(2), int64(3), int64(1)
+	cache4 := int64(4)
+	records := []analytics.RequestRecord{
+		analyticsUsageRecord("before", from.Add(-time.Millisecond), 9, "excluded", 90, "excluded-model", &input7, &output1, nil),
+		analyticsUsageRecord("included-from", from, 1, "client-old", 10, "model-old", &input10, &output2, &cache4),
+		analyticsUsageRecord("cache-unknown", from.Add(5*time.Minute), 1, "client-current", 10, "model-current", &input20, &output3, nil),
+		analyticsUsageRecord("unmetered", from.Add(10*time.Minute), 2, "client-two", 20, "model-two", nil, nil, nil),
+		analyticsUsageRecord("excluded-to", to, 2, "client-two", 20, "model-two", &input7, &output1, nil),
+		analyticsUsageRecord("latest-retained-name", to.Add(time.Minute), 1, "client-renamed", 10, "model-renamed", nil, nil, nil),
+	}
+	if err := db.InsertUsageBatch(ctx, records); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+
+	dataset, err := db.Analytics(ctx, analytics.Filter{From: from, To: to})
+	if err != nil {
+		t.Fatalf("Analytics() error = %v", err)
+	}
+	wantSummary := analytics.Summary{
+		RequestCount: 3, MeteredRequestCount: 2, UsageCoverage: 2.0 / 3.0,
+		InputTokens: 30, OutputTokens: 5,
+		CacheReadTokens: int64Pointer(4), UncachedInputTokens: int64Pointer(6), CacheHitRatio: float64Pointer(0.4),
+	}
+	if !reflect.DeepEqual(dataset.Summary, wantSummary) {
+		t.Fatalf("Analytics().Summary = %+v, want %+v", dataset.Summary, wantSummary)
+	}
+	if len(dataset.Series) != 3 {
+		t.Fatalf("Analytics().Series length = %d, want 3: %+v", len(dataset.Series), dataset.Series)
+	}
+	if got := dataset.Series[0]; !got.BucketStart.Equal(from) || got.RequestCount != 1 || got.InputTokens != 10 ||
+		got.OutputTokens != 2 || !reflect.DeepEqual(got.CacheReadTokens, int64Pointer(4)) ||
+		!reflect.DeepEqual(got.CacheHitRatio, float64Pointer(0.4)) {
+		t.Fatalf("first series point = %+v", got)
+	}
+	if got := dataset.Series[1]; !got.BucketStart.Equal(from.Add(5*time.Minute)) || got.RequestCount != 1 ||
+		got.InputTokens != 20 || got.OutputTokens != 3 || got.CacheReadTokens != nil || got.CacheHitRatio != nil {
+		t.Fatalf("cache-unknown series point = %+v", got)
+	}
+	if got := dataset.Series[2]; !got.BucketStart.Equal(from.Add(10*time.Minute)) || got.RequestCount != 1 ||
+		got.InputTokens != 0 || got.OutputTokens != 0 || got.CacheReadTokens != nil || got.CacheHitRatio != nil {
+		t.Fatalf("unmetered series point = %+v", got)
+	}
+	if len(dataset.Breakdown) != 2 {
+		t.Fatalf("Analytics().Breakdown length = %d, want 2: %+v", len(dataset.Breakdown), dataset.Breakdown)
+	}
+	wantBreakdown := []analytics.BreakdownRow{
+		{ClientID: 1, ClientName: "client-renamed", ModelPoolID: 10, ModelName: "model-renamed",
+			RequestCount: 2, MeteredRequestCount: 2, InputTokens: 30, OutputTokens: 5,
+			CacheReadTokens: int64Pointer(4), UncachedInputTokens: int64Pointer(6), CacheHitRatio: float64Pointer(0.4)},
+		{ClientID: 2, ClientName: "client-two", ModelPoolID: 20, ModelName: "model-two", RequestCount: 1},
+	}
+	if !reflect.DeepEqual(dataset.Breakdown, wantBreakdown) {
+		t.Fatalf("Analytics().Breakdown = %+v, want %+v", dataset.Breakdown, wantBreakdown)
+	}
+	wantClients := []analytics.Dimension{{ID: 1, Name: "client-renamed"}, {ID: 2, Name: "client-two"}, {ID: 9, Name: "excluded"}}
+	wantModels := []analytics.Dimension{{ID: 10, Name: "model-renamed"}, {ID: 20, Name: "model-two"}, {ID: 90, Name: "excluded-model"}}
+	if !reflect.DeepEqual(dataset.Clients, wantClients) || !reflect.DeepEqual(dataset.Models, wantModels) {
+		t.Fatalf("dimensions clients/models = %+v/%+v, want %+v/%+v", dataset.Clients, dataset.Models, wantClients, wantModels)
+	}
+
+	filterCases := []struct {
+		name   string
+		filter analytics.Filter
+		want   int64
+	}{
+		{name: "client", filter: analytics.Filter{From: from, To: to, ClientID: int64Pointer(1)}, want: 2},
+		{name: "model", filter: analytics.Filter{From: from, To: to, ModelPoolID: int64Pointer(20)}, want: 1},
+		{name: "available", filter: analytics.Filter{From: from, To: to, UsageAvailable: boolPointer(true)}, want: 2},
+		{name: "unavailable", filter: analytics.Filter{From: from, To: to, UsageAvailable: boolPointer(false)}, want: 1},
+		{name: "combined", filter: analytics.Filter{From: from, To: to, ClientID: int64Pointer(2), ModelPoolID: int64Pointer(20), UsageAvailable: boolPointer(false)}, want: 1},
+	}
+	for _, test := range filterCases {
+		t.Run("filter_"+test.name, func(t *testing.T) {
+			got, err := db.Analytics(ctx, test.filter)
+			if err != nil {
+				t.Fatalf("Analytics() error = %v", err)
+			}
+			if got.Summary.RequestCount != test.want {
+				t.Fatalf("Analytics().Summary.RequestCount = %d, want %d", got.Summary.RequestCount, test.want)
+			}
+		})
+	}
+}
+
+func TestAnalyticsChoosesAutomaticBucketWidth(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	occurredAt := time.Date(2026, time.August, 27, 12, 34, 56, 789_000_000, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{analyticsUsageRecord(
+		"bucketed", occurredAt, 1, "client", 2, "model", nil, nil, nil,
+	)}); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+	tests := []struct {
+		name       string
+		rangeWidth time.Duration
+		wantBucket time.Time
+	}{
+		{name: "twenty_four_hours", rangeWidth: 24 * time.Hour, wantBucket: time.Date(2026, time.August, 27, 12, 30, 0, 0, time.UTC)},
+		{name: "over_twenty_four_hours", rangeWidth: 24*time.Hour + time.Millisecond, wantBucket: time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)},
+		{name: "seven_days", rangeWidth: 7 * 24 * time.Hour, wantBucket: time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)},
+		{name: "over_seven_days", rangeWidth: 7*24*time.Hour + time.Millisecond, wantBucket: time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			filter := analytics.Filter{From: occurredAt.Add(-time.Millisecond), To: occurredAt.Add(-time.Millisecond).Add(test.rangeWidth)}
+			got, err := db.Analytics(ctx, filter)
+			if err != nil {
+				t.Fatalf("Analytics() error = %v", err)
+			}
+			if len(got.Series) != 1 || !got.Series[0].BucketStart.Equal(test.wantBucket) {
+				t.Fatalf("Analytics().Series = %+v, want bucket %s", got.Series, test.wantBucket)
+			}
+		})
+	}
+}
+
+func TestAnalyticsEmptyReturnsInitializedSlices(t *testing.T) {
+	db := openTestDB(t)
+	at := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	got, err := db.Analytics(context.Background(), analytics.Filter{From: at, To: at})
+	if err != nil {
+		t.Fatalf("Analytics() error = %v", err)
+	}
+	if got.Summary != (analytics.Summary{}) {
+		t.Fatalf("Analytics().Summary = %+v, want zero", got.Summary)
+	}
+	if got.Series == nil || got.Breakdown == nil || got.Clients == nil || got.Models == nil {
+		t.Fatalf("Analytics() returned nil slices: %+v", got)
+	}
+	if len(got.Series)+len(got.Breakdown)+len(got.Clients)+len(got.Models) != 0 {
+		t.Fatalf("Analytics() returned non-empty slices: %+v", got)
+	}
+}
+
+func TestAnalyticsUsageRequestsPaginationAndDeterministicOrdering(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	input, output, cache, ttft := int64(5), int64(2), int64(3), int64(17)
+	records := []analytics.RequestRecord{
+		analyticsUsageRecord("old", from.Add(time.Minute), 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("tie-low-id", from.Add(2*time.Minute), 1, "client", 10, "model", &input, &output, &cache),
+		analyticsUsageRecord("tie-high-id", from.Add(2*time.Minute), 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("new", from.Add(3*time.Minute), 2, "other", 20, "other-model", nil, nil, nil),
+	}
+	records[1].ParentRequestID = "parent"
+	records[1].BackendName = "gpu-a"
+	records[1].TTFTMS = &ttft
+	records[1].RetryCount = 2
+	records[1].Disconnected = true
+	if err := db.InsertUsageBatch(ctx, records); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+	filter := analytics.Filter{From: from, To: from.Add(time.Hour), ClientID: int64Pointer(1)}
+
+	first, err := db.UsageRequests(ctx, filter, 2, 0)
+	if err != nil {
+		t.Fatalf("UsageRequests() first page error = %v", err)
+	}
+	if first.Total != 3 || first.Limit != 2 || first.Offset != 0 || requestIDs(first.Requests) == nil ||
+		!reflect.DeepEqual(requestIDs(first.Requests), []string{"tie-high-id", "tie-low-id"}) {
+		t.Fatalf("UsageRequests() first page = %+v", first)
+	}
+	second, err := db.UsageRequests(ctx, filter, 2, 2)
+	if err != nil {
+		t.Fatalf("UsageRequests() second page error = %v", err)
+	}
+	if second.Total != 3 || !reflect.DeepEqual(requestIDs(second.Requests), []string{"old"}) {
+		t.Fatalf("UsageRequests() second page = %+v", second)
+	}
+	detail := first.Requests[1]
+	if detail.ParentRequestID != "parent" || detail.BackendName != "gpu-a" || detail.TTFTMS == nil || *detail.TTFTMS != 17 ||
+		detail.RetryCount != 2 || !detail.Disconnected || !detail.UsageAvailable || detail.InputTokens == nil ||
+		*detail.InputTokens != 5 || detail.OutputTokens == nil || *detail.OutputTokens != 2 ||
+		detail.CacheReadTokens == nil || *detail.CacheReadTokens != 3 {
+		t.Fatalf("UsageRequests() detailed row = %+v", detail)
+	}
+}
+
+func TestAnalyticsStreamUsageRequestsChronologicalAndCancellation(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("tie-low-id", from, 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("tie-high-id", from, 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("later", from.Add(time.Millisecond), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+	filter := analytics.Filter{From: from, To: from.Add(time.Hour)}
+	var ids []string
+	if err := db.StreamUsageRequests(ctx, filter, func(record analytics.RequestRecord) error {
+		ids = append(ids, record.RequestID)
+		return nil
+	}); err != nil {
+		t.Fatalf("StreamUsageRequests() error = %v", err)
+	}
+	if !reflect.DeepEqual(ids, []string{"tie-low-id", "tie-high-id", "later"}) {
+		t.Fatalf("StreamUsageRequests() order = %v", ids)
+	}
+
+	callbackErr := errors.New("stop export")
+	err := db.StreamUsageRequests(ctx, filter, func(analytics.RequestRecord) error { return callbackErr })
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("StreamUsageRequests() callback error = %v, want %v", err, callbackErr)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	seen := 0
+	err = db.StreamUsageRequests(cancelCtx, filter, func(analytics.RequestRecord) error {
+		seen++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || seen != 1 {
+		t.Fatalf("StreamUsageRequests() cancellation error/seen = %v/%d, want context.Canceled/1", err, seen)
+	}
+}
+
+func TestAnalyticsHistoricalDimensionsUseLatestRetainedSnapshotDeterministically(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	at := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("first", at, 7, "old-client", 8, "old-model", nil, nil, nil),
+		analyticsUsageRecord("second", at, 7, "latest-client", 8, "latest-model", nil, nil, nil),
+	}); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+	got, err := db.Analytics(ctx, analytics.Filter{From: at.Add(time.Hour), To: at.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatalf("Analytics() error = %v", err)
+	}
+	if !reflect.DeepEqual(got.Clients, []analytics.Dimension{{ID: 7, Name: "latest-client"}}) ||
+		!reflect.DeepEqual(got.Models, []analytics.Dimension{{ID: 8, Name: "latest-model"}}) {
+		t.Fatalf("Analytics() historical dimensions = %+v/%+v", got.Clients, got.Models)
+	}
+}
+
+func TestAnalyticsPropagatesSQLiteAggregateOverflow(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	max, zero := int64(math.MaxInt64), int64(0)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("one", from, 1, "client", 2, "model", &max, &zero, nil),
+		analyticsUsageRecord("two", from.Add(time.Millisecond), 1, "client", 2, "model", &max, &zero, nil),
+	}); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+	_, err := db.Analytics(ctx, analytics.Filter{From: from, To: from.Add(time.Hour)})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "integer overflow") {
+		t.Fatalf("Analytics() overflow error = %v, want SQLite integer overflow", err)
+	}
+}
 
 func TestUsageBatchPreservesMetadataNullabilityAndIndexes(t *testing.T) {
 	ctx := context.Background()
@@ -225,6 +491,38 @@ func usageRecord(requestID string, occurredAt time.Time) analytics.RequestRecord
 		ClientID: 1, ClientName: "client", ModelPoolID: 2, ModelName: "model",
 		HTTPStatus: 200, DurationMS: 1,
 	}
+}
+
+func analyticsUsageRecord(
+	requestID string,
+	occurredAt time.Time,
+	clientID int64,
+	clientName string,
+	modelPoolID int64,
+	modelName string,
+	inputTokens *int64,
+	outputTokens *int64,
+	cacheReadTokens *int64,
+) analytics.RequestRecord {
+	return analytics.RequestRecord{
+		OccurredAt: occurredAt, RequestID: requestID,
+		ClientID: clientID, ClientName: clientName, ModelPoolID: modelPoolID, ModelName: modelName,
+		HTTPStatus: 200, DurationMS: 1,
+		UsageAvailable: inputTokens != nil && outputTokens != nil,
+		InputTokens:    inputTokens, OutputTokens: outputTokens, CacheReadTokens: cacheReadTokens,
+	}
+}
+
+func int64Pointer(value int64) *int64       { return &value }
+func float64Pointer(value float64) *float64 { return &value }
+func boolPointer(value bool) *bool          { return &value }
+
+func requestIDs(records []analytics.RequestRecord) []string {
+	ids := make([]string, len(records))
+	for index := range records {
+		ids[index] = records[index].RequestID
+	}
+	return ids
 }
 
 func assertUsageColumns(t *testing.T, db *sql.DB) {

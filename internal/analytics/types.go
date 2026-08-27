@@ -1,6 +1,15 @@
 package analytics
 
-import "time"
+import (
+	"context"
+	"time"
+)
+
+type QueryStore interface {
+	Analytics(context.Context, Filter) (Dataset, error)
+	UsageRequests(context.Context, Filter, int, int) (RequestPage, error)
+	StreamUsageRequests(context.Context, Filter, func(RequestRecord) error) error
+}
 
 type RequestRecord struct {
 	ID              int64     `json:"id"`
