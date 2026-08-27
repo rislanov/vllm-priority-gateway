@@ -63,7 +63,14 @@ func TestForwardInspectsUsageWithoutChangingStreamingBehavior(t *testing.T) {
 		_, _ = writer.Write([]byte(secondChunk))
 		writer.(http.Flusher).Flush()
 	}))
-	defer upstream.Close()
+	defer func() {
+		select {
+		case <-releaseFinalChunk:
+		default:
+			close(releaseFinalChunk)
+		}
+		upstream.Close()
+	}()
 
 	downstream := newObservingWriter()
 	finished := make(chan proxy.Result, 1)
@@ -106,6 +113,35 @@ func TestForwardInspectsUsageWithoutChangingStreamingBehavior(t *testing.T) {
 	if result.Usage == nil || result.Usage.InputTokens != 13 || result.Usage.OutputTokens != 5 ||
 		result.Usage.CacheReadTokens == nil || *result.Usage.CacheReadTokens != 8 || result.UsageParseFailure != "" {
 		t.Fatalf("usage=%+v parse_failure=%q", result.Usage, result.UsageParseFailure)
+	}
+}
+
+func TestForwardInspectsMalformedUsageWithoutAffectingDelivery(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":3,"completion_tokens":2},"bad":}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusAccepted)
+		_, _ = writer.Write([]byte(body))
+		writer.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	downstream := newObservingWriter()
+	result := proxy.New(upstream.Client()).Forward(context.Background(), downstream, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{Backend: backend(1, upstream.URL)},
+	})
+	if got := downstream.String(); got != body {
+		t.Fatalf("body = %q, want byte-identical %q", got, body)
+	}
+	if downstream.status != http.StatusAccepted || result.Status != http.StatusAccepted {
+		t.Fatalf("downstream status=%d result=%+v", downstream.status, result)
+	}
+	if downstream.FlushCount() != 1 || result.BytesSent != int64(len(body)) {
+		t.Fatalf("flushes=%d bytes=%d, want 1 and %d", downstream.FlushCount(), result.BytesSent, len(body))
+	}
+	if result.Err != nil || result.Usage != nil || result.UsageParseFailure != "json" {
+		t.Fatalf("result=%+v", result)
 	}
 }
 

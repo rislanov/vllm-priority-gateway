@@ -23,18 +23,18 @@ type usageInspector struct {
 	finalized bool
 	usage     *domain.TokenUsage
 
-	jsonInString       bool
-	jsonEscaped        bool
-	jsonStringMatches  bool
-	jsonStringPosition int
-	jsonUsageKey       bool
-	jsonAwaitingValue  bool
-	jsonStack          [maxJSONNestingDepth]byte
-	jsonDepth          int
-	jsonSawData        bool
-	jsonCapturing      bool
-	jsonCaptureBase    int
-	jsonCapture        []byte
+	jsonValidator         incrementalJSONValidator
+	jsonInString          bool
+	jsonEscaped           bool
+	jsonStringMatches     bool
+	jsonStringPosition    int
+	jsonStringIsTopKey    bool
+	jsonUsageKey          bool
+	jsonAwaitingValue     bool
+	jsonCapturing         bool
+	jsonCaptureBase       int
+	jsonCapture           []byte
+	invalidUsageCandidate bool
 
 	sseEvent     []byte
 	sseLineStart int
@@ -54,6 +54,7 @@ func newUsageInspector(contentType string) *usageInspector {
 	case mediaType == "application/json" || strings.HasSuffix(mediaType, "+json"):
 		inspector.format = "json"
 		inspector.jsonCapture = make([]byte, 0, 256)
+		inspector.jsonValidator.reset()
 	}
 	return inspector
 }
@@ -78,7 +79,7 @@ func (i *usageInspector) Result() (*domain.TokenUsage, string, bool) {
 		i.finalized = true
 		switch i.format {
 		case "json":
-			if i.jsonSawData && (i.jsonInString || i.jsonEscaped || i.jsonDepth != 0 || i.jsonCapturing) {
+			if !i.jsonValidator.eof() {
 				i.failed = true
 				i.usage = nil
 			}
@@ -102,10 +103,35 @@ func (i *usageInspector) writeJSON(data []byte) {
 		if i.disabled {
 			return
 		}
-		if !isJSONWhitespace(current) {
-			i.jsonSawData = true
-		}
 		if i.jsonCapturing && !i.appendJSONCapture(current) {
+			return
+		}
+		startsTopLevelKey := !i.jsonInString && current == '"' && i.jsonValidator.expectsTopLevelObjectKey()
+
+		if !i.jsonInString && !i.jsonCapturing && i.jsonUsageKey && !isJSONWhitespace(current) {
+			i.jsonUsageKey = false
+			if current == ':' {
+				i.jsonAwaitingValue = true
+			}
+		} else if !i.jsonInString && !i.jsonCapturing && i.jsonAwaitingValue && !isJSONWhitespace(current) {
+			i.jsonAwaitingValue = false
+			if current == '{' {
+				i.jsonCapturing = true
+				i.jsonCaptureBase = i.jsonValidator.depth
+				i.jsonCapture = i.jsonCapture[:0]
+				if !i.appendJSONCapture(current) {
+					return
+				}
+			} else {
+				i.failed = true
+				i.invalidUsageCandidate = true
+				i.usage = nil
+			}
+		}
+
+		op := i.jsonValidator.stepByte(current)
+		if op == jsonScanError {
+			i.disableInspection()
 			return
 		}
 		if i.jsonInString {
@@ -120,7 +146,7 @@ func (i *usageInspector) writeJSON(data []byte) {
 				i.jsonStringMatches = false
 			case '"':
 				i.jsonInString = false
-				if !i.jsonCapturing {
+				if !i.jsonCapturing && i.jsonStringIsTopKey {
 					i.jsonUsageKey = i.jsonStringMatches && i.jsonStringPosition == len(usageKey)
 				}
 			default:
@@ -133,56 +159,17 @@ func (i *usageInspector) writeJSON(data []byte) {
 			}
 			continue
 		}
-
-		if !i.jsonCapturing && i.jsonUsageKey {
-			if isJSONWhitespace(current) {
-				continue
-			}
-			i.jsonUsageKey = false
-			if current == ':' {
-				i.jsonAwaitingValue = true
-				continue
-			}
-		}
-		if !i.jsonCapturing && i.jsonAwaitingValue {
-			if isJSONWhitespace(current) {
-				continue
-			}
-			i.jsonAwaitingValue = false
-			if current == '{' {
-				i.jsonCapturing = true
-				i.jsonCaptureBase = i.jsonDepth
-				i.jsonCapture = i.jsonCapture[:0]
-				if !i.appendJSONCapture(current) {
-					return
-				}
-			}
-		}
-
-		switch current {
-		case '"':
+		if current == '"' {
 			i.jsonInString = true
 			i.jsonEscaped = false
-			i.jsonStringMatches = !i.jsonCapturing
+			i.jsonStringMatches = startsTopLevelKey
 			i.jsonStringPosition = 0
-		case '{', '[':
-			if i.jsonDepth == len(i.jsonStack) {
-				i.disableInspection()
-				return
-			}
-			i.jsonStack[i.jsonDepth] = current
-			i.jsonDepth++
-		case '}', ']':
-			if i.jsonDepth == 0 || !matchingJSONDelimiter(i.jsonStack[i.jsonDepth-1], current) {
-				i.failed = true
-				continue
-			}
-			i.jsonDepth--
-			if i.jsonCapturing && i.jsonDepth == i.jsonCaptureBase {
-				i.jsonCapturing = false
-				i.consumeUsageObject(i.jsonCapture)
-				i.jsonCapture = i.jsonCapture[:0]
-			}
+			i.jsonStringIsTopKey = startsTopLevelKey
+		}
+		if i.jsonCapturing && op == jsonScanEndObject && i.jsonValidator.depth == i.jsonCaptureBase {
+			i.jsonCapturing = false
+			i.consumeUsageObject(i.jsonCapture)
+			i.jsonCapture = i.jsonCapture[:0]
 		}
 	}
 }
@@ -250,7 +237,7 @@ func (i *usageInspector) consumeSSEEvent(event []byte) {
 		i.failed = true
 		return
 	}
-	candidate, found := findUsageCandidate(value)
+	candidate, found := findAuthoritativeSSEUsage(value)
 	if !found {
 		return
 	}
@@ -271,7 +258,10 @@ func (i *usageInspector) consumeNormalizedUsage(value any) {
 	if validationFailed {
 		i.failed = true
 	}
-	if valid {
+	if !valid {
+		i.invalidUsageCandidate = true
+		i.usage = nil
+	} else if !i.invalidUsageCandidate {
 		i.usage = usage
 	}
 }
@@ -295,22 +285,20 @@ func decodeJSONValue(data []byte) (any, bool) {
 	return value, decoder.Decode(&extra) == io.EOF
 }
 
-func findUsageCandidate(root any) (any, bool) {
-	queue := []any{root}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		switch value := current.(type) {
-		case map[string]any:
-			if usage, found := value["usage"]; found && usage != nil {
-				return usage, true
-			}
-			for _, child := range value {
-				queue = append(queue, child)
-			}
-		case []any:
-			queue = append(queue, value...)
-		}
+func findAuthoritativeSSEUsage(root any) (any, bool) {
+	object, ok := root.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if usage, found := object["usage"]; found {
+		return usage, true
+	}
+	response, ok := object["response"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if usage, found := response["usage"]; found {
+		return usage, true
 	}
 	return nil, false
 }
@@ -368,10 +356,378 @@ func parseTokenCount(value any) (int64, bool) {
 	return parsed, err == nil && parsed >= 0
 }
 
-func matchingJSONDelimiter(open, close byte) bool {
-	return open == '{' && close == '}' || open == '[' && close == ']'
-}
-
 func isJSONWhitespace(value byte) bool {
 	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
+}
+
+type jsonScanOp uint8
+
+const (
+	jsonScanContinue jsonScanOp = iota
+	jsonScanEndObject
+	jsonScanError
+)
+
+type jsonScanState uint8
+
+const (
+	jsonStateBeginValue jsonScanState = iota
+	jsonStateBeginValueOrEmpty
+	jsonStateBeginStringOrEmpty
+	jsonStateBeginString
+	jsonStateEndValue
+	jsonStateEndTop
+	jsonStateInString
+	jsonStateInStringEscape
+	jsonStateInStringUnicode1
+	jsonStateInStringUnicode2
+	jsonStateInStringUnicode3
+	jsonStateInStringUnicode4
+	jsonStateNegative
+	jsonStateZero
+	jsonStateInteger
+	jsonStateDecimalPoint
+	jsonStateDecimal
+	jsonStateExponent
+	jsonStateExponentSign
+	jsonStateExponentDigits
+	jsonStateTrueR
+	jsonStateTrueU
+	jsonStateTrueE
+	jsonStateFalseA
+	jsonStateFalseL
+	jsonStateFalseS
+	jsonStateFalseE
+	jsonStateNullU
+	jsonStateNullL1
+	jsonStateNullL2
+	jsonStateError
+)
+
+type jsonParseState uint8
+
+const (
+	jsonParseObjectKey jsonParseState = iota
+	jsonParseObjectValue
+	jsonParseArrayValue
+)
+
+type incrementalJSONValidator struct {
+	state  jsonScanState
+	stack  [maxJSONNestingDepth]jsonParseState
+	depth  int
+	endTop bool
+	failed bool
+}
+
+func (v *incrementalJSONValidator) reset() {
+	v.state = jsonStateBeginValue
+	v.depth = 0
+	v.endTop = false
+	v.failed = false
+}
+
+func (v *incrementalJSONValidator) expectsTopLevelObjectKey() bool {
+	if v.depth != 1 || v.stack[0] != jsonParseObjectKey {
+		return false
+	}
+	return v.state == jsonStateBeginStringOrEmpty || v.state == jsonStateBeginString
+}
+
+func (v *incrementalJSONValidator) eof() bool {
+	if v.failed {
+		return false
+	}
+	if v.endTop {
+		return true
+	}
+	return v.stepByte(' ') != jsonScanError && v.endTop
+}
+
+func (v *incrementalJSONValidator) stepByte(current byte) jsonScanOp {
+	if v.failed {
+		return jsonScanError
+	}
+	switch v.state {
+	case jsonStateBeginValue:
+		return v.beginValue(current)
+	case jsonStateBeginValueOrEmpty:
+		if isJSONWhitespace(current) {
+			return jsonScanContinue
+		}
+		if current == ']' {
+			return v.endValue(current)
+		}
+		return v.beginValue(current)
+	case jsonStateBeginStringOrEmpty:
+		if isJSONWhitespace(current) {
+			return jsonScanContinue
+		}
+		if current == '}' {
+			v.stack[v.depth-1] = jsonParseObjectValue
+			return v.endValue(current)
+		}
+		return v.beginString(current)
+	case jsonStateBeginString:
+		return v.beginString(current)
+	case jsonStateEndValue:
+		return v.endValue(current)
+	case jsonStateEndTop:
+		if !isJSONWhitespace(current) {
+			return v.fail()
+		}
+		return jsonScanContinue
+	case jsonStateInString:
+		if current == '"' {
+			v.state = jsonStateEndValue
+			return jsonScanContinue
+		}
+		if current == '\\' {
+			v.state = jsonStateInStringEscape
+			return jsonScanContinue
+		}
+		if current < 0x20 {
+			return v.fail()
+		}
+		return jsonScanContinue
+	case jsonStateInStringEscape:
+		switch current {
+		case 'b', 'f', 'n', 'r', 't', '\\', '/', '"':
+			v.state = jsonStateInString
+		case 'u':
+			v.state = jsonStateInStringUnicode1
+		default:
+			return v.fail()
+		}
+		return jsonScanContinue
+	case jsonStateInStringUnicode1:
+		return v.unicode(current, jsonStateInStringUnicode2)
+	case jsonStateInStringUnicode2:
+		return v.unicode(current, jsonStateInStringUnicode3)
+	case jsonStateInStringUnicode3:
+		return v.unicode(current, jsonStateInStringUnicode4)
+	case jsonStateInStringUnicode4:
+		return v.unicode(current, jsonStateInString)
+	case jsonStateNegative:
+		if current == '0' {
+			v.state = jsonStateZero
+			return jsonScanContinue
+		}
+		if current >= '1' && current <= '9' {
+			v.state = jsonStateInteger
+			return jsonScanContinue
+		}
+		return v.fail()
+	case jsonStateInteger:
+		if current >= '0' && current <= '9' {
+			return jsonScanContinue
+		}
+		return v.afterInteger(current)
+	case jsonStateZero:
+		return v.afterInteger(current)
+	case jsonStateDecimalPoint:
+		if current < '0' || current > '9' {
+			return v.fail()
+		}
+		v.state = jsonStateDecimal
+		return jsonScanContinue
+	case jsonStateDecimal:
+		if current >= '0' && current <= '9' {
+			return jsonScanContinue
+		}
+		if current == 'e' || current == 'E' {
+			v.state = jsonStateExponent
+			return jsonScanContinue
+		}
+		return v.endValue(current)
+	case jsonStateExponent:
+		if current == '+' || current == '-' {
+			v.state = jsonStateExponentSign
+			return jsonScanContinue
+		}
+		return v.exponentDigit(current)
+	case jsonStateExponentSign:
+		return v.exponentDigit(current)
+	case jsonStateExponentDigits:
+		if current >= '0' && current <= '9' {
+			return jsonScanContinue
+		}
+		return v.endValue(current)
+	case jsonStateTrueR:
+		return v.literal(current, 'r', jsonStateTrueU)
+	case jsonStateTrueU:
+		return v.literal(current, 'u', jsonStateTrueE)
+	case jsonStateTrueE:
+		return v.literal(current, 'e', jsonStateEndValue)
+	case jsonStateFalseA:
+		return v.literal(current, 'a', jsonStateFalseL)
+	case jsonStateFalseL:
+		return v.literal(current, 'l', jsonStateFalseS)
+	case jsonStateFalseS:
+		return v.literal(current, 's', jsonStateFalseE)
+	case jsonStateFalseE:
+		return v.literal(current, 'e', jsonStateEndValue)
+	case jsonStateNullU:
+		return v.literal(current, 'u', jsonStateNullL1)
+	case jsonStateNullL1:
+		return v.literal(current, 'l', jsonStateNullL2)
+	case jsonStateNullL2:
+		return v.literal(current, 'l', jsonStateEndValue)
+	default:
+		return v.fail()
+	}
+}
+
+func (v *incrementalJSONValidator) beginValue(current byte) jsonScanOp {
+	if isJSONWhitespace(current) {
+		return jsonScanContinue
+	}
+	switch current {
+	case '{':
+		if !v.push(jsonParseObjectKey) {
+			return jsonScanError
+		}
+		v.state = jsonStateBeginStringOrEmpty
+	case '[':
+		if !v.push(jsonParseArrayValue) {
+			return jsonScanError
+		}
+		v.state = jsonStateBeginValueOrEmpty
+	case '"':
+		v.state = jsonStateInString
+	case '-':
+		v.state = jsonStateNegative
+	case '0':
+		v.state = jsonStateZero
+	case 't':
+		v.state = jsonStateTrueR
+	case 'f':
+		v.state = jsonStateFalseA
+	case 'n':
+		v.state = jsonStateNullU
+	default:
+		if current >= '1' && current <= '9' {
+			v.state = jsonStateInteger
+		} else {
+			return v.fail()
+		}
+	}
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) beginString(current byte) jsonScanOp {
+	if isJSONWhitespace(current) {
+		return jsonScanContinue
+	}
+	if current != '"' {
+		return v.fail()
+	}
+	v.state = jsonStateInString
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) endValue(current byte) jsonScanOp {
+	if v.depth == 0 {
+		v.state = jsonStateEndTop
+		v.endTop = true
+		if !isJSONWhitespace(current) {
+			return v.fail()
+		}
+		return jsonScanContinue
+	}
+	if isJSONWhitespace(current) {
+		v.state = jsonStateEndValue
+		return jsonScanContinue
+	}
+	switch v.stack[v.depth-1] {
+	case jsonParseObjectKey:
+		if current != ':' {
+			return v.fail()
+		}
+		v.stack[v.depth-1] = jsonParseObjectValue
+		v.state = jsonStateBeginValue
+	case jsonParseObjectValue:
+		if current == ',' {
+			v.stack[v.depth-1] = jsonParseObjectKey
+			v.state = jsonStateBeginString
+			return jsonScanContinue
+		}
+		if current != '}' {
+			return v.fail()
+		}
+		v.pop()
+		return jsonScanEndObject
+	case jsonParseArrayValue:
+		if current == ',' {
+			v.state = jsonStateBeginValue
+			return jsonScanContinue
+		}
+		if current != ']' {
+			return v.fail()
+		}
+		v.pop()
+	}
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) afterInteger(current byte) jsonScanOp {
+	if current == '.' {
+		v.state = jsonStateDecimalPoint
+		return jsonScanContinue
+	}
+	if current == 'e' || current == 'E' {
+		v.state = jsonStateExponent
+		return jsonScanContinue
+	}
+	return v.endValue(current)
+}
+
+func (v *incrementalJSONValidator) exponentDigit(current byte) jsonScanOp {
+	if current < '0' || current > '9' {
+		return v.fail()
+	}
+	v.state = jsonStateExponentDigits
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) unicode(current byte, next jsonScanState) jsonScanOp {
+	if !(current >= '0' && current <= '9' || current >= 'a' && current <= 'f' || current >= 'A' && current <= 'F') {
+		return v.fail()
+	}
+	v.state = next
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) literal(current, expected byte, next jsonScanState) jsonScanOp {
+	if current != expected {
+		return v.fail()
+	}
+	v.state = next
+	return jsonScanContinue
+}
+
+func (v *incrementalJSONValidator) push(state jsonParseState) bool {
+	if v.depth == len(v.stack) {
+		v.fail()
+		return false
+	}
+	v.stack[v.depth] = state
+	v.depth++
+	return true
+}
+
+func (v *incrementalJSONValidator) pop() {
+	v.depth--
+	if v.depth == 0 {
+		v.state = jsonStateEndTop
+		v.endTop = true
+	} else {
+		v.state = jsonStateEndValue
+	}
+}
+
+func (v *incrementalJSONValidator) fail() jsonScanOp {
+	v.failed = true
+	v.state = jsonStateError
+	return jsonScanError
 }

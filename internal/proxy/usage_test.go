@@ -20,9 +20,9 @@ func TestUsageInspectorNormalizesOrdinaryJSONAtEverySplit(t *testing.T) {
 			want: domain.TokenUsage{InputTokens: 12, OutputTokens: 5, CacheReadTokens: int64Pointer(3)},
 		},
 		{
-			name: "responses completed event with nested usage",
-			payload: `{"type":"response.completed","response":{"output":[],"usage":` +
-				`{"output_tokens":8,"input_tokens_details":{"cached_tokens":2},"input_tokens":21}}}`,
+			name: "responses API with top-level usage",
+			payload: `{"output":[],"usage":` +
+				`{"output_tokens":8,"input_tokens_details":{"cached_tokens":2},"input_tokens":21}}`,
 			want: domain.TokenUsage{InputTokens: 21, OutputTokens: 8, CacheReadTokens: int64Pointer(2)},
 		},
 	}
@@ -37,6 +37,81 @@ func TestUsageInspectorNormalizesOrdinaryJSONAtEverySplit(t *testing.T) {
 				if failed || format != "" || got == nil || !equalTokenUsage(*got, test.want) {
 					t.Fatalf("split %d: usage=%+v format=%q failed=%v, want %+v", split, got, format, failed, test.want)
 				}
+			}
+		})
+	}
+}
+
+func TestUsageInspectorRejectsMalformedCompleteOrdinaryJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "balanced missing value", payload: `{"usage":{"prompt_tokens":1,"completion_tokens":1},"bad":}`},
+		{name: "invalid escape outside usage", payload: `{"usage":{"prompt_tokens":1,"completion_tokens":1},"bad":"\q"}`},
+		{name: "extra closing delimiter", payload: `{"usage":{"prompt_tokens":1,"completion_tokens":1}}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for split := 0; split <= len(test.payload); split++ {
+				inspector := newUsageInspector("application/json")
+				inspector.Write([]byte(test.payload[:split]))
+				inspector.Write([]byte(test.payload[split:]))
+				got, format, failed := inspector.Result()
+				if got != nil || !failed || format != "json" {
+					t.Fatalf("split %d: usage=%+v format=%q failed=%v", split, got, format, failed)
+				}
+			}
+		})
+	}
+}
+
+func TestUsageInspectorRejectsPresentNonObjectAuthoritativeUsage(t *testing.T) {
+	for _, value := range []string{"null", `[]`, `"invalid"`, "1"} {
+		t.Run(value, func(t *testing.T) {
+			inspector := newUsageInspector("application/json")
+			inspector.Write([]byte(`{"usage":` + value + `}`))
+			got, format, failed := inspector.Result()
+			if got != nil || !failed || format != "json" {
+				t.Fatalf("usage=%+v format=%q failed=%v", got, format, failed)
+			}
+		})
+	}
+}
+
+func TestUsageInspectorScopesOrdinaryJSONUsageToTopLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    *domain.TokenUsage
+	}{
+		{
+			name:    "nested usage-shaped data is ignored",
+			payload: `{"generated":{"usage":{"prompt_tokens":90,"completion_tokens":80}}}`,
+		},
+		{
+			name: "nested usage cannot overwrite top-level usage",
+			payload: `{"usage":{"prompt_tokens":9,"completion_tokens":4},` +
+				`"generated":{"usage":{"prompt_tokens":90,"completion_tokens":80}}}`,
+			want: &domain.TokenUsage{InputTokens: 9, OutputTokens: 4},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			inspector := newUsageInspector("application/json")
+			inspector.Write([]byte(test.payload))
+			got, format, failed := inspector.Result()
+			if failed || format != "" {
+				t.Fatalf("usage=%+v format=%q failed=%v", got, format, failed)
+			}
+			if test.want == nil {
+				if got != nil {
+					t.Fatalf("usage=%+v, want nil", got)
+				}
+				return
+			}
+			if got == nil || !equalTokenUsage(*got, *test.want) {
+				t.Fatalf("usage=%+v, want %+v", got, test.want)
 			}
 		})
 	}
@@ -138,11 +213,72 @@ func TestUsageInspectorParsesSSEAtEverySplit(t *testing.T) {
 	}
 }
 
+func TestUsageInspectorScopesSSEUsageToAuthoritativeFields(t *testing.T) {
+	tests := []struct {
+		name       string
+		stream     string
+		want       *domain.TokenUsage
+		wantFailed bool
+	}{
+		{
+			name:   "arbitrary nested usage-shaped data is ignored",
+			stream: "data: {\"generated\":{\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":80}}}\n\n",
+		},
+		{
+			name:   "top-level chat usage",
+			stream: "data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+			want:   &domain.TokenUsage{InputTokens: 9, OutputTokens: 4},
+		},
+		{
+			name:   "top-level responses usage",
+			stream: "data: {\"usage\":{\"input_tokens\":11,\"output_tokens\":5}}\n\n",
+			want:   &domain.TokenUsage{InputTokens: 11, OutputTokens: 5},
+		},
+		{
+			name:       "present invalid top-level usage",
+			stream:     "data: {\"usage\":null}\n\n",
+			wantFailed: true,
+		},
+		{
+			name:       "present invalid response usage",
+			stream:     "data: {\"response\":{\"usage\":[]}}\n\n",
+			wantFailed: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			inspector := newUsageInspector("text/event-stream")
+			inspector.Write([]byte(test.stream))
+			got, format, failed := inspector.Result()
+			if failed != test.wantFailed {
+				t.Fatalf("usage=%+v format=%q failed=%v, want failed=%v", got, format, failed, test.wantFailed)
+			}
+			if failed && format != "sse" {
+				t.Fatalf("format=%q, want sse", format)
+			}
+			if !failed && format != "" {
+				t.Fatalf("unexpected format=%q", format)
+			}
+			if test.want == nil {
+				if got != nil {
+					t.Fatalf("usage=%+v, want nil", got)
+				}
+				return
+			}
+			if got == nil || !equalTokenUsage(*got, *test.want) {
+				t.Fatalf("usage=%+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestUsageInspectorDisablesAfterOversizedSSEEvent(t *testing.T) {
 	stream := "data: \"" + strings.Repeat("x", maxUsageCaptureSize+1) + "\"\n\n" +
 		"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n"
 	inspector := newUsageInspector("text/event-stream")
-	inspector.Write([]byte(stream))
+	for index := range len(stream) {
+		inspector.Write([]byte(stream[index : index+1]))
+	}
 	got, format, failed := inspector.Result()
 	if got != nil || !failed || format != "sse" {
 		t.Fatalf("usage=%+v format=%q failed=%v", got, format, failed)
