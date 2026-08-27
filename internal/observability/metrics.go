@@ -3,6 +3,7 @@ package observability
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -27,6 +28,11 @@ type Metrics struct {
 	disconnects      *prometheus.CounterVec
 	backendFailures  *prometheus.CounterVec
 	retries          *prometheus.CounterVec
+	inputTokens      *prometheus.CounterVec
+	outputTokens     *prometheus.CounterVec
+	cacheReadTokens  *prometheus.CounterVec
+	usageParseFails  *prometheus.CounterVec
+	usagePersistFail prometheus.Counter
 }
 
 func NewMetrics() *Metrics {
@@ -45,10 +51,16 @@ func NewMetrics() *Metrics {
 	m.disconnects = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_stream_disconnects_total", Help: "Streaming requests cancelled by a disconnected downstream."}, []string{"model", "backend", "priority_class"})
 	m.backendFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_backend_failures_total", Help: "Requests that failed at a selected backend."}, []string{"model", "backend", "reason"})
 	m.retries = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_retries_total", Help: "Transparent pre-response retries."}, []string{"model", "backend"})
+	m.inputTokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_input_tokens_total", Help: "Input tokens reported by upstream inference responses."}, []string{"client", "model"})
+	m.outputTokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_output_tokens_total", Help: "Output tokens reported by upstream inference responses."}, []string{"client", "model"})
+	m.cacheReadTokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_cache_read_tokens_total", Help: "Cache-read tokens reported by upstream inference responses."}, []string{"client", "model"})
+	m.usageParseFails = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_usage_parse_failures_total", Help: "Upstream usage metadata parse failures."}, []string{"format"})
+	m.usagePersistFail = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_usage_persistence_failures_total", Help: "Usage records that failed to persist."})
 	m.registry.MustRegister(
 		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight,
 		m.backendPressure, m.backendRunning, m.backendWaiting, m.backendKV, m.duration,
-		m.ttft, m.disconnects, m.backendFailures, m.retries,
+		m.ttft, m.disconnects, m.backendFailures, m.retries, m.inputTokens,
+		m.outputTokens, m.cacheReadTokens, m.usageParseFails, m.usagePersistFail,
 	)
 	return m
 }
@@ -92,6 +104,22 @@ func (m *Metrics) Complete(event gateway.RequestEvent) {
 	if event.RetryCount > 0 {
 		m.retries.WithLabelValues(model, backend).Add(float64(event.RetryCount))
 	}
+	if event.Usage != nil {
+		m.inputTokens.WithLabelValues(client, model).Add(float64(event.Usage.InputTokens))
+		m.outputTokens.WithLabelValues(client, model).Add(float64(event.Usage.OutputTokens))
+		if event.Usage.CacheReadTokens != nil {
+			m.cacheReadTokens.WithLabelValues(client, model).Add(float64(*event.Usage.CacheReadTokens))
+		}
+	}
+	if format, ok := usageParseFailureFormat(event.UsageParseFailure); ok {
+		m.usageParseFails.WithLabelValues(format).Inc()
+	}
+}
+
+// UsagePersistenceFailure records a usage row that could not be persisted.
+// Prometheus counters are safe for concurrent use by recorder workers.
+func (m *Metrics) UsagePersistenceFailure() {
+	m.usagePersistFail.Inc()
 }
 
 func (m *Metrics) SetBackend(model, backend string, runtime domain.BackendRuntime) {
@@ -114,4 +142,15 @@ func statusClass(status int) string {
 		return "unknown"
 	}
 	return strconv.Itoa(status/100) + "xx"
+}
+
+func usageParseFailureFormat(input string) (string, bool) {
+	format := strings.ToLower(strings.TrimSpace(input))
+	if format == "" {
+		return "", false
+	}
+	if format == "json" || format == "sse" {
+		return format, true
+	}
+	return "unknown", true
 }
