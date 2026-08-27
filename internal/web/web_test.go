@@ -45,7 +45,7 @@ func TestAnalyticsPageRendersCanonicalFiltersSummaryAndPagination(t *testing.T) 
 	}
 	for _, expected := range []string{
 		`href="/admin/analytics" aria-current="page"`,
-		`value="2026-08-26T09:00"`, `value="2026-08-26T12:00"`,
+		`value="2026-08-26T09:00:00.000"`, `value="2026-08-26T12:00:00.000"`,
 		`value="1" selected`, `value="true" selected`,
 		"Requests", "2", "Usage coverage", "100%", "Input tokens", "150",
 		"Output tokens", "30", "Cache-read tokens", "40", "Cache-hit ratio", "40%",
@@ -121,13 +121,110 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 
 	script := httptest.NewRecorder()
 	handler.ServeHTTP(script, httptest.NewRequest(http.MethodGet, "/admin/static/app.js", nil))
-	for _, required := range []string{"fetch(", "createElementNS", "textContent", "/admin/api/analytics"} {
+	for _, required := range []string{"[data-analytics-point]", "dataset.bucketStart", "createElementNS", "textContent"} {
 		if !strings.Contains(script.Body.String(), required) {
 			t.Fatalf("self-hosted chart script missing %q: %s", required, script.Body.String())
 		}
 	}
-	if strings.Contains(script.Body.String(), "innerHTML") {
-		t.Fatalf("chart script must not construct markup with innerHTML: %s", script.Body.String())
+	for _, forbidden := range []string{"fetch(", "/admin/api/analytics", "innerHTML"} {
+		if strings.Contains(script.Body.String(), forbidden) {
+			t.Fatalf("chart script must use only server-rendered series, found %q: %s", forbidden, script.Body.String())
+		}
+	}
+	scriptBody := script.Body.String()
+	if namespace, render := strings.Index(scriptBody, "const svgNamespace"), strings.Index(scriptBody, "chartContainers.forEach"); namespace < 0 || render < 0 || namespace > render {
+		t.Fatal("chart script must initialize the SVG namespace before synchronously rendering SSR series")
+	}
+}
+
+func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	values := url.Values{
+		"from":            {"2026-08-26T09:59:59.123Z"},
+		"to":              {"2026-08-26T11:00:00.456Z"},
+		"client_id":       {"1"},
+		"model_pool_id":   {"1"},
+		"usage_available": {"true"},
+		"limit":           {"1"},
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?"+values.Encode(), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, expected := range []string{
+		`step="0.001"`, `value="2026-08-26T09:59:59.123"`, `value="2026-08-26T11:00:00.456"`,
+		`data-range-from="2026-08-26T09:59:59.123Z"`, `data-range-to="2026-08-26T11:00:00.456Z"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("fractional analytics page missing %q: %s", expected, body)
+		}
+	}
+	document, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAnalyticsLink(t, attrForElementWithText(document, "a", "Download CSV", "href"), "/admin/api/analytics/export.csv", values, false)
+	assertAnalyticsLink(t, attrForElementWithText(document, "a", "Next", "href"), "/admin/analytics", values, true)
+	assertAnalyticsSeriesSource(t, document)
+
+	form := url.Values{
+		"from_local":      {"2026-08-26T09:59:59.123"},
+		"to_local":        {"2026-08-26T11:00:00.456"},
+		"client_id":       {"1"},
+		"model_pool_id":   {"1"},
+		"usage_available": {"true"},
+		"limit":           {"1"},
+	}
+	redirect := httptest.NewRecorder()
+	handler.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "/admin/analytics?"+form.Encode(), nil))
+	if redirect.Code != http.StatusSeeOther {
+		t.Fatalf("form status = %d body=%s", redirect.Code, redirect.Body.String())
+	}
+	location := redirect.Header().Get("Location")
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"from", "to", "client_id", "model_pool_id", "usage_available", "limit"} {
+		if got := parsed.Query().Get(name); got != values.Get(name) {
+			t.Fatalf("unchanged Apply altered %s = %q, want %q (%s)", name, got, values.Get(name), location)
+		}
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("canonical target status = %d body=%s", response.Code, response.Body.String())
+	}
+	canonicalDocument, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAnalyticsSeriesSource(t, canonicalDocument)
+}
+
+func TestAnalyticsChartStatusIsHonestWithoutJavaScript(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-26T09%3A00%3A00Z&to=2026-08-26T12%3A00%3A00Z", nil))
+	body := response.Body.String()
+	if response.Code != http.StatusOK || strings.Contains(body, "Loading interactive") || strings.Count(body, "Exact chart data is available in the table below. JavaScript enhances it as an SVG.") != 3 {
+		t.Fatalf("non-empty chart status = %d body=%s", response.Code, body)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-20T09%3A00%3A00Z&to=2026-08-20T12%3A00%3A00Z", nil))
+	body = response.Body.String()
+	if response.Code != http.StatusOK || strings.Contains(body, "Exact chart data") || strings.Count(body, "No series data is available for this range.") < 3 {
+		t.Fatalf("empty chart status = %d body=%s", response.Code, body)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-26T09%3A00%3A00Z&to=2026-08-26T12%3A00%3A00Z&usage_available=false", nil))
+	body = response.Body.String()
+	if response.Code != http.StatusOK || !strings.Contains(body, "Cache usage is unavailable for every bucket in this range.") {
+		t.Fatalf("cache-unknown chart status = %d body=%s", response.Code, body)
 	}
 }
 
@@ -530,4 +627,59 @@ func assertAnalyticsLink(t *testing.T, raw, wantPath string, want url.Values, pa
 	} else if parsed.Query().Has("limit") || parsed.Query().Has("offset") {
 		t.Fatalf("export link unexpectedly contains pagination: %s", raw)
 	}
+}
+
+func assertAnalyticsSeriesSource(t *testing.T, document *html.Node) {
+	t.Helper()
+	type point struct {
+		bucket, requests, input, output, cache, ratio string
+	}
+	want := []point{
+		{bucket: "2026-08-26T10:00:00Z", requests: "1", input: "100", output: "20", cache: "40", ratio: "0.4"},
+		{bucket: "2026-08-26T11:00:00Z", requests: "1", input: "50", output: "10"},
+	}
+	var got []point
+	var visit func(*html.Node)
+	visit = func(node *html.Node) {
+		if node.Type == html.ElementNode && nodeHasAttr(node, "data-analytics-point") {
+			got = append(got, point{
+				bucket:   nodeAttr(node, "data-bucket-start"),
+				requests: nodeAttr(node, "data-request-count"),
+				input:    nodeAttr(node, "data-input-tokens"),
+				output:   nodeAttr(node, "data-output-tokens"),
+				cache:    nodeAttr(node, "data-cache-read-tokens"),
+				ratio:    nodeAttr(node, "data-cache-hit-ratio"),
+			})
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(document)
+	if len(got) != len(want) {
+		t.Fatalf("chart source points = %+v, want %+v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("chart source point %d = %+v, want %+v", index, got[index], want[index])
+		}
+	}
+}
+
+func nodeHasAttr(node *html.Node, name string) bool {
+	for _, attribute := range node.Attr {
+		if attribute.Key == name {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeAttr(node *html.Node, name string) string {
+	for _, attribute := range node.Attr {
+		if attribute.Key == name {
+			return attribute.Val
+		}
+	}
+	return ""
 }

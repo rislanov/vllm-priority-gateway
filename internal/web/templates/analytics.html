@@ -17,11 +17,11 @@
   <form method="get" action="/admin/analytics" class="analytics-filter-grid">
     <div>
       <label for="analytics-from">From (UTC)</label>
-      <input id="analytics-from" name="from_local" type="datetime-local" value="{{.Analytics.FromValue}}" required>
+      <input id="analytics-from" name="from_local" type="datetime-local" step="0.001" value="{{.Analytics.FromValue}}" required>
     </div>
     <div>
       <label for="analytics-to">To (UTC)</label>
-      <input id="analytics-to" name="to_local" type="datetime-local" value="{{.Analytics.ToValue}}" required>
+      <input id="analytics-to" name="to_local" type="datetime-local" step="0.001" value="{{.Analytics.ToValue}}" required>
     </div>
     <div>
       <label for="analytics-client">Client</label>
@@ -74,21 +74,21 @@
     <article class="chart-panel" aria-labelledby="request-volume-title">
       <h3 id="request-volume-title">Request volume</h3>
       <p class="chart-note">Requests per UTC bucket, shown from a zero baseline.</p>
-      <div class="chart-stage" data-analytics-chart="requests" data-analytics-url="{{.Analytics.APIURL}}">
-        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive request chart…{{else}}No series data is available for this range.{{end}}</p>
+      <div class="chart-stage" data-analytics-chart="requests">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
       </div>
       <details class="chart-fallback">
         <summary>View request volume data</summary>
-        <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (UTC)</th><th>Requests</th></tr></thead><tbody>
-          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+        <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (UTC)</th><th>Requests</th></tr></thead><tbody data-analytics-series data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
+          {{range .Analytics.Dataset.Series}}<tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}"{{with .CacheReadTokens}} data-cache-read-tokens="{{.}}"{{end}}{{with .CacheHitRatio}} data-cache-hit-ratio="{{.}}"{{end}}><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
     <article class="chart-panel" aria-labelledby="token-volume-title">
       <h3 id="token-volume-title">Input and output tokens</h3>
       <p class="chart-note">Two independent, non-stacked series from a zero baseline.</p>
-      <div class="chart-stage" data-analytics-chart="tokens" data-analytics-url="{{.Analytics.APIURL}}">
-        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive token chart…{{else}}No series data is available for this range.{{end}}</p>
+      <div class="chart-stage" data-analytics-chart="tokens">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
       </div>
       <details class="chart-fallback">
         <summary>View input and output token data</summary>
@@ -100,8 +100,8 @@
     <article class="chart-panel chart-panel-wide" aria-labelledby="cache-usage-title">
       <h3 id="cache-usage-title">Cache usage</h3>
       <p class="chart-note">Aligned token and ratio plots for cache-known buckets only. Gaps mean unavailable data.</p>
-      <div class="chart-stage chart-stage-tall" data-analytics-chart="cache" data-analytics-url="{{.Analytics.APIURL}}">
-        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive cache charts…{{else}}No series data is available for this range.{{end}}</p>
+      <div class="chart-stage chart-stage-tall" data-analytics-chart="cache">
+        <p data-chart-status>{{if not .Analytics.Dataset.Series}}No series data is available for this range.{{else if .Analytics.HasCacheSeries}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}Cache usage is unavailable for every bucket in this range.{{end}}</p>
       </div>
       <details class="chart-fallback">
         <summary>View cache-known usage data</summary>

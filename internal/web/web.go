@@ -54,11 +54,13 @@ type analyticsPage struct {
 	Requests       analytics.RequestPage
 	FromValue      string
 	ToValue        string
+	FromCanonical  string
+	ToCanonical    string
 	ClientID       string
 	ModelPoolID    string
 	UsageAvailable string
+	HasCacheSeries bool
 	Limit          int
-	APIURL         string
 	CSVURL         string
 	Presets        []analyticsPreset
 	HasPrevious    bool
@@ -98,7 +100,8 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 			}
 			return fmt.Sprintf("%.0f%%", *value*100)
 		},
-		"utcTimestamp": func(value time.Time) string { return value.UTC().Format("2006-01-02 15:04:05.000 UTC") },
+		"utcTimestamp":  func(value time.Time) string { return value.UTC().Format("2006-01-02 15:04:05.000 UTC") },
+		"canonicalTime": func(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) },
 		"totalRunning": func(backends []httpapi.AdminBackend) string {
 			var total float64
 			for _, backend := range backends {
@@ -200,12 +203,11 @@ func normalizeAnalyticsWebValues(input url.Values) (url.Values, bool, error) {
 	if !hasFrom || !hasTo || len(fromLocal) != 1 || len(toLocal) != 1 {
 		return nil, false, fmt.Errorf("custom UTC from and to must be supplied together")
 	}
-	const localLayout = "2006-01-02T15:04"
-	from, err := time.ParseInLocation(localLayout, fromLocal[0], time.UTC)
+	from, err := parseAnalyticsLocalTime(fromLocal[0])
 	if err != nil {
 		return nil, false, fmt.Errorf("from must be a valid UTC date and time")
 	}
-	to, err := time.ParseInLocation(localLayout, toLocal[0], time.UTC)
+	to, err := parseAnalyticsLocalTime(toLocal[0])
 	if err != nil {
 		return nil, false, fmt.Errorf("to must be a valid UTC date and time")
 	}
@@ -216,9 +218,19 @@ func normalizeAnalyticsWebValues(input url.Values) (url.Values, bool, error) {
 			values.Del(name)
 		}
 	}
-	values.Set("from", from.Format(time.RFC3339))
-	values.Set("to", to.Format(time.RFC3339))
+	values.Set("from", from.Format(time.RFC3339Nano))
+	values.Set("to", to.Format(time.RFC3339Nano))
 	return values, true, nil
+}
+
+func parseAnalyticsLocalTime(value string) (time.Time, error) {
+	for _, layout := range []string{"2006-01-02T15:04:05.999999999", "2006-01-02T15:04"} {
+		parsed, err := time.ParseInLocation(layout, value, time.UTC)
+		if err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid local time")
 }
 
 func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset, requests analytics.RequestPage) *analyticsPage {
@@ -230,11 +242,12 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 	}
 	page := &analyticsPage{
 		Dataset: dataset, Requests: requests,
-		FromValue: query.Filter.From.UTC().Format("2006-01-02T15:04"),
-		ToValue:   query.Filter.To.UTC().Format("2006-01-02T15:04"),
-		Limit:     query.Limit,
-		APIURL:    analyticsURL("/admin/api/analytics", filterValues),
-		CSVURL:    analyticsURL("/admin/api/analytics/export.csv", filterValues),
+		FromValue:     query.Filter.From.UTC().Format("2006-01-02T15:04:05.000"),
+		ToValue:       query.Filter.To.UTC().Format("2006-01-02T15:04:05.000"),
+		FromCanonical: query.Filter.From.UTC().Format(time.RFC3339Nano),
+		ToCanonical:   query.Filter.To.UTC().Format(time.RFC3339Nano),
+		Limit:         query.Limit,
+		CSVURL:        analyticsURL("/admin/api/analytics/export.csv", filterValues),
 	}
 	if query.Filter.ClientID != nil {
 		page.ClientID = strconv.FormatInt(*query.Filter.ClientID, 10)
@@ -245,12 +258,18 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 	if query.Filter.UsageAvailable != nil {
 		page.UsageAvailable = strconv.FormatBool(*query.Filter.UsageAvailable)
 	}
+	for _, point := range dataset.Series {
+		if point.CacheReadTokens != nil || point.CacheHitRatio != nil {
+			page.HasCacheSeries = true
+			break
+		}
+	}
 	for _, preset := range []struct {
 		label string
 		width time.Duration
 	}{{"1h", time.Hour}, {"24h", 24 * time.Hour}, {"7d", 7 * 24 * time.Hour}, {"30d", 30 * 24 * time.Hour}, {"90d", 90 * 24 * time.Hour}} {
 		presetValues := filterValues.Clone()
-		presetValues.Set("from", query.Filter.To.Add(-preset.width).Format(time.RFC3339))
+		presetValues.Set("from", query.Filter.To.Add(-preset.width).Format(time.RFC3339Nano))
 		page.Presets = append(page.Presets, analyticsPreset{
 			Label: preset.label, URL: analyticsURL("/admin/analytics", presetValues),
 			Active: query.Filter.To.Sub(query.Filter.From) == preset.width,
@@ -285,8 +304,8 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 
 func analyticsFilterValues(filter analytics.Filter) url.Values {
 	values := url.Values{
-		"from": {filter.From.UTC().Format(time.RFC3339)},
-		"to":   {filter.To.UTC().Format(time.RFC3339)},
+		"from": {filter.From.UTC().Format(time.RFC3339Nano)},
+		"to":   {filter.To.UTC().Format(time.RFC3339Nano)},
 	}
 	if filter.ClientID != nil {
 		values.Set("client_id", strconv.FormatInt(*filter.ClientID, 10))

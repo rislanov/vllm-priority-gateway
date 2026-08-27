@@ -25,26 +25,19 @@
     window.setTimeout(autoRefresh, 15000);
   }
 
-  const chartContainers = [...document.querySelectorAll('[data-analytics-chart]')];
-  if (chartContainers.length === 0) return;
-  const analyticsURL = chartContainers[0].dataset.analyticsUrl;
-  if (!analyticsURL || !analyticsURL.startsWith('/admin/api/analytics')) return;
-
-  fetch(analyticsURL, {headers: {Accept: 'application/json'}, credentials: 'same-origin'})
-    .then((response) => {
-      if (!response.ok) throw new Error(`analytics request failed: ${response.status}`);
-      return response.json();
-    })
-    .then((dataset) => {
-      const series = Array.isArray(dataset.series) ? dataset.series : [];
-      chartContainers.forEach((container) => renderChart(container, series));
-    })
-    .catch(() => {
-      chartContainers.forEach((container) => setChartMessage(container, 'Interactive chart unavailable. The data table below remains available.'));
-    });
-
   const svgNamespace = 'http://www.w3.org/2000/svg';
   const palette = {grid: '#34475a', text: '#9aa8ba', request: '#ffb32c', input: '#38d6a2', output: '#b883f4', cache: '#78b8ff', ratio: '#ffb32c'};
+  const chartContainers = [...document.querySelectorAll('[data-analytics-chart]')];
+  if (chartContainers.length === 0) return;
+  const series = [...document.querySelectorAll('[data-analytics-point]')].map((point) => ({
+    bucketStart: point.dataset.bucketStart,
+    requestCount: numeric(point.dataset.requestCount),
+    inputTokens: numeric(point.dataset.inputTokens),
+    outputTokens: numeric(point.dataset.outputTokens),
+    cacheReadTokens: nullableDatasetNumber(point.dataset, 'cacheReadTokens'),
+    cacheHitRatio: nullableDatasetNumber(point.dataset, 'cacheHitRatio'),
+  }));
+  chartContainers.forEach((container) => renderChart(container, series));
 
   function renderChart(container, series) {
     if (series.length === 0) {
@@ -206,6 +199,11 @@
   function nullableNumber(value) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
     return Number(value);
+  }
+
+  function nullableDatasetNumber(dataset, name) {
+    if (!Object.prototype.hasOwnProperty.call(dataset, name)) return null;
+    return nullableNumber(dataset[name]);
   }
 
   function compactNumber(value) {
