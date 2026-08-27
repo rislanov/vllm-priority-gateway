@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,8 +73,9 @@ func TestOrdinaryCompletionRecordsObservableRequest(t *testing.T) {
 	}
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || !json.Valid(body) {
-		t.Fatalf("response = %d %s", response.StatusCode, body)
+	wantBody := `{"id":"fake-response","model":"upstream","object":"fake.completion"}`
+	if response.StatusCode != http.StatusOK || string(body) != wantBody {
+		t.Fatalf("legacy nil-usage response = %d %s, want %s", response.StatusCode, body, wantBody)
 	}
 	snapshot := fake.Snapshot()
 	if len(snapshot.Requests) != 1 {

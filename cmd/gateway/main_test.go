@@ -6,9 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/html"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
@@ -278,6 +280,56 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 		dataset.Summary.CacheHitRatio == nil || *dataset.Summary.CacheHitRatio != 7.0/11.0 {
 		t.Fatalf("filtered analytics summary = %+v", dataset.Summary)
 	}
+	negativeArtifacts := make(map[string][]byte)
+	for _, test := range []struct {
+		name string
+		edit func(url.Values)
+	}{
+		{name: "wrong client", edit: func(values url.Values) { values.Set("client_id", strconv.FormatInt(seed.clientID+1000, 10)) }},
+		{name: "wrong model", edit: func(values url.Values) { values.Set("model_pool_id", strconv.FormatInt(seed.modelPoolID+1000, 10)) }},
+		{name: "usage unavailable", edit: func(values url.Values) { values.Set("usage_available", "false") }},
+	} {
+		values := filter.Clone()
+		test.edit(values)
+		body, negativeStatus, requestErr := gatewayGET(baseURL+"/admin/api/analytics?"+values.Encode(), "operator", "correct horse battery staple")
+		if requestErr != nil || negativeStatus != http.StatusOK {
+			t.Fatalf("%s analytics = %d err=%v body=%s", test.name, negativeStatus, requestErr, body)
+		}
+		var emptyDataset analytics.Dataset
+		if err := json.Unmarshal(body, &emptyDataset); err != nil {
+			t.Fatal(err)
+		}
+		if emptyDataset.Summary != (analytics.Summary{}) || len(emptyDataset.Series) != 0 || len(emptyDataset.Breakdown) != 0 {
+			t.Fatalf("%s analytics was not empty: %+v", test.name, emptyDataset)
+		}
+		negativeArtifacts[test.name+" analytics JSON"] = body
+	}
+	usageUnavailable := filter.Clone()
+	usageUnavailable.Set("usage_available", "false")
+	emptyRequestsBody, status, err := gatewayGET(baseURL+"/admin/api/analytics/requests?"+usageUnavailable.Encode(), "operator", "correct horse battery staple")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("usage-unavailable requests = %d err=%v body=%s", status, err, emptyRequestsBody)
+	}
+	var emptyPage analytics.RequestPage
+	if err := json.Unmarshal(emptyRequestsBody, &emptyPage); err != nil {
+		t.Fatal(err)
+	}
+	if emptyPage.Total != 0 || len(emptyPage.Requests) != 0 {
+		t.Fatalf("usage-unavailable request page = %+v", emptyPage)
+	}
+	negativeArtifacts["usage-unavailable request JSON"] = emptyRequestsBody
+	emptyCSVBody, status, err := gatewayGET(baseURL+"/admin/api/analytics/export.csv?"+usageUnavailable.Encode(), "operator", "correct horse battery staple")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("usage-unavailable CSV = %d err=%v body=%s", status, err, emptyCSVBody)
+	}
+	emptyCSVRows, err := csv.NewReader(bytes.NewReader(emptyCSVBody)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyCSVRows) != 1 || len(emptyCSVRows[0]) != 18 {
+		t.Fatalf("usage-unavailable CSV rows = %#v", emptyCSVRows)
+	}
+	negativeArtifacts["usage-unavailable CSV"] = emptyCSVBody
 
 	var requestPage analytics.RequestPage
 	if err := json.Unmarshal(pageBody, &requestPage); err != nil {
@@ -297,10 +349,22 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 		t.Fatalf("analytics HTML = %d err=%v body=%s", status, err, htmlBody)
 	}
 	htmlText := string(htmlBody)
-	if !strings.Contains(htmlText, "Usage analytics") || !strings.Contains(htmlText, ordinaryRequestID) || !strings.Contains(htmlText, streamRequestID) ||
-		strings.Index(htmlText, streamRequestID) > strings.Index(htmlText, ordinaryRequestID) ||
+	if !strings.Contains(htmlText, "Usage analytics") ||
 		!strings.Contains(htmlText, ">24</strong>") || !strings.Contains(htmlText, ">9</strong>") || !strings.Contains(htmlText, ">7</strong>") {
 		t.Fatalf("analytics HTML does not agree with filtered data: %s", htmlText)
+	}
+	htmlRows, htmlOrder, err := analyticsHTMLRequestRows(htmlBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(htmlOrder, []string{streamRequestID, ordinaryRequestID}) {
+		t.Fatalf("analytics HTML request order = %v", htmlOrder)
+	}
+	if got := htmlRows[ordinaryRequestID]; !reflect.DeepEqual(got, []string{"11", "4", "7"}) {
+		t.Fatalf("ordinary analytics HTML token cells = %v, want [11 4 7]", got)
+	}
+	if got := htmlRows[streamRequestID]; !reflect.DeepEqual(got, []string{"13", "5", "—"}) {
+		t.Fatalf("stream analytics HTML token cells = %v, want [13 5 —]", got)
 	}
 
 	csvBody, status, err := gatewayGET(baseURL+"/admin/api/analytics/export.csv?"+filter.Encode(), "operator", "correct horse battery staple")
@@ -326,6 +390,15 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("gateway did not shut down")
 	}
+	artifacts := map[string][]byte{
+		"stderr logs": stderr.Bytes(), "metrics": metricsBody, "analytics JSON": summaryBody,
+		"request JSON": pageBody, "analytics HTML": htmlBody, "analytics CSV": csvBody,
+	}
+	for name, contents := range negativeArtifacts {
+		artifacts[name] = contents
+	}
+	assertSensitiveArtifactsAbsent(t, artifacts, sensitive)
+	assertSensitiveSQLiteFilesAbsent(t, "before raw database open/checkpoint", databasePath, sensitive)
 
 	raw, err := sql.Open("sqlite", databasePath)
 	if err != nil {
@@ -353,6 +426,9 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	if err := rows.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if len(databaseRows) != 2 || databaseRows[0].requestID != ordinaryRequestID || databaseRows[0].status != http.StatusOK ||
 		databaseRows[0].input.Int64 != 11 || !databaseRows[0].input.Valid || databaseRows[0].output.Int64 != 4 || !databaseRows[0].output.Valid ||
 		databaseRows[0].cacheRead.Int64 != 7 || !databaseRows[0].cacheRead.Valid ||
@@ -366,26 +442,20 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
+	assertSensitiveSQLiteFilesAbsent(t, "after checkpoint and close", databasePath, sensitive)
+}
 
-	artifacts := map[string][]byte{
-		"stderr logs": stderr.Bytes(), "metrics": metricsBody, "analytics JSON": summaryBody,
-		"request JSON": pageBody, "analytics HTML": htmlBody, "analytics CSV": csvBody,
+func TestGatewayRequestIDValidationRequiresLowercaseHex(t *testing.T) {
+	if !validGatewayRequestID("0123456789abcdef0123456789abcdef") {
+		t.Fatal("valid lowercase request ID was rejected")
 	}
-	for _, suffix := range []string{"", "-wal"} {
-		contents, readErr := os.ReadFile(databasePath + suffix)
-		if readErr != nil {
-			if suffix == "-wal" && os.IsNotExist(readErr) {
-				continue
-			}
-			t.Fatal(readErr)
-		}
-		artifacts["SQLite"+suffix] = contents
-	}
-	for name, contents := range artifacts {
-		for _, sentinel := range sensitive {
-			if bytes.Contains(contents, []byte(sentinel)) {
-				t.Fatalf("%s contains sensitive body sentinel %q", name, sentinel)
-			}
+	for _, invalid := range []string{
+		"0123456789ABCDEF0123456789ABCDEF",
+		"0123456789abcdef0123456789abcdeg",
+		"0123456789abcdef",
+	} {
+		if validGatewayRequestID(invalid) {
+			t.Fatalf("invalid request ID %q was accepted", invalid)
 		}
 	}
 }
@@ -660,9 +730,140 @@ func waitForGateway(t *testing.T, timeout time.Duration, condition func() bool) 
 
 func assertGatewayRequestID(t *testing.T, requestID string) {
 	t.Helper()
-	decoded, err := hex.DecodeString(requestID)
-	if err != nil || len(requestID) != 32 || len(decoded) != 16 {
+	if !validGatewayRequestID(requestID) {
 		t.Fatalf("gateway request ID %q is not 16-byte lowercase hex", requestID)
+	}
+}
+
+func validGatewayRequestID(requestID string) bool {
+	if len(requestID) != 32 {
+		return false
+	}
+	for index := 0; index < len(requestID); index++ {
+		character := requestID[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func analyticsHTMLRequestRows(body []byte) (map[string][]string, []string, error) {
+	document, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	table := findHTMLElement(document, "table", "request-table")
+	if table == nil {
+		return nil, nil, errors.New("analytics request table is missing")
+	}
+	rows := make(map[string][]string)
+	order := make([]string, 0)
+	var visit func(*html.Node) error
+	visit = func(node *html.Node) error {
+		if node.Type == html.ElementNode && node.Data == "tr" {
+			requestIDNode := findHTMLElement(node, "strong", "request-id")
+			if requestIDNode != nil {
+				requestID := normalizedHTMLText(requestIDNode)
+				cells := directHTMLChildren(node, "td")
+				if len(cells) != 12 {
+					return fmt.Errorf("analytics request %q has %d cells, want 12", requestID, len(cells))
+				}
+				rows[requestID] = []string{
+					normalizedHTMLText(cells[9]), normalizedHTMLText(cells[10]), normalizedHTMLText(cells[11]),
+				}
+				order = append(order, requestID)
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(table); err != nil {
+		return nil, nil, err
+	}
+	return rows, order, nil
+}
+
+func findHTMLElement(node *html.Node, tag, class string) *html.Node {
+	if node.Type == html.ElementNode && node.Data == tag && htmlHasClass(node, class) {
+		return node
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if found := findHTMLElement(child, tag, class); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func htmlHasClass(node *html.Node, class string) bool {
+	for _, attribute := range node.Attr {
+		if attribute.Key == "class" {
+			for _, candidate := range strings.Fields(attribute.Val) {
+				if candidate == class {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func directHTMLChildren(node *html.Node, tag string) []*html.Node {
+	children := make([]*html.Node, 0)
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type == html.ElementNode && child.Data == tag {
+			children = append(children, child)
+		}
+	}
+	return children
+}
+
+func normalizedHTMLText(node *html.Node) string {
+	var text strings.Builder
+	var visit func(*html.Node)
+	visit = func(current *html.Node) {
+		if current.Type == html.TextNode {
+			text.WriteString(current.Data)
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(node)
+	return strings.Join(strings.Fields(text.String()), " ")
+}
+
+func assertSensitiveArtifactsAbsent(t *testing.T, artifacts map[string][]byte, sentinels []string) {
+	t.Helper()
+	for name, contents := range artifacts {
+		for _, sentinel := range sentinels {
+			if bytes.Contains(contents, []byte(sentinel)) {
+				t.Fatalf("%s contains sensitive body sentinel %q", name, sentinel)
+			}
+		}
+	}
+}
+
+func assertSensitiveSQLiteFilesAbsent(t *testing.T, phase, databasePath string, sentinels []string) {
+	t.Helper()
+	for _, suffix := range []string{"", "-wal"} {
+		contents, err := os.ReadFile(databasePath + suffix)
+		if err != nil {
+			if suffix == "-wal" && os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("%s: read SQLite%s: %v", phase, suffix, err)
+		}
+		for _, sentinel := range sentinels {
+			if bytes.Contains(contents, []byte(sentinel)) {
+				t.Fatalf("%s: SQLite%s contains sensitive body sentinel %q", phase, suffix, sentinel)
+			}
+		}
 	}
 }
 
