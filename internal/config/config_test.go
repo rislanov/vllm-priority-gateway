@@ -50,6 +50,42 @@ func TestLoadUsesMVPDefaults(t *testing.T) {
 	if cfg.SessionAffinityMaxPressure != 1 {
 		t.Fatalf("SessionAffinityMaxPressure = %v, want 1", cfg.SessionAffinityMaxPressure)
 	}
+	if cfg.AnalyticsRetention != 2160*time.Hour {
+		t.Fatalf("AnalyticsRetention = %s, want 2160h", cfg.AnalyticsRetention)
+	}
+}
+
+func TestLoadAnalyticsRetention(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "positive custom duration", value: "720h", want: 720 * time.Hour},
+		{name: "disabled at zero", value: "0", want: 0},
+		{name: "malformed", value: "ninety days", wantErr: true},
+		{name: "negative", value: "-1h", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := validEnvironment()
+			env["LLMGW_ANALYTICS_RETENTION"] = tt.value
+			cfg, err := config.Load(lookup(env))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Load() accepted analytics retention %q", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.AnalyticsRetention != tt.want {
+				t.Fatalf("AnalyticsRetention = %s, want %s", cfg.AnalyticsRetention, tt.want)
+			}
+		})
+	}
 }
 
 func TestLoadRejectsMissingOrWeakSecrets(t *testing.T) {

@@ -44,6 +44,7 @@ type Config struct {
 	TLSHandshakeTimeout        time.Duration
 	ResponseHeaderTimeout      time.Duration
 	ShutdownGracePeriod        time.Duration
+	AnalyticsRetention         time.Duration
 }
 
 func Load(lookup LookupFunc) (Config, error) {
@@ -77,6 +78,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		TLSHandshakeTimeout:        3 * time.Second,
 		ResponseHeaderTimeout:      30 * time.Second,
 		ShutdownGracePeriod:        30 * time.Second,
+		AnalyticsRetention:         2160 * time.Hour,
 	}
 
 	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
@@ -167,6 +169,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	if cfg.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", cfg.ShutdownGracePeriod); err != nil {
 		return Config{}, err
 	}
+	if cfg.AnalyticsRetention, err = durationValue(lookup, "LLMGW_ANALYTICS_RETENTION", cfg.AnalyticsRetention); err != nil {
+		return Config{}, err
+	}
 
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
@@ -202,6 +207,9 @@ func (c Config) validate() error {
 	}
 	if c.UnhealthyAfter <= 0 || c.RecoveryAfter <= 0 {
 		return errors.New("health transition counts must be positive")
+	}
+	if c.AnalyticsRetention < 0 {
+		return errors.New("analytics retention must be non-negative")
 	}
 	if !finitePositive(c.QueueSoftLimit) {
 		return errors.New("queue soft limit must be positive")

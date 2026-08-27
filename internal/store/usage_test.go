@@ -172,6 +172,61 @@ func TestUsageBatchRollsBackOnConstraintFailure(t *testing.T) {
 	}
 }
 
+func TestDeleteUsageBeforeUsesExclusiveUTCMillisecondCutoff(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	cutoff := time.Date(2026, time.August, 27, 18, 0, 0, 123_000_000, time.FixedZone("test", 2*60*60))
+	records := []analytics.RequestRecord{
+		usageRecord("old", cutoff.UTC().Add(-time.Millisecond)),
+		usageRecord("equal", cutoff.UTC()),
+		usageRecord("new", cutoff.UTC().Add(time.Millisecond)),
+	}
+	if err := db.InsertUsageBatch(ctx, records); err != nil {
+		t.Fatalf("InsertUsageBatch() error = %v", err)
+	}
+
+	deleted, err := db.DeleteUsageBefore(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("DeleteUsageBefore() error = %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("DeleteUsageBefore() deleted = %d, want 1", deleted)
+	}
+
+	raw, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	defer raw.Close()
+	rows, err := raw.QueryContext(ctx, `SELECT request_id FROM usage_requests ORDER BY occurred_at_ms`)
+	if err != nil {
+		t.Fatalf("query remaining usage requests: %v", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan request ID: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate remaining usage requests: %v", err)
+	}
+	if !reflect.DeepEqual(ids, []string{"equal", "new"}) {
+		t.Fatalf("remaining request IDs = %v", ids)
+	}
+}
+
+func usageRecord(requestID string, occurredAt time.Time) analytics.RequestRecord {
+	return analytics.RequestRecord{
+		OccurredAt: occurredAt, RequestID: requestID,
+		ClientID: 1, ClientName: "client", ModelPoolID: 2, ModelName: "model",
+		HTTPStatus: 200, DurationMS: 1,
+	}
+}
+
 func assertUsageColumns(t *testing.T, db *sql.DB) {
 	t.Helper()
 	rows, err := db.Query(`PRAGMA table_info(usage_requests)`)

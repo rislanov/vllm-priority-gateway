@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net"
@@ -154,6 +155,21 @@ func TestRunLetsActiveStreamFinishInsideGracePeriod(t *testing.T) {
 	}
 	if snapshot := fake.Snapshot(); snapshot.ActiveRequests != 0 {
 		t.Fatalf("upstream requests still active: %+v", snapshot)
+	}
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open usage database: %v", err)
+	}
+	var usageRows int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM usage_requests WHERE http_status = 200`).Scan(&usageRows); err != nil {
+		_ = raw.Close()
+		t.Fatalf("count usage requests after shutdown: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close usage database: %v", err)
+	}
+	if usageRows != 1 {
+		t.Fatalf("persisted successful usage rows after graceful shutdown = %d, want 1", usageRows)
 	}
 	database, err := store.Open(context.Background(), databasePath)
 	if err != nil {
