@@ -52,16 +52,13 @@ func (b *Breaker) Acquire(now time.Time) (complete func(domain.InferenceOutcome)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	switch b.state {
-	case domain.CircuitClosed:
+	b.transitionOpenToHalfOpen(now)
+	if b.state == domain.CircuitClosed {
 		b.pruneFailures(now)
 		return b.completion(now, false), true
-	case domain.CircuitOpen:
-		if now.Before(b.openedAt.Add(b.options.OpenCooldown)) {
-			return nil, false
-		}
-		b.state = domain.CircuitHalfOpen
-		b.openedAt = time.Time{}
+	}
+	if b.state != domain.CircuitHalfOpen {
+		return nil, false
 	}
 
 	if b.probesInFlight >= b.options.HalfOpenMaxProbes {
@@ -75,9 +72,7 @@ func (b *Breaker) Snapshot(now time.Time) Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.state == domain.CircuitClosed {
-		b.pruneFailures(now)
-	}
+	b.transitionOpenToHalfOpen(now)
 
 	snapshot := Snapshot{
 		State:          b.state,
@@ -115,11 +110,10 @@ func (b *Breaker) complete(now time.Time, probe bool, outcome domain.InferenceOu
 	if b.state != domain.CircuitClosed || outcome != domain.InferenceFailure {
 		return
 	}
-	b.pruneFailures(now)
-	b.failures = append(b.failures, now)
+	openedAt := b.recordFailure(now)
 	if len(b.failures) >= b.options.FailureThreshold {
 		b.state = domain.CircuitOpen
-		b.openedAt = now
+		b.openedAt = openedAt
 	}
 }
 
@@ -137,23 +131,40 @@ func (b *Breaker) completeProbe(now time.Time, outcome domain.InferenceOutcome) 
 		b.openedAt = time.Time{}
 		b.probesInFlight = 0
 	case domain.InferenceFailure:
-		b.pruneFailures(now)
-		b.failures = append(b.failures, now)
+		openedAt := b.recordFailure(now)
 		b.state = domain.CircuitOpen
-		b.openedAt = now
+		b.openedAt = openedAt
 		b.probesInFlight = 0
 	}
 }
 
-func (b *Breaker) pruneFailures(now time.Time) {
-	cutoff := now.Add(-b.options.FailureWindow)
-	first := 0
-	for first < len(b.failures) && b.failures[first].Before(cutoff) {
-		first++
-	}
-	if first == 0 {
+func (b *Breaker) transitionOpenToHalfOpen(now time.Time) {
+	if b.state != domain.CircuitOpen || now.Before(b.openedAt.Add(b.options.OpenCooldown)) {
 		return
 	}
-	copy(b.failures, b.failures[first:])
-	b.failures = b.failures[:len(b.failures)-first]
+	b.state = domain.CircuitHalfOpen
+	b.openedAt = time.Time{}
+}
+
+func (b *Breaker) recordFailure(failedAt time.Time) time.Time {
+	b.failures = append(b.failures, failedAt)
+	latest := b.failures[0]
+	for _, failure := range b.failures[1:] {
+		if failure.After(latest) {
+			latest = failure
+		}
+	}
+	b.pruneFailures(latest)
+	return latest
+}
+
+func (b *Breaker) pruneFailures(now time.Time) {
+	cutoff := now.Add(-b.options.FailureWindow)
+	kept := b.failures[:0]
+	for _, failure := range b.failures {
+		if !failure.Before(cutoff) {
+			kept = append(kept, failure)
+		}
+	}
+	b.failures = kept
 }

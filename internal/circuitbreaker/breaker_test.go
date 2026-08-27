@@ -90,6 +90,19 @@ func TestBreakerCooldownAllowsOnlyOneHalfOpenProbe(t *testing.T) {
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitHalfOpen, 3, time.Time{}, 0, true)
 }
 
+func TestSnapshotTransitionsExpiredOpenCircuitToHalfOpenBeforeAcquire(t *testing.T) {
+	b := newTestBreaker(t)
+	trip(t, b)
+	retryAt := base.Add(7 * time.Second)
+
+	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 0, true)
+	complete, ok := b.Acquire(retryAt)
+	if !ok || complete == nil {
+		t.Fatal("Acquire() did not reserve a probe after Snapshot() exposed the half-open circuit")
+	}
+	assertSnapshot(t, b.Snapshot(retryAt), domain.CircuitHalfOpen, 3, time.Time{}, 1, false)
+}
+
 func TestBreakerHalfOpenSuccessClosesAndFailureReopens(t *testing.T) {
 	b := newTestBreaker(t)
 	trip(t, b)
@@ -136,6 +149,28 @@ func TestBreakerCompletionIsIdempotent(t *testing.T) {
 	complete(domain.InferenceFailure)
 	complete(domain.InferenceFailure)
 	assertSnapshot(t, b.Snapshot(base.Add(7*time.Second)), domain.CircuitOpen, 4, base.Add(12*time.Second), 0, false)
+}
+
+func TestBreakerKeepsOnlyRollingFailuresWhenCompletionsArriveOutOfOrder(t *testing.T) {
+	b := newTestBreaker(t)
+	completeAtZero, ok := b.Acquire(base)
+	if !ok {
+		t.Fatal("Acquire() rejected the first request")
+	}
+	completeAtTwenty, ok := b.Acquire(base.Add(20 * time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the second request")
+	}
+	completeAtTwentyOne, ok := b.Acquire(base.Add(21 * time.Second))
+	if !ok {
+		t.Fatal("Acquire() rejected the third request")
+	}
+
+	completeAtTwenty(domain.InferenceFailure)
+	completeAtTwentyOne(domain.InferenceFailure)
+	completeAtZero(domain.InferenceFailure)
+
+	assertSnapshot(t, b.Snapshot(base.Add(21*time.Second)), domain.CircuitClosed, 2, time.Time{}, 0, true)
 }
 
 func TestOptionsRejectInvalidValues(t *testing.T) {
