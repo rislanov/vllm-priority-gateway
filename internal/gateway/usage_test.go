@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
@@ -302,6 +303,61 @@ func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *te
 	}
 }
 
+func TestForwardPanicRollsBackCompletionReservation(t *testing.T) {
+	store := &panicUsageStore{}
+	recorder := analytics.NewRecorder(store, 0, nil, nil)
+	observer := &rollbackTrackingRecorder{Recorder: recorder}
+	t.Cleanup(func() {
+		observer.RollbackAll()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := recorder.Close(ctx); err != nil {
+			t.Errorf("cleanup Recorder.Close() error = %v", err)
+		}
+		select {
+		case <-recorder.Done():
+		default:
+			t.Error("cleanup returned before Recorder.Done closed")
+		}
+	})
+
+	panicValue := errors.New("panic after completion reservation")
+	service, rawKey := newUsageTestService(t, panickingUsageForwarder{value: panicValue}, observer, nil, nil)
+	const requestID = "panicking-request"
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _, _ = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+			Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: requestID,
+		})
+	}()
+	if recovered != panicValue {
+		t.Errorf("recovered panic = %#v, want original panic %#v", recovered, panicValue)
+	}
+
+	_, reusedRollback, reused := recorder.ReserveResponseComplete(context.Background(), requestID)
+	if !reused {
+		t.Error("panic leaked the completion reservation; request ID was not reusable")
+	} else {
+		reusedRollback()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Errorf("Recorder.Close() after recovered panic = %v", err)
+	}
+	select {
+	case <-recorder.Done():
+	default:
+		t.Error("Recorder.Done remained open after recovered panic")
+	}
+	if records := store.Records(); len(records) != 0 {
+		t.Fatalf("panic staged durable usage rows = %+v, want none", records)
+	}
+}
+
 func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
 	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
 	observer := &usageRecordingObserver{}
@@ -327,6 +383,64 @@ type usageCaptureForwarder struct {
 	mu      sync.Mutex
 	request proxy.Request
 	result  proxy.Result
+}
+
+type panickingUsageForwarder struct {
+	value any
+}
+
+func (f panickingUsageForwarder) Forward(context.Context, http.ResponseWriter, proxy.Request) proxy.Result {
+	panic(f.value)
+}
+
+type rollbackTrackingRecorder struct {
+	*analytics.Recorder
+	mu        sync.Mutex
+	rollbacks []func()
+}
+
+func (r *rollbackTrackingRecorder) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	reservation, rollback, reserved := r.Recorder.ReserveResponseComplete(ctx, requestID)
+	if reserved && rollback != nil {
+		r.mu.Lock()
+		r.rollbacks = append(r.rollbacks, rollback)
+		r.mu.Unlock()
+	}
+	return reservation, rollback, reserved
+}
+
+func (r *rollbackTrackingRecorder) RollbackAll() {
+	r.mu.Lock()
+	rollbacks := append([]func(){}, r.rollbacks...)
+	r.mu.Unlock()
+	for _, rollback := range rollbacks {
+		rollback()
+	}
+}
+
+type panicUsageStore struct {
+	mu      sync.Mutex
+	records []analytics.RequestRecord
+}
+
+func (s *panicUsageStore) InsertUsageBatch(_ context.Context, records []analytics.RequestRecord) error {
+	s.mu.Lock()
+	s.records = append(s.records, records...)
+	s.mu.Unlock()
+	return nil
+}
+
+func (*panicUsageStore) DeleteUsageBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (s *panicUsageStore) Records() []analytics.RequestRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]analytics.RequestRecord(nil), s.records...)
 }
 
 func (f *usageCaptureForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {

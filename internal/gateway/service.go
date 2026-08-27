@@ -166,6 +166,18 @@ func (s *Service) Forward(
 ) (result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
 	started := time.Now()
 	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
+	var reservationRollback func()
+	// Register before event finalization so panics from forwarding or deferred
+	// observer delivery both release an acquired lifecycle before propagating.
+	defer func() {
+		if reservationRollback == nil {
+			return
+		}
+		if panicValue := recover(); panicValue != nil {
+			reservationRollback()
+			panic(panicValue)
+		}
+	}()
 	defer func() {
 		event.OccurredAt = s.now().UTC()
 		event.Duration = time.Since(started)
@@ -223,6 +235,7 @@ func (s *Service) Forward(
 			return proxy.Result{}, nil, gatewayUnavailable(s.retryAfter)
 		}
 		reservation = reservedLifecycle
+		reservationRollback = rollback
 	}
 	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 		return proxy.Result{}, reservation, modelNotAllowed()
