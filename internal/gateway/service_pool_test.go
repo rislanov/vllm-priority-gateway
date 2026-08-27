@@ -592,8 +592,9 @@ func (r *poolRuntimeStub) Snapshot(backendID int64, _ time.Time) domain.BackendR
 	return r.backends[backendID]
 }
 
-func (r *poolRuntimeStub) AcquireBackend(backendID int64, _ time.Time) (func(domain.InferenceOutcome), bool) {
+func (r *poolRuntimeStub) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
 	r.mu.Lock()
+	backendID := expected.ID
 	runtime, ok := r.backends[backendID]
 	if !ok {
 		r.mu.Unlock()

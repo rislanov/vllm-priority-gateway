@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -80,4 +81,41 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 			t.Fatalf("metrics missing sample %q:\n%s", sample, text)
 		}
 	}
+}
+
+func TestMetricsUnmanagedCircuitEncodingFollowsTopologyLifecycle(t *testing.T) {
+	metrics := observability.NewMetrics()
+	backend := observability.BackendRuntimeMetric{
+		Model: "qwen", Backend: "gpu-disabled", Runtime: domain.BackendRuntime{BackendID: 7},
+	}
+	metrics.PublishRuntime(nil, []observability.BackendRuntimeMetric{backend}, nil)
+	text := scrapeRuntimeMetrics(t, metrics)
+	for _, sample := range []string{
+		`# HELP llmgw_backend_circuit_state Backend circuit state (unmanaged/unknown=-1, closed=0, open=1, half_open=2).`,
+		`llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"} -1`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("unmanaged circuit metrics missing %q:\n%s", sample, text)
+		}
+	}
+
+	metrics.PublishRuntime(nil, nil, nil)
+	text = scrapeRuntimeMetrics(t, metrics)
+	if strings.Contains(text, `llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"}`) {
+		t.Fatalf("removed unmanaged circuit series survived topology cleanup:\n%s", text)
+	}
+
+	backend.Runtime.CircuitState = domain.CircuitClosed
+	metrics.PublishRuntime(nil, []observability.BackendRuntimeMetric{backend}, nil)
+	text = scrapeRuntimeMetrics(t, metrics)
+	if sample := `llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"} 0`; !strings.Contains(text, sample) {
+		t.Fatalf("recreated managed closed circuit sample missing %q:\n%s", sample, text)
+	}
+}
+
+func scrapeRuntimeMetrics(t *testing.T, metrics *observability.Metrics) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return response.Body.String()
 }

@@ -129,7 +129,23 @@ func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
 		runtime = domain.PoolRuntime{PoolID: poolID, State: domain.PoolUnavailable}
 	}
 	runtime.GatewayInflight = m.poolInflight[poolID]
+	runtime.TotalWaiting = m.currentPoolWaitingLocked(poolID, at)
 	return runtime
+}
+
+func (m *Manager) currentPoolWaitingLocked(poolID int64, at time.Time) float64 {
+	total := float64(0)
+	for _, managed := range m.workers {
+		backend := managed.worker.Backend()
+		if backend.ModelPoolID != poolID || backend.Draining {
+			continue
+		}
+		snapshot := managed.worker.Snapshot(at)
+		if snapshot.Healthy && snapshot.MetricsFresh {
+			total += snapshot.Waiting
+		}
+	}
+	return total
 }
 
 func (m *Manager) AcquirePool(poolID int64, maximum int) (func(), bool) {
@@ -236,10 +252,10 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 	}
 }
 
-func (m *Manager) AcquireBackend(backendID int64, at time.Time) (func(domain.InferenceOutcome), bool) {
+func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(domain.InferenceOutcome), bool) {
 	m.mu.Lock()
-	managed := m.workers[backendID]
-	if managed == nil {
+	managed := m.workers[expected.ID]
+	if managed == nil || managed.worker.Backend() != expected {
 		m.mu.Unlock()
 		return nil, false
 	}

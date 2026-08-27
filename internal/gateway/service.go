@@ -32,7 +32,7 @@ type Runtime interface {
 	PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime
 	AcquirePool(poolID int64, maximum int) (release func(), ok bool)
 	Snapshot(backendID int64, at time.Time) domain.BackendRuntime
-	AcquireBackend(backendID int64, at time.Time) (complete func(domain.InferenceOutcome), ok bool)
+	AcquireBackend(expected domain.Backend, at time.Time) (complete func(domain.InferenceOutcome), ok bool)
 }
 
 type Forwarder interface {
@@ -280,7 +280,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 			if err != nil {
 				return proxy.Target{}, err
 			}
-			completeBackend, acquired := s.runtime.AcquireBackend(candidate.Backend.ID, selectionTime)
+			completeBackend, acquired := s.runtime.AcquireBackend(candidate.Backend, selectionTime)
 			if !acquired {
 				excluded[candidate.Backend.ID] = struct{}{}
 				continue

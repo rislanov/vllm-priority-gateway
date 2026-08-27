@@ -614,8 +614,9 @@ func (r *runtimeStub) Snapshot(backendID int64, _ time.Time) domain.BackendRunti
 	defer r.mu.Unlock()
 	return r.runtimes[backendID]
 }
-func (r *runtimeStub) AcquireBackend(backendID int64, _ time.Time) (func(domain.InferenceOutcome), bool) {
+func (r *runtimeStub) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
 	r.mu.Lock()
+	backendID := expected.ID
 	runtime, exists := r.runtimes[backendID]
 	if !exists {
 		r.mu.Unlock()

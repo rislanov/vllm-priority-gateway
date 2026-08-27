@@ -2,6 +2,7 @@ package monitor_test
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
@@ -175,11 +176,13 @@ func TestManagerPoolSnapshotAggregatesWaitingAndCircuitAvailability(t *testing.T
 	options.RecoveryAfter = 1
 	manager := monitor.NewManager(ctx, options)
 	defer manager.Shutdown()
+	backendA := testBackend(serverA.URL, 1, 9)
+	backendB := testBackend(serverB.URL, 2, 9)
 	draining := testBackend(serverDraining.URL, 3, 9)
 	draining.Draining = true
 	if err := manager.Reconcile([]domain.Backend{
-		testBackend(serverA.URL, 1, 9),
-		testBackend(serverB.URL, 2, 9),
+		backendA,
+		backendB,
 		draining,
 	}); err != nil {
 		t.Fatal(err)
@@ -189,11 +192,70 @@ func TestManagerPoolSnapshotAggregatesWaitingAndCircuitAvailability(t *testing.T
 		return runtime.AvailableBackends == 2 && runtime.TotalWaiting == 5
 	})
 	base := time.Now()
-	completeBackend(t, manager, 1, base, domain.InferenceFailure)
-	completeBackend(t, manager, 1, base.Add(time.Millisecond), domain.InferenceFailure)
+	completeBackend(t, manager, backendA, base, domain.InferenceFailure)
+	completeBackend(t, manager, backendA, base.Add(time.Millisecond), domain.InferenceFailure)
 	waitPoolRuntime(t, manager, 9, func(runtime domain.PoolRuntime) bool {
 		return runtime.AvailableBackends == 1 && runtime.TotalWaiting == 5
 	})
+}
+
+func TestManagerPoolSnapshotOverlaysLatestWaitingBeforeObserverTick(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{Waiting: 7})
+	metricsStarted := make(chan struct{})
+	releaseMetrics := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseMetrics) }) }
+	defer release()
+	upstream := fake.Handler()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/metrics" {
+			startedOnce.Do(func() { close(metricsStarted) })
+			<-releaseMetrics
+		}
+		upstream.ServeHTTP(writer, request)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	options := monitorOptions(server.Client())
+	options.HealthInterval = time.Hour
+	options.MetricsInterval = time.Hour
+	options.RecoveryAfter = 1
+	manager := monitor.NewManager(ctx, options)
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 9)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-metricsStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start its initial metrics poll")
+	}
+	cached := manager.PoolSnapshot(9, time.Now())
+	release()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		now := time.Now()
+		backend := manager.Snapshot(1, now)
+		if backend.Healthy && backend.MetricsFresh && backend.Waiting == 7 {
+			pool := manager.PoolSnapshot(9, now)
+			if pool.TotalWaiting != 7 {
+				t.Fatalf("pool waiting before observer tick = %v, want latest stored 7", pool.TotalWaiting)
+			}
+			if pool.State != cached.State {
+				t.Fatalf("pool state changed during read overlay: got %q want cached %q", pool.State, cached.State)
+			}
+			return
+		}
+		if now.After(deadline) {
+			t.Fatalf("worker did not store healthy/fresh waiting sample: %+v", backend)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func waitPoolRuntime(t *testing.T, manager *monitor.Manager, poolID int64, ready func(domain.PoolRuntime) bool) {
@@ -249,11 +311,12 @@ func TestManagerAcquireBackendTracksInflightAndCircuitOutcome(t *testing.T) {
 	defer cancel()
 	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
 	defer manager.Shutdown()
-	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
 		t.Fatal(err)
 	}
 	at := time.Now()
-	complete, ok := manager.AcquireBackend(1, at)
+	complete, ok := manager.AcquireBackend(backend, at)
 	if !ok {
 		t.Fatal("AcquireBackend() rejected known backend")
 	}
@@ -268,6 +331,57 @@ func TestManagerAcquireBackendTracksInflightAndCircuitOutcome(t *testing.T) {
 	}
 }
 
+func TestManagerAcquireBackendRequiresExactIdentityAndKeepsOldCompletionBalanced(t *testing.T) {
+	fakeOld := fakevllm.New()
+	serverOld := httptest.NewServer(fakeOld.Handler())
+	defer serverOld.Close()
+	fakeNew := fakevllm.New()
+	serverNew := httptest.NewServer(fakeNew.Handler())
+	defer serverNew.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(serverOld.Client()))
+	defer manager.Shutdown()
+	oldBackend := testBackend(serverOld.URL, 1, 1)
+	newBackend := oldBackend
+	newBackend.BaseURL = serverNew.URL
+	if err := manager.Reconcile([]domain.Backend{oldBackend}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldComplete, ok := manager.AcquireBackend(oldBackend, time.Now())
+	if !ok {
+		t.Fatal("AcquireBackend() rejected the exact old identity")
+	}
+	if mismatchComplete, acquired := manager.AcquireBackend(newBackend, time.Now()); acquired || mismatchComplete != nil {
+		oldComplete(domain.InferenceNeutral)
+		t.Fatal("AcquireBackend() paired the new identity with the old worker")
+	}
+	if err := manager.Reconcile([]domain.Backend{newBackend}); err != nil {
+		oldComplete(domain.InferenceNeutral)
+		t.Fatal(err)
+	}
+	newComplete, ok := manager.AcquireBackend(newBackend, time.Now())
+	if !ok {
+		oldComplete(domain.InferenceNeutral)
+		t.Fatal("AcquireBackend() rejected the exact reconciled identity")
+	}
+	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
+		oldComplete(domain.InferenceNeutral)
+		newComplete(domain.InferenceNeutral)
+		t.Fatalf("new worker inflight = %d, want 1", got)
+	}
+	oldComplete(domain.InferenceSuccess)
+	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
+		newComplete(domain.InferenceNeutral)
+		t.Fatalf("old completion changed new worker inflight to %d, want 1", got)
+	}
+	newComplete(domain.InferenceSuccess)
+	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("new worker inflight after completion = %d, want 0", got)
+	}
+}
+
 func TestManagerTimestampsBackendOutcomeAtCompletion(t *testing.T) {
 	fake := fakevllm.New()
 	server := httptest.NewServer(fake.Handler())
@@ -276,16 +390,17 @@ func TestManagerTimestampsBackendOutcomeAtCompletion(t *testing.T) {
 	defer cancel()
 	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
 	defer manager.Shutdown()
-	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
 		t.Fatal(err)
 	}
 
 	acquiredAt := time.Now().Add(-time.Hour)
-	first, ok := manager.AcquireBackend(1, acquiredAt)
+	first, ok := manager.AcquireBackend(backend, acquiredAt)
 	if !ok {
 		t.Fatal("AcquireBackend() rejected the first delayed request")
 	}
-	second, ok := manager.AcquireBackend(1, acquiredAt)
+	second, ok := manager.AcquireBackend(backend, acquiredAt)
 	if !ok {
 		t.Fatal("AcquireBackend() rejected the second delayed request")
 	}
@@ -313,21 +428,22 @@ func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
 	defer cancel()
 	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
 	defer manager.Shutdown()
-	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
 		t.Fatal(err)
 	}
 
-	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
-	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, backend, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, backend, time.Now(), domain.InferenceFailure)
 	open := manager.Snapshot(1, time.Now())
 	if open.CircuitState != domain.CircuitOpen || open.CircuitAvailable || open.CircuitRetryAt.IsZero() {
 		t.Fatalf("open snapshot = %+v", open)
 	}
-	if complete, ok := manager.AcquireBackend(1, open.CircuitRetryAt.Add(-time.Nanosecond)); ok || complete != nil {
+	if complete, ok := manager.AcquireBackend(backend, open.CircuitRetryAt.Add(-time.Nanosecond)); ok || complete != nil {
 		t.Fatal("AcquireBackend() admitted a request before cooldown")
 	}
 
-	probe, ok := manager.AcquireBackend(1, open.CircuitRetryAt)
+	probe, ok := manager.AcquireBackend(backend, open.CircuitRetryAt)
 	if !ok || probe == nil {
 		t.Fatal("AcquireBackend() rejected the half-open probe")
 	}
@@ -335,7 +451,7 @@ func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
 	if halfOpen.CircuitState != domain.CircuitHalfOpen || halfOpen.CircuitAvailable || halfOpen.CircuitProbesInFlight != 1 || halfOpen.GatewayInflight != 1 {
 		t.Fatalf("half-open snapshot = %+v", halfOpen)
 	}
-	if complete, ok := manager.AcquireBackend(1, open.CircuitRetryAt); ok || complete != nil {
+	if complete, ok := manager.AcquireBackend(backend, open.CircuitRetryAt); ok || complete != nil {
 		t.Fatal("AcquireBackend() admitted a second half-open probe")
 	}
 	probe(domain.InferenceSuccess)
@@ -344,10 +460,10 @@ func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
 		t.Fatalf("closed snapshot = %+v", closed)
 	}
 
-	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
-	completeBackend(t, manager, 1, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, backend, time.Now(), domain.InferenceFailure)
+	completeBackend(t, manager, backend, time.Now(), domain.InferenceFailure)
 	secondOpen := manager.Snapshot(1, time.Now())
-	probe, ok = manager.AcquireBackend(1, secondOpen.CircuitRetryAt)
+	probe, ok = manager.AcquireBackend(backend, secondOpen.CircuitRetryAt)
 	if !ok || probe == nil {
 		t.Fatal("AcquireBackend() rejected the second half-open probe")
 	}
@@ -373,11 +489,12 @@ func TestManagerBackendCompletionIsIdempotent(t *testing.T) {
 	defer cancel()
 	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
 	defer manager.Shutdown()
-	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
 		t.Fatal(err)
 	}
 	at := time.Now()
-	complete, ok := manager.AcquireBackend(1, at)
+	complete, ok := manager.AcquireBackend(backend, at)
 	if !ok {
 		t.Fatal("AcquireBackend() rejected known backend")
 	}
@@ -402,8 +519,8 @@ func TestManagerReconcileKeepsOrResetsCircuitWithWorkerIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := time.Now()
-	completeBackend(t, manager, backend.ID, base, domain.InferenceFailure)
-	completeBackend(t, manager, backend.ID, base.Add(time.Second), domain.InferenceFailure)
+	completeBackend(t, manager, backend, base, domain.InferenceFailure)
+	completeBackend(t, manager, backend, base.Add(time.Second), domain.InferenceFailure)
 	if got := manager.Snapshot(backend.ID, base.Add(time.Second)).CircuitState; got != domain.CircuitOpen {
 		t.Fatalf("circuit state = %q, want open", got)
 	}
@@ -426,11 +543,11 @@ func TestManagerReconcileKeepsOrResetsCircuitWithWorkerIdentity(t *testing.T) {
 	}
 }
 
-func completeBackend(t *testing.T, manager *monitor.Manager, backendID int64, at time.Time, outcome domain.InferenceOutcome) {
+func completeBackend(t *testing.T, manager *monitor.Manager, backend domain.Backend, at time.Time, outcome domain.InferenceOutcome) {
 	t.Helper()
-	complete, ok := manager.AcquireBackend(backendID, at)
+	complete, ok := manager.AcquireBackend(backend, at)
 	if !ok {
-		t.Fatalf("AcquireBackend(%d, %s) rejected", backendID, at)
+		t.Fatalf("AcquireBackend(%d, %s) rejected", backend.ID, at)
 	}
 	complete(outcome)
 }

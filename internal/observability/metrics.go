@@ -106,7 +106,7 @@ func NewMetrics() *Metrics {
 	m.backendRunning = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_running_requests", Help: "Running requests reported by vLLM."}, []string{"model", "backend"})
 	m.backendWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_waiting_requests", Help: "Waiting requests reported by vLLM."}, []string{"model", "backend"})
 	m.backendKV = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_kv_cache_usage", Help: "KV cache utilization reported by vLLM."}, []string{"model", "backend"})
-	m.backendCircuitState = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_circuit_state", Help: "Backend circuit state (closed=0, open=1, half_open=2)."}, []string{"model", "backend"})
+	m.backendCircuitState = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_circuit_state", Help: "Backend circuit state (unmanaged/unknown=-1, closed=0, open=1, half_open=2)."}, []string{"model", "backend"})
 	m.backendCircuitFailures = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_circuit_failures", Help: "Qualifying failures retained by the backend circuit."}, []string{"model", "backend"})
 	m.poolGatewayInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_gateway_inflight", Help: "Gateway requests currently holding a pool lease."}, []string{"model"})
 	m.poolWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_waiting_requests", Help: "Aggregate waiting requests reported by healthy, metrics-fresh, non-draining pool backends."}, []string{"model"})
@@ -360,12 +360,14 @@ func (m *Metrics) deleteBackendRuntimeLabels(labels backendMetricLabels) {
 
 func circuitStateValue(state domain.CircuitState) float64 {
 	switch state {
+	case domain.CircuitClosed:
+		return 0
 	case domain.CircuitOpen:
 		return 1
 	case domain.CircuitHalfOpen:
 		return 2
 	default:
-		return 0
+		return -1
 	}
 }
 

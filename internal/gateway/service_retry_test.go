@@ -166,6 +166,51 @@ func TestForwardRetriesSelectionWhenBackendAcquisitionRaces(t *testing.T) {
 	}
 }
 
+func TestForwardRejectsPublishedBackendUntilMatchingRuntimeIsHealthy(t *testing.T) {
+	oldBackend := retryBackend(20, "gpu-20", "http://old-gpu.invalid")
+	newBackend := oldBackend
+	newBackend.BaseURL = "http://new-gpu.invalid"
+	runtime := &recordingRuntime{
+		values: map[int64]domain.BackendRuntime{
+			20: {BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true},
+		},
+		identities: map[int64]domain.Backend{20: oldBackend},
+	}
+	forwarder := &completionForwarder{}
+	service, request := retryService([]domain.Backend{newBackend}, runtime, forwarder, nil, time.Now)
+
+	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr == nil || apiErr.Code != "backend_unavailable" {
+		t.Fatalf("identity mismatch API error = %+v, want backend_unavailable", apiErr)
+	}
+	if got := forwarder.Calls(); got != 0 {
+		t.Fatalf("forward calls before runtime reconcile = %d, want 0", got)
+	}
+	if got := strings.Join(runtime.Events(), ","); got != "acquire-20:identity-mismatch" {
+		t.Fatalf("runtime events before reconcile = %q", got)
+	}
+
+	runtime.SetBackend(newBackend, domain.BackendRuntime{BackendID: 20, CircuitAvailable: true})
+	_, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr == nil || apiErr.Code != "backend_unavailable" {
+		t.Fatalf("unhealthy reconciled runtime API error = %+v, want backend_unavailable", apiErr)
+	}
+	if got := forwarder.Calls(); got != 0 {
+		t.Fatalf("forward calls before reconciled runtime became healthy = %d, want 0", got)
+	}
+
+	runtime.SetBackend(newBackend, domain.BackendRuntime{
+		BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true,
+	})
+	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr != nil || result.Status != http.StatusOK {
+		t.Fatalf("healthy reconciled result=%+v API error=%+v", result, apiErr)
+	}
+	if got := forwarder.Calls(); got != 1 {
+		t.Fatalf("forward calls after healthy reconcile = %d, want 1", got)
+	}
+}
+
 func TestForwardCompletesFailedBackendBeforeSelectingAlternateAndBalancesObserver(t *testing.T) {
 	backends := []domain.Backend{
 		retryBackend(20, "gpu-20", "http://gpu-20.invalid"),
@@ -299,6 +344,7 @@ func (c *mutableClock) Set(value time.Time) {
 type recordingRuntime struct {
 	mu                 sync.Mutex
 	values             map[int64]domain.BackendRuntime
+	identities         map[int64]domain.Backend
 	snapshotTimes      []time.Time
 	rejectAcquisitions map[int64]int
 	events             []string
@@ -339,9 +385,15 @@ func (r *recordingRuntime) Snapshot(backendID int64, at time.Time) domain.Backen
 	return r.values[backendID]
 }
 
-func (r *recordingRuntime) AcquireBackend(backendID int64, _ time.Time) (func(domain.InferenceOutcome), bool) {
+func (r *recordingRuntime) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
 	r.mu.Lock()
+	backendID := expected.ID
 	runtime, exists := r.values[backendID]
+	if identity, managed := r.identities[backendID]; managed && identity != expected {
+		r.events = append(r.events, "acquire-"+strconv.FormatInt(backendID, 10)+":identity-mismatch")
+		r.mu.Unlock()
+		return nil, false
+	}
 	if exists && r.rejectAcquisitions[backendID] > 0 {
 		r.rejectAcquisitions[backendID]--
 		r.events = append(r.events, "acquire-"+strconv.FormatInt(backendID, 10)+":rejected")
@@ -368,6 +420,16 @@ func (r *recordingRuntime) AcquireBackend(backendID int64, _ time.Time) (func(do
 			r.mu.Unlock()
 		})
 	}, true
+}
+
+func (r *recordingRuntime) SetBackend(backend domain.Backend, runtime domain.BackendRuntime) {
+	r.mu.Lock()
+	if r.identities == nil {
+		r.identities = make(map[int64]domain.Backend)
+	}
+	r.identities[backend.ID] = backend
+	r.values[backend.ID] = runtime
+	r.mu.Unlock()
 }
 
 func (r *recordingRuntime) SnapshotTimes() []time.Time {
@@ -410,15 +472,23 @@ func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWri
 type completionForwarder struct {
 	mu        sync.Mutex
 	backendID int64
+	calls     int
 }
 
 func (f *completionForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
 	f.mu.Lock()
 	f.backendID = request.Target.Backend.ID
+	f.calls++
 	f.mu.Unlock()
 	request.Target.Complete(domain.InferenceSuccess)
 	writer.WriteHeader(http.StatusOK)
 	return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
+}
+
+func (f *completionForwarder) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 func (f *completionForwarder) BackendID() int64 {
