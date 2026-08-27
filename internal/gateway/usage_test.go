@@ -62,7 +62,7 @@ func TestStreamingUsageIsForcedOnlyForSupportedStreamingEndpoints(t *testing.T) 
 			forwarder := &usageCaptureForwarder{result: proxy.Result{Status: http.StatusOK}}
 			service, rawKey := newUsageTestService(t, forwarder, nil, nil, nil)
 
-			_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 				Method: http.MethodPost, Path: test.path, Headers: make(http.Header), Body: []byte(test.body), APIKey: rawKey,
 			})
 			if apiErr != nil {
@@ -116,7 +116,7 @@ func TestRequestEventUsageContainsStableLedgerAndProxyOutcome(t *testing.T) {
 		{ID: 21, ModelPoolID: 10, Name: "gpu-21", BaseURL: "http://gpu-21.invalid", Enabled: true, CapacityHint: 1, RunningSoftLimit: 8},
 	})
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/chat/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model","stream":true}`), APIKey: rawKey,
 		RequestID: "request-id", ParentRequestID: "parent-id",
@@ -153,7 +153,7 @@ func TestRequestEventUsageContainsParseFailureFormat(t *testing.T) {
 	forwarder := &usageCaptureForwarder{result: proxy.Result{Status: http.StatusOK, UsageParseFailure: "shape"}}
 	service, rawKey := newUsageTestService(t, forwarder, observer, nil, nil)
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
 	})
@@ -184,7 +184,7 @@ func TestRequestEventUsagePreModelFailuresDoNotHaveBothLedgerIdentities(t *testi
 			if test.apiKey != "" {
 				rawKey = test.apiKey
 			}
-			_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 				Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(test.body), APIKey: rawKey,
 			})
 			if apiErr == nil || apiErr.HTTPStatus != test.wantStatus {
@@ -233,7 +233,7 @@ func TestRequestEventUsageRecordsIdentityForKnownModelPolicyDenials(t *testing.T
 			observer := &usageRecordingObserver{}
 			forwarder := &usageCaptureForwarder{}
 			service, rawKey := newUsageTestServiceWithSnapshot(t, forwarder, observer, nil, nil, test.configure)
-			_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 				Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 				Body: []byte(`{"model":` + strconv.Quote(test.model) + `}`), APIKey: rawKey,
 			})
@@ -262,7 +262,7 @@ func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *te
 		snapshot.PoolsByID[pool.ID] = pool
 	})
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "policy-request",
 	})
@@ -275,7 +275,7 @@ func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *te
 	if forwarder.Request().Method != "" {
 		t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
 	}
-	_, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+	_, _, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"attacker-controlled-model"}`), APIKey: rawKey, RequestID: "unknown-request",
 	})
@@ -287,7 +287,7 @@ func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *te
 	}
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result, apiErr := service.Forward(canceledCtx, httptest.NewRecorder(), gateway.ForwardRequest{
+	result, _, apiErr := service.Forward(canceledCtx, httptest.NewRecorder(), gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "canceled-request",
 	})
@@ -353,15 +353,24 @@ type usageReservationObserver struct {
 	reservations []string
 }
 
-func (o *usageReservationObserver) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
+func (o *usageReservationObserver) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
 	o.mu.Lock()
 	o.reservations = append(o.reservations, requestID)
 	o.mu.Unlock()
 	if !o.accept || ctx.Err() != nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return func() {}, true
+	return usageResponseReservation{}, func() {}, true
 }
+
+func (*usageReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {}
+
+type usageResponseReservation struct{}
+
+func (usageResponseReservation) StageResponseComplete(gateway.RequestEvent) {}
 
 func (o *usageReservationObserver) Reservations() []string {
 	o.mu.Lock()

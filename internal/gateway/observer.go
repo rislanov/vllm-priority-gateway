@@ -48,16 +48,26 @@ type Observer interface {
 	Complete(RequestEvent)
 }
 
-// ResponseCompleteObserver receives a terminal signal after the handler or
-// proxy finishes writing. It runs before ServeHTTP returns, so implementations
-// must not wait for response-finalization capacity here.
+// ResponseCompleteReservation is an opaque, in-memory lifecycle handle. The
+// gateway stages the enriched event through the handle that reserved capacity;
+// it must never be added to durable records, API responses, logs, or metrics.
+type ResponseCompleteReservation interface {
+	StageResponseComplete(RequestEvent)
+}
+
+// ResponseCompleteObserver receives a terminal signal for the exact reserved
+// lifecycle after the handler or proxy finishes writing. It runs before
+// ServeHTTP returns, so implementations must not wait for response-finalization
+// capacity here.
 type ResponseCompleteObserver interface {
-	ResponseComplete(requestID string)
+	ResponseComplete(ResponseCompleteReservation)
 }
 
 // ResponseCompleteReserver applies cancellable backpressure before response
-// generation. A successful reservation returns an idempotent rollback that
-// releases only that reservation if the aggregate lifecycle cannot proceed.
+// generation. Every capable observer also accepts terminal completion. A
+// successful reservation returns an opaque handle plus an idempotent rollback
+// that releases only that reservation if the aggregate lifecycle cannot proceed.
 type ResponseCompleteReserver interface {
-	ReserveResponseComplete(ctx context.Context, requestID string) (rollback func(), ok bool)
+	ResponseCompleteObserver
+	ReserveResponseComplete(ctx context.Context, requestID string) (reservation ResponseCompleteReservation, rollback func(), ok bool)
 }

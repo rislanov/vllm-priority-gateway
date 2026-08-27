@@ -322,6 +322,42 @@ func TestPublicControlledErrors(t *testing.T) {
 	}
 }
 
+func TestLiveCompletionReservationRefusalReturnsControlledRetryableError(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &refusingReservationObserver{}
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, observer: observer, forwarder: forwarder,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	var envelope httpapi.ErrorEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode refusal error: %v; body=%s", err, response.Body.String())
+	}
+	if envelope.Error.Code != "gateway_unavailable" || envelope.Error.Type != "server_error" ||
+		envelope.Error.Message != "The gateway is temporarily unable to accept requests" {
+		t.Fatalf("refusal error = %+v", envelope.Error)
+	}
+	if forwarder.Calls() != 0 {
+		t.Fatalf("reservation refusal reached upstream forwarder %d time(s)", forwarder.Calls())
+	}
+	if got := observer.Snapshot(); got.reservations != 1 || got.terminals != 0 ||
+		len(got.events) != 1 || got.events[0].Status != http.StatusServiceUnavailable || got.events[0].Reason != "gateway_unavailable" {
+		t.Fatalf("reservation refusal lifecycle = %+v", got)
+	}
+}
+
 func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	raw, key := testKey(t)
 	handler, _ := newFixture(t, fixtureOptions{
@@ -341,6 +377,7 @@ func TestResolvedRejectionBodyReachesEOFBeforeBlockedAnalyticsStoreRelease(t *te
 	raw, key := testKey(t)
 	recorder, store, release := newBlockedAnalyticsRecorder(t)
 	gate := newCompletionGate("finalized-429")
+	releaseGate := sync.OnceFunc(func() { close(gate.release) })
 	observer := observability.Multi(recorder, gate)
 	handler, _ := newFixture(t, fixtureOptions{
 		client: backgroundClient(), key: key, poolState: domain.PoolSaturated, observer: observer,
@@ -348,6 +385,7 @@ func TestResolvedRejectionBodyReachesEOFBeforeBlockedAnalyticsStoreRelease(t *te
 	})
 	server := httptest.NewServer(handler)
 	defer func() {
+		releaseGate()
 		release()
 		server.Close()
 		closeAnalyticsRecorder(t, recorder)
@@ -363,7 +401,7 @@ func TestResolvedRejectionBodyReachesEOFBeforeBlockedAnalyticsStoreRelease(t *te
 	}()
 	awaitSignal(t, gate.entered, "target completion staging")
 	filled := fillRecorderBehindReservedRequest(t, recorder, "json-queued")
-	close(gate.release)
+	releaseGate()
 
 	select {
 	case response := <-result:
@@ -391,6 +429,7 @@ func TestStreamingResponseBodyReachesChunkedEOFBeforeBlockedAnalyticsStoreReleas
 	raw, key := testKey(t)
 	recorder, store, release := newBlockedAnalyticsRecorder(t)
 	gate := newCompletionGate("finalized-sse")
+	releaseGate := sync.OnceFunc(func() { close(gate.release) })
 	observer := observability.Multi(recorder, gate)
 	handler, _ := newFixture(t, fixtureOptions{
 		client: enabledClient(), key: key, observer: observer, forwarder: streamingForwarder{},
@@ -398,6 +437,7 @@ func TestStreamingResponseBodyReachesChunkedEOFBeforeBlockedAnalyticsStoreReleas
 	})
 	server := httptest.NewServer(handler)
 	defer func() {
+		releaseGate()
 		release()
 		server.Close()
 		closeAnalyticsRecorder(t, recorder)
@@ -413,7 +453,7 @@ func TestStreamingResponseBodyReachesChunkedEOFBeforeBlockedAnalyticsStoreReleas
 	}()
 	awaitSignal(t, gate.entered, "stream completion staging")
 	filled := fillRecorderBehindReservedRequest(t, recorder, "sse-queued")
-	close(gate.release)
+	releaseGate()
 
 	select {
 	case response := <-result:
@@ -493,6 +533,99 @@ func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
 		if event.Model != "" {
 			t.Fatalf("attacker-controlled model reached observability: %q", event.Model)
 		}
+	}
+}
+
+func TestDuplicateRequestIDRefusalCannotConsumeOriginalRecorderLifecycle(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	recorder := analytics.NewRecorder(database, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	raw, key := testKey(t)
+	forwarder := newOriginalLifecycleForwarder()
+	releaseForwarder := sync.OnceFunc(func() { close(forwarder.release) })
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder,
+		observer: observability.Multi(recorder),
+		generateID: func() (string, error) {
+			return "duplicate-lifecycle-id", nil
+		},
+	})
+	server := httptest.NewServer(handler)
+	defer func() {
+		releaseForwarder()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
+	}()
+
+	firstRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRequest.Header.Set("Authorization", "Bearer "+raw)
+	firstRequest.Header.Set("X-Request-Id", "original-parent")
+	firstResult := make(chan completedHTTPResponse, 1)
+	go func() {
+		firstResult <- readHTTPResponse(server.Client(), firstRequest)
+	}()
+	awaitSignal(t, forwarder.started, "original request forwarding")
+
+	secondRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest.Header.Set("Authorization", "Bearer "+raw)
+	secondRequest.Header.Set("X-Request-Id", "rejected-parent")
+	second := readHTTPResponse(server.Client(), secondRequest)
+	if second.err != nil {
+		t.Errorf("read duplicate refusal: %v", second.err)
+	} else {
+		if second.status != http.StatusServiceUnavailable {
+			t.Errorf("duplicate refusal status = %d body=%s, want 503", second.status, second.body)
+		}
+		var envelope httpapi.ErrorEnvelope
+		if err := json.Unmarshal(second.body, &envelope); err != nil {
+			t.Errorf("decode duplicate refusal: %v; body=%s", err, second.body)
+		} else if envelope.Error.Code != "gateway_unavailable" {
+			t.Errorf("duplicate refusal code = %q, want gateway_unavailable", envelope.Error.Code)
+		}
+	}
+
+	releaseForwarder()
+	select {
+	case first := <-firstResult:
+		if first.err != nil {
+			t.Fatalf("read original response: %v", first.err)
+		}
+		if first.status != http.StatusCreated || string(first.body) != `{"original":true}` {
+			t.Fatalf("original response = status %d body=%s", first.status, first.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original request did not finish after release")
+	}
+	if got := forwarder.Calls(); got != 1 {
+		t.Fatalf("upstream forward calls = %d, want original only", got)
+	}
+
+	closeAnalyticsRecorder(t, recorder)
+	page, err := database.UsageRequests(context.Background(), analytics.Filter{
+		From: testNow.Add(-time.Millisecond), To: testNow.Add(time.Millisecond),
+	}, 100, 0)
+	if err != nil {
+		t.Fatalf("UsageRequests() error = %v", err)
+	}
+	if page.Total != 1 || len(page.Requests) != 1 {
+		t.Fatalf("duplicate lifecycle rows = %+v, want exactly the original", page)
+	}
+	record := page.Requests[0]
+	if record.RequestID != "duplicate-lifecycle-id" || record.ParentRequestID != "original-parent" ||
+		record.ClientID != 1 || record.ModelPoolID != 10 || record.ClientName != "client" ||
+		record.ModelName != "public-model" || record.BackendName != "gpu" ||
+		record.HTTPStatus != http.StatusCreated || record.Disconnected {
+		t.Fatalf("durable original lifecycle row = %+v", record)
 	}
 }
 
@@ -791,11 +924,98 @@ type blockingForwarder struct {
 	once    sync.Once
 }
 
+type originalLifecycleForwarder struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func newOriginalLifecycleForwarder() *originalLifecycleForwarder {
+	return &originalLifecycleForwarder{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (f *originalLifecycleForwarder) Forward(ctx context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.mu.Unlock()
+	if call > 1 {
+		writer.WriteHeader(http.StatusAccepted)
+		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusAccepted}
+	}
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-f.release:
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusCreated)
+		written, _ := writer.Write([]byte(`{"original":true}`))
+		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusCreated, BytesSent: int64(written)}
+	case <-ctx.Done():
+		return proxy.Result{BackendID: request.Target.Backend.ID, Cancelled: true, Err: ctx.Err()}
+	}
+}
+
+func (f *originalLifecycleForwarder) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 type recordingObserver struct {
 	mu            sync.Mutex
 	events        []gateway.RequestEvent
 	clientDeltas  []int
 	backendDeltas []int
+}
+
+type refusingReservationObserver struct {
+	mu           sync.Mutex
+	reservations int
+	terminals    int
+	events       []gateway.RequestEvent
+}
+
+type refusingReservationSnapshot struct {
+	reservations int
+	terminals    int
+	events       []gateway.RequestEvent
+}
+
+func (*refusingReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*refusingReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+
+func (o *refusingReservationObserver) Complete(event gateway.RequestEvent) {
+	o.mu.Lock()
+	o.events = append(o.events, event)
+	o.mu.Unlock()
+}
+
+func (o *refusingReservationObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	o.mu.Lock()
+	o.reservations++
+	o.mu.Unlock()
+	return nil, nil, false
+}
+
+func (o *refusingReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {
+	o.mu.Lock()
+	o.terminals++
+	o.mu.Unlock()
+}
+
+func (o *refusingReservationObserver) Snapshot() refusingReservationSnapshot {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return refusingReservationSnapshot{
+		reservations: o.reservations,
+		terminals:    o.terminals,
+		events:       append([]gateway.RequestEvent(nil), o.events...),
+	}
 }
 
 type blockingAnalyticsStore struct {
@@ -886,13 +1106,13 @@ func fillRecorderBehindReservedRequest(t *testing.T, recorder *analytics.Recorde
 	for index := 0; index < 1024; index++ {
 		requestID := prefix + "-" + strconv.Itoa(index)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		_, reserved := recorder.ReserveResponseComplete(ctx, requestID)
+		reservation, _, reserved := recorder.ReserveResponseComplete(ctx, requestID)
 		cancel()
 		if !reserved {
 			break
 		}
-		recorder.Complete(resolvedEvent(requestID))
-		recorder.ResponseComplete(requestID)
+		reservation.StageResponseComplete(resolvedEvent(requestID))
+		recorder.ResponseComplete(reservation)
 		filled++
 	}
 	return filled
@@ -900,12 +1120,12 @@ func fillRecorderBehindReservedRequest(t *testing.T, recorder *analytics.Recorde
 
 func reserveAndCompleteAnalytics(t *testing.T, recorder *analytics.Recorder, requestID string) {
 	t.Helper()
-	_, reserved := recorder.ReserveResponseComplete(context.Background(), requestID)
+	reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), requestID)
 	if !reserved {
 		t.Fatalf("analytics reservation refused for %q", requestID)
 	}
-	recorder.Complete(resolvedEvent(requestID))
-	recorder.ResponseComplete(requestID)
+	reservation.StageResponseComplete(resolvedEvent(requestID))
+	recorder.ResponseComplete(reservation)
 }
 
 func closeAnalyticsRecorder(t *testing.T, recorder *analytics.Recorder) {

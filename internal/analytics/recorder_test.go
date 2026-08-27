@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
@@ -105,7 +106,7 @@ func TestRecorderReservationBackpressureHonorsCancellationWithoutStagingRow(t *t
 	returned := make(chan bool, 1)
 	go func() {
 		close(started)
-		_, reserved := recorder.ReserveResponseComplete(ctx, "request-cancelled")
+		_, _, reserved := recorder.ReserveResponseComplete(ctx, "request-cancelled")
 		returned <- reserved
 	}()
 	awaitSignal(t, started, "cancelled reservation start")
@@ -124,7 +125,12 @@ func TestRecorderReservationBackpressureHonorsCancellationWithoutStagingRow(t *t
 		t.Fatal("canceled saturated reservation did not return")
 	}
 	recorder.mu.Lock()
-	_, staged := recorder.pending["request-cancelled"]
+	staged := false
+	for _, record := range recorder.pending {
+		if record.RequestID == "request-cancelled" {
+			staged = true
+		}
+	}
 	_, held := recorder.reserved["request-cancelled"]
 	recorder.mu.Unlock()
 	if staged || held {
@@ -141,7 +147,7 @@ func TestRecorderRejectsAlreadyCanceledReservationWhenCapacityIsAvailable(t *tes
 
 	for index := 0; index < 128; index++ {
 		requestID := "already-canceled-" + strconv.Itoa(index)
-		rollback, reserved := recorder.ReserveResponseComplete(ctx, requestID)
+		_, rollback, reserved := recorder.ReserveResponseComplete(ctx, requestID)
 		if reserved {
 			rollback()
 			t.Fatalf("already-canceled reservation %d acquired available capacity", index)
@@ -154,11 +160,11 @@ func TestRecorderRejectsDuplicateReservationWithoutStealingOriginal(t *testing.T
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	_, reserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
+	reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
 	if !reserved {
 		t.Fatal("first reservation was refused")
 	}
-	duplicateRollback, duplicateReserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
+	_, duplicateRollback, duplicateReserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
 	if duplicateReserved {
 		if duplicateRollback != nil {
 			duplicateRollback()
@@ -166,11 +172,46 @@ func TestRecorderRejectsDuplicateReservationWithoutStealingOriginal(t *testing.T
 		t.Fatal("duplicate request ID acquired a second reservation")
 	}
 
-	recorder.Complete(recordEvent("duplicate-request"))
-	recorder.ResponseComplete("duplicate-request")
+	reservation.StageResponseComplete(recordEvent("duplicate-request"))
+	recorder.ResponseComplete(reservation)
 	batch := awaitBatch(t, store)
 	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"duplicate-request"}) {
 		t.Fatalf("persisted request IDs = %v", got)
+	}
+}
+
+func TestRecorderRejectedDuplicateCallbacksCannotConsumeOriginalReservation(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+
+	originalReservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-lifecycle")
+	if !reserved {
+		t.Fatal("original reservation was refused")
+	}
+	duplicateReservation, duplicateRollback, duplicateReserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-lifecycle")
+	if duplicateReserved {
+		if duplicateRollback != nil {
+			duplicateRollback()
+		}
+		t.Fatal("duplicate request ID acquired a second reservation")
+	}
+
+	rejected := recordEvent("duplicate-lifecycle")
+	rejected.ParentRequestID = "rejected-parent"
+	rejected.Status = http.StatusServiceUnavailable
+	recorder.Complete(rejected)
+	recorder.ResponseComplete(duplicateReservation)
+
+	original := recordEvent("duplicate-lifecycle")
+	original.ParentRequestID = "original-parent"
+	original.Status = http.StatusCreated
+	originalReservation.StageResponseComplete(original)
+	recorder.ResponseComplete(originalReservation)
+
+	batch := awaitBatch(t, store)
+	if len(batch) != 1 || batch[0].ParentRequestID != "original-parent" || batch[0].HTTPStatus != http.StatusCreated {
+		t.Fatalf("persisted duplicate lifecycle batch = %+v, want original reservation metadata", batch)
 	}
 }
 
@@ -179,21 +220,21 @@ func TestRecorderStaleRollbackCannotReleaseReusedRequestID(t *testing.T) {
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	staleRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "reused-request")
+	firstReservation, staleRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "reused-request")
 	if !reserved {
 		t.Fatal("first reservation was refused")
 	}
-	recorder.Complete(recordEvent("reused-request"))
-	recorder.ResponseComplete("reused-request")
+	firstReservation.StageResponseComplete(recordEvent("reused-request"))
+	recorder.ResponseComplete(firstReservation)
 	_ = awaitBatch(t, store)
 
-	_, reserved = recorder.ReserveResponseComplete(context.Background(), "reused-request")
+	secondReservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), "reused-request")
 	if !reserved {
 		t.Fatal("reused request ID reservation was refused after prior completion")
 	}
 	staleRollback()
-	recorder.Complete(recordEvent("reused-request"))
-	recorder.ResponseComplete("reused-request")
+	secondReservation.StageResponseComplete(recordEvent("reused-request"))
+	recorder.ResponseComplete(secondReservation)
 	batch := awaitBatch(t, store)
 	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"reused-request"}) {
 		t.Fatalf("persisted reused request IDs = %v", got)
@@ -219,24 +260,25 @@ func TestRecorderReservedTerminalHandoffUsesItsPreacquiredQueueSlot(t *testing.T
 	})
 	awaitSignal(t, writerStarted, "paused writer start")
 
-	targetRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "target-request")
+	targetReservation, targetRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "target-request")
 	if !reserved {
 		t.Fatal("target reservation was refused")
 	}
 	t.Cleanup(targetRollback)
-	if _, reserved := recorder.ReserveResponseComplete(context.Background(), "queued-request"); !reserved {
+	queuedReservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), "queued-request")
+	if !reserved {
 		t.Fatal("queued reservation was refused")
 	}
-	recorder.Complete(recordEvent("queued-request"))
-	recorder.ResponseComplete("queued-request")
+	queuedReservation.StageResponseComplete(recordEvent("queued-request"))
+	recorder.ResponseComplete(queuedReservation)
 	if got := len(recorder.permits); got != 2 {
 		t.Fatalf("held recorder permits after terminal enqueue = %d, want 2 until writer dequeue", got)
 	}
 
-	recorder.Complete(recordEvent("target-request"))
+	targetReservation.StageResponseComplete(recordEvent("target-request"))
 	returned := make(chan struct{})
 	go func() {
-		recorder.ResponseComplete("target-request")
+		recorder.ResponseComplete(targetReservation)
 		close(returned)
 	}()
 	select {
@@ -252,16 +294,16 @@ func TestRecorderReservedTerminalHandoffUsesItsPreacquiredQueueSlot(t *testing.T
 func TestRecorderCloseWaitsForReservedTerminalHandoffWithoutClosingQueue(t *testing.T) {
 	store := newFakeRecordStore()
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
-	_, reserved := recorder.ReserveResponseComplete(context.Background(), "shutdown-request")
+	shutdownReservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), "shutdown-request")
 	if !reserved {
 		t.Fatal("reservation was refused")
 	}
-	recorder.Complete(recordEvent("shutdown-request"))
+	shutdownReservation.StageResponseComplete(recordEvent("shutdown-request"))
 	blockedStarted := make(chan struct{})
 	blockedReturned := make(chan bool, 1)
 	go func() {
 		close(blockedStarted)
-		_, blockedReturnedValue := recorder.ReserveResponseComplete(context.Background(), "blocked-at-shutdown")
+		_, _, blockedReturnedValue := recorder.ReserveResponseComplete(context.Background(), "blocked-at-shutdown")
 		blockedReturned <- blockedReturnedValue
 	}()
 	awaitSignal(t, blockedStarted, "blocked shutdown reservation start")
@@ -289,7 +331,7 @@ func TestRecorderCloseWaitsForReservedTerminalHandoffWithoutClosingQueue(t *test
 		t.Fatal("reservation blocked on capacity did not wake when Close stopped intake")
 	}
 
-	recorder.ResponseComplete("shutdown-request")
+	recorder.ResponseComplete(shutdownReservation)
 	select {
 	case err := <-closeReturned:
 		if err != nil {
@@ -483,11 +525,12 @@ func TestRecorderCompleteAndCloseAreSafeConcurrently(t *testing.T) {
 			defer callers.Done()
 			<-start
 			event := recordEvent(requestID)
-			if _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID); !reserved {
+			reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID)
+			if !reserved {
 				return
 			}
-			recorder.Complete(event)
-			recorder.ResponseComplete(event.RequestID)
+			reservation.StageResponseComplete(event)
+			recorder.ResponseComplete(reservation)
 		}("concurrent-request-" + strconv.Itoa(i))
 	}
 	close(start)
@@ -504,12 +547,13 @@ func TestRecorderKeepsOnePendingRecordAndEnqueuesResponseOnce(t *testing.T) {
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 	event := recordEvent("same-request")
-	if _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID); !reserved {
+	reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID)
+	if !reserved {
 		t.Fatal("reservation was refused")
 	}
 
-	recorder.Complete(event)
-	recorder.Complete(event)
+	reservation.StageResponseComplete(event)
+	reservation.StageResponseComplete(event)
 	recorder.mu.Lock()
 	pending := len(recorder.pending)
 	recorder.mu.Unlock()
@@ -517,8 +561,8 @@ func TestRecorderKeepsOnePendingRecordAndEnqueuesResponseOnce(t *testing.T) {
 		t.Fatalf("pending records for duplicate Complete = %d, want 1", pending)
 	}
 
-	recorder.ResponseComplete(event.RequestID)
-	recorder.ResponseComplete(event.RequestID)
+	recorder.ResponseComplete(reservation)
+	recorder.ResponseComplete(reservation)
 	batch := awaitBatch(t, store)
 	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"same-request"}) {
 		t.Fatalf("enqueued request IDs = %v", got)
@@ -583,18 +627,18 @@ func recordEvent(requestID string) gateway.RequestEvent {
 	}
 }
 
-func completeResponse(recorder *Recorder, event gateway.RequestEvent) {
-	recorder.Complete(event)
-	recorder.ResponseComplete(event.RequestID)
+func completeResponse(recorder *Recorder, reservation gateway.ResponseCompleteReservation, event gateway.RequestEvent) {
+	reservation.StageResponseComplete(event)
+	recorder.ResponseComplete(reservation)
 }
 
 func reserveAndCompleteResponse(t *testing.T, recorder *Recorder, event gateway.RequestEvent) {
 	t.Helper()
-	_, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID)
+	reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID)
 	if !reserved {
 		t.Fatalf("ReserveResponseComplete(%q) refused", event.RequestID)
 	}
-	completeResponse(recorder, event)
+	completeResponse(recorder, reservation, event)
 }
 
 func requestIDs(records []RequestRecord) []string {

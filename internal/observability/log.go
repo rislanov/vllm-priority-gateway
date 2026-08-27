@@ -43,70 +43,121 @@ func (l *Logger) Complete(event gateway.RequestEvent) {
 	)
 }
 
-type observers []gateway.Observer
+type observers struct {
+	values []gateway.Observer
+}
+
+type reservedPeer struct {
+	observer    gateway.ResponseCompleteObserver
+	reservation gateway.ResponseCompleteReservation
+	rollback    func()
+}
+
+type responseCompleteReservation struct {
+	owner    *observers
+	mu       sync.Mutex
+	peers    []reservedPeer
+	staged   bool
+	finished bool
+}
 
 // Multi combines observers in declaration order and skips nil entries.
 func Multi(values ...gateway.Observer) gateway.Observer {
-	combined := make(observers, 0, len(values))
+	combined := make([]gateway.Observer, 0, len(values))
 	for _, observer := range values {
 		if observer != nil {
 			combined = append(combined, observer)
 		}
 	}
-	return combined
+	return &observers{values: combined}
 }
 
-func (o observers) ClientInflight(event gateway.InflightEvent, delta int) {
-	for _, observer := range o {
+func (o *observers) ClientInflight(event gateway.InflightEvent, delta int) {
+	for _, observer := range o.values {
 		observer.ClientInflight(event, delta)
 	}
 }
 
-func (o observers) BackendInflight(event gateway.InflightEvent, delta int) {
-	for _, observer := range o {
+func (o *observers) BackendInflight(event gateway.InflightEvent, delta int) {
+	for _, observer := range o.values {
 		observer.BackendInflight(event, delta)
 	}
 }
 
-func (o observers) Complete(event gateway.RequestEvent) {
-	for _, observer := range o {
+func (o *observers) Complete(event gateway.RequestEvent) {
+	for _, observer := range o.values {
 		observer.Complete(event)
 	}
 }
 
-func (o observers) ResponseComplete(requestID string) {
-	for _, observer := range o {
-		if responseObserver, ok := observer.(gateway.ResponseCompleteObserver); ok {
-			responseObserver.ResponseComplete(requestID)
-		}
+func (o *observers) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*responseCompleteReservation)
+	if !ok || reservation.owner != o {
+		return
 	}
+	reservation.complete()
 }
 
-func (o observers) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
-	rollbacks := make([]func(), 0, len(o))
-	for _, observer := range o {
+func (o *observers) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	reservation := &responseCompleteReservation{owner: o, peers: make([]reservedPeer, 0, len(o.values))}
+	for _, observer := range o.values {
 		reserver, ok := observer.(gateway.ResponseCompleteReserver)
 		if !ok {
 			continue
 		}
-		rollback, reserved := reserver.ReserveResponseComplete(ctx, requestID)
-		if !reserved {
-			for index := len(rollbacks) - 1; index >= 0; index-- {
-				rollbacks[index]()
+		peerReservation, rollback, reserved := reserver.ReserveResponseComplete(ctx, requestID)
+		if !reserved || peerReservation == nil {
+			if rollback != nil {
+				rollback()
 			}
-			return nil, false
+			reservation.rollback()
+			return nil, nil, false
 		}
 		if rollback == nil {
 			rollback = func() {}
 		}
-		rollbacks = append(rollbacks, rollback)
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			for index := len(rollbacks) - 1; index >= 0; index-- {
-				rollbacks[index]()
-			}
+		reservation.peers = append(reservation.peers, reservedPeer{
+			observer: reserver, reservation: peerReservation, rollback: rollback,
 		})
-	}, true
+	}
+	return reservation, reservation.rollback, true
+}
+
+func (r *responseCompleteReservation) StageResponseComplete(event gateway.RequestEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.staged || r.finished {
+		return
+	}
+	r.staged = true
+	for _, peer := range r.peers {
+		peer.reservation.StageResponseComplete(event)
+	}
+}
+
+func (r *responseCompleteReservation) complete() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	for _, peer := range r.peers {
+		peer.observer.ResponseComplete(peer.reservation)
+	}
+}
+
+func (r *responseCompleteReservation) rollback() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	for index := len(r.peers) - 1; index >= 0; index-- {
+		r.peers[index].rollback()
+	}
 }

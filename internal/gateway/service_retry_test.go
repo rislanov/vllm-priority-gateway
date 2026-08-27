@@ -49,7 +49,7 @@ func TestRetrySelectionUsesCurrentRegistryAndTime(t *testing.T) {
 	})
 	response := httptest.NewRecorder()
 
-	_, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
 	})
@@ -98,7 +98,7 @@ func TestRetrySelectionRejectsPoolModelReconfiguration(t *testing.T) {
 	})
 	response := httptest.NewRecorder()
 
-	_, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
 	})

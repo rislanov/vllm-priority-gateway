@@ -40,7 +40,7 @@ type Recorder struct {
 
 	mu         sync.Mutex
 	accepting  bool
-	pending    map[string]RequestRecord
+	pending    map[*completionReservation]RequestRecord
 	reserved   map[string]*completionReservation
 	lifecycles sync.WaitGroup
 	closeOnce  sync.Once
@@ -61,9 +61,12 @@ type recorderSettings struct {
 	afterCleanupTick func()
 }
 
-// Keep this token non-zero-sized: pointer identity prevents a stale rollback
-// from releasing a later reservation that reuses the same request ID.
-type completionReservation struct{ token byte }
+// Pointer identity, rather than request ID alone, owns staging and terminal
+// completion. The handle is process-local and never enters a durable record.
+type completionReservation struct {
+	recorder  *Recorder
+	requestID string
+}
 
 // NewRecorder starts one writer for request metadata and retention cleanup.
 func NewRecorder(store RecordStore, retention time.Duration, onFailure func(), logger *slog.Logger) *Recorder {
@@ -109,7 +112,7 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 		store: store, retention: retention, onFailure: onFailure, logger: settings.logger, settings: settings,
 		ctx: ctx, cancel: cancel, events: make(chan RequestRecord, settings.queueCapacity),
 		permits: make(chan struct{}, settings.queueCapacity), intakeClosed: make(chan struct{}), done: make(chan struct{}),
-		accepting: true, pending: make(map[string]RequestRecord), reserved: make(map[string]*completionReservation),
+		accepting: true, pending: make(map[*completionReservation]RequestRecord), reserved: make(map[string]*completionReservation),
 	}
 	go recorder.run()
 	return recorder
@@ -119,37 +122,40 @@ func (*Recorder) ClientInflight(gateway.InflightEvent, int)  {}
 func (*Recorder) BackendInflight(gateway.InflightEvent, int) {}
 
 // ReserveResponseComplete acquires bounded capacity before response generation.
-func (r *Recorder) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
+func (r *Recorder) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
 	if requestID == "" || ctx.Err() != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	r.mu.Lock()
 	if !r.accepting || r.reserved[requestID] != nil || ctx.Err() != nil {
 		r.mu.Unlock()
-		return nil, false
+		return nil, nil, false
 	}
 	r.mu.Unlock()
 
 	select {
 	case r.permits <- struct{}{}:
 	case <-ctx.Done():
-		return nil, false
+		return nil, nil, false
 	case <-r.intakeClosed:
-		return nil, false
+		return nil, nil, false
 	}
 
 	r.mu.Lock()
 	if !r.accepting || r.reserved[requestID] != nil || ctx.Err() != nil {
 		r.mu.Unlock()
 		<-r.permits
-		return nil, false
+		return nil, nil, false
 	}
-	reservation := &completionReservation{token: 1}
+	reservation := &completionReservation{recorder: r, requestID: requestID}
 	r.reserved[requestID] = reservation
 	r.lifecycles.Add(1)
 	r.mu.Unlock()
 	var once sync.Once
-	return func() {
+	return reservation, func() {
 		once.Do(func() {
 			r.mu.Lock()
 			if r.reserved[requestID] != reservation {
@@ -157,7 +163,7 @@ func (r *Recorder) ReserveResponseComplete(ctx context.Context, requestID string
 				return
 			}
 			delete(r.reserved, requestID)
-			delete(r.pending, requestID)
+			delete(r.pending, reservation)
 			r.mu.Unlock()
 			<-r.permits
 			r.lifecycles.Done()
@@ -165,32 +171,43 @@ func (r *Recorder) ReserveResponseComplete(ctx context.Context, requestID string
 	}, true
 }
 
-// Complete stages metadata only for a request that already owns capacity.
-func (r *Recorder) Complete(event gateway.RequestEvent) {
-	if event.RequestID == "" || event.ClientID <= 0 || event.ModelPoolID <= 0 {
+// Complete intentionally leaves generic observer delivery side-effect free.
+// Reserved metadata is staged only through its opaque lifecycle handle.
+func (*Recorder) Complete(gateway.RequestEvent) {}
+
+// StageResponseComplete stages metadata only through the reservation that owns
+// the corresponding bounded slot.
+func (reservation *completionReservation) StageResponseComplete(event gateway.RequestEvent) {
+	if reservation == nil || reservation.recorder == nil || event.RequestID != reservation.requestID ||
+		event.ClientID <= 0 || event.ModelPoolID <= 0 {
 		return
 	}
 	record := requestRecord(event)
+	r := reservation.recorder
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, reserved := r.reserved[event.RequestID]; !reserved {
+	if r.reserved[reservation.requestID] != reservation {
 		return
 	}
-	r.pending[event.RequestID] = record
+	r.pending[reservation] = record
 }
 
 // ResponseComplete hands a staged record to the bounded worker queue without
 // waiting for capacity; the successful reservation already owns that slot.
-func (r *Recorder) ResponseComplete(requestID string) {
-	r.mu.Lock()
-	_, reserved := r.reserved[requestID]
-	if reserved {
-		delete(r.reserved, requestID)
+func (r *Recorder) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*completionReservation)
+	if !ok || reservation.recorder != r {
+		return
 	}
-	record, exists := r.pending[requestID]
+	r.mu.Lock()
+	reserved := r.reserved[reservation.requestID] == reservation
+	if reserved {
+		delete(r.reserved, reservation.requestID)
+	}
+	record, exists := r.pending[reservation]
 	if exists {
-		delete(r.pending, requestID)
+		delete(r.pending, reservation)
 	}
 	if !reserved {
 		r.mu.Unlock()
