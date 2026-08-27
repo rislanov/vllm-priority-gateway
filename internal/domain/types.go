@@ -4,6 +4,22 @@ import "time"
 
 type PriorityClass string
 
+type InferenceOutcome string
+
+const (
+	InferenceSuccess InferenceOutcome = "success"
+	InferenceFailure InferenceOutcome = "failure"
+	InferenceNeutral InferenceOutcome = "neutral"
+)
+
+type CircuitState string
+
+const (
+	CircuitClosed   CircuitState = "closed"
+	CircuitOpen     CircuitState = "open"
+	CircuitHalfOpen CircuitState = "half_open"
+)
+
 const (
 	PriorityCritical   PriorityClass = "critical"
 	PriorityHigh       PriorityClass = "high"
