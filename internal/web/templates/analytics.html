@@ -1,0 +1,150 @@
+{{define "content"}}
+<section class="page-heading analytics-heading">
+  <div>
+    <h1>Usage analytics</h1>
+    <p>Request volume and token usage for the live gateway ledger.</p>
+  </div>
+  <a class="button" href="{{.Analytics.CSVURL}}">Download CSV</a>
+</section>
+
+<section class="analytics-filters" aria-labelledby="analytics-filter-title">
+  <div class="filter-heading">
+    <h2 id="analytics-filter-title">Filters</h2>
+    <div class="preset-list" aria-label="Time range presets">
+      {{range .Analytics.Presets}}<a class="preset{{if .Active}} active{{end}}" href="{{.URL}}"{{if .Active}} aria-current="true"{{end}}>{{.Label}}</a>{{end}}
+    </div>
+  </div>
+  <form method="get" action="/admin/analytics" class="analytics-filter-grid">
+    <div>
+      <label for="analytics-from">From (UTC)</label>
+      <input id="analytics-from" name="from_local" type="datetime-local" value="{{.Analytics.FromValue}}" required>
+    </div>
+    <div>
+      <label for="analytics-to">To (UTC)</label>
+      <input id="analytics-to" name="to_local" type="datetime-local" value="{{.Analytics.ToValue}}" required>
+    </div>
+    <div>
+      <label for="analytics-client">Client</label>
+      <select id="analytics-client" name="client_id">
+        <option value="">All clients</option>
+        {{range .Analytics.Dataset.Clients}}<option value="{{.ID}}"{{if eq (printf "%d" .ID) $.Analytics.ClientID}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </div>
+    <div>
+      <label for="analytics-model">Model</label>
+      <select id="analytics-model" name="model_pool_id">
+        <option value="">All models</option>
+        {{range .Analytics.Dataset.Models}}<option value="{{.ID}}"{{if eq (printf "%d" .ID) $.Analytics.ModelPoolID}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </div>
+    <div>
+      <label for="analytics-usage">Usage availability</label>
+      <select id="analytics-usage" name="usage_available">
+        <option value=""{{if eq .Analytics.UsageAvailable ""}} selected{{end}}>All requests</option>
+        <option value="true"{{if eq .Analytics.UsageAvailable "true"}} selected{{end}}>Usage available</option>
+        <option value="false"{{if eq .Analytics.UsageAvailable "false"}} selected{{end}}>Usage unavailable</option>
+      </select>
+    </div>
+    <input type="hidden" name="limit" value="{{.Analytics.Limit}}">
+    <div class="filter-actions">
+      <a class="button" href="/admin/analytics">Reset</a>
+      <button class="button primary" type="submit">Apply</button>
+    </div>
+  </form>
+</section>
+
+<section aria-labelledby="analytics-summary-title">
+  <h2 id="analytics-summary-title">Summary</h2>
+  <div class="analytics-summary">
+    <article><span>Requests</span><strong class="mono">{{integer .Analytics.Dataset.Summary.RequestCount}}</strong><small>All requests matching the active filters.</small></article>
+    <article><span>Usage coverage</span><strong class="mono">{{ratio .Analytics.Dataset.Summary.UsageCoverage}}</strong><small>{{integer .Analytics.Dataset.Summary.MeteredRequestCount}} of {{integer .Analytics.Dataset.Summary.RequestCount}} requests have token usage.</small></article>
+    <article><span>Input tokens</span><strong class="mono">{{integer .Analytics.Dataset.Summary.InputTokens}}</strong><small>Reported prompt-side tokens.</small></article>
+    <article><span>Output tokens</span><strong class="mono">{{integer .Analytics.Dataset.Summary.OutputTokens}}</strong><small>Reported generated tokens.</small></article>
+    <article><span>Cache-read tokens</span><strong class="mono">{{optionalInteger .Analytics.Dataset.Summary.CacheReadTokens}}</strong><small>Known cache reads; unavailable when no matching request reports cache usage.</small></article>
+    <article><span>Cache-hit ratio</span><strong class="mono">{{optionalRatio .Analytics.Dataset.Summary.CacheHitRatio}}</strong><small>Cache reads divided by input tokens for the cache-known subset.</small></article>
+  </div>
+  <p class="metric-definitions">Coverage is metered requests divided by all matching requests. Cache metrics use only requests where cache-read usage is known. Missing cache data is unavailable, not zero.</p>
+</section>
+
+<section class="analytics-section" aria-labelledby="movement-title">
+  <div class="section-heading">
+    <div><h2 id="movement-title">Movement</h2><p>UTC buckets adapt to the selected range.</p></div>
+  </div>
+  <div class="chart-grid">
+    <article class="chart-panel" aria-labelledby="request-volume-title">
+      <h3 id="request-volume-title">Request volume</h3>
+      <p class="chart-note">Requests per UTC bucket, shown from a zero baseline.</p>
+      <div class="chart-stage" data-analytics-chart="requests" data-analytics-url="{{.Analytics.APIURL}}">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive request chart…{{else}}No series data is available for this range.{{end}}</p>
+      </div>
+      <details class="chart-fallback">
+        <summary>View request volume data</summary>
+        <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (UTC)</th><th>Requests</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+        </tbody></table></div>
+      </details>
+    </article>
+    <article class="chart-panel" aria-labelledby="token-volume-title">
+      <h3 id="token-volume-title">Input and output tokens</h3>
+      <p class="chart-note">Two independent, non-stacked series from a zero baseline.</p>
+      <div class="chart-stage" data-analytics-chart="tokens" data-analytics-url="{{.Analytics.APIURL}}">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive token chart…{{else}}No series data is available for this range.{{end}}</p>
+      </div>
+      <details class="chart-fallback">
+        <summary>View input and output token data</summary>
+        <div class="table-wrap"><table><caption>Input and output token data</caption><thead><tr><th>Bucket (UTC)</th><th>Input</th><th>Output</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .InputTokens}}</td><td class="mono">{{integer .OutputTokens}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
+        </tbody></table></div>
+      </details>
+    </article>
+    <article class="chart-panel chart-panel-wide" aria-labelledby="cache-usage-title">
+      <h3 id="cache-usage-title">Cache usage</h3>
+      <p class="chart-note">Aligned token and ratio plots for cache-known buckets only. Gaps mean unavailable data.</p>
+      <div class="chart-stage chart-stage-tall" data-analytics-chart="cache" data-analytics-url="{{.Analytics.APIURL}}">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Loading interactive cache charts…{{else}}No series data is available for this range.{{end}}</p>
+      </div>
+      <details class="chart-fallback">
+        <summary>View cache-known usage data</summary>
+        <div class="table-wrap"><table><caption>Cache-known usage data</caption><thead><tr><th>Bucket (UTC)</th><th>Cache read</th><th>Cache hit</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{optionalInteger .CacheReadTokens}}</td><td class="mono">{{optionalRatio .CacheHitRatio}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
+        </tbody></table></div>
+      </details>
+    </article>
+  </div>
+</section>
+
+<section class="analytics-section" aria-labelledby="breakdown-title">
+  <h2 id="breakdown-title">Breakdown</h2>
+  <p class="section-copy">Usage by client and model. Coverage is shown as metered requests over total requests.</p>
+  <div class="table-wrap"><table><thead><tr><th>Client</th><th>Model</th><th>Requests</th><th>Coverage</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache hit</th></tr></thead><tbody>
+    {{range .Analytics.Dataset.Breakdown}}<tr>
+      <td><strong>{{.ClientName}}</strong><small class="mono">ID {{.ClientID}}</small></td>
+      <td><strong>{{.ModelName}}</strong><small class="mono">ID {{.ModelPoolID}}</small></td>
+      <td class="mono">{{integer .RequestCount}}</td><td class="mono">{{integer .MeteredRequestCount}} / {{integer .RequestCount}}</td>
+      <td class="mono">{{integer .InputTokens}}</td><td class="mono">{{integer .OutputTokens}}</td>
+      <td class="mono">{{optionalInteger .CacheReadTokens}}</td><td class="mono">{{optionalRatio .CacheHitRatio}}</td>
+    </tr>{{else}}<tr><td colspan="8" class="empty">No requests match the active filters.</td></tr>{{end}}
+  </tbody></table></div>
+</section>
+
+<section class="analytics-section" aria-labelledby="requests-title">
+  <div class="section-heading">
+    <div><h2 id="requests-title">Request detail</h2><p>Operational timestamps are precise UTC; token fields are em dashes when usage was not reported.</p></div>
+    {{if .Analytics.Requests.Requests}}<p class="page-count">Showing {{integer .Analytics.FirstRequest}}–{{integer .Analytics.LastRequest}} of {{integer .Analytics.Requests.Total}}</p>{{end}}
+  </div>
+  <div class="table-wrap"><table class="request-table"><thead><tr><th>Occurred at</th><th>Request ID</th><th>Client</th><th>Model</th><th>Backend</th><th>Status</th><th>Duration</th><th>TTFT</th><th>Retries</th><th>Input</th><th>Output</th><th>Cache read</th></tr></thead><tbody>
+    {{range .Analytics.Requests.Requests}}<tr>
+      <td class="mono timestamp">{{utcTimestamp .OccurredAt}}</td>
+      <td><strong class="mono request-id">{{.RequestID}}</strong>{{if .ParentRequestID}}<small class="mono">Parent {{.ParentRequestID}}</small>{{end}}</td>
+      <td>{{.ClientName}}</td><td>{{.ModelName}}</td><td>{{.BackendName}}</td>
+      <td class="mono">{{.HTTPStatus}}{{if .Disconnected}}<small>Disconnected</small>{{end}}</td>
+      <td class="mono">{{integer .DurationMS}} ms</td><td class="mono">{{optionalInteger .TTFTMS}}{{if .TTFTMS}} ms{{end}}</td><td class="mono">{{.RetryCount}}</td>
+      <td class="mono">{{optionalInteger .InputTokens}}</td><td class="mono">{{optionalInteger .OutputTokens}}</td><td class="mono">{{optionalInteger .CacheReadTokens}}</td>
+    </tr>{{else}}<tr><td colspan="12" class="empty">No requests match the active filters.</td></tr>{{end}}
+  </tbody></table></div>
+  {{if or .Analytics.HasPrevious .Analytics.HasNext}}<nav class="pagination" aria-label="Request pages">
+    {{if .Analytics.HasPrevious}}<a class="button" href="{{.Analytics.PreviousURL}}">Previous</a>{{else}}<span></span>{{end}}
+    {{if .Analytics.HasNext}}<a class="button" href="{{.Analytics.NextURL}}">Next</a>{{end}}
+  </nav>{{end}}
+</section>
+{{end}}

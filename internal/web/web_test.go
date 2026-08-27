@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,12 +15,149 @@ import (
 
 	"golang.org/x/net/html"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 	"github.com/rislanov/vllm-priority-gateway/internal/web"
 )
+
+func TestAnalyticsPageRendersCanonicalFiltersSummaryAndPagination(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	values := url.Values{
+		"from":            {"2026-08-26T09:00:00Z"},
+		"to":              {"2026-08-26T12:00:00Z"},
+		"client_id":       {"1"},
+		"model_pool_id":   {"1"},
+		"usage_available": {"true"},
+		"limit":           {"1"},
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?"+values.Encode(), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	document, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`href="/admin/analytics" aria-current="page"`,
+		`value="2026-08-26T09:00"`, `value="2026-08-26T12:00"`,
+		`value="1" selected`, `value="true" selected`,
+		"Requests", "2", "Usage coverage", "100%", "Input tokens", "150",
+		"Output tokens", "30", "Cache-read tokens", "40", "Cache-hit ratio", "40%",
+		"Coverage is metered requests divided by all matching requests.",
+		"Cache metrics use only requests where cache-read usage is known.",
+		"req-cache-unknown",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("analytics page missing %q: %s", expected, body)
+		}
+	}
+	if strings.Contains(strings.ToLower(body), "prompt text") || strings.Contains(strings.ToLower(body), "response text") {
+		t.Fatalf("analytics page exposed prompt/response text fields: %s", body)
+	}
+	for _, header := range []string{"Client", "Model", "Requests", "Coverage", "Input", "Output", "Cache read", "Cache hit", "Occurred at", "Request ID", "Backend", "Status", "Duration", "TTFT", "Retries"} {
+		if !hasElementText(document, "th", header) {
+			t.Fatalf("missing analytics table header %q", header)
+		}
+	}
+	if !allLabelsReferenceControls(document) {
+		t.Fatal("analytics page has a label whose for attribute does not reference a control")
+	}
+
+	exportURL := attrForElementWithText(document, "a", "Download CSV", "href")
+	assertAnalyticsLink(t, exportURL, "/admin/api/analytics/export.csv", values, false)
+	nextURL := attrForElementWithText(document, "a", "Next", "href")
+	assertAnalyticsLink(t, nextURL, "/admin/analytics", values, true)
+}
+
+func TestAnalyticsPageRendersMissingUsageAndHonestEmptyState(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-26T09%3A00%3A00Z&to=2026-08-26T12%3A00%3A00Z", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "req-unmetered") || !strings.Contains(body, "—") {
+		t.Fatalf("missing-usage request or em dash absent: %s", body)
+	}
+	if strings.Contains(body, "<script>alert(1)</script>") || !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Fatalf("dimension labels were not HTML escaped: %s", body)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-20T09%3A00%3A00Z&to=2026-08-20T12%3A00%3A00Z", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "No requests match the active filters.") || !strings.Contains(response.Body.String(), "No series data is available for this range.") {
+		t.Fatalf("empty analytics response = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	document, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countElementsWithAttr(document, "data-analytics-chart") != 3 {
+		t.Fatalf("chart containers = %d, want 3: %s", countElementsWithAttr(document, "data-analytics-chart"), body)
+	}
+	if countElements(document, "caption") < 3 || !strings.Contains(body, "Request volume data") || !strings.Contains(body, "Input and output token data") || !strings.Contains(body, "Cache-known usage data") {
+		t.Fatalf("server-rendered chart fallbacks missing: %s", body)
+	}
+	if !strings.Contains(body, `src="/admin/static/app.js"`) || strings.Contains(body, "https://") || strings.Contains(body, "http://") {
+		t.Fatalf("analytics page must use only self-hosted assets: %s", body)
+	}
+
+	script := httptest.NewRecorder()
+	handler.ServeHTTP(script, httptest.NewRequest(http.MethodGet, "/admin/static/app.js", nil))
+	for _, required := range []string{"fetch(", "createElementNS", "textContent", "/admin/api/analytics"} {
+		if !strings.Contains(script.Body.String(), required) {
+			t.Fatalf("self-hosted chart script missing %q: %s", required, script.Body.String())
+		}
+	}
+	if strings.Contains(script.Body.String(), "innerHTML") {
+		t.Fatalf("chart script must not construct markup with innerHTML: %s", script.Body.String())
+	}
+}
+
+func TestAnalyticsCustomUTCFormRedirectsToStrictCanonicalQuery(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from_local=2026-08-26T09%3A00&to_local=2026-08-26T12%3A00&client_id=&model_pool_id=&usage_available=&limit=100", nil))
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	location := response.Header().Get("Location")
+	parsed, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/admin/analytics" || parsed.Query().Get("from") != "2026-08-26T09:00:00Z" || parsed.Query().Get("to") != "2026-08-26T12:00:00Z" {
+		t.Fatalf("canonical redirect = %q", location)
+	}
+	for _, empty := range []string{"from_local", "to_local", "client_id", "model_pool_id", "usage_available"} {
+		if parsed.Query().Has(empty) {
+			t.Fatalf("canonical redirect retained empty/web-only %q: %s", empty, location)
+		}
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("canonical target status = %d body=%s", response.Code, response.Body.String())
+	}
+}
 
 func TestAdminPagesHaveSemanticNavigationFormsAndTables(t *testing.T) {
 	handler := newWebFixture(t)
@@ -170,6 +308,35 @@ func TestBackendEditPageAndEnableToggle(t *testing.T) {
 }
 
 func newWebFixture(t *testing.T) http.Handler {
+	return newWebFixtureWithUsage(t, nil)
+}
+
+func newAnalyticsWebFixture(t *testing.T) http.Handler {
+	t.Helper()
+	input100, output20, cache40 := int64(100), int64(20), int64(40)
+	input50, output10 := int64(50), int64(10)
+	return newWebFixtureWithUsage(t, []analytics.RequestRecord{
+		{
+			OccurredAt: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC), RequestID: "req-cache-known",
+			ClientID: 1, ClientName: "payments", ModelPoolID: 1, ModelName: "qwen-72b", BackendName: "gpu-a",
+			HTTPStatus: 200, DurationMS: 320, UsageAvailable: true,
+			InputTokens: &input100, OutputTokens: &output20, CacheReadTokens: &cache40,
+		},
+		{
+			OccurredAt: time.Date(2026, 8, 26, 11, 0, 0, 0, time.UTC), RequestID: "req-cache-unknown",
+			ClientID: 1, ClientName: "payments", ModelPoolID: 1, ModelName: "qwen-72b", BackendName: "gpu-a",
+			HTTPStatus: 200, DurationMS: 280, RetryCount: 1, UsageAvailable: true,
+			InputTokens: &input50, OutputTokens: &output10,
+		},
+		{
+			OccurredAt: time.Date(2026, 8, 26, 11, 30, 0, 0, time.UTC), RequestID: "req-unmetered",
+			ClientID: 2, ClientName: "<script>alert(1)</script>", ModelPoolID: 2, ModelName: "unmetered-model", BackendName: "gpu-b",
+			HTTPStatus: 503, DurationMS: 45,
+		},
+	})
+}
+
+func newWebFixtureWithUsage(t *testing.T, records []analytics.RequestRecord) http.Handler {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -177,6 +344,9 @@ func newWebFixture(t *testing.T) http.Handler {
 	}
 	t.Cleanup(func() { database.Close() })
 	if err := database.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InsertUsageBatch(context.Background(), records); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := database.CreatePool(context.Background(), store.CreatePoolParams{PublicModelName: "qwen-72b", UpstreamModelName: "Qwen/Qwen2.5-72B-Instruct", Enabled: true})
@@ -305,4 +475,59 @@ func hasAttr(node *html.Node, key, value string) bool {
 		}
 	}
 	return false
+}
+
+func countElementsWithAttr(node *html.Node, attribute string) int {
+	count := 0
+	if node.Type == html.ElementNode {
+		for _, item := range node.Attr {
+			if item.Key == attribute {
+				count++
+				break
+			}
+		}
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		count += countElementsWithAttr(child, attribute)
+	}
+	return count
+}
+
+func attrForElementWithText(node *html.Node, element, text, attribute string) string {
+	if node.Type == html.ElementNode && node.Data == element && strings.TrimSpace(nodeText(node)) == text {
+		for _, item := range node.Attr {
+			if item.Key == attribute {
+				return item.Val
+			}
+		}
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if value := attrForElementWithText(child, element, text, attribute); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func assertAnalyticsLink(t *testing.T, raw, wantPath string, want url.Values, paginated bool) {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != wantPath {
+		t.Fatalf("link path = %q, want %q (%s)", parsed.Path, wantPath, raw)
+	}
+	for _, name := range []string{"from", "to", "client_id", "model_pool_id", "usage_available"} {
+		if got := parsed.Query().Get(name); got != want.Get(name) {
+			t.Fatalf("link %s = %q, want %q (%s)", name, got, want.Get(name), raw)
+		}
+	}
+	if paginated {
+		if parsed.Query().Get("limit") != "1" || parsed.Query().Get("offset") != "1" {
+			t.Fatalf("pagination link query = %s, want limit=1 offset=1", parsed.RawQuery)
+		}
+	} else if parsed.Query().Has("limit") || parsed.Query().Has("offset") {
+		t.Fatalf("export link unexpectedly contains pagination: %s", raw)
+	}
 }

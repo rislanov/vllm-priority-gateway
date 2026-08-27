@@ -7,11 +7,13 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 )
@@ -44,6 +46,33 @@ type pageData struct {
 	EditBackend *httpapi.AdminBackend
 	Secret      string
 	Error       string
+	Analytics   *analyticsPage
+}
+
+type analyticsPage struct {
+	Dataset        analytics.Dataset
+	Requests       analytics.RequestPage
+	FromValue      string
+	ToValue        string
+	ClientID       string
+	ModelPoolID    string
+	UsageAvailable string
+	Limit          int
+	APIURL         string
+	CSVURL         string
+	Presets        []analyticsPreset
+	HasPrevious    bool
+	PreviousURL    string
+	HasNext        bool
+	NextURL        string
+	FirstRequest   int64
+	LastRequest    int64
+}
+
+type analyticsPreset struct {
+	Label  string
+	URL    string
+	Active bool
 }
 
 func New(service *httpapi.AdminService) (http.Handler, error) {
@@ -55,6 +84,21 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 		"timeValue": timeValue,
 		"percent":   func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
 		"decimal":   func(value float64) string { return fmt.Sprintf("%.2f", value) },
+		"integer":   formatInteger,
+		"ratio":     func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
+		"optionalInteger": func(value *int64) string {
+			if value == nil {
+				return "—"
+			}
+			return formatInteger(*value)
+		},
+		"optionalRatio": func(value *float64) string {
+			if value == nil {
+				return "—"
+			}
+			return fmt.Sprintf("%.0f%%", *value*100)
+		},
+		"utcTimestamp": func(value time.Time) string { return value.UTC().Format("2006-01-02 15:04:05.000 UTC") },
 		"totalRunning": func(backends []httpapi.AdminBackend) string {
 			var total float64
 			for _, backend := range backends {
@@ -72,8 +116,8 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 			return false
 		},
 	}
-	templates := make(map[string]*template.Template, 4)
-	for _, page := range []string{"dashboard", "clients", "keys", "backends"} {
+	templates := make(map[string]*template.Template, 5)
+	for _, page := range []string{"dashboard", "analytics", "clients", "keys", "backends"} {
 		parsed, err := template.New("layout.html").Funcs(functions).ParseFS(assets, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse %s template: %w", page, err)
@@ -101,6 +145,8 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		h.render(writer, request, "dashboard", pageData{Title: "Gateway overview", Active: "Dashboard"}, http.StatusOK)
 	case "/admin/clients":
 		h.clients(writer, request)
+	case "/admin/analytics":
+		h.analytics(writer, request)
 	case "/admin/keys":
 		h.keys(writer, request)
 	case "/admin/backends":
@@ -108,6 +154,169 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	default:
 		http.NotFound(writer, request)
 	}
+}
+
+func (h *Handler) analytics(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		methodNotAllowed(writer)
+		return
+	}
+	values, normalized, err := normalizeAnalyticsWebValues(request.URL.Query())
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if normalized {
+		http.Redirect(writer, request, analyticsURL("/admin/analytics", values), http.StatusSeeOther)
+		return
+	}
+	query, err := h.service.ParseAnalyticsQuery(values)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dataset, err := h.service.Analytics(request.Context(), query.Filter)
+	if err != nil {
+		http.Error(writer, "Unable to query analytics", http.StatusInternalServerError)
+		return
+	}
+	requests, err := h.service.UsageRequests(request.Context(), query)
+	if err != nil {
+		http.Error(writer, "Unable to query analytics requests", http.StatusInternalServerError)
+		return
+	}
+	data := pageData{Title: "Usage analytics", Active: "Analytics"}
+	data.Analytics = buildAnalyticsPage(query, dataset, requests)
+	h.render(writer, request, "analytics", data, http.StatusOK)
+}
+
+func normalizeAnalyticsWebValues(input url.Values) (url.Values, bool, error) {
+	values := input.Clone()
+	fromLocal, hasFrom := values["from_local"]
+	toLocal, hasTo := values["to_local"]
+	if !hasFrom && !hasTo {
+		return values, false, nil
+	}
+	if !hasFrom || !hasTo || len(fromLocal) != 1 || len(toLocal) != 1 {
+		return nil, false, fmt.Errorf("custom UTC from and to must be supplied together")
+	}
+	const localLayout = "2006-01-02T15:04"
+	from, err := time.ParseInLocation(localLayout, fromLocal[0], time.UTC)
+	if err != nil {
+		return nil, false, fmt.Errorf("from must be a valid UTC date and time")
+	}
+	to, err := time.ParseInLocation(localLayout, toLocal[0], time.UTC)
+	if err != nil {
+		return nil, false, fmt.Errorf("to must be a valid UTC date and time")
+	}
+	values.Del("from_local")
+	values.Del("to_local")
+	for _, name := range []string{"client_id", "model_pool_id", "usage_available"} {
+		if items := values[name]; len(items) == 1 && items[0] == "" {
+			values.Del(name)
+		}
+	}
+	values.Set("from", from.Format(time.RFC3339))
+	values.Set("to", to.Format(time.RFC3339))
+	return values, true, nil
+}
+
+func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset, requests analytics.RequestPage) *analyticsPage {
+	filterValues := analyticsFilterValues(query.Filter)
+	pageValues := filterValues.Clone()
+	pageValues.Set("limit", strconv.Itoa(query.Limit))
+	if query.Offset > 0 {
+		pageValues.Set("offset", strconv.Itoa(query.Offset))
+	}
+	page := &analyticsPage{
+		Dataset: dataset, Requests: requests,
+		FromValue: query.Filter.From.UTC().Format("2006-01-02T15:04"),
+		ToValue:   query.Filter.To.UTC().Format("2006-01-02T15:04"),
+		Limit:     query.Limit,
+		APIURL:    analyticsURL("/admin/api/analytics", filterValues),
+		CSVURL:    analyticsURL("/admin/api/analytics/export.csv", filterValues),
+	}
+	if query.Filter.ClientID != nil {
+		page.ClientID = strconv.FormatInt(*query.Filter.ClientID, 10)
+	}
+	if query.Filter.ModelPoolID != nil {
+		page.ModelPoolID = strconv.FormatInt(*query.Filter.ModelPoolID, 10)
+	}
+	if query.Filter.UsageAvailable != nil {
+		page.UsageAvailable = strconv.FormatBool(*query.Filter.UsageAvailable)
+	}
+	for _, preset := range []struct {
+		label string
+		width time.Duration
+	}{{"1h", time.Hour}, {"24h", 24 * time.Hour}, {"7d", 7 * 24 * time.Hour}, {"30d", 30 * 24 * time.Hour}, {"90d", 90 * 24 * time.Hour}} {
+		presetValues := filterValues.Clone()
+		presetValues.Set("from", query.Filter.To.Add(-preset.width).Format(time.RFC3339))
+		page.Presets = append(page.Presets, analyticsPreset{
+			Label: preset.label, URL: analyticsURL("/admin/analytics", presetValues),
+			Active: query.Filter.To.Sub(query.Filter.From) == preset.width,
+		})
+	}
+	page.HasPrevious = query.Offset > 0
+	if page.HasPrevious {
+		previous := query.Offset - query.Limit
+		if previous < 0 {
+			previous = 0
+		}
+		values := pageValues.Clone()
+		if previous == 0 {
+			values.Del("offset")
+		} else {
+			values.Set("offset", strconv.Itoa(previous))
+		}
+		page.PreviousURL = analyticsURL("/admin/analytics", values)
+	}
+	page.HasNext = int64(query.Offset+len(requests.Requests)) < requests.Total
+	if page.HasNext {
+		values := pageValues.Clone()
+		values.Set("offset", strconv.Itoa(query.Offset+query.Limit))
+		page.NextURL = analyticsURL("/admin/analytics", values)
+	}
+	if len(requests.Requests) > 0 {
+		page.FirstRequest = int64(query.Offset + 1)
+		page.LastRequest = int64(query.Offset + len(requests.Requests))
+	}
+	return page
+}
+
+func analyticsFilterValues(filter analytics.Filter) url.Values {
+	values := url.Values{
+		"from": {filter.From.UTC().Format(time.RFC3339)},
+		"to":   {filter.To.UTC().Format(time.RFC3339)},
+	}
+	if filter.ClientID != nil {
+		values.Set("client_id", strconv.FormatInt(*filter.ClientID, 10))
+	}
+	if filter.ModelPoolID != nil {
+		values.Set("model_pool_id", strconv.FormatInt(*filter.ModelPoolID, 10))
+	}
+	if filter.UsageAvailable != nil {
+		values.Set("usage_available", strconv.FormatBool(*filter.UsageAvailable))
+	}
+	return values
+}
+
+func analyticsURL(path string, values url.Values) string {
+	if encoded := values.Encode(); encoded != "" {
+		return path + "?" + encoded
+	}
+	return path
+}
+
+func formatInteger(value int64) string {
+	raw := strconv.FormatInt(value, 10)
+	start := 0
+	if strings.HasPrefix(raw, "-") {
+		start = 1
+	}
+	for position := len(raw) - 3; position > start; position -= 3 {
+		raw = raw[:position] + "," + raw[position:]
+	}
+	return raw
 }
 
 func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {

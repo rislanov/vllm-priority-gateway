@@ -12,6 +12,7 @@
     <a class="brand" href="/admin">vLLM <span>Priority Gateway</span></a>
     <nav aria-label="Admin navigation">
       <a href="/admin"{{if eq .Active "Dashboard"}} aria-current="page"{{end}}>Dashboard</a>
+      <a href="/admin/analytics"{{if eq .Active "Analytics"}} aria-current="page"{{end}}>Analytics</a>
       <a href="/admin/clients"{{if eq .Active "Clients"}} aria-current="page"{{end}}>Clients</a>
       <a href="/admin/keys"{{if eq .Active "API Keys"}} aria-current="page"{{end}}>API Keys</a>
       <a href="/admin/backends"{{if eq .Active "Backends"}} aria-current="page"{{end}}>Backends</a>
