@@ -524,3 +524,64 @@
   git add internal/store/usage.go internal/store/usage_test.go docs/superpowers/specs/2026-08-27-usage-analytics-design.md docs/superpowers/plans/2026-08-27-usage-analytics.md
   git commit -m "fix: bound custom analytics series"
   ```
+
+---
+
+### Task 11: Reserve recorder capacity before response generation
+
+**Files:**
+
+- Modify: `internal/gateway/observer.go`
+- Modify: `internal/gateway/service.go`
+- Modify: `internal/gateway/usage_test.go`
+- Modify: `internal/observability/log.go`
+- Modify: `internal/observability/log_test.go`
+- Modify: `internal/analytics/recorder.go`
+- Modify: `internal/analytics/recorder_test.go`
+- Modify: `internal/httpapi/public_test.go`
+- Modify: `docs/superpowers/specs/2026-08-27-usage-analytics-design.md`
+
+- [ ] Add failing real-`httptest.Server` regressions proving that, after a request has reserved recorder capacity, both a generated 429 JSON response and a chunked/SSE response become fully readable through EOF before a blocked analytics store is released. The tests must fail against the existing deferred blocking `ResponseComplete` behavior; an in-memory `ResponseWriter.Write` signal is insufficient.
+
+- [ ] Add failing recorder and `observability.Multi` tests for cancellable reservation backpressure, successful-reservation rollback, duplicate IDs, shutdown races, and non-blocking terminal handoff. Name the concrete production mutation each test catches before writing it.
+
+- [ ] Add an optional gateway observer capability that reserves a completion slot by request ID with request-context cancellation. `observability.Multi` must combine capable peers in order and roll back earlier reservations if a later peer cannot reserve.
+
+- [ ] After authenticated client and public-model resolution, reserve recorder capacity before testing model policy, pool availability, admission, routing, or forwarding. Unknown public models remain unreserved and outside the ledger. Context cancellation while waiting must stop the request without staging a row.
+
+- [ ] Move recorder capacity backpressure from terminal `ResponseComplete` to the reservation. A successful reservation must guarantee that `ResponseComplete` cannot block on queue capacity. Keep one writer, bounded memory, exactly-once metadata rows, no silent drops, post-response event enrichment, retention, failure accounting, and hard-bounded shutdown/store ownership.
+
+- [ ] Update the outdated in-memory backpressure regression and comments/docs to describe pre-response reservation backpressure and actual HTTP finalization.
+
+- [ ] Run focused analytics/gateway/observability/httpapi tests, their race suites, the real-network regressions, and `git diff --check`.
+
+- [ ] Commit:
+
+  ```bash
+  git add internal/gateway/observer.go internal/gateway/service.go internal/gateway/usage_test.go internal/observability/log.go internal/observability/log_test.go internal/analytics/recorder.go internal/analytics/recorder_test.go internal/httpapi/public_test.go docs/superpowers/specs/2026-08-27-usage-analytics-design.md docs/superpowers/plans/2026-08-27-usage-analytics.md
+  git commit -m "fix: reserve analytics recorder capacity"
+  ```
+
+---
+
+### Task 12: Bound CSV temporary files through delivery
+
+**Files:**
+
+- Modify: `internal/httpapi/analytics.go`
+- Modify: `internal/httpapi/analytics_test.go`
+
+- [ ] Add a failing concurrency regression with two blocked CSV deliveries. Prove a third authenticated export immediately receives the controlled busy response and creates no additional temporary file. Release the deliveries and prove every file and slot is cleaned up.
+
+- [ ] Keep the existing non-blocking maximum of two exports, but hold each slot from before `CreateTemp` through client delivery, file close, and removal. Rename spool-only identifiers if necessary so ownership is unambiguous.
+
+- [ ] Preserve the invariant that SQLite streaming/cursor work finishes before any client write, and preserve `0600` mode, metadata-only contents, filter parity, chronology, RFC 4180, formula neutralization, cancellation, and pre-commit error handling. Do not add a global server write timeout.
+
+- [ ] Run focused CSV tests, HTTP API race tests, and `git diff --check`.
+
+- [ ] Commit:
+
+  ```bash
+  git add internal/httpapi/analytics.go internal/httpapi/analytics_test.go
+  git commit -m "fix: bound analytics export lifecycle"
+  ```

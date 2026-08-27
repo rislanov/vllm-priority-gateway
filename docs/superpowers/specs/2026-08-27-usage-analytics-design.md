@@ -113,7 +113,7 @@ If final usage is absent or malformed, set `usage_available=false` and leave tok
 
 ## Recorder, Durability, and Retention
 
-The recorder owns a bounded channel and one SQLite writer goroutine. It groups pending events into transactions, flushing on a short interval or batch-size threshold. Queue saturation applies backpressure after the downstream response is already written rather than silently dropping analytics rows.
+The recorder owns a bounded channel and one SQLite writer goroutine. It groups pending events into transactions, flushing on a short interval or batch-size threshold. Once an authenticated request has a resolved public-model identity, it reserves one bounded recorder-completion slot before policy rejection or upstream forwarding. Queue saturation therefore applies cancellable backpressure before new inference work or an error response begins, rather than blocking handler return after response bytes have been written or silently dropping analytics rows. A successful reservation guarantees that terminal response completion can hand the staged row to the recorder without blocking HTTP response finalization.
 
 Database write failures do not rewrite an already delivered inference response. They are logged with safe metadata and counted by a dedicated persistence-failure Prometheus counter. The recorder continues accepting later batches. Graceful shutdown stops new ingestion, drains queued rows, commits the final batch, and then closes.
 
@@ -182,7 +182,7 @@ GET /admin/api/analytics/export.csv
 
 `/analytics` returns summary, series, breakdown, and dimensions for the selected range. `/requests` returns bounded pagination with a default page size of 100 and maximum of 500. Invalid ranges, unsupported timestamps, negative IDs, and excessive page sizes return the existing controlled admin error envelope with HTTP 400.
 
-CSV export applies the identical range/client/model/usage filters and streams rows in stable chronological order. It includes only ledger columns, never body or secret data. String fields beginning with spreadsheet formula markers (`=`, `+`, `-`, or `@`) are prefixed safely before RFC 4180 encoding. Client cancellation stops the database scan promptly.
+CSV export applies the identical range/client/model/usage filters and streams rows in stable chronological order. It includes only ledger columns, never body or secret data. String fields beginning with spreadsheet formula markers (`=`, `+`, `-`, or `@`) are prefixed safely before RFC 4180 encoding. Client cancellation stops the database scan promptly. The complete CSV is first spooled to a secure `0600` temporary file so no database cursor is held during client I/O. At most two export temporary files may exist concurrently: the non-blocking export slot remains held through delivery and cleanup, and excess exports receive a controlled retryable response.
 
 ## Built-in Analytics UI
 

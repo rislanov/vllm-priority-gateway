@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 )
@@ -79,4 +80,33 @@ func (o observers) ResponseComplete(requestID string) {
 			responseObserver.ResponseComplete(requestID)
 		}
 	}
+}
+
+func (o observers) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
+	rollbacks := make([]func(), 0, len(o))
+	for _, observer := range o {
+		reserver, ok := observer.(gateway.ResponseCompleteReserver)
+		if !ok {
+			continue
+		}
+		rollback, reserved := reserver.ReserveResponseComplete(ctx, requestID)
+		if !reserved {
+			for index := len(rollbacks) - 1; index >= 0; index-- {
+				rollbacks[index]()
+			}
+			return nil, false
+		}
+		if rollback == nil {
+			rollback = func() {}
+		}
+		rollbacks = append(rollbacks, rollback)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for index := len(rollbacks) - 1; index >= 0; index-- {
+				rollbacks[index]()
+			}
+		})
+	}, true
 }

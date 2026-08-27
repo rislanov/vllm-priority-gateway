@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -47,8 +48,16 @@ type Observer interface {
 	Complete(RequestEvent)
 }
 
-// ResponseCompleteObserver receives a signal after the downstream response is
-// fully written. Implementations may apply post-response backpressure here.
+// ResponseCompleteObserver receives a terminal signal after the handler or
+// proxy finishes writing. It runs before ServeHTTP returns, so implementations
+// must not wait for response-finalization capacity here.
 type ResponseCompleteObserver interface {
 	ResponseComplete(requestID string)
+}
+
+// ResponseCompleteReserver applies cancellable backpressure before response
+// generation. A successful reservation returns an idempotent rollback that
+// releases only that reservation if the aggregate lifecycle cannot proceed.
+type ResponseCompleteReserver interface {
+	ReserveResponseComplete(ctx context.Context, requestID string) (rollback func(), ok bool)
 }

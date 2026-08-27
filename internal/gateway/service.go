@@ -147,8 +147,8 @@ func (s *Service) CompletePublic(event RequestEvent) {
 	}
 }
 
-// ResponseComplete signals observer peers only after the public HTTP response
-// has been written by the handler or upstream proxy.
+// ResponseComplete signals observer peers after the handler or upstream proxy
+// finishes writing and before the public handler returns to net/http.
 func (s *Service) ResponseComplete(requestID string) {
 	if observer, ok := s.observer.(ResponseCompleteObserver); ok {
 		observer.ResponseComplete(requestID)
@@ -200,6 +200,15 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	}
 	event.ModelPoolID = pool.ID
 	event.Model = pool.PublicModelName
+	if reserver, ok := s.observer.(ResponseCompleteReserver); ok {
+		if _, reserved := reserver.ReserveResponseComplete(ctx, request.RequestID); !reserved {
+			reservationErr := ctx.Err()
+			if reservationErr == nil {
+				reservationErr = context.Canceled
+			}
+			return proxy.Result{Cancelled: true, Err: reservationErr}, nil
+		}
+	}
 	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 		return proxy.Result{}, modelNotAllowed()
 	}

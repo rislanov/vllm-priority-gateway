@@ -337,72 +337,108 @@ func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	}
 }
 
-func TestResolvedRejectionWritesResponseBeforeRecorderBackpressure(t *testing.T) {
+func TestResolvedRejectionBodyReachesEOFBeforeBlockedAnalyticsStoreRelease(t *testing.T) {
 	raw, key := testKey(t)
-	store := &blockingAnalyticsStore{insertStarted: make(chan struct{}, 1), releaseInsert: make(chan struct{})}
-	recorder := analytics.NewRecorder(store, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	release := sync.OnceFunc(func() { close(store.releaseInsert) })
-	t.Cleanup(func() {
-		release()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = recorder.Close(ctx)
-	})
-	observer := observability.Multi(recorder)
-	responseObserver, ok := observer.(gateway.ResponseCompleteObserver)
-	if !ok {
-		t.Fatal("Multi did not expose response-complete capability")
-	}
-
-	for index := 0; index < 64; index++ {
-		id := "writer-" + strconv.Itoa(index)
-		observer.Complete(resolvedEvent(id))
-		responseObserver.ResponseComplete(id)
-	}
-	select {
-	case <-store.insertStarted:
-	case <-time.After(time.Second):
-		t.Fatal("recorder writer did not reach blocked store")
-	}
-	for index := 0; index < 1024; index++ {
-		id := "queued-" + strconv.Itoa(index)
-		observer.Complete(resolvedEvent(id))
-		responseObserver.ResponseComplete(id)
-	}
-
+	recorder, store, release := newBlockedAnalyticsRecorder(t)
+	gate := newCompletionGate("finalized-429")
+	observer := observability.Multi(recorder, gate)
 	handler, _ := newFixture(t, fixtureOptions{
 		client: backgroundClient(), key: key, poolState: domain.PoolSaturated, observer: observer,
+		generateID: func() (string, error) { return "finalized-429", nil },
 	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
-	request.Header.Set("Authorization", "Bearer "+raw)
-	response := &responseSignalWriter{ResponseRecorder: httptest.NewRecorder(), wroteBody: make(chan struct{})}
-	handlerDone := make(chan struct{})
-	go func() {
-		handler.ServeHTTP(response, request)
-		close(handlerDone)
+	server := httptest.NewServer(handler)
+	defer func() {
+		release()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
 	}()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+raw)
+	result := make(chan completedHTTPResponse, 1)
+	go func() {
+		result <- readHTTPResponse(server.Client(), request)
+	}()
+	awaitSignal(t, gate.entered, "target completion staging")
+	filled := fillRecorderBehindReservedRequest(t, recorder, "json-queued")
+	close(gate.release)
 
 	select {
-	case <-response.wroteBody:
-	case <-time.After(200 * time.Millisecond):
-		release()
-		t.Fatal("resolved rejection response was blocked by recorder queue saturation")
+	case response := <-result:
+		if response.err != nil {
+			t.Fatalf("read generated response through EOF: %v", response.err)
+		}
+		if response.status != http.StatusTooManyRequests {
+			t.Fatalf("status = %d body=%s", response.status, response.body)
+		}
+		assertErrorCode(t, response.body, "gateway_overloaded")
+	case <-time.After(time.Second):
+		t.Fatal("generated response did not reach EOF while the analytics store remained blocked")
 	}
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	if filled != 1023 {
+		t.Fatalf("queued completions behind target reservation = %d, want 1023", filled)
 	}
-	assertErrorCode(t, response.Body.Bytes(), "gateway_overloaded")
 	select {
-	case <-handlerDone:
-		t.Fatal("handler returned before post-response recorder backpressure was released")
+	case <-store.releaseInsert:
+		t.Fatal("analytics store was released before JSON response finalization was proved")
 	default:
 	}
+}
 
-	release()
+func TestStreamingResponseBodyReachesChunkedEOFBeforeBlockedAnalyticsStoreRelease(t *testing.T) {
+	raw, key := testKey(t)
+	recorder, store, release := newBlockedAnalyticsRecorder(t)
+	gate := newCompletionGate("finalized-sse")
+	observer := observability.Multi(recorder, gate)
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, observer: observer, forwarder: streamingForwarder{},
+		generateID: func() (string, error) { return "finalized-sse", nil },
+	})
+	server := httptest.NewServer(handler)
+	defer func() {
+		release()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
+	}()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+raw)
+	result := make(chan completedHTTPResponse, 1)
+	go func() {
+		result <- readHTTPResponse(server.Client(), request)
+	}()
+	awaitSignal(t, gate.entered, "stream completion staging")
+	filled := fillRecorderBehindReservedRequest(t, recorder, "sse-queued")
+	close(gate.release)
+
 	select {
-	case <-handlerDone:
+	case response := <-result:
+		if response.err != nil {
+			t.Fatalf("read streaming response through chunked EOF: %v", response.err)
+		}
+		if response.status != http.StatusOK {
+			t.Fatalf("status = %d body=%s", response.status, response.body)
+		}
+		if got := strings.Join(response.transferEncoding, ","); got != "chunked" {
+			t.Fatalf("stream transfer encoding = %q, want chunked", got)
+		}
+		if want := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"; string(response.body) != want {
+			t.Fatalf("stream body = %q, want %q", response.body, want)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("handler did not finish after recorder queue was released")
+		t.Fatal("streaming response did not reach chunked EOF while the analytics store remained blocked")
+	}
+	if filled != 1023 {
+		t.Fatalf("queued completions behind target reservation = %d, want 1023", filled)
+	}
+	select {
+	case <-store.releaseInsert:
+		t.Fatal("analytics store was released before chunked EOF was proved")
+	default:
 	}
 }
 
@@ -762,18 +798,6 @@ type recordingObserver struct {
 	backendDeltas []int
 }
 
-type responseSignalWriter struct {
-	*httptest.ResponseRecorder
-	once      sync.Once
-	wroteBody chan struct{}
-}
-
-func (w *responseSignalWriter) Write(value []byte) (int, error) {
-	written, err := w.ResponseRecorder.Write(value)
-	w.once.Do(func() { close(w.wroteBody) })
-	return written, err
-}
-
 type blockingAnalyticsStore struct {
 	insertStarted chan struct{}
 	releaseInsert chan struct{}
@@ -796,6 +820,125 @@ func resolvedEvent(requestID string) gateway.RequestEvent {
 	return gateway.RequestEvent{
 		OccurredAt: time.Unix(1_800_000_000, 0).UTC(), RequestID: requestID,
 		ClientID: 1, ModelPoolID: 10, Client: "client", Model: "public-model", Status: http.StatusOK,
+	}
+}
+
+type completionGate struct {
+	requestID string
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func newCompletionGate(requestID string) *completionGate {
+	return &completionGate{requestID: requestID, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (*completionGate) ClientInflight(gateway.InflightEvent, int)  {}
+func (*completionGate) BackendInflight(gateway.InflightEvent, int) {}
+
+func (g *completionGate) Complete(event gateway.RequestEvent) {
+	if event.RequestID != g.requestID {
+		return
+	}
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+}
+
+type completedHTTPResponse struct {
+	status           int
+	transferEncoding []string
+	body             []byte
+	err              error
+}
+
+func readHTTPResponse(client *http.Client, request *http.Request) completedHTTPResponse {
+	response, err := client.Do(request)
+	if err != nil {
+		return completedHTTPResponse{err: err}
+	}
+	body, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	transferEncoding := append([]string(nil), response.TransferEncoding...)
+	if readErr != nil {
+		return completedHTTPResponse{status: response.StatusCode, transferEncoding: transferEncoding, body: body, err: readErr}
+	}
+	return completedHTTPResponse{status: response.StatusCode, transferEncoding: transferEncoding, body: body, err: closeErr}
+}
+
+func newBlockedAnalyticsRecorder(t *testing.T) (*analytics.Recorder, *blockingAnalyticsStore, func()) {
+	t.Helper()
+	store := &blockingAnalyticsStore{insertStarted: make(chan struct{}, 1), releaseInsert: make(chan struct{})}
+	recorder := analytics.NewRecorder(store, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	release := sync.OnceFunc(func() { close(store.releaseInsert) })
+	for index := 0; index < 64; index++ {
+		reserveAndCompleteAnalytics(t, recorder, "writer-"+strconv.Itoa(index))
+	}
+	awaitSignal(t, store.insertStarted, "recorder writer blocked in store")
+	return recorder, store, release
+}
+
+func fillRecorderBehindReservedRequest(t *testing.T, recorder *analytics.Recorder, prefix string) int {
+	t.Helper()
+	filled := 0
+	for index := 0; index < 1024; index++ {
+		requestID := prefix + "-" + strconv.Itoa(index)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, reserved := recorder.ReserveResponseComplete(ctx, requestID)
+		cancel()
+		if !reserved {
+			break
+		}
+		recorder.Complete(resolvedEvent(requestID))
+		recorder.ResponseComplete(requestID)
+		filled++
+	}
+	return filled
+}
+
+func reserveAndCompleteAnalytics(t *testing.T, recorder *analytics.Recorder, requestID string) {
+	t.Helper()
+	_, reserved := recorder.ReserveResponseComplete(context.Background(), requestID)
+	if !reserved {
+		t.Fatalf("analytics reservation refused for %q", requestID)
+	}
+	recorder.Complete(resolvedEvent(requestID))
+	recorder.ResponseComplete(requestID)
+}
+
+func closeAnalyticsRecorder(t *testing.T, recorder *analytics.Recorder) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("Recorder.Close() error = %v", err)
+	}
+}
+
+func awaitSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+type streamingForwarder struct{}
+
+func (streamingForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	const body = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.WriteHeader(http.StatusOK)
+	written, _ := writer.Write([]byte(body))
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return proxy.Result{
+		BackendID: request.Target.Backend.ID, Status: http.StatusOK,
+		ResponseStarted: true, BytesSent: int64(written),
 	}
 }
 

@@ -31,17 +31,20 @@ type Recorder struct {
 	logger    *slog.Logger
 	settings  recorderSettings
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	events chan RequestRecord
-	done   chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
+	events       chan RequestRecord
+	permits      chan struct{}
+	intakeClosed chan struct{}
+	done         chan struct{}
 
-	mu        sync.Mutex
-	accepting bool
-	pending   map[string]RequestRecord
-	senders   sync.WaitGroup
-	closeOnce sync.Once
-	lastErr   error
+	mu         sync.Mutex
+	accepting  bool
+	pending    map[string]RequestRecord
+	reserved   map[string]*completionReservation
+	lifecycles sync.WaitGroup
+	closeOnce  sync.Once
+	lastErr    error
 }
 
 type recorderSettings struct {
@@ -57,6 +60,10 @@ type recorderSettings struct {
 	onStart          func()
 	afterCleanupTick func()
 }
+
+// Keep this token non-zero-sized: pointer identity prevents a stale rollback
+// from releasing a later reservation that reuses the same request ID.
+type completionReservation struct{ token byte }
 
 // NewRecorder starts one writer for request metadata and retention cleanup.
 func NewRecorder(store RecordStore, retention time.Duration, onFailure func(), logger *slog.Logger) *Recorder {
@@ -100,8 +107,9 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 	ctx, cancel := context.WithCancel(context.Background())
 	recorder := &Recorder{
 		store: store, retention: retention, onFailure: onFailure, logger: settings.logger, settings: settings,
-		ctx: ctx, cancel: cancel, events: make(chan RequestRecord, settings.queueCapacity), done: make(chan struct{}),
-		accepting: true, pending: make(map[string]RequestRecord),
+		ctx: ctx, cancel: cancel, events: make(chan RequestRecord, settings.queueCapacity),
+		permits: make(chan struct{}, settings.queueCapacity), intakeClosed: make(chan struct{}), done: make(chan struct{}),
+		accepting: true, pending: make(map[string]RequestRecord), reserved: make(map[string]*completionReservation),
 	}
 	go recorder.run()
 	return recorder
@@ -110,7 +118,54 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 func (*Recorder) ClientInflight(gateway.InflightEvent, int)  {}
 func (*Recorder) BackendInflight(gateway.InflightEvent, int) {}
 
-// Complete stages one resolved request without blocking the response path.
+// ReserveResponseComplete acquires bounded capacity before response generation.
+func (r *Recorder) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
+	if requestID == "" || ctx.Err() != nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	if !r.accepting || r.reserved[requestID] != nil || ctx.Err() != nil {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.mu.Unlock()
+
+	select {
+	case r.permits <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false
+	case <-r.intakeClosed:
+		return nil, false
+	}
+
+	r.mu.Lock()
+	if !r.accepting || r.reserved[requestID] != nil || ctx.Err() != nil {
+		r.mu.Unlock()
+		<-r.permits
+		return nil, false
+	}
+	reservation := &completionReservation{token: 1}
+	r.reserved[requestID] = reservation
+	r.lifecycles.Add(1)
+	r.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.reserved[requestID] != reservation {
+				r.mu.Unlock()
+				return
+			}
+			delete(r.reserved, requestID)
+			delete(r.pending, requestID)
+			r.mu.Unlock()
+			<-r.permits
+			r.lifecycles.Done()
+		})
+	}, true
+}
+
+// Complete stages metadata only for a request that already owns capacity.
 func (r *Recorder) Complete(event gateway.RequestEvent) {
 	if event.RequestID == "" || event.ClientID <= 0 || event.ModelPoolID <= 0 {
 		return
@@ -119,32 +174,47 @@ func (r *Recorder) Complete(event gateway.RequestEvent) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.accepting {
+	if _, reserved := r.reserved[event.RequestID]; !reserved {
 		return
 	}
 	r.pending[event.RequestID] = record
 }
 
-// ResponseComplete moves a staged record into the bounded worker queue. Any
-// resulting backpressure occurs only after the downstream response is written.
+// ResponseComplete hands a staged record to the bounded worker queue without
+// waiting for capacity; the successful reservation already owns that slot.
 func (r *Recorder) ResponseComplete(requestID string) {
 	r.mu.Lock()
+	_, reserved := r.reserved[requestID]
+	if reserved {
+		delete(r.reserved, requestID)
+	}
 	record, exists := r.pending[requestID]
 	if exists {
 		delete(r.pending, requestID)
 	}
-	if !exists || !r.accepting {
+	if !reserved {
 		r.mu.Unlock()
 		return
 	}
-	r.senders.Add(1)
+	if !exists {
+		r.mu.Unlock()
+		<-r.permits
+		r.lifecycles.Done()
+		return
+	}
 	r.mu.Unlock()
-	defer r.senders.Done()
+	defer r.lifecycles.Done()
 
 	if r.settings.beforeEnqueue != nil {
 		r.settings.beforeEnqueue()
 	}
-	r.events <- record
+	// Queued records retain their permits until the writer dequeues them. This
+	// lifecycle still owns one, so at most capacity-1 records can be queued.
+	select {
+	case r.events <- record:
+	default:
+		panic("analytics recorder completion reservation invariant violated")
+	}
 }
 
 // Close stops intake, drains accepted sends, and waits for the final batch.
@@ -153,10 +223,10 @@ func (r *Recorder) Close(ctx context.Context) error {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
 		r.accepting = false
-		clear(r.pending)
+		close(r.intakeClosed)
 		r.mu.Unlock()
 		go func() {
-			r.senders.Wait()
+			r.lifecycles.Wait()
 			close(r.events)
 		}()
 	})
@@ -200,6 +270,7 @@ func (r *Recorder) run() {
 				return
 			}
 			batch = append(batch, record)
+			<-r.permits
 			if r.settings.afterDequeue != nil {
 				r.settings.afterDequeue()
 			}

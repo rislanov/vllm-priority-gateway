@@ -3,6 +3,7 @@ package gateway_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -251,6 +252,56 @@ func TestRequestEventUsageRecordsIdentityForKnownModelPolicyDenials(t *testing.T
 	}
 }
 
+func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *testing.T) {
+	observer := &usageReservationObserver{accept: true}
+	forwarder := &usageCaptureForwarder{}
+	service, rawKey := newUsageTestServiceWithSnapshot(t, forwarder, observer, nil, nil, func(snapshot *registry.Snapshot) {
+		pool := snapshot.PoolsByName["public-model"]
+		pool.Enabled = false
+		snapshot.PoolsByName[pool.PublicModelName] = pool
+		snapshot.PoolsByID[pool.ID] = pool
+	})
+
+	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "policy-request",
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("Forward() API error = %+v, want 403", apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request" {
+		t.Fatalf("completion reservations = %v, want resolved policy request", got)
+	}
+	if forwarder.Request().Method != "" {
+		t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
+	}
+	_, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"attacker-controlled-model"}`), APIKey: rawKey, RequestID: "unknown-request",
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("unknown-model Forward() API error = %+v, want 403", apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request" {
+		t.Fatalf("completion reservations after unknown model = %v, want known model only", got)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, apiErr := service.Forward(canceledCtx, httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "canceled-request",
+	})
+	if apiErr != nil || !result.Cancelled || !errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("canceled reservation result/API error = %+v/%+v", result, apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request,canceled-request" {
+		t.Fatalf("completion reservation attempts after cancellation = %v", got)
+	}
+	if forwarder.Request().Method != "" {
+		t.Fatalf("canceled reservation reached upstream forwarder: %+v", forwarder.Request())
+	}
+}
+
 func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
 	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
 	observer := &usageRecordingObserver{}
@@ -294,6 +345,28 @@ func (f *usageCaptureForwarder) Request() proxy.Request {
 type usageRecordingObserver struct {
 	mu     sync.Mutex
 	events []gateway.RequestEvent
+}
+
+type usageReservationObserver struct {
+	usageRecordingObserver
+	accept       bool
+	reservations []string
+}
+
+func (o *usageReservationObserver) ReserveResponseComplete(ctx context.Context, requestID string) (func(), bool) {
+	o.mu.Lock()
+	o.reservations = append(o.reservations, requestID)
+	o.mu.Unlock()
+	if !o.accept || ctx.Err() != nil {
+		return nil, false
+	}
+	return func() {}, true
+}
+
+func (o *usageReservationObserver) Reservations() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.reservations...)
 }
 
 func (*usageRecordingObserver) ClientInflight(gateway.InflightEvent, int)  {}

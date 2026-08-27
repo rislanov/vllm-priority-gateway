@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,8 +22,8 @@ func TestRecorderFlushesAtBatchThreshold(t *testing.T) {
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 4, batchSize: 2})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	completeResponse(recorder, recordEvent("request-1"))
-	completeResponse(recorder, recordEvent("request-2"))
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-1"))
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-2"))
 
 	batch := awaitBatch(t, store)
 	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"request-1", "request-2"}) {
@@ -42,7 +43,7 @@ func TestRecorderFlushesPendingRowsOnTimer(t *testing.T) {
 	})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	completeResponse(recorder, recordEvent("timed-request"))
+	reserveAndCompleteResponse(t, recorder, recordEvent("timed-request"))
 	awaitSignal(t, dequeued, "recorder dequeue")
 	flush <- time.Unix(1_800_000_000, 0)
 
@@ -52,45 +53,262 @@ func TestRecorderFlushesPendingRowsOnTimer(t *testing.T) {
 	}
 }
 
-func TestRecorderAppliesBackpressureWhenQueueIsFull(t *testing.T) {
+func TestRecorderAppliesBackpressureBeforeCompletionWhenQueueIsFull(t *testing.T) {
 	releaseInsert := make(chan struct{})
-	enqueueAttempts := make(chan struct{}, 4)
+	release := sync.OnceFunc(func() { close(releaseInsert) })
 	store := newFakeRecordStore()
 	store.insertBlock = releaseInsert
 	recorder := newRecorder(store, 0, nil, recorderSettings{
 		queueCapacity: 1,
 		batchSize:     1,
-		beforeEnqueue: func() { enqueueAttempts <- struct{}{} },
 	})
-	t.Cleanup(func() { closeRecorder(t, recorder) })
+	t.Cleanup(func() {
+		release()
+		closeRecorder(t, recorder)
+	})
 
-	completeResponse(recorder, recordEvent("request-in-writer"))
-	awaitSignal(t, enqueueAttempts, "first enqueue attempt")
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-in-writer"))
 	awaitSignal(t, store.insertStarted, "writer start")
-	completeResponse(recorder, recordEvent("request-in-queue"))
-	awaitSignal(t, enqueueAttempts, "second enqueue attempt")
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-in-queue"))
 
 	returned := make(chan struct{})
 	go func() {
-		completeResponse(recorder, recordEvent("request-blocked"))
+		reserveAndCompleteResponse(t, recorder, recordEvent("request-blocked"))
 		close(returned)
 	}()
-	awaitSignal(t, enqueueAttempts, "third enqueue attempt")
 	select {
 	case <-returned:
-		t.Fatal("Complete returned while the recorder queue was saturated")
-	default:
+		t.Fatal("reservation returned while the recorder queue was saturated")
+	case <-time.After(20 * time.Millisecond):
 	}
 
-	close(releaseInsert)
-	awaitSignal(t, returned, "blocked Complete return")
+	release()
+	awaitSignal(t, returned, "blocked reservation return")
+}
+
+func TestRecorderReservationBackpressureHonorsCancellationWithoutStagingRow(t *testing.T) {
+	releaseInsert := make(chan struct{})
+	store := newFakeRecordStore()
+	store.insertBlock = releaseInsert
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
+	t.Cleanup(func() {
+		close(releaseInsert)
+		closeRecorder(t, recorder)
+	})
+
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-in-writer"))
+	awaitSignal(t, store.insertStarted, "writer start")
+	reserveAndCompleteResponse(t, recorder, recordEvent("request-in-queue"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	returned := make(chan bool, 1)
+	go func() {
+		close(started)
+		_, reserved := recorder.ReserveResponseComplete(ctx, "request-cancelled")
+		returned <- reserved
+	}()
+	awaitSignal(t, started, "cancelled reservation start")
+	select {
+	case reserved := <-returned:
+		t.Fatalf("saturated reservation returned before cancellation: reserved=%t", reserved)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case reserved := <-returned:
+		if reserved {
+			t.Fatal("canceled saturated reservation succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled saturated reservation did not return")
+	}
+	recorder.mu.Lock()
+	_, staged := recorder.pending["request-cancelled"]
+	_, held := recorder.reserved["request-cancelled"]
+	recorder.mu.Unlock()
+	if staged || held {
+		t.Fatalf("canceled reservation retained state: staged=%t reserved=%t", staged, held)
+	}
+}
+
+func TestRecorderRejectsAlreadyCanceledReservationWhenCapacityIsAvailable(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for index := 0; index < 128; index++ {
+		requestID := "already-canceled-" + strconv.Itoa(index)
+		rollback, reserved := recorder.ReserveResponseComplete(ctx, requestID)
+		if reserved {
+			rollback()
+			t.Fatalf("already-canceled reservation %d acquired available capacity", index)
+		}
+	}
+}
+
+func TestRecorderRejectsDuplicateReservationWithoutStealingOriginal(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+
+	_, reserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
+	if !reserved {
+		t.Fatal("first reservation was refused")
+	}
+	duplicateRollback, duplicateReserved := recorder.ReserveResponseComplete(context.Background(), "duplicate-request")
+	if duplicateReserved {
+		if duplicateRollback != nil {
+			duplicateRollback()
+		}
+		t.Fatal("duplicate request ID acquired a second reservation")
+	}
+
+	recorder.Complete(recordEvent("duplicate-request"))
+	recorder.ResponseComplete("duplicate-request")
+	batch := awaitBatch(t, store)
+	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"duplicate-request"}) {
+		t.Fatalf("persisted request IDs = %v", got)
+	}
+}
+
+func TestRecorderStaleRollbackCannotReleaseReusedRequestID(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+
+	staleRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "reused-request")
+	if !reserved {
+		t.Fatal("first reservation was refused")
+	}
+	recorder.Complete(recordEvent("reused-request"))
+	recorder.ResponseComplete("reused-request")
+	_ = awaitBatch(t, store)
+
+	_, reserved = recorder.ReserveResponseComplete(context.Background(), "reused-request")
+	if !reserved {
+		t.Fatal("reused request ID reservation was refused after prior completion")
+	}
+	staleRollback()
+	recorder.Complete(recordEvent("reused-request"))
+	recorder.ResponseComplete("reused-request")
+	batch := awaitBatch(t, store)
+	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"reused-request"}) {
+		t.Fatalf("persisted reused request IDs = %v", got)
+	}
+}
+
+func TestRecorderReservedTerminalHandoffUsesItsPreacquiredQueueSlot(t *testing.T) {
+	writerStarted := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseWriter) })
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{
+		queueCapacity: 2,
+		batchSize:     2,
+		onStart: func() {
+			close(writerStarted)
+			<-releaseWriter
+		},
+	})
+	t.Cleanup(func() {
+		release()
+		closeRecorder(t, recorder)
+	})
+	awaitSignal(t, writerStarted, "paused writer start")
+
+	targetRollback, reserved := recorder.ReserveResponseComplete(context.Background(), "target-request")
+	if !reserved {
+		t.Fatal("target reservation was refused")
+	}
+	t.Cleanup(targetRollback)
+	if _, reserved := recorder.ReserveResponseComplete(context.Background(), "queued-request"); !reserved {
+		t.Fatal("queued reservation was refused")
+	}
+	recorder.Complete(recordEvent("queued-request"))
+	recorder.ResponseComplete("queued-request")
+	if got := len(recorder.permits); got != 2 {
+		t.Fatalf("held recorder permits after terminal enqueue = %d, want 2 until writer dequeue", got)
+	}
+
+	recorder.Complete(recordEvent("target-request"))
+	returned := make(chan struct{})
+	go func() {
+		recorder.ResponseComplete("target-request")
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("reserved terminal handoff waited for queue capacity")
+	}
+	if got := len(recorder.events); got != 2 {
+		t.Fatalf("queued terminal records = %d, want full two-slot queue", got)
+	}
+}
+
+func TestRecorderCloseWaitsForReservedTerminalHandoffWithoutClosingQueue(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
+	_, reserved := recorder.ReserveResponseComplete(context.Background(), "shutdown-request")
+	if !reserved {
+		t.Fatal("reservation was refused")
+	}
+	recorder.Complete(recordEvent("shutdown-request"))
+	blockedStarted := make(chan struct{})
+	blockedReturned := make(chan bool, 1)
+	go func() {
+		close(blockedStarted)
+		_, blockedReturnedValue := recorder.ReserveResponseComplete(context.Background(), "blocked-at-shutdown")
+		blockedReturned <- blockedReturnedValue
+	}()
+	awaitSignal(t, blockedStarted, "blocked shutdown reservation start")
+	select {
+	case reservedAtShutdown := <-blockedReturned:
+		t.Fatalf("saturated shutdown reservation returned before Close: reserved=%t", reservedAtShutdown)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closeReturned := make(chan error, 1)
+	go func() { closeReturned <- recorder.Close(ctx) }()
+	select {
+	case err := <-closeReturned:
+		t.Fatalf("Close() returned before the reserved terminal handoff: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case reservedAtShutdown := <-blockedReturned:
+		if reservedAtShutdown {
+			t.Fatal("reservation blocked at shutdown unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reservation blocked on capacity did not wake when Close stopped intake")
+	}
+
+	recorder.ResponseComplete("shutdown-request")
+	select {
+	case err := <-closeReturned:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not finish after the reserved terminal handoff")
+	}
+	batch := awaitBatch(t, store)
+	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"shutdown-request"}) {
+		t.Fatalf("shutdown batch request IDs = %v", got)
+	}
 }
 
 func TestRecorderCloseDrainsAndFlushesPendingRows(t *testing.T) {
 	store := newFakeRecordStore()
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 8, batchSize: 10})
 	for _, id := range []string{"request-1", "request-2", "request-3"} {
-		completeResponse(recorder, recordEvent(id))
+		reserveAndCompleteResponse(t, recorder, recordEvent(id))
 	}
 
 	closeRecorder(t, recorder)
@@ -116,7 +334,7 @@ func TestRecorderContinuesAfterFailedBatchAndReportsEachLostRow(t *testing.T) {
 		event := recordEvent(id)
 		event.Client = "secret-client-name"
 		event.Model = "secret-model-name"
-		completeResponse(recorder, event)
+		reserveAndCompleteResponse(t, recorder, event)
 	}
 	first := awaitBatch(t, store)
 	second := awaitBatch(t, store)
@@ -237,13 +455,13 @@ func TestRecorderIgnoresMissingStableIDsAndPersistsMissingUsage(t *testing.T) {
 
 	missingClient := recordEvent("missing-client")
 	missingClient.ClientID = 0
-	completeResponse(recorder, missingClient)
+	reserveAndCompleteResponse(t, recorder, missingClient)
 	missingModel := recordEvent("missing-model")
 	missingModel.ModelPoolID = 0
-	completeResponse(recorder, missingModel)
+	reserveAndCompleteResponse(t, recorder, missingModel)
 	valid := recordEvent("unmetered")
 	valid.Usage = nil
-	completeResponse(recorder, valid)
+	reserveAndCompleteResponse(t, recorder, valid)
 
 	batch := awaitBatch(t, store)
 	if len(batch) != 1 || batch[0].RequestID != "unmetered" {
@@ -261,13 +479,16 @@ func TestRecorderCompleteAndCloseAreSafeConcurrently(t *testing.T) {
 	var callers sync.WaitGroup
 	for i := 0; i < 64; i++ {
 		callers.Add(1)
-		go func() {
+		go func(requestID string) {
 			defer callers.Done()
 			<-start
-			event := recordEvent("concurrent-request")
+			event := recordEvent(requestID)
+			if _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID); !reserved {
+				return
+			}
 			recorder.Complete(event)
 			recorder.ResponseComplete(event.RequestID)
-		}()
+		}("concurrent-request-" + strconv.Itoa(i))
 	}
 	close(start)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -283,6 +504,9 @@ func TestRecorderKeepsOnePendingRecordAndEnqueuesResponseOnce(t *testing.T) {
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 	event := recordEvent("same-request")
+	if _, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID); !reserved {
+		t.Fatal("reservation was refused")
+	}
 
 	recorder.Complete(event)
 	recorder.Complete(event)
@@ -312,7 +536,7 @@ func TestRecorderCloseReturnsAtDeadlineWhileNonCooperativeStoreFinishesLater(t *
 	store.insertBlock = releaseInsert
 	store.ignoreInsertContext = true
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
-	completeResponse(recorder, recordEvent("blocked-store"))
+	reserveAndCompleteResponse(t, recorder, recordEvent("blocked-store"))
 	awaitSignal(t, store.insertStarted, "non-cooperative insert start")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -362,6 +586,15 @@ func recordEvent(requestID string) gateway.RequestEvent {
 func completeResponse(recorder *Recorder, event gateway.RequestEvent) {
 	recorder.Complete(event)
 	recorder.ResponseComplete(event.RequestID)
+}
+
+func reserveAndCompleteResponse(t *testing.T, recorder *Recorder, event gateway.RequestEvent) {
+	t.Helper()
+	_, reserved := recorder.ReserveResponseComplete(context.Background(), event.RequestID)
+	if !reserved {
+		t.Fatalf("ReserveResponseComplete(%q) refused", event.RequestID)
+	}
+	completeResponse(recorder, event)
 }
 
 func requestIDs(records []RequestRecord) []string {

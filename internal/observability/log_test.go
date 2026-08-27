@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strings"
 	"sync"
@@ -52,9 +53,66 @@ func TestMultiPropagatesResponseCompleteToCapablePeers(t *testing.T) {
 	}
 }
 
+func TestMultiRollsBackEarlierReservationWhenLaterPeerRefuses(t *testing.T) {
+	var calls []string
+	first := &reservationObserver{name: "first", calls: &calls, accept: true}
+	second := &reservationObserver{name: "second", calls: &calls, accept: true, refuseCanceled: true}
+	third := &reservationObserver{name: "third", calls: &calls, accept: true}
+	combined := observability.Multi(first, observability.NewLogger(nil), second, third)
+	reserver, ok := combined.(gateway.ResponseCompleteReserver)
+	if !ok {
+		t.Fatal("Multi does not expose response-completion reservation capability")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rollback, reserved := reserver.ReserveResponseComplete(ctx, "request-1")
+	if reserved {
+		t.Fatal("reservation succeeded after a capable peer refused it")
+	}
+	if rollback != nil {
+		t.Fatal("failed aggregate reservation returned a rollback handle")
+	}
+	if got := strings.Join(calls, ","); got != "reserve:first,reserve:second,rollback:first" {
+		t.Fatalf("reservation lifecycle = %q", got)
+	}
+
+	calls = nil
+	combined = observability.Multi(first, third)
+	reserver = combined.(gateway.ResponseCompleteReserver)
+	rollback, reserved = reserver.ReserveResponseComplete(context.Background(), "request-2")
+	if !reserved || rollback == nil {
+		t.Fatal("successful aggregate reservation did not return its rollback handle")
+	}
+	rollback()
+	rollback()
+	if got := strings.Join(calls, ","); got != "reserve:first,reserve:third,rollback:third,rollback:first" {
+		t.Fatalf("successful reservation rollback lifecycle = %q", got)
+	}
+}
+
 type responseCompleteObserver struct {
 	mu         sync.Mutex
 	requestIDs []string
+}
+
+type reservationObserver struct {
+	name           string
+	calls          *[]string
+	accept         bool
+	refuseCanceled bool
+}
+
+func (*reservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*reservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*reservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *reservationObserver) ReserveResponseComplete(ctx context.Context, _ string) (func(), bool) {
+	*o.calls = append(*o.calls, "reserve:"+o.name)
+	if !o.accept || (o.refuseCanceled && ctx.Err() != nil) {
+		return nil, false
+	}
+	return func() { *o.calls = append(*o.calls, "rollback:"+o.name) }, true
 }
 
 func (*responseCompleteObserver) ClientInflight(gateway.InflightEvent, int)  {}
