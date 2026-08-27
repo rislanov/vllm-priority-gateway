@@ -349,7 +349,11 @@ PublicModelName
 UpstreamModelName
 
 Enabled
+MaxGatewayInflight
+MaxWaiting
 ```
+
+The persisted safety fields are non-negative integers. `0` means disabled/unlimited. SQLite schema migration version 2 adds both columns with `NOT NULL DEFAULT 0` checks while preserving version-1 rows.
 
 ---
 
@@ -624,6 +628,8 @@ The numbers must be configurable.
 During overload, the Gateway restricts **new** requests.
 
 The Gateway does not cancel requests that are already running on its own initiative.
+
+Before per-client priority admission, the single-replica implementation applies two pool-wide safety guards. A positive `MaxWaiting` rejects when the aggregate healthy/fresh, enabled, non-draining upstream waiting count is greater than or equal to the limit. A positive `MaxGatewayInflight` atomically bounds requests held across the full pool request lifecycle. Either guard returns the same bounded `429 gateway_overloaded` response below, and no priority class can bypass it. Zero disables the limit while runtime telemetry still counts gateway in-flight work.
 
 Initial policy:
 
@@ -912,6 +918,8 @@ qwen       3/3         22         0          64%    NORMAL
 llama      2/2         31         8          91%    SATURATED
 ```
 
+The implemented dashboard also shows pool `GatewayInflight`, aggregate `TotalWaiting`, `AvailableBackends`, `MaxGatewayInflight`, and `MaxWaiting`.
+
 Backend details:
 
 ```text
@@ -922,6 +930,7 @@ running     14
 waiting      0
 kv cache    72%
 pressure    0.38
+circuit     closed
 ```
 
 ---
@@ -978,6 +987,7 @@ State
 Pressure
 Enabled
 Draining
+Circuit state/failures/retry/probes/availability
 ```
 
 Actions:
@@ -1082,6 +1092,12 @@ llmgw_stream_disconnects_total
 
 llmgw_backend_failures_total
 llmgw_retries_total
+
+llmgw_backend_circuit_state
+llmgw_backend_circuit_failures
+llmgw_pool_gateway_inflight
+llmgw_pool_waiting_requests
+llmgw_pool_available_backends
 ```
 
 Labels:
@@ -1768,6 +1784,19 @@ HalfOpen
 
 In HalfOpen, a limited number of probe requests are routed to the backend.
 
+The single-replica implementation now provides this inference circuit with exact defaults:
+
+```text
+LLMGW_CIRCUIT_FAILURE_THRESHOLD=5
+LLMGW_CIRCUIT_FAILURE_WINDOW=30s
+LLMGW_CIRCUIT_OPEN_COOLDOWN=15s
+LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES=1
+```
+
+In `closed`, qualifying failure timestamps are retained only inside the rolling window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity; a probe success closes and clears failures, a probe failure reopens immediately, and a neutral result only releases its probe slot.
+
+Outcome precedence is explicit: connection/DNS/TLS/response-header failures, upstream HTTP `5xx`, and upstream response-body read failures are failures. A completed upstream response below `500`, including `4xx` and `429`, is success because the endpoint responded. Downstream cancellation or write failure is neutral and neither penalizes nor heals. An HTTP `5xx` is forwarded without retry; the existing single retry applies only to a transport failure before downstream response bytes.
+
 ---
 
 # 46. Production Overload Protection
@@ -1775,8 +1804,8 @@ In HalfOpen, a limited number of probe requests are routed to the backend.
 Add global safety limits for each ModelPool:
 
 ```text
-MaxGatewayInflight?
-MaxWaiting?
+MaxGatewayInflight (integer >= 0; 0 = unlimited)
+MaxWaiting (integer >= 0; 0 = disabled)
 ```
 
 They are intended to protect the Gateway itself and the upstream service from unbounded accumulation of HTTP connections.
@@ -1794,6 +1823,10 @@ Retry-After
 ```
 
 It is better to reject a background request than to keep 10,000 HTTP connections waiting for a GPU.
+
+This protection is implemented for one gateway process. Pool fields are exposed through SQLite, Admin JSON/forms, immutable registry snapshots, and runtime dashboards. Distributed enforcement across gateway replicas remains out of scope.
+
+Inference capacity has its own unauthenticated `GET /inference-readyz`: HTTP `200`/`status: ready` when at least one enabled pool has a healthy, metrics-fresh, secret-ready, non-draining backend whose circuit has capacity; otherwise HTTP `503`/`status: unavailable`. The body includes configuration `revision`, `poolAvailability`, and `backendAvailability`. Pool congestion does not make inference readiness flap. `GET /readyz` remains separate management-plane readiness and stays HTTP `200` during an inference outage.
 
 ---
 
@@ -2432,7 +2465,7 @@ multiple gateway replicas
 OIDC
 audit
 advanced metrics
-circuit breaker
+distributed circuit/pool coordination (single-replica circuit breaking and pool safety are implemented)
 ```
 
 ---
@@ -2512,7 +2545,7 @@ capacity weights
 
 soft session affinity
 
-circuit breaker
+coordinated circuit breaker across replicas
 
 draining
 

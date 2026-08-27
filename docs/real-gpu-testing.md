@@ -1,8 +1,8 @@
 # Real-GPU vLLM validation
 
-This procedure validates behavior that the deterministic fake backend cannot prove: current OpenAI API compatibility, upstream cancellation on a real engine, queue metrics under GPU contention, vLLM priority scheduling, and gateway hysteretic recovery.
+This procedure validates behavior that the deterministic fake backend cannot prove: current OpenAI API compatibility, upstream cancellation on a real engine, queue metrics under GPU contention, vLLM priority scheduling, gateway hysteretic recovery, and circuit recovery against a live inference endpoint.
 
-The priority-isolation and recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run that suite first; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
+The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
 
 ## 1. Prerequisites
 
@@ -140,7 +140,7 @@ The recommended repeatable gate is:
 LLMGW_E2E_MODE=priority make test-real-vllm
 ```
 
-Configure all required identities and tuning variables as described in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). The automated test covers three independent Low probes, body/header priority spoofing, session-affinity bypass resistance, High/Critical continuity while saturated, optional one-backend drain, and hysteretic recovery. The manual mixed-load run below remains useful for longer percentile and capacity-calibration evidence.
+Configure all required identities and tuning variables as described in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). The automated test covers three independent Low probes, body/header priority spoofing, session-affinity bypass resistance, non-zero pool gateway-inflight/waiting observation, High/Critical continuity while saturated, a temporary pool-wide limit that also rejects Critical, exact limit restoration, optional one-backend drain, and hysteretic recovery. The manual mixed-load run below remains useful for longer percentile and capacity-calibration evidence.
 
 Run the fixed seeded mix while background traffic already fills the queue:
 
@@ -233,6 +233,18 @@ Pass criteria:
 4. Emergency/saturated recovery steps down progressively rather than jumping directly to normal.
 5. An unhealthy backend is excluded after the configured failure count and returns after the configured consecutive successes.
 
-## 7. Evidence to retain
+## 7. Inference circuit and readiness recovery
+
+Run the isolated resilience scenario from the same host as the gateway:
+
+```bash
+LLMGW_E2E_MODE=resilience make test-real-vllm
+```
+
+Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires a loopback gateway URL, captures and restores the target URL, all sibling drain states, all backend update fields, and both pool limits, and uses a loopback fault proxy that faults only supported inference routes. Do not run it against production traffic.
+
+Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open → half_open → closed`, `/readyz` remaining HTTP 200, `/inference-readyz` changing `200 → 503 → 200`, and the five Prometheus families `llmgw_backend_circuit_state`, `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Also retain the complete recovery stream timing and the cleanup status. Do not claim this gate until the real-vLLM command has actually run.
+
+## 8. Evidence to retain
 
 Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.

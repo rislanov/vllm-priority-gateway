@@ -6,7 +6,7 @@ Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, st
 
 The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
 
-Status: the implementation and deterministic acceptance suite are code-complete. An opt-in real-vLLM black-box suite now automates production smoke, priority isolation, drain, and hysteretic recovery checks. Threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
+Status: the implementation and deterministic acceptance suite are code-complete. An opt-in real-vLLM black-box suite automates production smoke, priority isolation and pool safety, drain, circuit-breaker recovery, and hysteretic recovery checks. Threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
 
 ## Architecture
 
@@ -32,7 +32,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 
 - [Technical specification (English)](docs/technical-specification.md) — complete MVP and Production V1 requirements translated from the original project brief.
 - [Real-GPU test plan](docs/real-gpu-testing.md) — hardware validation procedure for vLLM compatibility, cancellation, priority, pressure, and recovery.
-- [Automated real-vLLM priority E2E](docs/real-vllm-priority-e2e.md) — reproducible Mac M4/Linux setup and opt-in smoke, saturation, drain, and recovery suite.
+- [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md) — reproducible Mac M4/Linux setup and opt-in smoke, saturation, pool-safety, drain, and circuit-recovery suite.
 - [Acceptance evidence](docs/acceptance-evidence.md) — mapping from MVP acceptance criteria to automated or manual evidence.
 
 ## Implemented in the MVP
@@ -43,6 +43,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 - Public-to-upstream model rewriting and static multi-backend model pools.
 - Independent health and Prometheus scraping with EWMA pressure and hysteretic pool states.
 - Priority-aware admission, bounded `429` errors, least-pressure routing, draining exclusion, and one conservative pre-first-byte retry.
+- Per-backend inference circuit breakers and per-pool gateway-inflight/waiting safety limits, with explicit inference readiness.
 - Soft session affinity through `X-LLM-Session-Id`: rendezvous hashing improves prefix-cache locality while live pressure, health, freshness, drain state, and retry exclusions retain precedence.
 - Immediate response streaming, downstream cancellation propagation, Prometheus telemetry, and safe JSON completion logs.
 - Basic-authenticated, CSRF-protected JSON Admin API and embedded server-rendered Admin UI.
@@ -93,6 +94,10 @@ Common optional variables:
 | `LLMGW_OVERLOAD_ENTER_WINDOW` / `LLMGW_OVERLOAD_RECOVERY_WINDOW` | `3s` / `10s` |
 | `LLMGW_REQUEST_BODY_LIMIT` | `16777216` |
 | `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` | `1.0` |
+| `LLMGW_CIRCUIT_FAILURE_THRESHOLD` | `5` |
+| `LLMGW_CIRCUIT_FAILURE_WINDOW` | `30s` |
+| `LLMGW_CIRCUIT_OPEN_COOLDOWN` | `15s` |
+| `LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES` | `1` |
 | `LLMGW_SHUTDOWN_GRACE_PERIOD` | `30s` |
 
 Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
@@ -101,7 +106,7 @@ Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon valu
 
 The Admin UI is the simplest bootstrap path. Create resources in this order:
 
-1. A model pool with a public client-facing name and the exact upstream vLLM model name.
+1. A model pool with a public client-facing name, the exact upstream vLLM model name, and optional non-negative `MaxGatewayInflight` and `MaxWaiting` limits. Zero means unlimited/disabled.
 2. At least one enabled backend using an absolute `http://` or `https://` base URL.
 3. A client with priority class, integer vLLM priority, concurrency limit, and explicit pool access.
 4. An API key for that client; copy the returned secret immediately.
@@ -120,7 +125,7 @@ Then send both the cookie and `X-CSRF-Token` header:
 curl -sS -u "$LLMGW_ADMIN_USERNAME:$LLMGW_ADMIN_PASSWORD" \
   -b /tmp/llmgw-cookies -H "X-CSRF-Token: $CSRF_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"publicModelName":"qwen","upstreamModelName":"Qwen/Qwen2.5-7B-Instruct","enabled":true}' \
+  -d '{"publicModelName":"qwen","upstreamModelName":"Qwen/Qwen2.5-7B-Instruct","enabled":true,"maxGatewayInflight":0,"maxWaiting":0}' \
   http://127.0.0.1:8080/admin/api/pools | jq
 ```
 
@@ -141,16 +146,24 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-For routine operation, watch `/metrics`, drain a backend before maintenance, and resume it after the backend is healthy. `/readyz` confirms that the process, database, and registry are ready; it deliberately remains HTTP 200 when inference capacity is zero. Require `backendAvailability > 0` or make an authenticated inference-path probe before sending client traffic. The gateway reloads committed Admin changes without a process restart.
+For routine operation, watch `/metrics`, drain a backend before maintenance, and resume it after the backend is healthy. `/readyz` is management-plane readiness and deliberately remains HTTP 200 when inference capacity is zero. `/inference-readyz` is the load-balancer signal: it returns HTTP 200 with `status: "ready"` when at least one pool/backend is eligible for inference, or HTTP 503 with `status: "unavailable"` otherwise. The gateway reloads committed Admin changes without a process restart.
+
+### Circuit breaker, pool safety, and readiness
+
+Each managed backend has a process-local inference circuit. Five qualifying failures inside the rolling 30-second window open it for 15 seconds; after cooldown, one half-open probe may run. A completed response below HTTP 500, including `4xx` and `429`, closes/heals the circuit. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against it. Downstream cancellation/write failure is neutral. An upstream `5xx` is forwarded and is not retried; only the existing pre-first-byte transport retry remains.
+
+`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by SQLite schema migration version 2; reopening a current database is a no-op.
+
+Circuit availability contributes to `/inference-readyz`, but transient pool congestion does not: removing a gateway from service cannot create GPU capacity. `/readyz` remains independent so operators retain Admin access during a total inference outage. Circuit and pool leases are in memory and correct only for the documented single gateway replica.
 
 ## Admin UI and API
 
 The embedded UI has four screens:
 
-- `/admin`: pool and backend runtime status.
+- `/admin`: pool gateway in-flight/waiting/available counts and per-backend health, pressure, and circuit state.
 - `/admin/clients`: client policy and model access.
 - `/admin/keys`: one-time key generation, expiry/status, last use, and revocation.
-- `/admin/backends`: model pools, endpoints, enablement, pressure, drain, and resume.
+- `/admin/backends`: model-pool `MaxGatewayInflight`/`MaxWaiting`, endpoints, enablement, pressure, drain, and resume.
 
 The JSON API exposes:
 
@@ -253,11 +266,11 @@ The report separates successes, intentional `429` overload responses, `5xx`, oth
 
 ## Metrics and logging
 
-`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Labels are bounded to configured names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
+`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Labels are bounded to configured model/backend names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
 
 The gateway writes one JSON record per completed inference request to stderr. Records include correlation IDs, client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies and authorization headers are never logged.
 
-`GET /healthz` reports process liveness. `GET /readyz` reports database/registry readiness and current backend availability without making the management plane unavailable when all inference backends are down.
+`GET /healthz` reports process liveness. `GET /readyz` reports database/registry management readiness without becoming unavailable when inference capacity is zero. `GET /inference-readyz` returns HTTP 200/503 for usable inference capacity and includes `revision`, `poolAvailability`, and `backendAvailability`.
 
 ## Security
 
@@ -287,7 +300,7 @@ The SQLite driver is pure Go, so local development and Linux cross-compilation d
 
 The MVP is a single-replica service. Run exactly one gateway process against its local SQLite state directory. Put client and Admin traffic behind a trusted TLS reverse proxy and keep vLLM backends on a private network.
 
-The reverse proxy must terminate TLS, disable response buffering for streaming routes, use read/write timeouts longer than the longest permitted generation, propagate client disconnects, and avoid retrying inference `POST` requests. Expose only `/v1/*` to client networks. Restrict `/admin/*`, `/metrics`, `/healthz`, and `/readyz` to an operator or monitoring network; metrics contain configured client, model, pool, and backend labels.
+The reverse proxy must terminate TLS, disable response buffering for streaming routes, use read/write timeouts longer than the longest permitted generation, propagate client disconnects, and avoid retrying inference `POST` requests. Expose only `/v1/*` to client networks. Restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, and `/inference-readyz` to an operator, monitoring, or load-balancer network; metrics contain configured client, model, pool, and backend labels.
 
 ### Native Linux x86-64
 
@@ -366,7 +379,7 @@ curl -fsS http://127.0.0.1:8080/readyz | jq
 After bootstrapping a pool, backend, client, and key, require inference capacity and make an authenticated client-path check before enabling proxy traffic:
 
 ```bash
-curl -fsS http://127.0.0.1:8080/readyz | jq -e '.backendAvailability > 0'
+curl -fsS http://127.0.0.1:8080/inference-readyz | jq -e '.status == "ready" and .backendAvailability > 0'
 curl -fsS http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
 ```
@@ -386,13 +399,14 @@ export LLMGW_VERIFY_REQUEST_ID="deployment-verify-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 # from the deployment secret mechanism.
 ```
 
-1. Verify liveness, a loaded registry revision, and non-zero inference capacity:
+1. Verify liveness, management readiness, a loaded registry revision, and non-zero inference capacity:
 
 ```bash
 curl -fsS "$LLMGW_VERIFY_URL/healthz" | jq -e '.status == "alive"'
-curl -fsS "$LLMGW_VERIFY_URL/readyz" \
+curl -fsS "$LLMGW_VERIFY_URL/readyz" | jq -e '.status == "ready" and .revision > 0'
+curl -fsS "$LLMGW_VERIFY_URL/inference-readyz" \
   | jq -e --argjson expected "$LLMGW_VERIFY_EXPECTED_BACKENDS" \
-      '.status == "ready" and .revision > 0 and .backendAvailability >= $expected'
+      '.status == "ready" and .revision > 0 and .poolAvailability > 0 and .backendAvailability >= $expected'
 ```
 
 2. Verify that enabled, non-draining backends are healthy and their vLLM metrics are fresh:
@@ -430,7 +444,9 @@ curl -fsS -N "$LLMGW_VERIFY_URL/v1/completions" \
 (
   set -e
   LLMGW_VERIFY_METRICS="$(curl -fsS "$LLMGW_VERIFY_URL/metrics")"
-  for family in llmgw_requests_total llmgw_backend_pressure llmgw_backend_running_requests; do
+  for family in llmgw_requests_total llmgw_backend_pressure llmgw_backend_running_requests \
+    llmgw_backend_circuit_state llmgw_backend_circuit_failures llmgw_pool_gateway_inflight \
+    llmgw_pool_waiting_requests llmgw_pool_available_backends; do
     printf '%s\n' "$LLMGW_VERIFY_METRICS" | grep -qE "^(# HELP )?$family([ {])"
   done
 
@@ -521,13 +537,13 @@ Tests cover domain validation, key security, SQLite migrations and CRUD, registr
 
 ## Real-GPU validation
 
-Run `make test-real-vllm` with the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md) for automated production smoke, priority isolation, optional drain, and hysteretic recovery. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for the broader compatibility, cancellation, routing, and hardware-calibration evidence. Fake-backend tests prove gateway mechanics but cannot prove the scheduler behavior of a selected real model/hardware combination.
+Run `make test-real-vllm` with `LLMGW_E2E_MODE=smoke`, `priority`, or `resilience` and the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md). The modes cover production-safe inference readiness/streaming, intentional priority and pool-safety saturation, and isolated real-vLLM circuit recovery respectively. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for broader compatibility, cancellation, routing, and hardware-calibration evidence. Fake-backend tests prove gateway mechanics but cannot prove the scheduler behavior of a selected real model/hardware combination.
 
 ## Not implemented in the MVP
 
 - One gateway replica; concurrency leases and backend runtime state are process-local.
 - Operator-managed backend registration and SQLite persistence only; there is no automatic service discovery.
-- No distributed rate limits, token budgets, billing, circuit breaker, autoscaling, discovery, KV-block/prefix-index routing, or GPU/NVML scheduling. Soft session affinity is implemented without inspecting cache contents.
+- No distributed rate limits, token budgets, billing, autoscaling, discovery, KV-block/prefix-index routing, or GPU/NVML scheduling. Circuit and pool-safety state is process-local; soft session affinity is implemented without inspecting cache contents.
 - Priority admission rejects new lower-priority requests; it does not preempt an already admitted generation.
 - Basic auth is the MVP management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external or future responsibilities.
 - Capacity hints are persisted for forward compatibility but do not yet weight routing.
@@ -540,7 +556,7 @@ The package boundaries allow SQLite to be replaced with PostgreSQL, local leases
 - Real-GPU validation and calibrated pressure/admission thresholds for the selected models and hardware.
 - Multi-replica gateway HA with coordinated configuration revisions and distributed concurrency/rate/token budgets.
 - PostgreSQL for durable configuration and a defined degraded-mode policy for the distributed coordination store.
-- Request-failure/`5xx` circuit breaking with open/half-open recovery probes, orchestrated drain-aware rolling shutdown, capacity-aware routing, and optional KV-block/prefix-aware routing beyond the current soft affinity.
+- Orchestrated drain-aware rolling shutdown, capacity-weighted routing, and optional KV-block/prefix-aware routing beyond the current soft affinity.
 - OIDC-based Admin authentication, RBAC, audit logging, secret-manager integration, and managed TLS/network policy.
 - OpenTelemetry traces, production dashboards and alerts, configuration migration/versioning, and Kubernetes deployment/discovery where required.
 - Load, failure, upgrade, backup/restore, and security validation against the Production V1 acceptance criteria in the technical specification.

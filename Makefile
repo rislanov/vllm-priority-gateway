@@ -10,13 +10,8 @@ test-race:
 	$(GO) test -race ./...
 
 test-real-vllm:
-
-ifeq ($(filter smoke priority,$(LLMGW_E2E_MODE)),)
-	@printf '%s\n' 'LLMGW_E2E_MODE must be smoke or priority' >&2
-	@exit 2
-else
+	@case "$(LLMGW_E2E_MODE)" in smoke|priority|resilience) ;; *) printf '%s\n' 'LLMGW_E2E_MODE must be smoke, priority, or resilience' >&2; exit 2 ;; esac
 	$(GO) test -count=1 -v -timeout 10m ./tests/e2e
-endif
 
 vet:
 	$(GO) vet ./...

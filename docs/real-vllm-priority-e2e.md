@@ -1,9 +1,10 @@
-# Real-vLLM Priority E2E Test
+# Real-vLLM E2E Test
 
-This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has two modes:
+This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has exactly three modes:
 
-- `smoke` is safe for a production verification window. It checks readiness, Admin runtime state, healthy and metrics-fresh backends, model visibility, one short streaming inference, and required Prometheus metric families.
-- `priority` intentionally saturates inference capacity. It proves that background clients receive `429 Too Many Requests` while High and Critical clients remain admitted, client priority spoofing and session affinity cannot bypass admission, and recovery remains hysteretic. Run this mode only on an isolated environment or during an explicitly approved production test window.
+- `smoke` is safe for a production verification window. It checks management and inference readiness separately, Admin pool/backend counts, healthy and metrics-fresh backends, model visibility, one complete short stream, and required Prometheus families including all five circuit/pool gauges.
+- `priority` intentionally saturates inference capacity. It observes non-zero gateway in-flight and upstream waiting work, proves background shedding and High/Critical priority continuity, then temporarily sets a pool-wide in-flight limit and proves that even Critical receives the bounded `429 gateway_overloaded`. It restores the limit and proves Critical streaming continuity again.
+- `resilience` is destructive and isolated. It places a loopback fault proxy in front of one real backend, drains its siblings, proves inference-only `503` failures open the circuit while health/metrics remain fresh, then observes half-open streaming recovery and closure. Run it only against a gateway on the same host and with no production traffic.
 
 The test is opt-in. Ordinary `go test ./...` compiles it and reports it as skipped unless `LLMGW_E2E_MODE` is set.
 
@@ -129,7 +130,7 @@ Expected result:
 PASS
 ```
 
-This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state.
+This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state. `/readyz` must remain HTTP 200 management readiness and `/inference-readyz` must be HTTP 200 with `status: "ready"`, at least one available pool, and the expected backend count.
 
 ## 4. Run priority isolation and recovery
 
@@ -157,12 +158,13 @@ go test -count=1 -v -timeout 10m ./tests/e2e
 
 The priority test passes only when all of the following are observed:
 
-1. High streaming requests drive the selected pool into `saturated` or `emergency`.
+1. High streaming requests drive the selected pool into `saturated` or `emergency`, with `GatewayInflight > 0` and `TotalWaiting > 0` in Admin runtime.
 2. By default, `AllBackendsWaiting` is true.
 3. Ordinary Low, Low with a spoofed body/header priority, and Low with a session-affinity header all receive `429`, a positive `Retry-After`, and `gateway_overloaded`.
 4. Separate High and Critical probes receive `200` while the pool is saturated.
-5. Immediately after load cancellation, Low remains rejected during hysteresis.
-6. The pool recovers through `busy` to `normal`, and Low is accepted again.
+5. A temporary positive `MaxGatewayInflight` at or below observed in-flight work causes a separate Critical request to receive the same bounded pool-safety `429`; after the exact original limit is restored, a complete Critical stream succeeds again.
+6. Immediately after load cancellation, Low remains rejected during hysteresis.
+7. The pool recovers through `busy` to `normal`, and Low is accepted again.
 
 The load uses streaming deliberately. A queued non-streaming generation does not deliver response headers until its complete response is ready and can exceed the gateway response-header timeout under deep queues.
 
@@ -175,7 +177,33 @@ export LLMGW_E2E_DRAIN_BACKEND_ID=1
 go test -count=1 -v -timeout 10m ./tests/e2e -run TestPriorityIsolationWithRealVLLM
 ```
 
-Before mutation, the test requires the selected backend to belong to the tested pool, be enabled, and not already be draining. It drains that backend, confirms that Low remains rejected and a complete High stream still succeeds through remaining capacity, then resumes the backend and waits until `draining=false`. Cleanup restores the original non-draining state if the test exits early; it refuses to mutate a backend that was already under maintenance.
+Before the first mutation, the test captures the pool fields and every backend field/drain state in the selected pool. It drains the chosen backend, confirms that Low remains rejected and a complete High stream still succeeds through remaining capacity, then resumes the backend and waits until `draining=false`. Best-effort, idempotent cleanup restores the exact captured pool limits and all backend values even after an assertion failure, reporting every restoration error rather than stopping at the first.
+
+## 5. Run isolated circuit recovery
+
+Use the same local two-vLLM configuration, choose one enabled/non-draining backend in the `qwen` pool, and obtain its Admin ID. The gateway URL must use `localhost` or a loopback IP (`127.0.0.0/8` or `::1`); the test refuses any non-loopback gateway because its proxy listens only on `127.0.0.1` and must be reachable by that same gateway process.
+
+```bash
+export LLMGW_E2E_MODE=resilience
+export LLMGW_E2E_GATEWAY_URL='http://127.0.0.1:8080'
+export LLMGW_E2E_ADMIN_USERNAME='operator'
+export LLMGW_E2E_ADMIN_PASSWORD='read-from-the-secret-store'
+export LLMGW_E2E_MODEL='qwen'
+export LLMGW_E2E_HIGH_KEY="$HIGH_PROBE_KEY"
+export LLMGW_E2E_EXPECTED_BACKENDS=2
+export LLMGW_E2E_CIRCUIT_BACKEND_ID=1
+# Defaults to the gateway's documented failure threshold of 5.
+export LLMGW_E2E_CIRCUIT_FAILURE_COUNT=5
+export LLMGW_E2E_SATURATION_TIMEOUT=60s
+export LLMGW_E2E_RECOVERY_TIMEOUT=45s
+export LLMGW_E2E_PROBE_TIMEOUT=60s
+
+go test -count=1 -v -timeout 10m ./tests/e2e -run TestCircuitBreakerRecoveryWithRealVLLM
+```
+
+The scenario captures originals before mutation, starts a loopback reverse proxy to the selected real-vLLM URL, sets both pool safety limits to unlimited for fault isolation, updates the target URL, and drains every sibling. The proxy passes `/health`, `/metrics`, and all non-faulting inference headers, statuses, bytes, and streaming through to real vLLM. While faulting, only `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` return deterministic OpenAI-shaped HTTP 503; health and metrics continue to come from real vLLM.
+
+Each configured failure has a distinct `X-Request-Id`. Pass criteria are: target Admin runtime remains healthy/fresh and reaches `CircuitState=open`; `/inference-readyz` becomes HTTP 503 `unavailable`; after fault disable and the configured cooldown, Admin exposes half-open probe capacity and pool availability; one complete stream closes the circuit; `/inference-readyz` returns HTTP 200 `ready`. Cleanup restores the original target URL, every sibling drain state, all other backend fields, and both original pool limits before stopping the proxy. No API-key or Basic-auth value is included in test errors or logs.
 
 ## Configuration knobs
 
@@ -189,6 +217,8 @@ Before mutation, the test requires the selected backend to belong to the tested 
 | `LLMGW_E2E_PROBE_TIMEOUT` | `60s` | Per-request timeout for smoke and continuity probes |
 | `LLMGW_E2E_REQUIRE_ALL_WAITING` | `true` | Require queue-based saturation on every available backend |
 | `LLMGW_E2E_DRAIN_BACKEND_ID` | unset | Opt into the Admin drain/resume scenario |
+| `LLMGW_E2E_CIRCUIT_BACKEND_ID` | required in `resilience` | Positive Admin backend ID placed behind the fault proxy |
+| `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` | `5` | Positive number of distinct inference failures; keep aligned with `LLMGW_CIRCUIT_FAILURE_THRESHOLD` |
 
 On larger production GPUs, increase the number of High keys, requests per key, token count, or prompt size until the pool reaches the configured saturation threshold. If the intended production calibration reaches saturation through KV pressure without every backend reporting a waiting queue, set `LLMGW_E2E_REQUIRE_ALL_WAITING=false`; the Low/High admission assertions remain mandatory.
 
@@ -213,5 +243,9 @@ Copy the binary to an operator host and run it with the same environment variabl
 - The pool never saturates: the generated load is below physical capacity or thresholds are calibrated too high for this test shape.
 - A Low probe returns `200` while saturated: priority admission isolation is broken.
 - A High or Critical probe returns `429`: its configured class/concurrency is wrong or priority admission is broken.
+- The intentional pool-safety Critical probe returns `200`: the Admin pool mutation did not publish, or observed load ended before the guard was exercised.
 - A probe returns `502` after a long queue wait: inspect the gateway response-header timeout and prefer streaming for long queued generations.
 - Recovery skips the expected state or times out: inspect current traffic, pressure thresholds, and overload recovery windows.
+- Resilience mode rejects the gateway URL: run the gateway and test on the same host and use `localhost` or a loopback IP.
+- The circuit never opens: align `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` with the gateway threshold and confirm all siblings were drained.
+- Health or metrics becomes stale while inference is faulted: the proxy is not passing management paths to real vLLM, so circuit-isolation evidence is invalid.

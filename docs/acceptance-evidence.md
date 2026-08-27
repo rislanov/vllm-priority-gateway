@@ -13,6 +13,10 @@ This document maps the source specification's MVP acceptance criteria to repeata
 | 100 requests select pressure `0.3` rather than `1.1` | `TestRoutingUsesLeastPressureAndHealthRecovery` |
 | A stable session uses client-and-pool-scoped, order-independent rendezvous routing; overload falls back to least pressure; eligibility/retry exclusions rehash safely; retries use current state without mixing pool-model revisions; the header never reaches vLLM | `TestSelectWithSessionAffinityIsStableAcrossCandidateOrder`, `TestSelectWithSessionAffinityFallsBackWhenPreferredIsOverloaded`, `TestSelectWithSessionAffinityHonorsEligibilityAndRetryExclusion`, `TestSelectWithSessionAffinityRehashesAcrossEligibleBackendsBeforePressureFallback`, `TestSessionAffinityPrefersRendezvousBackendAndStripsHeader`, `TestSessionAffinityKeyIncludesClientAndPoolIdentity`, `TestRequestWithoutSessionAffinityUsesLeastPressure`, `TestSessionAffinityRejectsOversizedIdentifier`, `TestRetrySelectionUsesCurrentRegistryAndTime`, `TestRetrySelectionRejectsPoolModelReconfiguration` |
 | Failed backends leave routing and recovered backends return; monitor polls do not follow redirects | `TestRoutingUsesLeastPressureAndHealthRecovery`, `TestWorkerHealthFailureAndRecoveryCounts`, `TestWorkerDoesNotFollowHealthOrMetricsRedirects` |
+| Qualifying inference failures open a rolling-window circuit, cooldown permits bounded half-open probes, and success/failure/neutral outcomes close, reopen, or release exactly as specified | `TestBreakerOpensWithinRollingWindowAndExpiresOldFailures`, `TestBreakerCooldownAllowsOnlyOneHalfOpenProbe`, `TestBreakerHalfOpenSuccessClosesAndFailureReopens`, `TestBreakerNeutralOutcomeReleasesProbeWithoutHealing`, `TestHTTP5xxOpensCircuitAndRoutesNextRequestToHealthyBackend` |
+| Pool-wide gateway in-flight and upstream-waiting limits reject every priority with the bounded `429`; zero remains unlimited while counted; all admitted exits release leases | `TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion`, `TestServicePoolMaxWaitingRejectsBeforePoolAndClientAcquisition`, `TestServiceCriticalPriorityCannotBypassPoolLimit`, `TestServiceZeroPoolLimitsAreUnlimitedButCounted`, `TestServiceReleasesPoolLeaseOnEveryAdmittedExit` |
+| Pool safety fields migrate, validate, round-trip through SQLite/Admin/UI, and retain zero semantics | `TestSQLiteMigratesVersionOnePoolSafetyDefaults`, `TestModelPoolValidateAcceptsNonNegativeSafetyLimits`, `TestModelPoolValidateRejectsNegativeSafetyLimits`, `TestAdminPoolSafetyJSONRoundTripAndValidation`, `TestPoolSafetyFormsRenderAndPrefillExistingLimits` |
+| Management readiness stays available independently; inference readiness reports HTTP `200 ready` or `503 unavailable` from eligible circuit/health/secret capacity | `TestServiceInferenceReadinessMatrix`, `TestInferenceReadinessHandlerStatusAndJSONContract`, `TestInferenceReadinessHonorsContextDeadline` |
 | Lower-priority traffic is shed before high/critical traffic | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestEffectiveLimitUsesPriorityPolicy`, opt-in `TestPriorityIsolationWithRealVLLM` |
 | Client priority escalation is removed and server policy is applied | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestForwardRewritesModelAndClientControlledPriority`, opt-in `TestPriorityIsolationWithRealVLLM` |
 | SSE bytes are flushed without whole-response buffering | `TestStreamingCancellationAndLeaseLifetime`, `TestStreamingIsByteExactAndRetryStopsAfterFirstByte` |
@@ -20,7 +24,8 @@ This document maps the source specification's MVP acceptance criteria to repeata
 | A short spike is ignored, sustained overload advances without request polling, and recovery is hysteretic | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestManagerAdvancesPoolHysteresisWithoutSnapshotReads`, all `TestPoolMachine*` tests |
 | A transport failure retries once before response bytes, never after streaming starts | `TestStreamingIsByteExactAndRetryStopsAfterFirstByte`, `TestForwardRetriesOneAlternateBeforeFirstByte`, `TestForwardDoesNotRetryAfterStreamStarts` |
 | Admin auth, CSRF, CRUD publication, backend edit/enable/disable/drain/resume, live key usage, and concurrent one-time key displays work | `TestAdminAuthenticationCSRFCRUDAndOneTimeSecret`, `TestBackendEditPageAndEnableToggle`, `TestOverlappingKeyCreationsKeepSeparateOneTimeSecrets`, `TestAdminSecurityRequiresBasicAuthAndMatchingCSRF`, `TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce` |
-| Metrics use bounded labels; completion logs contain policy/result fields without body or secret data | `TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels`, `TestStructuredLoggerWritesSafeCompletionRecord` |
+| Metrics use bounded labels, including five circuit/pool runtime families; completion logs contain policy/result fields without body or secret data | `TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels`, `TestStructuredLoggerWritesSafeCompletionRecord` |
+| The real-vLLM fault proxy preserves health, metrics, headers/status/bytes/streaming while healthy, injects inference-only `503`, and Admin cleanup restores every captured pool/backend field despite an intermediate restore failure | `TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx`, `TestAdminMutationCleanupRestoresPoolAndBackends`, opt-in `TestCircuitBreakerRecoveryWithRealVLLM` |
 | Shutdown lets a short stream finish, force-closes a stream after grace expiry, and releases upstream work, monitors, and SQLite | `TestRunLetsActiveStreamFinishInsideGracePeriod`, `TestRunForceClosesActiveStreamAfterGracePeriod`, `TestRunServesHealthAndShutsDownGracefully`, integration harness cleanup checks |
 | Gateway-added fake-backend latency is measured against a warmed direct baseline and the optional engineering budget is enforced | `TestPerformanceSmoke` |
 | Seeded mixed traffic is proportionally apportioned; successful latency and outcomes are available per class | `TestSmallTrafficMixDoesNotAlwaysFavorLeadingClasses`, `TestRunReportsSuccessfulLatencyAndOutcomesByClass` |
@@ -56,21 +61,23 @@ With a running Docker daemon, verify the non-root scratch image against a fresh 
 make container-smoke
 ```
 
-Run the safe post-deployment smoke check or the intentional real-vLLM saturation suite with the environment from [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md):
+Run the safe post-deployment smoke check, intentional real-vLLM saturation/pool-safety suite, and isolated circuit-resilience suite with the environment from [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md):
 
 ```bash
 LLMGW_E2E_MODE=smoke make test-real-vllm
 LLMGW_E2E_MODE=priority make test-real-vllm
+LLMGW_E2E_MODE=resilience make test-real-vllm
 ```
 
 ## Real-GPU evidence
 
-The real-vLLM E2E suite has been exercised with two vLLM-Metal processes on Apple Silicon and provides reproducible evidence for Completions streaming compatibility, queue-driven saturation, Low shedding, High/Critical continuity, optional drain, and recovery. The following production claims remain pending until the same suite and the broader manual plan pass on the target CUDA host:
+The earlier smoke/priority real-vLLM E2E suite was exercised with two vLLM-Metal processes on Apple Silicon and provides reproducible evidence for Completions streaming compatibility, queue-driven saturation, Low shedding, High/Critical continuity, optional drain, and recovery. The new resilience mode is implemented and deterministic harness tests pass, but no real-vLLM resilience execution is claimed here; record that evidence only after an isolated local run. The following production claims remain pending until all three modes and the broader manual plan pass on the target CUDA host:
 
 - current vLLM wire compatibility for all three generation endpoints on the selected production vLLM version;
 - calibrated priority scheduling and TTFT isolation under the target GPU queue contention;
 - cancellation reaching a live model engine and releasing GPU work;
 - threshold calibration and TTFT isolation on the target RTX 4070 Ti;
 - one-versus-two real serving-group routing behavior.
+- inference circuit open/half-open/closed timing and recovery through the loopback fault proxy on the selected vLLM build.
 
 Use [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md) for the automated gate and [real-gpu-testing.md](real-gpu-testing.md) to collect the additional versioned commands, status snapshots, Prometheus data, gateway logs, vLLM logs, and load-generator reports required for target-hardware sign-off.
