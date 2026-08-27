@@ -139,6 +139,12 @@ func TestAnalyticsRejectsInvalidQueries(t *testing.T) {
 		"negative model":        "model_pool_id=-2",
 		"invalid boolean":       "usage_available=yes",
 		"empty boolean":         "usage_available=",
+		"numeric true boolean":  "usage_available=1",
+		"numeric false boolean": "usage_available=0",
+		"short true boolean":    "usage_available=t",
+		"short false boolean":   "usage_available=F",
+		"uppercase boolean":     "usage_available=TRUE",
+		"mixed-case boolean":    "usage_available=False",
 		"zero limit":            "limit=0",
 		"excessive limit":       "limit=501",
 		"negative offset":       "offset=-1",
@@ -182,6 +188,67 @@ func TestAnalyticsStoreErrorsUseControlledJSONEnvelope(t *testing.T) {
 			}
 			if envelope["error"]["code"] != "analytics_query_failed" || strings.Contains(response.Body.String(), "database unavailable") {
 				t.Fatalf("error envelope = %#v", envelope)
+			}
+		})
+	}
+}
+
+func TestAnalyticsCSVStoreErrorAfterFirstRowStopsWithoutJSON(t *testing.T) {
+	queryStore := &analyticsQueryStoreStub{}
+	queryStore.stream = func(_ context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
+		if err := yield(analytics.RequestRecord{
+			ID: 1, OccurredAt: time.Unix(1, 0).UTC(), RequestID: "committed-row",
+		}); err != nil {
+			return err
+		}
+		return errors.New("late database failure")
+	}
+	handler := newAnalyticsHandler(t, queryStore, time.Now)
+	response := analyticsRequest(t, handler, "/admin/api/analytics/export.csv")
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/csv; charset=utf-8" {
+		t.Fatalf("response = %d headers=%v body=%q", response.Code, response.Header(), response.Body.String())
+	}
+	rows, err := csv.NewReader(bytes.NewReader(response.Body.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse committed CSV: %v body=%q", err, response.Body.String())
+	}
+	if len(rows) != 2 || rows[1][2] != "committed-row" {
+		t.Fatalf("committed CSV rows = %#v", rows)
+	}
+	if strings.Contains(response.Body.String(), "analytics_query_failed") || strings.Contains(response.Body.String(), `{"error"`) {
+		t.Fatalf("late store error corrupted CSV: %q", response.Body.String())
+	}
+}
+
+func TestAnalyticsCSVWriterFailureAfterCommitStopsWithoutJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		records []analytics.RequestRecord
+		failAt  int
+	}{
+		{name: "empty export header flush", failAt: 1},
+		{
+			name: "first data row flush",
+			records: []analytics.RequestRecord{{
+				ID: 1, OccurredAt: time.Unix(1, 0).UTC(), RequestID: "row-that-will-fail",
+			}},
+			failAt: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newAnalyticsHandler(t, &analyticsQueryStoreStub{streamRecords: test.records}, time.Now)
+			request := httptest.NewRequest(http.MethodGet, "/admin/api/analytics/export.csv", nil)
+			request.SetBasicAuth(adminUser, adminPassword)
+			writer := &failingAnalyticsResponseWriter{header: make(http.Header), failAt: test.failAt}
+
+			handler.ServeHTTP(writer, request)
+
+			if writer.status != http.StatusOK || writer.writeCalls != test.failAt {
+				t.Fatalf("writer status/calls = %d/%d, want 200/%d", writer.status, writer.writeCalls, test.failAt)
+			}
+			if strings.Contains(writer.body.String(), "analytics_query_failed") || strings.Contains(writer.body.String(), `{"error"`) {
+				t.Fatalf("writer failure corrupted CSV: %q", writer.body.String())
 			}
 		})
 	}
@@ -456,3 +523,32 @@ func (s *analyticsQueryStoreStub) allFilters() []analytics.Filter {
 
 func int64Pointer(value int64) *int64 { return &value }
 func boolPointer(value bool) *bool    { return &value }
+
+type failingAnalyticsResponseWriter struct {
+	header     http.Header
+	status     int
+	writeCalls int
+	failAt     int
+	body       bytes.Buffer
+}
+
+func (w *failingAnalyticsResponseWriter) Header() http.Header { return w.header }
+
+func (w *failingAnalyticsResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *failingAnalyticsResponseWriter) Write(value []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.writeCalls++
+	if w.writeCalls == w.failAt {
+		return 0, errors.New("forced response write failure")
+	}
+	return w.body.Write(value)
+}
+
+func (w *failingAnalyticsResponseWriter) Flush() {}

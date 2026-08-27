@@ -104,9 +104,14 @@ func parseAnalyticsQuery(values url.Values, now time.Time) (AnalyticsQuery, erro
 	query.Filter.ModelPoolID = modelPoolID
 
 	if value, present := singleAnalyticsValue(values, "usage_available"); present {
-		usageAvailable, err := strconv.ParseBool(value)
-		if err != nil {
-			return AnalyticsQuery{}, errors.New("usage_available must be a boolean")
+		var usageAvailable bool
+		switch value {
+		case "true":
+			usageAvailable = true
+		case "false":
+			usageAvailable = false
+		default:
+			return AnalyticsQuery{}, errors.New("usage_available must be exactly true or false")
 		}
 		query.Filter.UsageAvailable = &usageAvailable
 	}
@@ -200,7 +205,9 @@ func analyticsCSVHandler(service *AdminService) http.HandlerFunc {
 			return
 		}
 		if !stream.started {
-			_ = stream.start()
+			if err := stream.start(); err != nil {
+				return
+			}
 		}
 	}
 }
