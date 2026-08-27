@@ -38,6 +38,7 @@ type Recorder struct {
 
 	mu        sync.Mutex
 	accepting bool
+	pending   map[string]RequestRecord
 	senders   sync.WaitGroup
 	closeOnce sync.Once
 	lastErr   error
@@ -100,7 +101,7 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 	recorder := &Recorder{
 		store: store, retention: retention, onFailure: onFailure, logger: settings.logger, settings: settings,
 		ctx: ctx, cancel: cancel, events: make(chan RequestRecord, settings.queueCapacity), done: make(chan struct{}),
-		accepting: true,
+		accepting: true, pending: make(map[string]RequestRecord),
 	}
 	go recorder.run()
 	return recorder
@@ -109,16 +110,30 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 func (*Recorder) ClientInflight(gateway.InflightEvent, int)  {}
 func (*Recorder) BackendInflight(gateway.InflightEvent, int) {}
 
-// Complete enqueues one resolved request. Once its bounded queue is full, this
-// method deliberately blocks rather than dropping an already-completed request.
+// Complete stages one resolved request without blocking the response path.
 func (r *Recorder) Complete(event gateway.RequestEvent) {
-	if event.ClientID <= 0 || event.ModelPoolID <= 0 {
+	if event.RequestID == "" || event.ClientID <= 0 || event.ModelPoolID <= 0 {
 		return
 	}
 	record := requestRecord(event)
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.accepting {
+		return
+	}
+	r.pending[event.RequestID] = record
+}
+
+// ResponseComplete moves a staged record into the bounded worker queue. Any
+// resulting backpressure occurs only after the downstream response is written.
+func (r *Recorder) ResponseComplete(requestID string) {
+	r.mu.Lock()
+	record, exists := r.pending[requestID]
+	if exists {
+		delete(r.pending, requestID)
+	}
+	if !exists || !r.accepting {
 		r.mu.Unlock()
 		return
 	}
@@ -138,6 +153,7 @@ func (r *Recorder) Close(ctx context.Context) error {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
 		r.accepting = false
+		clear(r.pending)
 		r.mu.Unlock()
 		go func() {
 			r.senders.Wait()
@@ -150,9 +166,13 @@ func (r *Recorder) Close(ctx context.Context) error {
 		return r.lastErr
 	case <-ctx.Done():
 		r.cancel()
-		<-r.done
 		return ctx.Err()
 	}
+}
+
+// Done is closed after the writer exits and can no longer access its store.
+func (r *Recorder) Done() <-chan struct{} {
+	return r.done
 }
 
 func (r *Recorder) run() {
@@ -192,7 +212,8 @@ func (r *Recorder) run() {
 				r.flush(batch)
 				batch = batch[:0]
 			}
-		case at := <-r.settings.cleanup:
+		case <-r.settings.cleanup:
+			at := r.settings.now()
 			if r.retention > 0 && (lastCleanup.IsZero() || at.Sub(lastCleanup) >= retentionCheckInterval) {
 				lastCleanup = at
 				r.cleanup(at)

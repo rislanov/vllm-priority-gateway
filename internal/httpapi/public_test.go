@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,10 +16,12 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
@@ -332,6 +335,75 @@ func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	}
 }
 
+func TestResolvedRejectionWritesResponseBeforeRecorderBackpressure(t *testing.T) {
+	raw, key := testKey(t)
+	store := &blockingAnalyticsStore{insertStarted: make(chan struct{}, 1), releaseInsert: make(chan struct{})}
+	recorder := analytics.NewRecorder(store, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	release := sync.OnceFunc(func() { close(store.releaseInsert) })
+	t.Cleanup(func() {
+		release()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = recorder.Close(ctx)
+	})
+	observer := observability.Multi(recorder)
+	responseObserver, ok := observer.(gateway.ResponseCompleteObserver)
+	if !ok {
+		t.Fatal("Multi did not expose response-complete capability")
+	}
+
+	for index := 0; index < 64; index++ {
+		id := "writer-" + strconv.Itoa(index)
+		observer.Complete(resolvedEvent(id))
+		responseObserver.ResponseComplete(id)
+	}
+	select {
+	case <-store.insertStarted:
+	case <-time.After(time.Second):
+		t.Fatal("recorder writer did not reach blocked store")
+	}
+	for index := 0; index < 1024; index++ {
+		id := "queued-" + strconv.Itoa(index)
+		observer.Complete(resolvedEvent(id))
+		responseObserver.ResponseComplete(id)
+	}
+
+	handler, _ := newFixture(t, fixtureOptions{
+		client: backgroundClient(), key: key, poolState: domain.PoolSaturated, observer: observer,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := &responseSignalWriter{ResponseRecorder: httptest.NewRecorder(), wroteBody: make(chan struct{})}
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(handlerDone)
+	}()
+
+	select {
+	case <-response.wroteBody:
+	case <-time.After(200 * time.Millisecond):
+		release()
+		t.Fatal("resolved rejection response was blocked by recorder queue saturation")
+	}
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	assertErrorCode(t, response.Body.Bytes(), "gateway_overloaded")
+	select {
+	case <-handlerDone:
+		t.Fatal("handler returned before post-response recorder backpressure was released")
+	default:
+	}
+
+	release()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish after recorder queue was released")
+	}
+}
+
 func TestServiceObserverTracksRejectionAndInflightLifecycle(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -621,6 +693,43 @@ type recordingObserver struct {
 	events        []gateway.RequestEvent
 	clientDeltas  []int
 	backendDeltas []int
+}
+
+type responseSignalWriter struct {
+	*httptest.ResponseRecorder
+	once      sync.Once
+	wroteBody chan struct{}
+}
+
+func (w *responseSignalWriter) Write(value []byte) (int, error) {
+	written, err := w.ResponseRecorder.Write(value)
+	w.once.Do(func() { close(w.wroteBody) })
+	return written, err
+}
+
+type blockingAnalyticsStore struct {
+	insertStarted chan struct{}
+	releaseInsert chan struct{}
+}
+
+func (s *blockingAnalyticsStore) InsertUsageBatch(context.Context, []analytics.RequestRecord) error {
+	select {
+	case s.insertStarted <- struct{}{}:
+	default:
+	}
+	<-s.releaseInsert
+	return nil
+}
+
+func (*blockingAnalyticsStore) DeleteUsageBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func resolvedEvent(requestID string) gateway.RequestEvent {
+	return gateway.RequestEvent{
+		OccurredAt: time.Unix(1_800_000_000, 0).UTC(), RequestID: requestID,
+		ClientID: 1, ModelPoolID: 10, Client: "client", Model: "public-model", Status: http.StatusOK,
+	}
 }
 
 func (o *recordingObserver) ClientInflight(_ gateway.InflightEvent, delta int) {

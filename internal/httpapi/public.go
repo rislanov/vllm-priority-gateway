@@ -87,6 +87,7 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 		h.completePublic(started, gateway.RequestEvent{Status: http.StatusInternalServerError, Reason: "internal_error"})
 		return
 	}
+	defer h.service.ResponseComplete(requestID)
 	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {

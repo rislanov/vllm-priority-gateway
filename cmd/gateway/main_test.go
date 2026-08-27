@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -31,6 +32,25 @@ func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
 	}
 	if destination.keyID != 7 || !destination.usedAt.Equal(usedAt) || projection.keyID != 7 || !projection.usedAt.Equal(usedAt) {
 		t.Fatalf("destination=%+v projection=%+v", destination, projection)
+	}
+}
+
+func TestCloseRecorderStoreDefersStoreCloseUntilRecorderDone(t *testing.T) {
+	recorder := &lifecycleRecorderStub{done: make(chan struct{}), closeErr: context.DeadlineExceeded}
+	store := &closeTrackingStore{closed: make(chan struct{})}
+	if err := closeRecorderStore(context.Background(), recorder, store); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("closeRecorderStore() error = %v", err)
+	}
+	select {
+	case <-store.closed:
+		t.Fatal("store closed while recorder worker could still access it")
+	default:
+	}
+	close(recorder.done)
+	select {
+	case <-store.closed:
+	case <-time.After(time.Second):
+		t.Fatal("store did not close after recorder worker completed")
 	}
 }
 
@@ -325,6 +345,21 @@ func (s *keyUsageStoreStub) TouchKeyLastUsed(_ context.Context, keyID int64, use
 type keyUsageRegistryStub struct {
 	keyID  int64
 	usedAt time.Time
+}
+
+type lifecycleRecorderStub struct {
+	done     chan struct{}
+	closeErr error
+}
+
+func (r *lifecycleRecorderStub) Close(context.Context) error { return r.closeErr }
+func (r *lifecycleRecorderStub) Done() <-chan struct{}       { return r.done }
+
+type closeTrackingStore struct{ closed chan struct{} }
+
+func (s *closeTrackingStore) Close() error {
+	close(s.closed)
+	return nil
 }
 
 func (s *keyUsageRegistryStub) MarkKeyUsed(keyID int64, usedAt time.Time) bool {

@@ -21,8 +21,8 @@ func TestRecorderFlushesAtBatchThreshold(t *testing.T) {
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 4, batchSize: 2})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	recorder.Complete(recordEvent("request-1"))
-	recorder.Complete(recordEvent("request-2"))
+	completeResponse(recorder, recordEvent("request-1"))
+	completeResponse(recorder, recordEvent("request-2"))
 
 	batch := awaitBatch(t, store)
 	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"request-1", "request-2"}) {
@@ -42,7 +42,7 @@ func TestRecorderFlushesPendingRowsOnTimer(t *testing.T) {
 	})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	recorder.Complete(recordEvent("timed-request"))
+	completeResponse(recorder, recordEvent("timed-request"))
 	awaitSignal(t, dequeued, "recorder dequeue")
 	flush <- time.Unix(1_800_000_000, 0)
 
@@ -64,15 +64,15 @@ func TestRecorderAppliesBackpressureWhenQueueIsFull(t *testing.T) {
 	})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 
-	recorder.Complete(recordEvent("request-in-writer"))
+	completeResponse(recorder, recordEvent("request-in-writer"))
 	awaitSignal(t, enqueueAttempts, "first enqueue attempt")
 	awaitSignal(t, store.insertStarted, "writer start")
-	recorder.Complete(recordEvent("request-in-queue"))
+	completeResponse(recorder, recordEvent("request-in-queue"))
 	awaitSignal(t, enqueueAttempts, "second enqueue attempt")
 
 	returned := make(chan struct{})
 	go func() {
-		recorder.Complete(recordEvent("request-blocked"))
+		completeResponse(recorder, recordEvent("request-blocked"))
 		close(returned)
 	}()
 	awaitSignal(t, enqueueAttempts, "third enqueue attempt")
@@ -90,7 +90,7 @@ func TestRecorderCloseDrainsAndFlushesPendingRows(t *testing.T) {
 	store := newFakeRecordStore()
 	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 8, batchSize: 10})
 	for _, id := range []string{"request-1", "request-2", "request-3"} {
-		recorder.Complete(recordEvent(id))
+		completeResponse(recorder, recordEvent(id))
 	}
 
 	closeRecorder(t, recorder)
@@ -116,7 +116,7 @@ func TestRecorderContinuesAfterFailedBatchAndReportsEachLostRow(t *testing.T) {
 		event := recordEvent(id)
 		event.Client = "secret-client-name"
 		event.Model = "secret-model-name"
-		recorder.Complete(event)
+		completeResponse(recorder, event)
 	}
 	first := awaitBatch(t, store)
 	second := awaitBatch(t, store)
@@ -160,6 +160,18 @@ func TestRecorderCleansUpRetentionAtStartup(t *testing.T) {
 
 func TestRecorderRunsRetentionCleanupAtMostHourly(t *testing.T) {
 	startedAt := time.Unix(1_800_000_000, 0).UTC()
+	actualNow := startedAt
+	var clockMu sync.Mutex
+	now := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return actualNow
+	}
+	setNow := func(value time.Time) {
+		clockMu.Lock()
+		actualNow = value
+		clockMu.Unlock()
+	}
 	cleanupTicks := make(chan time.Time)
 	tickHandled := make(chan struct{}, 4)
 	store := newFakeRecordStore()
@@ -167,29 +179,32 @@ func TestRecorderRunsRetentionCleanupAtMostHourly(t *testing.T) {
 		queueCapacity:    1,
 		batchSize:        1,
 		cleanup:          cleanupTicks,
-		now:              func() time.Time { return startedAt },
+		now:              now,
 		afterCleanupTick: func() { tickHandled <- struct{}{} },
 	})
 	t.Cleanup(func() { closeRecorder(t, recorder) })
 	_ = awaitCleanup(t, store)
 
-	cleanupTicks <- startedAt.Add(30 * time.Minute)
+	setNow(startedAt.Add(30 * time.Minute))
+	cleanupTicks <- startedAt.Add(2 * time.Hour)
 	awaitSignal(t, tickHandled, "sub-hour cleanup tick")
 	if calls := store.cleanupCallCount(); calls != 1 {
 		t.Fatalf("cleanup calls after 30 minutes = %d, want startup only", calls)
 	}
 
-	cleanupTicks <- startedAt.Add(time.Hour)
+	setNow(startedAt.Add(time.Hour))
+	cleanupTicks <- startedAt.Add(30 * time.Minute)
 	cutoff := awaitCleanup(t, store)
 	awaitSignal(t, tickHandled, "hourly cleanup tick")
 	if want := startedAt.Add(time.Hour - 24*time.Hour); !cutoff.Equal(want) {
 		t.Fatalf("hourly cleanup cutoff = %s, want %s", cutoff, want)
 	}
 
-	cleanupTicks <- startedAt.Add(time.Hour)
-	awaitSignal(t, tickHandled, "duplicate hourly cleanup tick")
+	setNow(startedAt.Add(90 * time.Minute))
+	cleanupTicks <- startedAt.Add(3 * time.Hour)
+	awaitSignal(t, tickHandled, "stale duplicate cleanup tick")
 	if calls := store.cleanupCallCount(); calls != 2 {
-		t.Fatalf("cleanup calls at same hour = %d, want 2 total", calls)
+		t.Fatalf("cleanup calls within an actual hour = %d, want 2 total", calls)
 	}
 }
 
@@ -222,13 +237,13 @@ func TestRecorderIgnoresMissingStableIDsAndPersistsMissingUsage(t *testing.T) {
 
 	missingClient := recordEvent("missing-client")
 	missingClient.ClientID = 0
-	recorder.Complete(missingClient)
+	completeResponse(recorder, missingClient)
 	missingModel := recordEvent("missing-model")
 	missingModel.ModelPoolID = 0
-	recorder.Complete(missingModel)
+	completeResponse(recorder, missingModel)
 	valid := recordEvent("unmetered")
 	valid.Usage = nil
-	recorder.Complete(valid)
+	completeResponse(recorder, valid)
 
 	batch := awaitBatch(t, store)
 	if len(batch) != 1 || batch[0].RequestID != "unmetered" {
@@ -249,7 +264,9 @@ func TestRecorderCompleteAndCloseAreSafeConcurrently(t *testing.T) {
 		go func() {
 			defer callers.Done()
 			<-start
-			recorder.Complete(recordEvent("concurrent-request"))
+			event := recordEvent("concurrent-request")
+			recorder.Complete(event)
+			recorder.ResponseComplete(event.RequestID)
 		}()
 	}
 	close(start)
@@ -259,6 +276,65 @@ func TestRecorderCompleteAndCloseAreSafeConcurrently(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 	callers.Wait()
+}
+
+func TestRecorderKeepsOnePendingRecordAndEnqueuesResponseOnce(t *testing.T) {
+	store := newFakeRecordStore()
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+	event := recordEvent("same-request")
+
+	recorder.Complete(event)
+	recorder.Complete(event)
+	recorder.mu.Lock()
+	pending := len(recorder.pending)
+	recorder.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending records for duplicate Complete = %d, want 1", pending)
+	}
+
+	recorder.ResponseComplete(event.RequestID)
+	recorder.ResponseComplete(event.RequestID)
+	batch := awaitBatch(t, store)
+	if got := requestIDs(batch); !reflect.DeepEqual(got, []string{"same-request"}) {
+		t.Fatalf("enqueued request IDs = %v", got)
+	}
+	select {
+	case duplicate := <-store.batchCalls:
+		t.Fatalf("duplicate response completion enqueued %+v", duplicate)
+	default:
+	}
+}
+
+func TestRecorderCloseReturnsAtDeadlineWhileNonCooperativeStoreFinishesLater(t *testing.T) {
+	releaseInsert := make(chan struct{})
+	store := newFakeRecordStore()
+	store.insertBlock = releaseInsert
+	store.ignoreInsertContext = true
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 1, batchSize: 1})
+	completeResponse(recorder, recordEvent("blocked-store"))
+	awaitSignal(t, store.insertStarted, "non-cooperative insert start")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { returned <- recorder.Close(ctx) }()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close() error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		close(releaseInsert)
+		t.Fatal("Close() waited for a non-cooperative store beyond its deadline")
+	}
+	select {
+	case <-recorder.Done():
+		t.Fatal("recorder worker finished while store remained blocked")
+	default:
+	}
+	close(releaseInsert)
+	awaitSignal(t, recorder.Done(), "recorder worker completion")
 }
 
 func recordEvent(requestID string) gateway.RequestEvent {
@@ -281,6 +357,11 @@ func recordEvent(requestID string) gateway.RequestEvent {
 			InputTokens: 7, OutputTokens: 5, CacheReadTokens: &cacheRead,
 		},
 	}
+}
+
+func completeResponse(recorder *Recorder, event gateway.RequestEvent) {
+	recorder.Complete(event)
+	recorder.ResponseComplete(event.RequestID)
 }
 
 func requestIDs(records []RequestRecord) []string {
@@ -332,14 +413,15 @@ func awaitSignal(t *testing.T, signal <-chan struct{}, description string) {
 }
 
 type fakeRecordStore struct {
-	mu            sync.Mutex
-	insertCalls   int
-	insertErrors  map[int]error
-	insertBlock   <-chan struct{}
-	insertStarted chan struct{}
-	batchCalls    chan []RequestRecord
-	cleanupCalls  chan time.Time
-	cleanupCount  int
+	mu                  sync.Mutex
+	insertCalls         int
+	insertErrors        map[int]error
+	insertBlock         <-chan struct{}
+	ignoreInsertContext bool
+	insertStarted       chan struct{}
+	batchCalls          chan []RequestRecord
+	cleanupCalls        chan time.Time
+	cleanupCount        int
 }
 
 func newFakeRecordStore() *fakeRecordStore {
@@ -362,6 +444,10 @@ func (s *fakeRecordStore) InsertUsageBatch(ctx context.Context, records []Reques
 	s.batchCalls <- batch
 	s.insertStarted <- struct{}{}
 	if s.insertBlock != nil {
+		if s.ignoreInsertContext {
+			<-s.insertBlock
+			return err
+		}
 		select {
 		case <-s.insertBlock:
 		case <-ctx.Done():

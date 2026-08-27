@@ -147,6 +147,14 @@ func (s *Service) CompletePublic(event RequestEvent) {
 	}
 }
 
+// ResponseComplete signals observer peers only after the public HTTP response
+// has been written by the handler or upstream proxy.
+func (s *Service) ResponseComplete(requestID string) {
+	if observer, ok := s.observer.(ResponseCompleteObserver); ok {
+		observer.ResponseComplete(requestID)
+	}
+}
+
 func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (result proxy.Result, apiErr *APIError) {
 	started := time.Now()
 	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}

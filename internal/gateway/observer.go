@@ -46,3 +46,9 @@ type Observer interface {
 	BackendInflight(InflightEvent, int)
 	Complete(RequestEvent)
 }
+
+// ResponseCompleteObserver receives a signal after the downstream response is
+// fully written. Implementations may apply post-response backpressure here.
+type ResponseCompleteObserver interface {
+	ResponseComplete(requestID string)
+}

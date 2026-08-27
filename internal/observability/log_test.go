@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,4 +36,39 @@ func TestStructuredLoggerWritesSafeCompletionRecord(t *testing.T) {
 			t.Fatalf("unsafe field %q found in log: %s", forbidden, text)
 		}
 	}
+}
+
+func TestMultiPropagatesResponseCompleteToCapablePeers(t *testing.T) {
+	peer := &responseCompleteObserver{}
+	combined := observability.Multi(observability.NewLogger(nil), peer)
+	notifier, ok := combined.(gateway.ResponseCompleteObserver)
+	if !ok {
+		t.Fatal("Multi does not expose response-complete capability")
+	}
+	notifier.ResponseComplete("request-1")
+	notifier.ResponseComplete("request-2")
+	if got := peer.RequestIDs(); strings.Join(got, ",") != "request-1,request-2" {
+		t.Fatalf("response-complete request IDs = %v", got)
+	}
+}
+
+type responseCompleteObserver struct {
+	mu         sync.Mutex
+	requestIDs []string
+}
+
+func (*responseCompleteObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*responseCompleteObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*responseCompleteObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *responseCompleteObserver) ResponseComplete(requestID string) {
+	o.mu.Lock()
+	o.requestIDs = append(o.requestIDs, requestID)
+	o.mu.Unlock()
+}
+
+func (o *responseCompleteObserver) RequestIDs() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.requestIDs...)
 }

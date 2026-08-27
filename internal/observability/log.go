@@ -72,3 +72,11 @@ func (o observers) Complete(event gateway.RequestEvent) {
 		observer.Complete(event)
 	}
 }
+
+func (o observers) ResponseComplete(requestID string) {
+	for _, observer := range o {
+		if responseObserver, ok := observer.(gateway.ResponseCompleteObserver); ok {
+			responseObserver.ResponseComplete(requestID)
+		}
+	}
+}

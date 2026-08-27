@@ -51,7 +51,12 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	databaseOwnedByRun := true
+	defer func() {
+		if databaseOwnedByRun {
+			runErr = errors.Join(runErr, database.Close())
+		}
+	}()
 
 	registryValue := registry.New(database)
 	if err := registryValue.Reload(ctx); err != nil {
@@ -87,15 +92,24 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	metrics := observability.NewMetrics()
 	apiKeyUsage := newAPIKeyUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
-	defer apiKeyUsage.Close()
+	apiKeyUsageClosed := false
+	closeAPIKeyUsage := func() {
+		if !apiKeyUsageClosed {
+			apiKeyUsageClosed = true
+			apiKeyUsage.Close()
+		}
+	}
+	defer closeAPIKeyUsage()
 	requestRecorder := analytics.NewRecorder(database, cfg.AnalyticsRetention, metrics.UsagePersistenceFailure, logger)
+	databaseOwnedByRun = false
 	requestRecorderClosed := false
 	closeRequestRecorder := func(closeCtx context.Context) error {
 		if requestRecorderClosed {
 			return nil
 		}
 		requestRecorderClosed = true
-		return requestRecorder.Close(closeCtx)
+		closeAPIKeyUsage()
+		return closeRecorderStore(closeCtx, requestRecorder, database)
 	}
 	defer func() {
 		if requestRecorderClosed {
@@ -196,6 +210,29 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 		recorderErr = fmt.Errorf("drain usage recorder: %w", err)
 	}
 	return errors.Join(shutdownErr, serveErr, recorderErr)
+}
+
+type recorderStoreLifecycle interface {
+	Close(context.Context) error
+	Done() <-chan struct{}
+}
+
+type closeStore interface {
+	Close() error
+}
+
+func closeRecorderStore(ctx context.Context, recorder recorderStoreLifecycle, destination closeStore) error {
+	recorderErr := recorder.Close(ctx)
+	select {
+	case <-recorder.Done():
+		return errors.Join(recorderErr, destination.Close())
+	default:
+		go func() {
+			<-recorder.Done()
+			_ = destination.Close()
+		}()
+		return recorderErr
+	}
 }
 
 func backends(snapshot *registry.Snapshot) []domain.Backend {
