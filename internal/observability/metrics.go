@@ -37,12 +37,30 @@ type Metrics struct {
 	runtimeTopologyKnown   bool
 	knownPoolLabels        map[string]struct{}
 	knownBackendLabels     map[backendMetricLabels]struct{}
+	knownRequestLabels     map[requestMetricLabels]struct{}
+	knownClientLabels      map[clientMetricLabels]struct{}
+	observedBackendLabels  map[backendMetricLabels]struct{}
+	observedRequestLabels  map[requestMetricLabels]struct{}
+	observedClientLabels   map[clientMetricLabels]struct{}
 	backendInflightValues  map[backendMetricLabels]int
+	requestInflightValues  map[requestMetricLabels]int
+	clientInflightValues   map[clientMetricLabels]int
 }
 
 type backendMetricLabels struct {
 	model   string
 	backend string
+}
+
+type requestMetricLabels struct {
+	model    string
+	priority string
+}
+
+type clientMetricLabels struct {
+	client   string
+	model    string
+	priority string
 }
 
 // PoolRuntimeMetric is one current-topology pool runtime sample.
@@ -58,12 +76,26 @@ type BackendRuntimeMetric struct {
 	Runtime domain.BackendRuntime
 }
 
+// InflightRuntimeLabels is one enabled client/model/priority admission label combination.
+type InflightRuntimeLabels struct {
+	Client        string
+	Model         string
+	PriorityClass domain.PriorityClass
+}
+
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		registry:              prometheus.NewRegistry(),
 		knownPoolLabels:       make(map[string]struct{}),
 		knownBackendLabels:    make(map[backendMetricLabels]struct{}),
+		knownRequestLabels:    make(map[requestMetricLabels]struct{}),
+		knownClientLabels:     make(map[clientMetricLabels]struct{}),
+		observedBackendLabels: make(map[backendMetricLabels]struct{}),
+		observedRequestLabels: make(map[requestMetricLabels]struct{}),
+		observedClientLabels:  make(map[clientMetricLabels]struct{}),
 		backendInflightValues: make(map[backendMetricLabels]int),
+		requestInflightValues: make(map[requestMetricLabels]int),
+		clientInflightValues:  make(map[clientMetricLabels]int),
 	}
 	m.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_requests_total", Help: "Completed public inference requests."}, []string{"client", "model", "priority_class", "status_class"})
 	m.requestsInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_requests_inflight", Help: "Public inference requests admitted and currently in flight."}, []string{"model", "priority_class"})
@@ -98,9 +130,38 @@ func (m *Metrics) Handler() http.Handler {
 }
 
 func (m *Metrics) ClientInflight(event gateway.InflightEvent, delta int) {
-	model, priority := value(event.Model), value(string(event.PriorityClass))
-	m.requestsInflight.WithLabelValues(model, priority).Add(float64(delta))
-	m.clientInflight.WithLabelValues(value(event.Client), model, priority).Add(float64(delta))
+	requestLabels := requestMetricLabels{model: value(event.Model), priority: value(string(event.PriorityClass))}
+	clientLabels := clientMetricLabels{
+		client: value(event.Client), model: requestLabels.model, priority: requestLabels.priority,
+	}
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+
+	m.observedRequestLabels[requestLabels] = struct{}{}
+	m.observedClientLabels[clientLabels] = struct{}{}
+	requestInflight := updateInflightValue(m.requestInflightValues, requestLabels, delta)
+	clientInflight := updateInflightValue(m.clientInflightValues, clientLabels, delta)
+	if m.runtimeTopologyKnown {
+		if _, current := m.knownRequestLabels[requestLabels]; !current {
+			m.requestsInflight.DeleteLabelValues(requestLabels.model, requestLabels.priority)
+			if requestInflight == 0 {
+				delete(m.observedRequestLabels, requestLabels)
+			}
+		} else {
+			m.requestsInflight.WithLabelValues(requestLabels.model, requestLabels.priority).Set(float64(requestInflight))
+		}
+		if _, current := m.knownClientLabels[clientLabels]; !current {
+			m.clientInflight.DeleteLabelValues(clientLabels.client, clientLabels.model, clientLabels.priority)
+			if clientInflight == 0 {
+				delete(m.observedClientLabels, clientLabels)
+			}
+		} else {
+			m.clientInflight.WithLabelValues(clientLabels.client, clientLabels.model, clientLabels.priority).Set(float64(clientInflight))
+		}
+		return
+	}
+	m.requestsInflight.WithLabelValues(requestLabels.model, requestLabels.priority).Set(float64(requestInflight))
+	m.clientInflight.WithLabelValues(clientLabels.client, clientLabels.model, clientLabels.priority).Set(float64(clientInflight))
 }
 
 func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
@@ -108,16 +169,14 @@ func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
 	m.runtimeMu.Lock()
 	defer m.runtimeMu.Unlock()
 
-	inflight := m.backendInflightValues[labels] + delta
-	if inflight <= 0 {
-		delete(m.backendInflightValues, labels)
-		inflight = 0
-	} else {
-		m.backendInflightValues[labels] = inflight
-	}
+	m.observedBackendLabels[labels] = struct{}{}
+	inflight := updateInflightValue(m.backendInflightValues, labels, delta)
 	if m.runtimeTopologyKnown {
 		if _, current := m.knownBackendLabels[labels]; !current {
 			m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
+			if inflight == 0 {
+				delete(m.observedBackendLabels, labels)
+			}
 			return
 		}
 	}
@@ -183,15 +242,26 @@ func (m *Metrics) setPool(model string, runtime domain.PoolRuntime) {
 // PublishRuntime replaces the bounded current-topology gauge label set and
 // publishes its latest samples atomically with respect to inflight updates.
 // Historical counters and histograms are intentionally left untouched.
-func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric) {
+func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric, inflight []InflightRuntimeLabels) {
 	currentPools := make(map[string]struct{}, len(pools))
 	currentBackends := make(map[backendMetricLabels]struct{}, len(backends))
+	currentRequests := make(map[requestMetricLabels]struct{}, len(inflight))
+	currentClients := make(map[clientMetricLabels]struct{}, len(inflight))
 	for _, pool := range pools {
 		currentPools[value(pool.Model)] = struct{}{}
 	}
 	for _, backend := range backends {
 		currentBackends[backendMetricLabels{
 			model: value(backend.Model), backend: value(backend.Backend),
+		}] = struct{}{}
+	}
+	for _, labels := range inflight {
+		requestLabels := requestMetricLabels{
+			model: value(labels.Model), priority: value(string(labels.PriorityClass)),
+		}
+		currentRequests[requestLabels] = struct{}{}
+		currentClients[clientMetricLabels{
+			client: value(labels.Client), model: requestLabels.model, priority: requestLabels.priority,
 		}] = struct{}{}
 	}
 
@@ -212,15 +282,46 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		}
 		m.deleteBackendRuntimeLabels(labels)
 	}
-	for labels := range m.backendInflightValues {
+	for labels := range m.observedBackendLabels {
 		if _, current := currentBackends[labels]; !current {
 			m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
+			if m.backendInflightValues[labels] == 0 {
+				delete(m.observedBackendLabels, labels)
+			}
+		}
+	}
+	for labels := range m.knownRequestLabels {
+		if _, current := currentRequests[labels]; !current {
+			m.requestsInflight.DeleteLabelValues(labels.model, labels.priority)
+		}
+	}
+	for labels := range m.observedRequestLabels {
+		if _, current := currentRequests[labels]; !current {
+			m.requestsInflight.DeleteLabelValues(labels.model, labels.priority)
+			if m.requestInflightValues[labels] == 0 {
+				delete(m.observedRequestLabels, labels)
+			}
+		}
+	}
+	for labels := range m.knownClientLabels {
+		if _, current := currentClients[labels]; !current {
+			m.clientInflight.DeleteLabelValues(labels.client, labels.model, labels.priority)
+		}
+	}
+	for labels := range m.observedClientLabels {
+		if _, current := currentClients[labels]; !current {
+			m.clientInflight.DeleteLabelValues(labels.client, labels.model, labels.priority)
+			if m.clientInflightValues[labels] == 0 {
+				delete(m.observedClientLabels, labels)
+			}
 		}
 	}
 
 	m.runtimeTopologyKnown = true
 	m.knownPoolLabels = currentPools
 	m.knownBackendLabels = currentBackends
+	m.knownRequestLabels = currentRequests
+	m.knownClientLabels = currentClients
 	for _, pool := range pools {
 		m.setPool(pool.Model, pool.Runtime)
 	}
@@ -229,6 +330,22 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		labels := backendMetricLabels{model: value(backend.Model), backend: value(backend.Backend)}
 		m.backendInflight.WithLabelValues(labels.model, labels.backend).Set(float64(m.backendInflightValues[labels]))
 	}
+	for labels := range currentRequests {
+		m.requestsInflight.WithLabelValues(labels.model, labels.priority).Set(float64(m.requestInflightValues[labels]))
+	}
+	for labels := range currentClients {
+		m.clientInflight.WithLabelValues(labels.client, labels.model, labels.priority).Set(float64(m.clientInflightValues[labels]))
+	}
+}
+
+func updateInflightValue[K comparable](values map[K]int, labels K, delta int) int {
+	inflight := values[labels] + delta
+	if inflight <= 0 {
+		delete(values, labels)
+		return 0
+	}
+	values[labels] = inflight
+	return inflight
 }
 
 func (m *Metrics) deleteBackendRuntimeLabels(labels backendMetricLabels) {

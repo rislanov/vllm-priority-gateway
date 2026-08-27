@@ -234,7 +234,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
 	}
-	poolRuntime, releasePool, poolErr := s.acquirePool(client.ID, pool)
+	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
 	event.PoolState = poolRuntime.State
 	if poolErr != nil {
 		return proxy.Result{}, poolErr
@@ -334,7 +334,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	return result, nil
 }
 
-func (s *Service) acquirePool(clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
+func (s *Service) acquirePool(ctx context.Context, clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
 	for {
 		before := s.registry.Snapshot()
 		pool, valid := currentAdmissionPool(before, clientID, original)
@@ -359,8 +359,11 @@ func (s *Service) acquirePool(clientID int64, original domain.ModelPool) (domain
 			release()
 			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
 		}
-		if after.Revision != before.Revision || validatedPool != pool {
+		if validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
 			release()
+			if ctx.Err() != nil {
+				return runtime, nil, backendUnavailable(s.retryAfter)
+			}
 			continue
 		}
 		return runtime, release, nil

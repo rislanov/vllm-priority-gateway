@@ -216,7 +216,23 @@ func publishRuntimeMetrics(metrics *observability.Metrics, snapshot *registry.Sn
 			Model: pool.PublicModelName, Backend: backend.Name, Runtime: runtime.Snapshot(backend.ID, at),
 		})
 	}
-	metrics.PublishRuntime(pools, backends)
+	inflight := make([]observability.InflightRuntimeLabels, 0)
+	for clientID, access := range snapshot.Access {
+		client, exists := snapshot.Clients[clientID]
+		if !exists || !client.Enabled {
+			continue
+		}
+		for poolID, allowed := range access {
+			pool, exists := snapshot.PoolsByID[poolID]
+			if !allowed || !exists || !pool.Enabled {
+				continue
+			}
+			inflight = append(inflight, observability.InflightRuntimeLabels{
+				Client: client.Name, Model: pool.PublicModelName, PriorityClass: client.PriorityClass,
+			})
+		}
+	}
+	metrics.PublishRuntime(pools, backends, inflight)
 }
 
 func updateBackendMetrics(ctx context.Context, metrics *observability.Metrics, registryValue *registry.Registry, manager *monitor.Manager, interval time.Duration) {

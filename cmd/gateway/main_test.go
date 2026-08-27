@@ -72,9 +72,41 @@ func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
 	}
 }
 
+func TestPublishRuntimeMetricsRemovesInflightSeriesObservedBeforeFirstEmptyPublication(t *testing.T) {
+	metrics := observability.NewMetrics()
+	inflight := gateway.InflightEvent{
+		Client: "removed-client", Model: "removed-model", Backend: "removed-backend",
+		PriorityClass: domain.PriorityHigh,
+	}
+	metrics.ClientInflight(inflight, 1)
+	metrics.BackendInflight(inflight, 1)
+	metrics.ClientInflight(inflight, -1)
+	metrics.BackendInflight(inflight, -1)
+
+	publishRuntimeMetrics(metrics, &registry.Snapshot{
+		Clients: map[int64]domain.Client{}, PoolsByID: map[int64]domain.ModelPool{},
+		BackendsByID: map[int64]domain.Backend{}, Access: map[int64]map[int64]bool{},
+	}, runtimeMetricsMapStub{}, time.Unix(1_700_000_000, 0))
+
+	text := scrapeMetrics(t, metrics)
+	for _, stale := range []string{
+		`llmgw_requests_inflight{model="removed-model",priority_class="high"}`,
+		`llmgw_client_inflight{client="removed-client",model="removed-model",priority_class="high"}`,
+		`llmgw_backend_requests_inflight{backend="removed-backend",model="removed-model"}`,
+	} {
+		if strings.Contains(text, stale) {
+			t.Fatalf("pre-publication inflight sample %q survived empty topology:\n%s", stale, text)
+		}
+	}
+}
+
 func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.T) {
 	metrics := observability.NewMetrics()
 	first := &registry.Snapshot{
+		Clients: map[int64]domain.Client{
+			1: {ID: 1, Name: "client-old", Enabled: true, PriorityClass: domain.PriorityHigh},
+			2: {ID: 2, Name: "removed-client", Enabled: true, PriorityClass: domain.PriorityBackground},
+		},
 		PoolsByID: map[int64]domain.ModelPool{
 			10: {ID: 10, PublicModelName: "qwen-old", Enabled: true},
 			11: {ID: 11, PublicModelName: "removed-pool", Enabled: true},
@@ -82,6 +114,10 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 		BackendsByID: map[int64]domain.Backend{
 			20: {ID: 20, ModelPoolID: 10, Name: "gpu-old", Enabled: true},
 			21: {ID: 21, ModelPoolID: 11, Name: "removed-gpu", Enabled: true},
+		},
+		Access: map[int64]map[int64]bool{
+			1: {10: true},
+			2: {11: true},
 		},
 	}
 	runtime := runtimeMetricsMapStub{
@@ -96,6 +132,15 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 	}
 	at := time.Unix(1_700_000_000, 0)
 	publishRuntimeMetrics(metrics, first, runtime, at)
+	oldClientInflight := gateway.InflightEvent{
+		Client: "client-old", Model: "qwen-old", PriorityClass: domain.PriorityHigh,
+	}
+	removedClientInflight := gateway.InflightEvent{
+		Client: "removed-client", Model: "removed-pool", PriorityClass: domain.PriorityBackground,
+	}
+	metrics.ClientInflight(oldClientInflight, 1)
+	metrics.ClientInflight(removedClientInflight, 1)
+	metrics.ClientInflight(removedClientInflight, -1)
 	oldInflight := gateway.InflightEvent{Model: "qwen-old", Backend: "gpu-old"}
 	metrics.BackendInflight(oldInflight, 1)
 	metrics.Complete(gateway.RequestEvent{
@@ -104,12 +149,16 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 	})
 
 	second := &registry.Snapshot{
+		Clients: map[int64]domain.Client{
+			1: {ID: 1, Name: "client-new", Enabled: true, PriorityClass: domain.PriorityNormal},
+		},
 		PoolsByID: map[int64]domain.ModelPool{
 			10: {ID: 10, PublicModelName: "qwen-new", Enabled: true},
 		},
 		BackendsByID: map[int64]domain.Backend{
 			20: {ID: 20, ModelPoolID: 10, Name: "gpu-new", Enabled: true},
 		},
+		Access: map[int64]map[int64]bool{1: {10: true}},
 	}
 	runtime.pools[10] = domain.PoolRuntime{PoolID: 10, GatewayInflight: 1, TotalWaiting: 2, AvailableBackends: 1}
 	runtime.backends[20] = domain.BackendRuntime{
@@ -117,6 +166,7 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 		CircuitState: domain.CircuitHalfOpen, CircuitFailures: 1,
 	}
 	publishRuntimeMetrics(metrics, second, runtime, at.Add(time.Second))
+	metrics.ClientInflight(oldClientInflight, -1)
 	metrics.BackendInflight(oldInflight, -1)
 	newInflight := gateway.InflightEvent{Model: "qwen-new", Backend: "gpu-new"}
 	metrics.BackendInflight(newInflight, 1)
@@ -126,6 +176,10 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	text := response.Body.String()
 	for _, stale := range []string{
+		`llmgw_requests_inflight{model="qwen-old",priority_class="high"}`,
+		`llmgw_client_inflight{client="client-old",model="qwen-old",priority_class="high"}`,
+		`llmgw_requests_inflight{model="removed-pool",priority_class="background"}`,
+		`llmgw_client_inflight{client="removed-client",model="removed-pool",priority_class="background"}`,
 		`llmgw_backend_requests_inflight{backend="gpu-old",model="qwen-old"}`,
 		`llmgw_backend_pressure{backend="gpu-old",model="qwen-old"}`,
 		`llmgw_backend_running_requests{backend="gpu-old",model="qwen-old"}`,
@@ -144,6 +198,8 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 		}
 	}
 	for _, current := range []string{
+		`llmgw_requests_inflight{model="qwen-new",priority_class="normal"} 0`,
+		`llmgw_client_inflight{client="client-new",model="qwen-new",priority_class="normal"} 0`,
 		`llmgw_backend_requests_inflight{backend="gpu-new",model="qwen-new"} 0`,
 		`llmgw_backend_pressure{backend="gpu-new",model="qwen-new"} 0.2`,
 		`llmgw_backend_running_requests{backend="gpu-new",model="qwen-new"} 1`,
@@ -160,6 +216,13 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 			t.Fatalf("current or historical sample %q missing after reconciliation:\n%s", current, text)
 		}
 	}
+}
+
+func scrapeMetrics(t *testing.T, metrics *observability.Metrics) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return response.Body.String()
 }
 
 func TestAdminDashboardRendersPoolSafetyAndCircuitRuntime(t *testing.T) {
