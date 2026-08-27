@@ -51,6 +51,64 @@ func TestForwardFlushesStreamingBytesWithoutFullBuffering(t *testing.T) {
 	}
 }
 
+func TestForwardInspectsUsageWithoutChangingStreamingBehavior(t *testing.T) {
+	firstChunk := `{"choices":[{"message":{"content":"one"}}],`
+	secondChunk := `"usage":{"prompt_tokens":13,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8}}}`
+	releaseFinalChunk := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(firstChunk))
+		writer.(http.Flusher).Flush()
+		<-releaseFinalChunk
+		_, _ = writer.Write([]byte(secondChunk))
+		writer.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	downstream := newObservingWriter()
+	finished := make(chan proxy.Result, 1)
+	go func() {
+		finished <- proxy.New(upstream.Client()).Forward(context.Background(), downstream, proxy.Request{
+			Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"upstream"}`),
+			Target: proxy.Target{Backend: backend(1, upstream.URL)},
+		})
+	}()
+
+	select {
+	case <-downstream.firstWrite:
+	case <-time.After(time.Second):
+		t.Fatal("first response chunk was not forwarded")
+	}
+	if got := downstream.String(); got != firstChunk {
+		t.Fatalf("body before completion = %q, want %q", got, firstChunk)
+	}
+	if downstream.FlushCount() != 1 {
+		t.Fatalf("flushes before completion = %d, want 1", downstream.FlushCount())
+	}
+	select {
+	case result := <-finished:
+		t.Fatalf("Forward returned before response completion: %+v", result)
+	default:
+	}
+
+	close(releaseFinalChunk)
+	result := <-finished
+	wantBody := firstChunk + secondChunk
+	if got := downstream.String(); got != wantBody {
+		t.Fatalf("body = %q, want byte-identical %q", got, wantBody)
+	}
+	if downstream.FlushCount() != 2 {
+		t.Fatalf("flushes = %d, want 2", downstream.FlushCount())
+	}
+	if result.Err != nil || result.BytesSent != int64(len(wantBody)) {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Usage == nil || result.Usage.InputTokens != 13 || result.Usage.OutputTokens != 5 ||
+		result.Usage.CacheReadTokens == nil || *result.Usage.CacheReadTokens != 8 || result.UsageParseFailure != "" {
+		t.Fatalf("usage=%+v parse_failure=%q", result.Usage, result.UsageParseFailure)
+	}
+}
+
 func TestForwardCancellationStopsUpstream(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{TTFT: 10 * time.Second})
