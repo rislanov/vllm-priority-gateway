@@ -152,5 +152,5 @@ func usageParseFailureFormat(input string) (string, bool) {
 	if format == "json" || format == "sse" {
 		return format, true
 	}
-	return "unknown", true
+	return "", false
 }

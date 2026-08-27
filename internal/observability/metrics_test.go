@@ -79,12 +79,14 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		`llmgw_cache_read_tokens_total{client="client-a",model="qwen"} 3`,
 		`llmgw_usage_parse_failures_total{format="json"} 1`,
 		`llmgw_usage_parse_failures_total{format="sse"} 1`,
-		`llmgw_usage_parse_failures_total{format="unknown"} 1`,
 		`llmgw_usage_persistence_failures_total 2`,
 	} {
 		if !strings.Contains(text, sample+"\n") {
 			t.Fatalf("metrics missing exact sample %q:\n%s", sample, text)
 		}
+	}
+	if strings.Contains(text, `llmgw_usage_parse_failures_total{format="unknown"}`) {
+		t.Fatalf("unsupported usage parse format should not increment a counter:\n%s", text)
 	}
 	for _, requestID := range []string{
 		"request-id-must-not-be-a-label", "other-request-id", "disconnected-request-id",
