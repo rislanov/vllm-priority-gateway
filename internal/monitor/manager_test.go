@@ -43,7 +43,7 @@ func TestManagerReconcileStartsKeepsAndStopsWorkers(t *testing.T) {
 	}
 }
 
-func TestManagerInflightReleaseIsIdempotent(t *testing.T) {
+func TestManagerAcquireBackendTracksInflightAndCircuitOutcome(t *testing.T) {
 	fake := fakevllm.New()
 	server := httptest.NewServer(fake.Handler())
 	defer server.Close()
@@ -54,18 +54,143 @@ func TestManagerInflightReleaseIsIdempotent(t *testing.T) {
 	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
 		t.Fatal(err)
 	}
-	release, ok := manager.IncrementInflight(1)
+	at := time.Now()
+	complete, ok := manager.AcquireBackend(1, at)
 	if !ok {
-		t.Fatal("IncrementInflight() rejected known backend")
+		t.Fatal("AcquireBackend() rejected known backend")
 	}
-	if got := manager.Snapshot(1, time.Now()).GatewayInflight; got != 1 {
-		t.Fatalf("inflight = %d", got)
+	snapshot := manager.Snapshot(1, at)
+	if snapshot.GatewayInflight != 1 || snapshot.CircuitState != domain.CircuitClosed || !snapshot.CircuitAvailable {
+		t.Fatalf("snapshot after acquire = %+v", snapshot)
 	}
-	release()
-	release()
-	if got := manager.Snapshot(1, time.Now()).GatewayInflight; got != 0 {
-		t.Fatalf("inflight after release = %d", got)
+	complete(domain.InferenceFailure)
+	snapshot = manager.Snapshot(1, at)
+	if snapshot.GatewayInflight != 0 || snapshot.CircuitFailures != 1 || snapshot.CircuitState != domain.CircuitClosed {
+		t.Fatalf("snapshot after failure = %+v", snapshot)
 	}
+}
+
+func TestManagerOpenCircuitRejectsUntilHalfOpenProbe(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Now()
+	completeBackend(t, manager, 1, base, domain.InferenceFailure)
+	completeBackend(t, manager, 1, base.Add(time.Second), domain.InferenceFailure)
+	open := manager.Snapshot(1, base.Add(time.Second))
+	if open.CircuitState != domain.CircuitOpen || open.CircuitAvailable || !open.CircuitRetryAt.Equal(base.Add(6*time.Second)) {
+		t.Fatalf("open snapshot = %+v", open)
+	}
+	if complete, ok := manager.AcquireBackend(1, base.Add(5*time.Second)); ok || complete != nil {
+		t.Fatal("AcquireBackend() admitted a request before cooldown")
+	}
+
+	probe, ok := manager.AcquireBackend(1, base.Add(6*time.Second))
+	if !ok || probe == nil {
+		t.Fatal("AcquireBackend() rejected the half-open probe")
+	}
+	halfOpen := manager.Snapshot(1, base.Add(6*time.Second))
+	if halfOpen.CircuitState != domain.CircuitHalfOpen || halfOpen.CircuitAvailable || halfOpen.CircuitProbesInFlight != 1 || halfOpen.GatewayInflight != 1 {
+		t.Fatalf("half-open snapshot = %+v", halfOpen)
+	}
+	if complete, ok := manager.AcquireBackend(1, base.Add(6*time.Second)); ok || complete != nil {
+		t.Fatal("AcquireBackend() admitted a second half-open probe")
+	}
+	probe(domain.InferenceSuccess)
+	closed := manager.Snapshot(1, base.Add(6*time.Second))
+	if closed.CircuitState != domain.CircuitClosed || !closed.CircuitAvailable || closed.CircuitFailures != 0 || closed.GatewayInflight != 0 {
+		t.Fatalf("closed snapshot = %+v", closed)
+	}
+
+	completeBackend(t, manager, 1, base.Add(7*time.Second), domain.InferenceFailure)
+	completeBackend(t, manager, 1, base.Add(8*time.Second), domain.InferenceFailure)
+	probe, ok = manager.AcquireBackend(1, base.Add(13*time.Second))
+	if !ok || probe == nil {
+		t.Fatal("AcquireBackend() rejected the second half-open probe")
+	}
+	probe(domain.InferenceFailure)
+	reopened := manager.Snapshot(1, base.Add(13*time.Second))
+	if reopened.CircuitState != domain.CircuitOpen || reopened.CircuitAvailable || !reopened.CircuitRetryAt.Equal(base.Add(18*time.Second)) || reopened.GatewayInflight != 0 {
+		t.Fatalf("reopened snapshot = %+v", reopened)
+	}
+}
+
+func TestManagerBackendCompletionIsIdempotent(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	if err := manager.Reconcile([]domain.Backend{testBackend(server.URL, 1, 1)}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now()
+	complete, ok := manager.AcquireBackend(1, at)
+	if !ok {
+		t.Fatal("AcquireBackend() rejected known backend")
+	}
+	complete(domain.InferenceFailure)
+	complete(domain.InferenceFailure)
+	snapshot := manager.Snapshot(1, at)
+	if snapshot.GatewayInflight != 0 || snapshot.CircuitFailures != 1 {
+		t.Fatalf("snapshot after duplicate completion = %+v", snapshot)
+	}
+}
+
+func TestManagerReconcileKeepsOrResetsCircuitWithWorkerIdentity(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now()
+	completeBackend(t, manager, backend.ID, base, domain.InferenceFailure)
+	completeBackend(t, manager, backend.ID, base.Add(time.Second), domain.InferenceFailure)
+	if got := manager.Snapshot(backend.ID, base.Add(time.Second)).CircuitState; got != domain.CircuitOpen {
+		t.Fatalf("circuit state = %q, want open", got)
+	}
+
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	retained := manager.Snapshot(backend.ID, base.Add(time.Second))
+	if retained.CircuitState != domain.CircuitOpen || retained.CircuitFailures != 2 {
+		t.Fatalf("retained circuit = %+v", retained)
+	}
+
+	backend.Name = "replacement"
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	reset := manager.Snapshot(backend.ID, base.Add(time.Second))
+	if reset.CircuitState != domain.CircuitClosed || reset.CircuitFailures != 0 || !reset.CircuitAvailable {
+		t.Fatalf("reset circuit = %+v", reset)
+	}
+}
+
+func completeBackend(t *testing.T, manager *monitor.Manager, backendID int64, at time.Time, outcome domain.InferenceOutcome) {
+	t.Helper()
+	complete, ok := manager.AcquireBackend(backendID, at)
+	if !ok {
+		t.Fatalf("AcquireBackend(%d, %s) rejected", backendID, at)
+	}
+	complete(outcome)
 }
 
 func TestManagerAdvancesPoolHysteresisWithoutSnapshotReads(t *testing.T) {

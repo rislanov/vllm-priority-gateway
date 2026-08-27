@@ -108,20 +108,25 @@ type Backend struct {
 }
 
 type BackendRuntime struct {
-	BackendID          int64
-	State              BackendState
-	Healthy            bool
-	MetricsFresh       bool
-	Running            float64
-	Waiting            float64
-	KVCacheUsage       float64
-	RawPressure        float64
-	Pressure           float64
-	GatewayInflight    int
-	LastHealthAt       time.Time
-	LastMetricsAt      time.Time
-	ConsecutiveFailure int
-	ConsecutiveSuccess int
+	BackendID             int64
+	State                 BackendState
+	CircuitState          CircuitState
+	CircuitFailures       int
+	CircuitRetryAt        time.Time
+	CircuitProbesInFlight int
+	CircuitAvailable      bool
+	Healthy               bool
+	MetricsFresh          bool
+	Running               float64
+	Waiting               float64
+	KVCacheUsage          float64
+	RawPressure           float64
+	Pressure              float64
+	GatewayInflight       int
+	LastHealthAt          time.Time
+	LastMetricsAt         time.Time
+	ConsecutiveFailure    int
+	ConsecutiveSuccess    int
 }
 
 type PoolRuntime struct {

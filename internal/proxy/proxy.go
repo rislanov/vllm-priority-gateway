@@ -16,6 +16,7 @@ import (
 type Target struct {
 	Backend        domain.Backend
 	UpstreamAPIKey string
+	Complete       func(domain.InferenceOutcome)
 }
 
 type AlternateSelector func(exclude map[int64]struct{}) (Target, error)
@@ -64,7 +65,10 @@ func (p *Proxy) Forward(ctx context.Context, downstream http.ResponseWriter, req
 	result := Result{BackendID: target.Backend.ID}
 	for attempt := 0; attempt < 2; attempt++ {
 		excluded[target.Backend.ID] = struct{}{}
-		attemptResult, retryable := p.forwardOnce(ctx, downstream, request, target, started)
+		attemptResult, retryable, outcome := p.forwardOnce(ctx, downstream, request, target, started)
+		if target.Complete != nil {
+			target.Complete(outcome)
+		}
 		attemptResult.RetryCount = result.RetryCount
 		result = attemptResult
 		if !retryable || attempt == 1 || request.SelectAlternate == nil {
@@ -87,13 +91,13 @@ func (p *Proxy) forwardOnce(
 	request Request,
 	target Target,
 	started time.Time,
-) (Result, bool) {
+) (Result, bool, domain.InferenceOutcome) {
 	result := Result{BackendID: target.Backend.ID}
 	upstreamURL := strings.TrimRight(target.Backend.BaseURL, "/") + request.Path
 	upstream, err := http.NewRequestWithContext(ctx, request.Method, upstreamURL, bytes.NewReader(request.Body))
 	if err != nil {
 		result.Err = fmt.Errorf("create upstream request: %w", err)
-		return result, false
+		return result, false, domain.InferenceNeutral
 	}
 	upstream.Header = PrepareUpstreamHeaders(request.Headers, request.RequestID, request.Priority, target.UpstreamAPIKey)
 	upstream.ContentLength = int64(len(request.Body))
@@ -103,9 +107,9 @@ func (p *Proxy) forwardOnce(
 		if ctx.Err() != nil {
 			result.Err = ctx.Err()
 			result.Cancelled = true
-			return result, false
+			return result, false, domain.InferenceNeutral
 		}
-		return result, true
+		return result, true, domain.InferenceFailure
 	}
 	defer response.Body.Close()
 	result.Status = response.StatusCode
@@ -128,14 +132,14 @@ func (p *Proxy) forwardOnce(
 		if ctx.Err() != nil {
 			result.Err = ctx.Err()
 			result.Cancelled = true
-			return result, false
+			return result, false, domain.InferenceNeutral
 		}
-		return result, response.StatusCode >= 200 && response.StatusCode < 300
+		return result, response.StatusCode >= 200 && response.StatusCode < 300, domain.InferenceFailure
 	}
 
 	if count == 0 && errors.Is(readErr, io.EOF) {
 		commit()
-		return result, false
+		return result, false, completedOutcome(response.StatusCode)
 	}
 	if count > 0 {
 		commit()
@@ -148,15 +152,19 @@ func (p *Proxy) forwardOnce(
 			}
 			result.Err = writeErr
 			result.Cancelled = ctx.Err() != nil
-			return result, false
+			return result, false, domain.InferenceNeutral
 		}
 	}
 	if readErr != nil {
 		if !errors.Is(readErr, io.EOF) {
 			result.Err = readErr
 			result.Cancelled = ctx.Err() != nil
+			if result.Cancelled {
+				return result, false, domain.InferenceNeutral
+			}
+			return result, false, domain.InferenceFailure
 		}
-		return result, false
+		return result, false, completedOutcome(response.StatusCode)
 	}
 
 	for {
@@ -171,17 +179,28 @@ func (p *Proxy) forwardOnce(
 				}
 				result.Err = writeErr
 				result.Cancelled = ctx.Err() != nil
-				return result, false
+				return result, false, domain.InferenceNeutral
 			}
 		}
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
 				result.Err = readErr
 				result.Cancelled = ctx.Err() != nil
+				if result.Cancelled {
+					return result, false, domain.InferenceNeutral
+				}
+				return result, false, domain.InferenceFailure
 			}
-			return result, false
+			return result, false, completedOutcome(response.StatusCode)
 		}
 	}
+}
+
+func completedOutcome(status int) domain.InferenceOutcome {
+	if status >= http.StatusInternalServerError {
+		return domain.InferenceFailure
+	}
+	return domain.InferenceSuccess
 }
 
 func flush(writer http.ResponseWriter) {

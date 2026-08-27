@@ -482,12 +482,12 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 	backendRuntimes := map[int64]domain.BackendRuntime{
 		backend.ID: {
 			BackendID: backend.ID, Healthy: !options.unhealthy, MetricsFresh: !options.unhealthy,
-			State: domain.BackendHealthy, Pressure: .3,
+			State: domain.BackendHealthy, Pressure: .3, CircuitAvailable: true,
 		},
 	}
 	if options.sessionAffinityBackends {
 		data.Backends[0].Name = "gpu-20"
-		backendRuntimes[20] = domain.BackendRuntime{BackendID: 20, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: .2}
+		backendRuntimes[20] = domain.BackendRuntime{BackendID: 20, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: .2, CircuitAvailable: true}
 		for _, id := range []int64{21, 22} {
 			value := backend
 			value.ID = id
@@ -497,7 +497,7 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 			if id == 22 {
 				pressure = .8
 			}
-			backendRuntimes[id] = domain.BackendRuntime{BackendID: id, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: pressure}
+			backendRuntimes[id] = domain.BackendRuntime{BackendID: id, Healthy: true, MetricsFresh: true, State: domain.BackendHealthy, Pressure: pressure, CircuitAvailable: true}
 		}
 	}
 	if options.extraPools {
@@ -548,7 +548,7 @@ func (r *runtimeStub) Snapshot(backendID int64, _ time.Time) domain.BackendRunti
 	defer r.mu.Unlock()
 	return r.runtimes[backendID]
 }
-func (r *runtimeStub) IncrementInflight(backendID int64) (func(), bool) {
+func (r *runtimeStub) AcquireBackend(backendID int64, _ time.Time) (func(domain.InferenceOutcome), bool) {
 	r.mu.Lock()
 	runtime, exists := r.runtimes[backendID]
 	if !exists {
@@ -559,7 +559,7 @@ func (r *runtimeStub) IncrementInflight(backendID int64) (func(), bool) {
 	r.runtimes[backendID] = runtime
 	r.mu.Unlock()
 	var once sync.Once
-	return func() {
+	return func(domain.InferenceOutcome) {
 		once.Do(func() {
 			r.mu.Lock()
 			value := r.runtimes[backendID]
@@ -578,6 +578,7 @@ type capturingForwarder struct {
 type committedErrorForwarder struct{}
 
 func (committedErrorForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
 	writer.WriteHeader(http.StatusServiceUnavailable)
 	return proxy.Result{
 		BackendID: request.Target.Backend.ID, Status: http.StatusServiceUnavailable,
@@ -589,6 +590,7 @@ func (f *capturingForwarder) Forward(_ context.Context, writer http.ResponseWrit
 	f.mu.Lock()
 	f.request = request
 	f.mu.Unlock()
+	request.Target.Complete(domain.InferenceSuccess)
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(http.StatusOK)
 	written, _ := writer.Write([]byte(`{"ok":true}`))
@@ -679,10 +681,12 @@ func (f *blockingForwarder) Forward(ctx context.Context, writer http.ResponseWri
 	f.once.Do(func() { close(f.started) })
 	select {
 	case <-f.release:
+		request.Target.Complete(domain.InferenceSuccess)
 		writer.WriteHeader(http.StatusOK)
 		written, _ := writer.Write([]byte(`{"ok":true}`))
 		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK, BytesSent: int64(written)}
 	case <-ctx.Done():
+		request.Target.Complete(domain.InferenceNeutral)
 		return proxy.Result{BackendID: request.Target.Backend.ID, Cancelled: true, Err: ctx.Err()}
 	}
 }

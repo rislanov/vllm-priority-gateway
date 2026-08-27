@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/monitor"
@@ -20,6 +21,7 @@ func monitorOptions(client *http.Client) monitor.Options {
 		HTTPClient: client, HealthInterval: time.Hour, MetricsInterval: time.Hour,
 		HealthTimeout: time.Second, MetricsTimeout: time.Second, StaleAfter: 5 * time.Second,
 		UnhealthyAfter: 3, RecoveryAfter: 2,
+		Circuit:       circuitbreaker.Options{FailureThreshold: 2, FailureWindow: 10 * time.Second, OpenCooldown: 5 * time.Second, HalfOpenMaxProbes: 1},
 		Limits:        pressure.Limits{QueueSoft: 2, KVSoft: .8, KVHard: .95, RunningSoft: 8},
 		EWMAWindow:    4 * time.Second,
 		BusyThreshold: .7, SaturatedThreshold: 1,

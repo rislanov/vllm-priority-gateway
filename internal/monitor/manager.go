@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
@@ -16,6 +17,7 @@ type managedWorker struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
 	generation uint64
+	breaker    *circuitbreaker.Breaker
 }
 
 type Manager struct {
@@ -33,6 +35,12 @@ type Manager struct {
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
+	if options.Circuit == (circuitbreaker.Options{}) {
+		options.Circuit = circuitbreaker.Options{
+			FailureThreshold: 5, FailureWindow: 30 * time.Second,
+			OpenCooldown: 15 * time.Second, HalfOpenMaxProbes: 1,
+		}
+	}
 	managerCtx, cancel := context.WithCancel(ctx)
 	manager := &Manager{
 		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
@@ -75,6 +83,12 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 		delete(m.workers, id)
 	}
 	for id, backend := range desired {
+		breaker, err := circuitbreaker.New(m.options.Circuit)
+		if err != nil {
+			m.mu.Unlock()
+			waitWorkers(stopped)
+			return fmt.Errorf("backend %d circuit breaker: %w", id, err)
+		}
 		worker, err := NewWorker(backend, m.options)
 		if err != nil {
 			m.mu.Unlock()
@@ -83,7 +97,7 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 		}
 		workerCtx, cancel := context.WithCancel(m.ctx)
 		m.nextGen++
-		managed := &managedWorker{worker: worker, cancel: cancel, done: make(chan struct{}), generation: m.nextGen}
+		managed := &managedWorker{worker: worker, cancel: cancel, done: make(chan struct{}), generation: m.nextGen, breaker: breaker}
 		m.workers[id] = managed
 		go func() {
 			defer close(managed.done)
@@ -103,7 +117,7 @@ func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime 
 	if managed == nil {
 		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy}
 	}
-	return managed.worker.Snapshot(at)
+	return snapshotManaged(managed, at)
 }
 
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
@@ -163,8 +177,11 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 		if managed.worker.Backend().ModelPoolID != poolID {
 			continue
 		}
-		snapshot := managed.worker.Snapshot(at)
+		snapshot := snapshotManaged(managed, at)
 		if !snapshot.Healthy || !snapshot.MetricsFresh || managed.worker.Backend().Draining {
+			continue
+		}
+		if !snapshot.CircuitAvailable {
 			continue
 		}
 		available++
@@ -191,16 +208,38 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 	}
 }
 
-func (m *Manager) IncrementInflight(backendID int64) (func(), bool) {
+func (m *Manager) AcquireBackend(backendID int64, at time.Time) (func(domain.InferenceOutcome), bool) {
 	m.mu.Lock()
 	managed := m.workers[backendID]
-	m.mu.Unlock()
 	if managed == nil {
+		m.mu.Unlock()
+		return nil, false
+	}
+	completeCircuit, ok := managed.breaker.Acquire(at)
+	if !ok {
+		m.mu.Unlock()
 		return nil, false
 	}
 	managed.worker.incrementInflight(1)
+	m.mu.Unlock()
 	var once sync.Once
-	return func() { once.Do(func() { managed.worker.incrementInflight(-1) }) }, true
+	return func(outcome domain.InferenceOutcome) {
+		once.Do(func() {
+			completeCircuit(outcome)
+			managed.worker.incrementInflight(-1)
+		})
+	}, true
+}
+
+func snapshotManaged(managed *managedWorker, at time.Time) domain.BackendRuntime {
+	snapshot := managed.worker.Snapshot(at)
+	circuit := managed.breaker.Snapshot(at)
+	snapshot.CircuitState = circuit.State
+	snapshot.CircuitFailures = circuit.FailureCount
+	snapshot.CircuitRetryAt = circuit.RetryAt
+	snapshot.CircuitProbesInFlight = circuit.ProbesInFlight
+	snapshot.CircuitAvailable = circuit.Available
+	return snapshot
 }
 
 func (m *Manager) WorkerCount() int {
