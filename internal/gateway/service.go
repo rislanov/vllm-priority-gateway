@@ -195,11 +195,14 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	}
 	snapshot := s.registry.Snapshot()
 	pool, exists := snapshot.PoolsByName[publicModel]
-	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
+	if !exists {
 		return proxy.Result{}, modelNotAllowed()
 	}
 	event.ModelPoolID = pool.ID
 	event.Model = pool.PublicModelName
+	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
+		return proxy.Result{}, modelNotAllowed()
+	}
 	affinityKey := ""
 	if sessionID != "" {
 		affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID

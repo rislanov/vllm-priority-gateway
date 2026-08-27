@@ -8,6 +8,7 @@ import (
 type QueryStore interface {
 	Analytics(context.Context, Filter) (Dataset, error)
 	UsageRequests(context.Context, Filter, int, int) (RequestPage, error)
+	AnalyticsDashboard(context.Context, Filter, int, int) (Dataset, RequestPage, error)
 	StreamUsageRequests(context.Context, Filter, func(RequestRecord) error) error
 }
 

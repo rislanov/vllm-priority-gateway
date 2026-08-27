@@ -30,6 +30,26 @@ const (
 	maximumPageLimit = 500
 )
 
+type usageQueryPhase uint8
+
+const (
+	usageQueryAfterSummary usageQueryPhase = iota + 1
+	usageQueryAfterRequestCount
+	usageQueryAfterDashboardDataset
+)
+
+type usageQueryHookKey struct{}
+
+func withUsageQueryHook(ctx context.Context, hook func(usageQueryPhase)) context.Context {
+	return context.WithValue(ctx, usageQueryHookKey{}, hook)
+}
+
+func notifyUsageQueryHook(ctx context.Context, phase usageQueryPhase) {
+	if hook, ok := ctx.Value(usageQueryHookKey{}).(func(usageQueryPhase)); ok && hook != nil {
+		hook(phase)
+	}
+}
+
 func (s *SQLite) InsertUsageBatch(ctx context.Context, records []analytics.RequestRecord) error {
 	if len(records) == 0 {
 		return nil
@@ -90,31 +110,63 @@ func (s *SQLite) DeleteUsageBefore(ctx context.Context, cutoff time.Time) (int64
 }
 
 func (s *SQLite) Analytics(ctx context.Context, filter analytics.Filter) (analytics.Dataset, error) {
+	if !filter.From.Before(filter.To) {
+		return emptyAnalyticsDataset(), nil
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return analytics.Dataset{}, err
+	}
+	defer tx.Rollback()
+	dataset, err := s.queryAnalytics(ctx, tx, filter)
+	if err != nil {
+		return analytics.Dataset{}, err
+	}
+	if err := commit(tx); err != nil {
+		if ctx.Err() != nil {
+			return analytics.Dataset{}, ctx.Err()
+		}
+		return analytics.Dataset{}, err
+	}
+	return dataset, nil
+}
+
+type usageQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (s *SQLite) queryAnalytics(
+	ctx context.Context,
+	queryer usageQueryer,
+	filter analytics.Filter,
+) (analytics.Dataset, error) {
 	dataset := emptyAnalyticsDataset()
 	if !filter.From.Before(filter.To) {
 		return dataset, nil
 	}
 	predicate, arguments := usageFilterPredicate(filter)
 
-	if err := s.queryAnalyticsSummary(ctx, predicate, arguments, &dataset.Summary); err != nil {
+	if err := s.queryAnalyticsSummary(ctx, queryer, predicate, arguments, &dataset.Summary); err != nil {
 		return analytics.Dataset{}, err
 	}
-	series, err := s.queryAnalyticsSeries(ctx, filter, predicate, arguments)
+	notifyUsageQueryHook(ctx, usageQueryAfterSummary)
+	series, err := s.queryAnalyticsSeries(ctx, queryer, filter, predicate, arguments)
 	if err != nil {
 		return analytics.Dataset{}, err
 	}
 	dataset.Series = series
-	breakdown, err := s.queryAnalyticsBreakdown(ctx, predicate, arguments)
+	breakdown, err := s.queryAnalyticsBreakdown(ctx, queryer, predicate, arguments)
 	if err != nil {
 		return analytics.Dataset{}, err
 	}
 	dataset.Breakdown = breakdown
-	clients, err := s.queryDimensions(ctx, "client")
+	clients, err := s.queryDimensions(ctx, queryer, "client")
 	if err != nil {
 		return analytics.Dataset{}, err
 	}
 	dataset.Clients = clients
-	models, err := s.queryDimensions(ctx, "model")
+	models, err := s.queryDimensions(ctx, queryer, "model")
 	if err != nil {
 		return analytics.Dataset{}, err
 	}
@@ -124,12 +176,13 @@ func (s *SQLite) Analytics(ctx context.Context, filter analytics.Filter) (analyt
 
 func (s *SQLite) queryAnalyticsSummary(
 	ctx context.Context,
+	queryer usageQueryer,
 	predicate string,
 	arguments []any,
 	summary *analytics.Summary,
 ) error {
 	var cacheRead, uncachedInput, cacheKnownInput sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `
+	err := queryer.QueryRowContext(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(usage_available), 0),
 		       COALESCE(SUM(input_tokens), 0),
@@ -161,11 +214,15 @@ func (s *SQLite) queryAnalyticsSummary(
 
 func (s *SQLite) queryAnalyticsSeries(
 	ctx context.Context,
+	queryer usageQueryer,
 	filter analytics.Filter,
 	predicate string,
 	arguments []any,
 ) ([]analytics.SeriesPoint, error) {
-	bucketExpression := analyticsBucketExpression(filter.To.Sub(filter.From))
+	fromMS := storedMillisecondCeiling(filter.From)
+	toMS := storedMillisecondCeiling(filter.To)
+	bucketWidthMS := analyticsBucketWidthMilliseconds(filter.To.Sub(filter.From))
+	bucketExpression := analyticsBucketExpression(bucketWidthMS)
 	query := `
 		SELECT ` + bucketExpression + ` AS bucket_start_ms,
 		       COUNT(*),
@@ -177,7 +234,10 @@ func (s *SQLite) queryAnalyticsSeries(
 		WHERE ` + predicate + `
 		GROUP BY bucket_start_ms
 		ORDER BY bucket_start_ms ASC`
-	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	queryArguments := make([]any, 0, len(arguments)+2)
+	queryArguments = append(queryArguments, fromMS, fromMS)
+	queryArguments = append(queryArguments, arguments...)
+	rows, err := queryer.QueryContext(ctx, query, queryArguments...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -218,11 +278,12 @@ func (s *SQLite) queryAnalyticsSeries(
 		}
 		return nil, err
 	}
-	return points, nil
+	return densifyAnalyticsSeries(ctx, points, fromMS, toMS, bucketWidthMS)
 }
 
 func (s *SQLite) queryAnalyticsBreakdown(
 	ctx context.Context,
+	queryer usageQueryer,
 	predicate string,
 	arguments []any,
 ) ([]analytics.BreakdownRow, error) {
@@ -263,7 +324,7 @@ func (s *SQLite) queryAnalyticsBreakdown(
 			GROUP BY client_id, model_pool_id
 		) AS grouped
 		ORDER BY grouped.client_id ASC, grouped.model_pool_id ASC`
-	rows, err := s.db.QueryContext(ctx, query, arguments...)
+	rows, err := queryer.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -306,12 +367,12 @@ func (s *SQLite) queryAnalyticsBreakdown(
 	return breakdown, nil
 }
 
-func (s *SQLite) queryDimensions(ctx context.Context, kind string) ([]analytics.Dimension, error) {
+func (s *SQLite) queryDimensions(ctx context.Context, queryer usageQueryer, kind string) ([]analytics.Dimension, error) {
 	query := clientDimensionsQuery
 	if kind == "model" {
 		query = modelDimensionsQuery
 	}
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := queryer.QueryContext(ctx, query)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -366,6 +427,72 @@ func (s *SQLite) UsageRequests(
 	offset int,
 ) (analytics.RequestPage, error) {
 	limit, offset = boundedPagination(limit, offset)
+	if !filter.From.Before(filter.To) {
+		return analytics.RequestPage{Requests: make([]analytics.RequestRecord, 0), Limit: limit, Offset: offset}, nil
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return analytics.RequestPage{}, err
+	}
+	defer tx.Rollback()
+	page, err := s.queryUsageRequests(ctx, tx, filter, limit, offset)
+	if err != nil {
+		return analytics.RequestPage{}, err
+	}
+	if err := commit(tx); err != nil {
+		if ctx.Err() != nil {
+			return analytics.RequestPage{}, ctx.Err()
+		}
+		return analytics.RequestPage{}, err
+	}
+	return page, nil
+}
+
+// AnalyticsDashboard returns the aggregate dataset and request page from one
+// read transaction so server-rendered cards, charts, totals, and rows reconcile.
+func (s *SQLite) AnalyticsDashboard(
+	ctx context.Context,
+	filter analytics.Filter,
+	limit int,
+	offset int,
+) (analytics.Dataset, analytics.RequestPage, error) {
+	limit, offset = boundedPagination(limit, offset)
+	if !filter.From.Before(filter.To) {
+		return emptyAnalyticsDataset(), analytics.RequestPage{
+			Requests: make([]analytics.RequestRecord, 0), Limit: limit, Offset: offset,
+		}, nil
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return analytics.Dataset{}, analytics.RequestPage{}, err
+	}
+	defer tx.Rollback()
+	dataset, err := s.queryAnalytics(ctx, tx, filter)
+	if err != nil {
+		return analytics.Dataset{}, analytics.RequestPage{}, err
+	}
+	notifyUsageQueryHook(ctx, usageQueryAfterDashboardDataset)
+	page, err := s.queryUsageRequests(ctx, tx, filter, limit, offset)
+	if err != nil {
+		return analytics.Dataset{}, analytics.RequestPage{}, err
+	}
+	if err := commit(tx); err != nil {
+		if ctx.Err() != nil {
+			return analytics.Dataset{}, analytics.RequestPage{}, ctx.Err()
+		}
+		return analytics.Dataset{}, analytics.RequestPage{}, err
+	}
+	return dataset, page, nil
+}
+
+func (s *SQLite) queryUsageRequests(
+	ctx context.Context,
+	queryer usageQueryer,
+	filter analytics.Filter,
+	limit int,
+	offset int,
+) (analytics.RequestPage, error) {
+	limit, offset = boundedPagination(limit, offset)
 	page := analytics.RequestPage{
 		Requests: make([]analytics.RequestRecord, 0),
 		Limit:    limit,
@@ -375,7 +502,7 @@ func (s *SQLite) UsageRequests(
 		return page, nil
 	}
 	predicate, arguments := usageFilterPredicate(filter)
-	if err := s.db.QueryRowContext(ctx,
+	if err := queryer.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM usage_requests WHERE `+predicate,
 		arguments...,
 	).Scan(&page.Total); err != nil {
@@ -384,9 +511,10 @@ func (s *SQLite) UsageRequests(
 		}
 		return analytics.RequestPage{}, err
 	}
+	notifyUsageQueryHook(ctx, usageQueryAfterRequestCount)
 
 	queryArguments := append(append([]any{}, arguments...), limit, offset)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := queryer.QueryContext(ctx, `
 		SELECT `+usageRequestColumns+`
 		FROM usage_requests
 		WHERE `+predicate+`
@@ -511,7 +639,7 @@ func scanUsageRequest(scanner usageRowScanner) (analytics.RequestRecord, error) 
 
 func usageFilterPredicate(filter analytics.Filter) (string, []any) {
 	clauses := []string{"occurred_at_ms >= ?", "occurred_at_ms < ?"}
-	arguments := []any{filter.From.UTC().UnixMilli(), filter.To.UTC().UnixMilli()}
+	arguments := []any{storedMillisecondCeiling(filter.From), storedMillisecondCeiling(filter.To)}
 	if filter.ClientID != nil {
 		clauses = append(clauses, "client_id = ?")
 		arguments = append(arguments, *filter.ClientID)
@@ -527,15 +655,55 @@ func usageFilterPredicate(filter analytics.Filter) (string, []any) {
 	return strings.Join(clauses, " AND "), arguments
 }
 
-func analyticsBucketExpression(rangeWidth time.Duration) string {
+func storedMillisecondCeiling(value time.Time) int64 {
+	value = value.UTC()
+	milliseconds := value.UnixMilli()
+	if value.Nanosecond()%int(time.Millisecond) != 0 {
+		milliseconds++
+	}
+	return milliseconds
+}
+
+func analyticsBucketWidthMilliseconds(rangeWidth time.Duration) int64 {
 	switch {
 	case rangeWidth <= 24*time.Hour:
-		return "(occurred_at_ms / 300000) * 300000"
+		return int64((5 * time.Minute) / time.Millisecond)
 	case rangeWidth <= 7*24*time.Hour:
-		return "(occurred_at_ms / 3600000) * 3600000"
+		return int64(time.Hour / time.Millisecond)
 	default:
-		return "(occurred_at_ms / 86400000) * 86400000"
+		return int64((24 * time.Hour) / time.Millisecond)
 	}
+}
+
+func analyticsBucketExpression(bucketWidthMS int64) string {
+	return fmt.Sprintf("((occurred_at_ms - ?) / %d) * %d + ?", bucketWidthMS, bucketWidthMS)
+}
+
+func densifyAnalyticsSeries(
+	ctx context.Context,
+	points []analytics.SeriesPoint,
+	fromMS int64,
+	toMS int64,
+	bucketWidthMS int64,
+) ([]analytics.SeriesPoint, error) {
+	if len(points) == 0 || fromMS >= toMS {
+		return points, nil
+	}
+	bucketCount := (toMS - fromMS + bucketWidthMS - 1) / bucketWidthMS
+	dense := make([]analytics.SeriesPoint, 0, int(bucketCount))
+	pointIndex := 0
+	for bucketStartMS := fromMS; bucketStartMS < toMS; bucketStartMS += bucketWidthMS {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if pointIndex < len(points) && points[pointIndex].BucketStart.UnixMilli() == bucketStartMS {
+			dense = append(dense, points[pointIndex])
+			pointIndex++
+			continue
+		}
+		dense = append(dense, analytics.SeriesPoint{BucketStart: time.UnixMilli(bucketStartMS).UTC()})
+	}
+	return dense, nil
 }
 
 func boundedPagination(limit int, offset int) (int, int) {

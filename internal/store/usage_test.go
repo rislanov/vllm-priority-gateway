@@ -105,6 +105,69 @@ func TestAnalyticsRangeFiltersAggregatesAndPartialCache(t *testing.T) {
 	}
 }
 
+func TestUsageRangeBoundsCeilFractionalMillisecondsForEveryQueryPath(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	base := time.Date(2026, time.August, 27, 12, 0, 0, 123_000_000, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("at-base", base, 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("at-next-millisecond", base.Add(time.Millisecond), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		filter analytics.Filter
+		wantID string
+	}{
+		{
+			name:   "fractional inclusive from excludes the containing stored millisecond",
+			filter: analytics.Filter{From: base.Add(time.Nanosecond), To: base.Add(2 * time.Millisecond)},
+			wantID: "at-next-millisecond",
+		},
+		{
+			name:   "fractional exclusive to includes the containing stored millisecond",
+			filter: analytics.Filter{From: base, To: base.Add(time.Nanosecond)},
+			wantID: "at-base",
+		},
+		{
+			name:   "exact millisecond remains unchanged",
+			filter: analytics.Filter{From: base, To: base.Add(time.Millisecond)},
+			wantID: "at-base",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataset, err := db.Analytics(ctx, test.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := db.UsageRequests(ctx, test.filter, 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dashboard, dashboardPage, err := db.AnalyticsDashboard(ctx, test.filter, 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var streamed []string
+			if err := db.StreamUsageRequests(ctx, test.filter, func(record analytics.RequestRecord) error {
+				streamed = append(streamed, record.RequestID)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if dataset.Summary.RequestCount != 1 || dashboard.Summary.RequestCount != 1 || page.Total != 1 ||
+				!reflect.DeepEqual(requestIDs(page.Requests), []string{test.wantID}) || dashboardPage.Total != 1 ||
+				!reflect.DeepEqual(requestIDs(dashboardPage.Requests), []string{test.wantID}) ||
+				!reflect.DeepEqual(streamed, []string{test.wantID}) {
+				t.Fatalf("range query mismatch: analytics=%d dashboard=%d page=%+v dashboardPage=%+v stream=%v",
+					dataset.Summary.RequestCount, dashboard.Summary.RequestCount, page, dashboardPage, streamed)
+			}
+		})
+	}
+}
+
 func TestAnalyticsChoosesAutomaticBucketWidth(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -115,24 +178,102 @@ func TestAnalyticsChoosesAutomaticBucketWidth(t *testing.T) {
 		t.Fatalf("InsertUsageBatch() error = %v", err)
 	}
 	tests := []struct {
-		name       string
-		rangeWidth time.Duration
-		wantBucket time.Time
+		name        string
+		rangeWidth  time.Duration
+		wantWidth   time.Duration
+		wantBuckets int
 	}{
-		{name: "twenty_four_hours", rangeWidth: 24 * time.Hour, wantBucket: time.Date(2026, time.August, 27, 12, 30, 0, 0, time.UTC)},
-		{name: "over_twenty_four_hours", rangeWidth: 24*time.Hour + time.Millisecond, wantBucket: time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)},
-		{name: "seven_days", rangeWidth: 7 * 24 * time.Hour, wantBucket: time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)},
-		{name: "over_seven_days", rangeWidth: 7*24*time.Hour + time.Millisecond, wantBucket: time.Date(2026, time.August, 27, 0, 0, 0, 0, time.UTC)},
+		{name: "twenty_four_hours", rangeWidth: 24 * time.Hour, wantWidth: 5 * time.Minute, wantBuckets: 288},
+		{name: "over_twenty_four_hours", rangeWidth: 24*time.Hour + time.Millisecond, wantWidth: time.Hour, wantBuckets: 25},
+		{name: "seven_days", rangeWidth: 7 * 24 * time.Hour, wantWidth: time.Hour, wantBuckets: 168},
+		{name: "over_seven_days", rangeWidth: 7*24*time.Hour + time.Millisecond, wantWidth: 24 * time.Hour, wantBuckets: 8},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			filter := analytics.Filter{From: occurredAt.Add(-time.Millisecond), To: occurredAt.Add(-time.Millisecond).Add(test.rangeWidth)}
+			from := occurredAt.Add(-time.Millisecond)
+			filter := analytics.Filter{From: from, To: from.Add(test.rangeWidth)}
 			got, err := db.Analytics(ctx, filter)
 			if err != nil {
 				t.Fatalf("Analytics() error = %v", err)
 			}
-			if len(got.Series) != 1 || !got.Series[0].BucketStart.Equal(test.wantBucket) {
-				t.Fatalf("Analytics().Series = %+v, want bucket %s", got.Series, test.wantBucket)
+			if len(got.Series) != test.wantBuckets {
+				t.Fatalf("Analytics().Series length = %d, want %d", len(got.Series), test.wantBuckets)
+			}
+			if !got.Series[0].BucketStart.Equal(from) || got.Series[0].RequestCount != 1 {
+				t.Fatalf("first bucket = %+v, want occupied bucket at %s", got.Series[0], from)
+			}
+			if width := got.Series[1].BucketStart.Sub(got.Series[0].BucketStart); width != test.wantWidth {
+				t.Fatalf("bucket width = %s, want %s", width, test.wantWidth)
+			}
+		})
+	}
+}
+
+func TestAnalyticsDensifiesSilentBucketsWithoutInventingAnEmptyRange(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("first", from.Add(time.Minute), 1, "client", 10, "model", nil, nil, nil),
+		analyticsUsageRecord("third", from.Add(11*time.Minute), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dataset, err := db.Analytics(ctx, analytics.Filter{From: from, To: from.Add(15 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dataset.Series) != 3 {
+		t.Fatalf("dense series = %+v, want three five-minute buckets", dataset.Series)
+	}
+	for index, wantStart := range []time.Time{from, from.Add(5 * time.Minute), from.Add(10 * time.Minute)} {
+		if !dataset.Series[index].BucketStart.Equal(wantStart) {
+			t.Fatalf("series bucket %d start = %s, want %s", index, dataset.Series[index].BucketStart, wantStart)
+		}
+	}
+	middle := dataset.Series[1]
+	if middle.RequestCount != 0 || middle.InputTokens != 0 || middle.OutputTokens != 0 ||
+		middle.CacheReadTokens != nil || middle.CacheHitRatio != nil {
+		t.Fatalf("silent bucket = %+v, want zero counts/tokens and unknown cache fields", middle)
+	}
+	if dataset.Series[0].RequestCount != 1 || dataset.Series[2].RequestCount != 1 {
+		t.Fatalf("occupied buckets = %+v, want one request each", dataset.Series)
+	}
+	empty, err := db.Analytics(ctx, analytics.Filter{From: from.Add(time.Hour), To: from.Add(2 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Series) != 0 {
+		t.Fatalf("truly empty range gained synthetic buckets: %+v", empty.Series)
+	}
+}
+
+func TestAnalyticsDenseSeriesKeepsStandardPresetPointBounds(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("one", from.Add(time.Minute), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		width time.Duration
+		want  int
+	}{
+		{name: "one hour", width: time.Hour, want: 12},
+		{name: "twenty four hours", width: 24 * time.Hour, want: 288},
+		{name: "seven days", width: 7 * 24 * time.Hour, want: 168},
+		{name: "ninety days", width: 90 * 24 * time.Hour, want: 90},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataset, err := db.Analytics(ctx, analytics.Filter{From: from, To: from.Add(test.width)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(dataset.Series) != test.want || !dataset.Series[0].BucketStart.Equal(from) {
+				t.Fatalf("dense series length/first = %d/%v, want %d/%v", len(dataset.Series), dataset.Series, test.want, from)
 			}
 		})
 	}

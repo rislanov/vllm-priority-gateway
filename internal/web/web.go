@@ -178,14 +178,9 @@ func (h *Handler) analytics(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
-	dataset, err := h.service.Analytics(request.Context(), query.Filter)
+	dataset, requests, err := h.service.AnalyticsDashboard(request.Context(), query)
 	if err != nil {
 		http.Error(writer, "Unable to query analytics", http.StatusInternalServerError)
-		return
-	}
-	requests, err := h.service.UsageRequests(request.Context(), query)
-	if err != nil {
-		http.Error(writer, "Unable to query analytics requests", http.StatusInternalServerError)
 		return
 	}
 	data := pageData{Title: "Usage analytics", Active: "Analytics"}

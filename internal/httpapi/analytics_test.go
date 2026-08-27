@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -193,7 +194,7 @@ func TestAnalyticsStoreErrorsUseControlledJSONEnvelope(t *testing.T) {
 	}
 }
 
-func TestAnalyticsCSVStoreErrorAfterFirstRowStopsWithoutJSON(t *testing.T) {
+func TestAnalyticsCSVStoreErrorAfterRowsReturnsControlledErrorBeforeCommit(t *testing.T) {
 	queryStore := &analyticsQueryStoreStub{}
 	queryStore.stream = func(_ context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
 		if err := yield(analytics.RequestRecord{
@@ -205,18 +206,11 @@ func TestAnalyticsCSVStoreErrorAfterFirstRowStopsWithoutJSON(t *testing.T) {
 	}
 	handler := newAnalyticsHandler(t, queryStore, time.Now)
 	response := analyticsRequest(t, handler, "/admin/api/analytics/export.csv")
-	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/csv; charset=utf-8" {
+	if response.Code != http.StatusInternalServerError || response.Header().Get("Content-Type") != "application/json; charset=utf-8" {
 		t.Fatalf("response = %d headers=%v body=%q", response.Code, response.Header(), response.Body.String())
 	}
-	rows, err := csv.NewReader(bytes.NewReader(response.Body.Bytes())).ReadAll()
-	if err != nil {
-		t.Fatalf("parse committed CSV: %v body=%q", err, response.Body.String())
-	}
-	if len(rows) != 2 || rows[1][2] != "committed-row" {
-		t.Fatalf("committed CSV rows = %#v", rows)
-	}
-	if strings.Contains(response.Body.String(), "analytics_query_failed") || strings.Contains(response.Body.String(), `{"error"`) {
-		t.Fatalf("late store error corrupted CSV: %q", response.Body.String())
+	if strings.Contains(response.Body.String(), "committed-row") || !strings.Contains(response.Body.String(), "analytics_query_failed") {
+		t.Fatalf("pre-commit store error response = %q", response.Body.String())
 	}
 }
 
@@ -228,11 +222,9 @@ func TestAnalyticsCSVWriterFailureAfterCommitStopsWithoutJSON(t *testing.T) {
 	}{
 		{name: "empty export header flush", failAt: 1},
 		{
-			name: "first data row flush",
-			records: []analytics.RequestRecord{{
-				ID: 1, OccurredAt: time.Unix(1, 0).UTC(), RequestID: "row-that-will-fail",
-			}},
-			failAt: 2,
+			name:    "large export second delivery write",
+			records: manyAnalyticsCSVRecords(2_000),
+			failAt:  2,
 		},
 	}
 	for _, test := range tests {
@@ -249,6 +241,151 @@ func TestAnalyticsCSVWriterFailureAfterCommitStopsWithoutJSON(t *testing.T) {
 			}
 			if strings.Contains(writer.body.String(), "analytics_query_failed") || strings.Contains(writer.body.String(), `{"error"`) {
 				t.Fatalf("writer failure corrupted CSV: %q", writer.body.String())
+			}
+		})
+	}
+}
+
+func TestAnalyticsCSVCompletesStoreStreamBeforeBlockedClientDelivery(t *testing.T) {
+	var cursor sync.RWMutex
+	streamDone := make(chan struct{})
+	queryStore := &analyticsQueryStoreStub{}
+	queryStore.stream = func(_ context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
+		cursor.RLock()
+		defer cursor.RUnlock()
+		defer close(streamDone)
+		return yield(analytics.RequestRecord{ID: 1, OccurredAt: time.Unix(1, 0).UTC(), RequestID: "metadata-row"})
+	}
+	handler := newAnalyticsHandler(t, queryStore, time.Now)
+	writer := newBlockingAnalyticsResponseWriter()
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/analytics/export.csv", nil)
+	request.SetBasicAuth(adminUser, adminPassword)
+	handlerDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(writer, request)
+		close(handlerDone)
+	}()
+
+	awaitAnalyticsSignal(t, writer.writeStarted, "client delivery start")
+	storeWriterProgress := make(chan struct{})
+	go func() {
+		cursor.Lock()
+		close(storeWriterProgress)
+		cursor.Unlock()
+	}()
+	streamFinished := analyticsSignalReady(streamDone)
+	writerProgressed := analyticsSignalReady(storeWriterProgress)
+	if !streamFinished || !writerProgressed {
+		close(writer.release)
+		awaitAnalyticsSignal(t, handlerDone, "blocked CSV handler cleanup")
+		awaitAnalyticsSignal(t, storeWriterProgress, "store writer cleanup")
+		t.Fatalf("client delivery began with store stream/writer progress = %t/%t, want true/true", streamFinished, writerProgressed)
+	}
+	close(writer.release)
+	awaitAnalyticsSignal(t, handlerDone, "CSV handler completion")
+	if writer.status != http.StatusOK {
+		t.Fatalf("CSV response status = %d", writer.status)
+	}
+}
+
+func TestAnalyticsCSVLimitsConcurrentSpoolsWithoutBlocking(t *testing.T) {
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	queryStore := &analyticsQueryStoreStub{}
+	queryStore.stream = func(ctx context.Context, _ analytics.Filter, _ func(analytics.RequestRecord) error) error {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	handler := newAnalyticsHandler(t, queryStore, time.Now)
+	serve := func() <-chan *httptest.ResponseRecorder {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- analyticsRequest(t, handler, "/admin/api/analytics/export.csv") }()
+		return done
+	}
+	first, second := serve(), serve()
+	awaitAnalyticsSignal(t, started, "first export spool")
+	awaitAnalyticsSignal(t, started, "second export spool")
+	third := serve()
+	select {
+	case response := <-third:
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") == "" ||
+			!strings.Contains(response.Body.String(), "analytics_export_busy") {
+			releaseOnce.Do(func() { close(release) })
+			t.Fatalf("saturated export response = %d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+		}
+	case <-time.After(200 * time.Millisecond):
+		releaseOnce.Do(func() { close(release) })
+		<-first
+		<-second
+		<-third
+		t.Fatal("third export blocked instead of returning a controlled saturation response")
+	}
+	releaseOnce.Do(func() { close(release) })
+	if response := <-first; response.Code != http.StatusOK {
+		t.Fatalf("first export status = %d body=%s", response.Code, response.Body.String())
+	}
+	if response := <-second; response.Code != http.StatusOK {
+		t.Fatalf("second export status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAnalyticsCSVTemporaryFileIsSecureAndRemovedOnEveryPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		storeError bool
+		failWrite  bool
+	}{
+		{name: "success"},
+		{name: "store error", storeError: true},
+		{name: "client write error", failWrite: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tempDirectory := t.TempDir()
+			t.Setenv("TMPDIR", tempDirectory)
+			observedSecureFile := false
+			queryStore := &analyticsQueryStoreStub{}
+			queryStore.stream = func(_ context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
+				matches, err := filepath.Glob(filepath.Join(tempDirectory, "llmgw-usage-analytics-*.csv"))
+				if err != nil || len(matches) != 1 {
+					return errors.New("secure analytics spool was not present during store scan")
+				}
+				info, err := os.Stat(matches[0])
+				if err != nil || info.Mode().Perm() != 0o600 {
+					return errors.New("analytics spool permissions were not 0600")
+				}
+				observedSecureFile = true
+				if err := yield(analytics.RequestRecord{ID: 1, OccurredAt: time.Unix(1, 0).UTC(), RequestID: "metadata-only"}); err != nil {
+					return err
+				}
+				if test.storeError {
+					return errors.New("forced store error")
+				}
+				return nil
+			}
+			handler := newAnalyticsHandler(t, queryStore, time.Now)
+			request := httptest.NewRequest(http.MethodGet, "/admin/api/analytics/export.csv", nil)
+			request.SetBasicAuth(adminUser, adminPassword)
+			if test.failWrite {
+				handler.ServeHTTP(&failingAnalyticsResponseWriter{header: make(http.Header), failAt: 1}, request)
+			} else {
+				handler.ServeHTTP(httptest.NewRecorder(), request)
+			}
+			if !observedSecureFile {
+				t.Fatal("store scan did not observe a secure local spool")
+			}
+			entries, err := os.ReadDir(tempDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("temporary analytics spools remain after handler return: %v", entries)
 			}
 		})
 	}
@@ -323,7 +460,7 @@ func TestAnalyticsCSVContainsOnlyChronologicalLedgerMetadataAndNeutralizesFormul
 	}
 }
 
-func TestAnalyticsCSVCancellationStopsStreaming(t *testing.T) {
+func TestAnalyticsCSVCancellationDuringSpoolingCommitsNoCSV(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var callbackErr error
 	queryStore := &analyticsQueryStoreStub{}
@@ -343,12 +480,23 @@ func TestAnalyticsCSVCancellationStopsStreaming(t *testing.T) {
 	if !errors.Is(callbackErr, context.Canceled) {
 		t.Fatalf("stream callback error = %v, want context cancellation", callbackErr)
 	}
-	rows, err := csv.NewReader(bytes.NewReader(response.Body.Bytes())).ReadAll()
-	if err != nil {
-		t.Fatalf("parse partial CSV: %v body=%q", err, response.Body.String())
+	if response.Header().Get("Content-Type") == "text/csv; charset=utf-8" || response.Body.Len() != 0 {
+		t.Fatalf("cancelled pre-commit export wrote response headers/body: headers=%v body=%q", response.Header(), response.Body.String())
 	}
-	if len(rows) != 2 || rows[1][2] != "first" || strings.Contains(response.Body.String(), "second") {
-		t.Fatalf("cancelled CSV rows = %#v", rows)
+}
+
+func TestAnalyticsCSVCancellationDuringDeliveryStopsCopying(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	queryStore := &analyticsQueryStoreStub{streamRecords: manyAnalyticsCSVRecords(2_000)}
+	handler := newAnalyticsHandler(t, queryStore, time.Now)
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/analytics/export.csv", nil).WithContext(ctx)
+	request.SetBasicAuth(adminUser, adminPassword)
+	writer := &cancelingAnalyticsResponseWriter{header: make(http.Header), cancel: cancel}
+
+	handler.ServeHTTP(writer, request)
+
+	if writer.status != http.StatusOK || writer.writeCalls != 1 {
+		t.Fatalf("cancelled delivery status/write calls = %d/%d, want 200/1", writer.status, writer.writeCalls)
 	}
 }
 
@@ -472,6 +620,17 @@ func (s *analyticsQueryStoreStub) UsageRequests(_ context.Context, filter analyt
 	return s.page, nil
 }
 
+func (s *analyticsQueryStoreStub) AnalyticsDashboard(_ context.Context, filter analytics.Filter, limit, offset int) (analytics.Dataset, analytics.RequestPage, error) {
+	s.mu.Lock()
+	s.analyticsSeen = append(s.analyticsSeen, filter)
+	s.requestsSeen = append(s.requestsSeen, analyticsRequestCall{filter: filter, limit: limit, offset: offset})
+	s.mu.Unlock()
+	if s.queryErr != nil {
+		return analytics.Dataset{}, analytics.RequestPage{}, s.queryErr
+	}
+	return s.dataset, s.page, nil
+}
+
 func (s *analyticsQueryStoreStub) StreamUsageRequests(ctx context.Context, filter analytics.Filter, yield func(analytics.RequestRecord) error) error {
 	s.mu.Lock()
 	s.streamsSeen = append(s.streamsSeen, filter)
@@ -523,6 +682,89 @@ func (s *analyticsQueryStoreStub) allFilters() []analytics.Filter {
 
 func int64Pointer(value int64) *int64 { return &value }
 func boolPointer(value bool) *bool    { return &value }
+
+func manyAnalyticsCSVRecords(count int) []analytics.RequestRecord {
+	records := make([]analytics.RequestRecord, 0, count)
+	for index := 0; index < count; index++ {
+		records = append(records, analytics.RequestRecord{
+			ID: int64(index + 1), OccurredAt: time.Unix(int64(index+1), 0).UTC(),
+			RequestID: strings.Repeat("metadata-", 8), ClientID: 1, ClientName: "client",
+			ModelPoolID: 2, ModelName: "model", HTTPStatus: http.StatusOK, DurationMS: 1,
+		})
+	}
+	return records
+}
+
+func awaitAnalyticsSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func analyticsSignalReady(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	case <-time.After(100 * time.Millisecond):
+		return false
+	}
+}
+
+type blockingAnalyticsResponseWriter struct {
+	header       http.Header
+	status       int
+	writeStarted chan struct{}
+	release      chan struct{}
+	once         sync.Once
+}
+
+func newBlockingAnalyticsResponseWriter() *blockingAnalyticsResponseWriter {
+	return &blockingAnalyticsResponseWriter{
+		header: make(http.Header), writeStarted: make(chan struct{}), release: make(chan struct{}),
+	}
+}
+
+func (w *blockingAnalyticsResponseWriter) Header() http.Header { return w.header }
+func (w *blockingAnalyticsResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *blockingAnalyticsResponseWriter) Write(value []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.once.Do(func() { close(w.writeStarted) })
+	<-w.release
+	return len(value), nil
+}
+
+type cancelingAnalyticsResponseWriter struct {
+	header     http.Header
+	status     int
+	writeCalls int
+	cancel     context.CancelFunc
+}
+
+func (w *cancelingAnalyticsResponseWriter) Header() http.Header { return w.header }
+func (w *cancelingAnalyticsResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *cancelingAnalyticsResponseWriter) Write(value []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.writeCalls++
+	if w.writeCalls == 1 {
+		w.cancel()
+	}
+	return len(value), nil
+}
 
 type failingAnalyticsResponseWriter struct {
 	header     http.Header

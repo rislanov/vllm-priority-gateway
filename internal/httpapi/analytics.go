@@ -5,8 +5,10 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 	"unicode/utf8"
@@ -15,8 +17,10 @@ import (
 )
 
 const (
-	defaultAnalyticsLimit = 100
-	maximumAnalyticsLimit = 500
+	defaultAnalyticsLimit               = 100
+	maximumAnalyticsLimit               = 500
+	maximumConcurrentAnalyticsCSVSpools = 2
+	analyticsCSVDeliveryBufferSize      = 32 << 10
 )
 
 var analyticsQueryNames = map[string]struct{}{
@@ -45,6 +49,15 @@ func (s *AdminService) Analytics(ctx context.Context, filter analytics.Filter) (
 // UsageRequests returns a bounded request-ledger page for a validated query.
 func (s *AdminService) UsageRequests(ctx context.Context, query AnalyticsQuery) (analytics.RequestPage, error) {
 	return s.analytics.UsageRequests(ctx, query.Filter, query.Limit, query.Offset)
+}
+
+// AnalyticsDashboard returns the aggregate dataset and request page from one
+// store snapshot for server-side rendering.
+func (s *AdminService) AnalyticsDashboard(
+	ctx context.Context,
+	query AnalyticsQuery,
+) (analytics.Dataset, analytics.RequestPage, error) {
+	return s.analytics.AnalyticsDashboard(ctx, query.Filter, query.Limit, query.Offset)
 }
 
 // StreamUsageRequests streams the complete filtered request ledger in stable
@@ -183,32 +196,76 @@ func analyticsRequestsHandler(service *AdminService) http.HandlerFunc {
 }
 
 func analyticsCSVHandler(service *AdminService) http.HandlerFunc {
+	spoolSlots := make(chan struct{}, maximumConcurrentAnalyticsCSVSpools)
 	return func(writer http.ResponseWriter, request *http.Request) {
 		query, ok := analyticsRequestQuery(writer, request, service)
 		if !ok {
 			return
 		}
-		stream := analyticsCSVStream{writer: writer}
-		err := service.StreamUsageRequests(request.Context(), query, func(record analytics.RequestRecord) error {
+		select {
+		case spoolSlots <- struct{}{}:
+		case <-request.Context().Done():
+			return
+		default:
+			writer.Header().Set("Retry-After", "1")
+			writeAdminJSONError(writer, http.StatusServiceUnavailable, "analytics_export_busy", "Analytics export capacity is temporarily exhausted")
+			return
+		}
+		spoolSlotHeld := true
+		releaseSpoolSlot := func() {
+			if spoolSlotHeld {
+				<-spoolSlots
+				spoolSlotHeld = false
+			}
+		}
+		defer releaseSpoolSlot()
+
+		spool, err := os.CreateTemp("", "llmgw-usage-analytics-*.csv")
+		if err != nil {
+			writeAnalyticsExportError(writer, request)
+			return
+		}
+		spoolPath := spool.Name()
+		defer func() {
+			_ = spool.Close()
+			_ = os.Remove(spoolPath)
+		}()
+		if err := spool.Chmod(0o600); err != nil {
+			writeAnalyticsExportError(writer, request)
+			return
+		}
+
+		csvWriter := csv.NewWriter(spool)
+		csvWriter.UseCRLF = true
+		if err := csvWriter.Write(analyticsCSVHeader); err != nil {
+			writeAnalyticsExportError(writer, request)
+			return
+		}
+		err = service.StreamUsageRequests(request.Context(), query, func(record analytics.RequestRecord) error {
 			if err := request.Context().Err(); err != nil {
 				return err
 			}
-			if err := stream.start(); err != nil {
-				return err
-			}
-			return stream.write(record)
+			return writeAnalyticsCSVRecord(csvWriter, record)
 		})
 		if err != nil {
-			if !stream.started {
-				writeAnalyticsStoreError(writer, request, err)
-			}
+			writeAnalyticsStoreError(writer, request, err)
 			return
 		}
-		if !stream.started {
-			if err := stream.start(); err != nil {
-				return
-			}
+		csvWriter.Flush()
+		if err := csvWriter.Error(); err != nil {
+			writeAnalyticsExportError(writer, request)
+			return
 		}
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			writeAnalyticsExportError(writer, request)
+			return
+		}
+		releaseSpoolSlot()
+
+		writer.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		writer.Header().Set("Content-Disposition", `attachment; filename="usage-analytics.csv"`)
+		writer.WriteHeader(http.StatusOK)
+		_ = copyAnalyticsCSV(request.Context(), writer, spool)
 	}
 }
 
@@ -228,35 +285,20 @@ func writeAnalyticsStoreError(writer http.ResponseWriter, request *http.Request,
 	writeAdminJSONError(writer, http.StatusInternalServerError, "analytics_query_failed", "Unable to query analytics")
 }
 
+func writeAnalyticsExportError(writer http.ResponseWriter, request *http.Request) {
+	if request.Context().Err() != nil {
+		return
+	}
+	writeAdminJSONError(writer, http.StatusInternalServerError, "analytics_export_failed", "Unable to prepare analytics export")
+}
+
 var analyticsCSVHeader = []string{
 	"id", "occurred_at", "request_id", "parent_request_id", "client_id", "client_name", "model_pool_id", "model_name",
 	"backend_name", "http_status", "duration_ms", "ttft_ms", "retry_count", "disconnected", "usage_available",
 	"input_tokens", "output_tokens", "cache_read_tokens",
 }
 
-type analyticsCSVStream struct {
-	writer  http.ResponseWriter
-	csv     *csv.Writer
-	started bool
-}
-
-func (s *analyticsCSVStream) start() error {
-	if s.started {
-		return nil
-	}
-	s.writer.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	s.writer.Header().Set("Content-Disposition", `attachment; filename="usage-analytics.csv"`)
-	s.writer.WriteHeader(http.StatusOK)
-	s.csv = csv.NewWriter(s.writer)
-	s.csv.UseCRLF = true
-	s.started = true
-	if err := s.csv.Write(analyticsCSVHeader); err != nil {
-		return err
-	}
-	return s.flush()
-}
-
-func (s *analyticsCSVStream) write(record analytics.RequestRecord) error {
+func writeAnalyticsCSVRecord(csvWriter *csv.Writer, record analytics.RequestRecord) error {
 	row := []string{
 		strconv.FormatInt(record.ID, 10),
 		record.OccurredAt.UTC().Format(time.RFC3339Nano),
@@ -277,21 +319,38 @@ func (s *analyticsCSVStream) write(record analytics.RequestRecord) error {
 		nullableCSVInt(record.OutputTokens),
 		nullableCSVInt(record.CacheReadTokens),
 	}
-	if err := s.csv.Write(row); err != nil {
-		return err
-	}
-	return s.flush()
+	return csvWriter.Write(row)
 }
 
-func (s *analyticsCSVStream) flush() error {
-	s.csv.Flush()
-	if err := s.csv.Error(); err != nil {
-		return err
+func copyAnalyticsCSV(ctx context.Context, writer http.ResponseWriter, source io.Reader) error {
+	buffer := make([]byte, analyticsCSVDeliveryBufferSize)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		read, readErr := source.Read(buffer)
+		if read > 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			written, writeErr := writer.Write(buffer[:read])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != read {
+				return io.ErrShortWrite
+			}
+			if flusher, ok := writer.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
 	}
-	if flusher, ok := s.writer.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return nil
 }
 
 func neutralizeCSVFormula(value string) string {

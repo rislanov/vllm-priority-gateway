@@ -213,6 +213,42 @@ func TestUsageInspectorParsesSSEAtEverySplit(t *testing.T) {
 	}
 }
 
+func TestUsageInspectorWaitsForResponsesCompletedUsageAtEveryByteBoundary(t *testing.T) {
+	stream := "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"usage\":null}}\n\n" +
+		"event: response.in_progress\n" +
+		"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"usage\":null}}\n\n" +
+		"event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"input_tokens\":17,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n" +
+		"data: [DONE]\n\n"
+	want := domain.TokenUsage{InputTokens: 17, OutputTokens: 7, CacheReadTokens: int64Pointer(5)}
+
+	for split := 0; split <= len(stream); split++ {
+		inspector := newUsageInspector("text/event-stream")
+		inspector.Write([]byte(stream[:split]))
+		inspector.Write([]byte(stream[split:]))
+		got, format, failed := inspector.Result()
+		if failed || format != "" || got == nil || !equalTokenUsage(*got, want) {
+			t.Fatalf("split %d: usage=%+v format=%q failed=%v, want %+v", split, got, format, failed, want)
+		}
+	}
+}
+
+func TestUsageInspectorRejectsInvalidResponsesCompletedUsage(t *testing.T) {
+	for _, usage := range []string{"null", `[]`} {
+		t.Run(usage, func(t *testing.T) {
+			stream := "data: {\"type\":\"response.created\",\"response\":{\"usage\":null}}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"usage\":" + usage + "}}\n\n"
+			inspector := newUsageInspector("text/event-stream")
+			inspector.Write([]byte(stream))
+			got, format, failed := inspector.Result()
+			if got != nil || !failed || format != "sse" {
+				t.Fatalf("usage=%+v format=%q failed=%v, want nil/sse/true", got, format, failed)
+			}
+		})
+	}
+}
+
 func TestUsageInspectorScopesSSEUsageToAuthoritativeFields(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -241,7 +277,7 @@ func TestUsageInspectorScopesSSEUsageToAuthoritativeFields(t *testing.T) {
 		},
 		{
 			name:       "present invalid response usage",
-			stream:     "data: {\"response\":{\"usage\":[]}}\n\n",
+			stream:     "data: {\"type\":\"response.completed\",\"response\":{\"usage\":[]}}\n\n",
 			wantFailed: true,
 		},
 	}

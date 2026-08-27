@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
+	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
 )
 
@@ -195,6 +197,60 @@ func TestRequestEventUsagePreModelFailuresDoNotHaveBothLedgerIdentities(t *testi
 	}
 }
 
+func TestRequestEventUsageRecordsIdentityForKnownModelPolicyDenials(t *testing.T) {
+	tests := []struct {
+		name          string
+		model         string
+		configure     func(*registry.Snapshot)
+		wantModelID   int64
+		wantModelName string
+	}{
+		{
+			name:  "disabled model is resolved before policy rejection",
+			model: "public-model",
+			configure: func(snapshot *registry.Snapshot) {
+				pool := snapshot.PoolsByName["public-model"]
+				pool.Enabled = false
+				snapshot.PoolsByName[pool.PublicModelName] = pool
+				snapshot.PoolsByID[pool.ID] = pool
+			},
+			wantModelID: 10, wantModelName: "public-model",
+		},
+		{
+			name:  "ungranted model is resolved before policy rejection",
+			model: "public-model",
+			configure: func(snapshot *registry.Snapshot) {
+				delete(snapshot.Access[1], int64(10))
+			},
+			wantModelID: 10, wantModelName: "public-model",
+		},
+		{name: "unknown model remains unresolved", model: "attacker-controlled-model"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observer := &usageRecordingObserver{}
+			forwarder := &usageCaptureForwarder{}
+			service, rawKey := newUsageTestServiceWithSnapshot(t, forwarder, observer, nil, nil, test.configure)
+			_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+				Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+				Body: []byte(`{"model":` + strconv.Quote(test.model) + `}`), APIKey: rawKey,
+			})
+			if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+				t.Fatalf("Forward() API error = %+v, want 403", apiErr)
+			}
+			event := observer.SingleEvent(t)
+			if event.ClientID != 1 || event.ModelPoolID != test.wantModelID || event.Model != test.wantModelName {
+				t.Fatalf("ledger identity = client %d pool %d model %q, want client 1 pool %d model %q",
+					event.ClientID, event.ModelPoolID, event.Model, test.wantModelID, test.wantModelName)
+			}
+			if forwarder.Request().Method != "" {
+				t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
+			}
+		})
+	}
+}
+
 func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
 	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
 	observer := &usageRecordingObserver{}
@@ -265,6 +321,17 @@ func newUsageTestService(
 	clock *mutableClock,
 	backends []domain.Backend,
 ) (*gateway.Service, string) {
+	return newUsageTestServiceWithSnapshot(t, forwarder, observer, clock, backends, nil)
+}
+
+func newUsageTestServiceWithSnapshot(
+	t *testing.T,
+	forwarder gateway.Forwarder,
+	observer gateway.Observer,
+	clock *mutableClock,
+	backends []domain.Backend,
+	configure func(*registry.Snapshot),
+) (*gateway.Service, string) {
 	t.Helper()
 	secret := []byte(strings.Repeat("s", 32))
 	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
@@ -286,7 +353,11 @@ func newUsageTestService(
 		}
 	}
 	provider := &mutableSnapshotProvider{}
-	provider.Set(testSnapshot(client, key, pool, backends))
+	snapshot := testSnapshot(client, key, pool, backends)
+	if configure != nil {
+		configure(snapshot)
+	}
+	provider.Set(snapshot)
 	if clock == nil {
 		clock = &mutableClock{current: time.Date(2026, time.August, 27, 15, 0, 0, 0, time.UTC)}
 	}

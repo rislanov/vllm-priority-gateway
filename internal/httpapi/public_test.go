@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
+	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
 
 var testNow = time.Unix(1_700_000_000, 0).UTC()
@@ -458,6 +460,66 @@ func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
 	}
 }
 
+func TestKnownModelPolicyDenialsAreDurablyRecordedButUnknownModelsAreNot(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	recorder := analytics.NewRecorder(database, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = recorder.Close(ctx)
+	})
+
+	raw, key := testKey(t)
+	nextID := 0
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, extraPools: true,
+		observer: observability.Multi(recorder),
+		generateID: func() (string, error) {
+			nextID++
+			return "policy-request-" + strconv.Itoa(nextID), nil
+		},
+	})
+	for _, model := range []string{"disabled-model", "not-allowed", "attacker-controlled-model"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":`+strconv.Quote(model)+`}`))
+		request.Header.Set("Authorization", "Bearer "+raw)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("model %q status = %d body=%s", model, response.Code, response.Body.String())
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("Recorder.Close() error = %v", err)
+	}
+	page, err := database.UsageRequests(context.Background(), analytics.Filter{
+		From: testNow.Add(-time.Millisecond), To: testNow.Add(time.Millisecond),
+	}, 100, 0)
+	if err != nil {
+		t.Fatalf("UsageRequests() error = %v", err)
+	}
+	if page.Total != 2 || len(page.Requests) != 2 {
+		t.Fatalf("durable policy-denial rows = %+v, want exactly two known models", page)
+	}
+	wantModels := map[int64]string{11: "disabled-model", 12: "not-allowed"}
+	for _, record := range page.Requests {
+		if record.ClientID != 1 || record.HTTPStatus != http.StatusForbidden || record.UsageAvailable ||
+			wantModels[record.ModelPoolID] != record.ModelName {
+			t.Fatalf("policy-denial row = %+v, want resolved 403 unavailable metadata", record)
+		}
+		delete(wantModels, record.ModelPoolID)
+	}
+	if len(wantModels) != 0 {
+		t.Fatalf("missing known policy-denial models: %+v", wantModels)
+	}
+}
+
 func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -536,6 +598,7 @@ type fixtureOptions struct {
 	sessionAffinityBackends bool
 	observer                gateway.Observer
 	retryAfter              time.Duration
+	generateID              httpapi.IDGenerator
 }
 
 func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStub) {
@@ -600,7 +663,11 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 		RetryAfter: options.retryAfter,
 		Now:        func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
 	})
-	handler := httpapi.NewPublicHandler(service, 1024*1024, func() (string, error) { return "fixed-gateway-id", nil })
+	generateID := options.generateID
+	if generateID == nil {
+		generateID = func() (string, error) { return "fixed-gateway-id", nil }
+	}
+	handler := httpapi.NewPublicHandler(service, 1024*1024, generateID)
 	return handler, runtime
 }
 

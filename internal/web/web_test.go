@@ -3,6 +3,7 @@ package web_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -75,6 +76,33 @@ func TestAnalyticsPageRendersCanonicalFiltersSummaryAndPagination(t *testing.T) 
 	assertAnalyticsLink(t, nextURL, "/admin/analytics", values, true)
 }
 
+func TestAnalyticsPageUsesCombinedDashboardSnapshotOperation(t *testing.T) {
+	queryStore := &dashboardQueryStoreStub{
+		dataset: analytics.Dataset{
+			Summary: analytics.Summary{RequestCount: 1},
+			Series:  []analytics.SeriesPoint{}, Breakdown: []analytics.BreakdownRow{},
+			Clients: []analytics.Dimension{}, Models: []analytics.Dimension{},
+		},
+		page: analytics.RequestPage{
+			Requests: []analytics.RequestRecord{{
+				OccurredAt: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC), RequestID: "snapshot-request",
+				ClientID: 1, ClientName: "payments", ModelPoolID: 1, ModelName: "qwen-72b", HTTPStatus: 200,
+			}},
+			Total: 1, Limit: 100,
+		},
+	}
+	handler := newWebFixtureWithQueryStore(t, nil, queryStore)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/admin/analytics?from=2026-08-26T09%3A00%3A00Z&to=2026-08-26T12%3A00%3A00Z", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "snapshot-request") {
+		t.Fatalf("combined dashboard response = %d body=%s", response.Code, response.Body.String())
+	}
+	if queryStore.dashboardCalls != 1 || queryStore.separateCalls != 0 {
+		t.Fatalf("dashboard/separate query calls = %d/%d, want 1/0", queryStore.dashboardCalls, queryStore.separateCalls)
+	}
+}
+
 func TestAnalyticsPageRendersMissingUsageAndHonestEmptyState(t *testing.T) {
 	handler := newAnalyticsWebFixture(t)
 	response := httptest.NewRecorder()
@@ -134,6 +162,60 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 	scriptBody := script.Body.String()
 	if namespace, render := strings.Index(scriptBody, "const svgNamespace"), strings.Index(scriptBody, "chartContainers.forEach"); namespace < 0 || render < 0 || namespace > render {
 		t.Fatal("chart script must initialize the SVG namespace before synchronously rendering SSR series")
+	}
+}
+
+func TestAnalyticsPageRendersSilentBucketAsZeroChartPoint(t *testing.T) {
+	input, output := int64(10), int64(2)
+	handler := newWebFixtureWithUsage(t, []analytics.RequestRecord{
+		{
+			OccurredAt: time.Date(2026, 8, 26, 10, 1, 0, 0, time.UTC), RequestID: "before-silence",
+			ClientID: 1, ClientName: "payments", ModelPoolID: 1, ModelName: "qwen-72b",
+			HTTPStatus: 200, UsageAvailable: true, InputTokens: &input, OutputTokens: &output,
+		},
+		{
+			OccurredAt: time.Date(2026, 8, 26, 10, 11, 0, 0, time.UTC), RequestID: "after-silence",
+			ClientID: 1, ClientName: "payments", ModelPoolID: 1, ModelName: "qwen-72b",
+			HTTPStatus: 200, UsageAvailable: true, InputTokens: &input, OutputTokens: &output,
+		},
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/admin/analytics?from=2026-08-26T10%3A00%3A00Z&to=2026-08-26T10%3A15%3A00Z", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var points []*html.Node
+	var visit func(*html.Node)
+	visit = func(node *html.Node) {
+		if node.Type == html.ElementNode && nodeHasAttr(node, "data-analytics-point") {
+			points = append(points, node)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(document)
+	if len(points) != 3 {
+		t.Fatalf("rendered chart points = %d, want three including the silent bucket: %s", len(points), response.Body.String())
+	}
+	middle := points[1]
+	for name, want := range map[string]string{
+		"data-bucket-start":  "2026-08-26T10:05:00Z",
+		"data-request-count": "0",
+		"data-input-tokens":  "0",
+		"data-output-tokens": "0",
+	} {
+		if got := nodeAttr(middle, name); got != want {
+			t.Fatalf("silent point %s = %q, want %q", name, got, want)
+		}
+	}
+	if nodeHasAttr(middle, "data-cache-read-tokens") || nodeHasAttr(middle, "data-cache-hit-ratio") {
+		t.Fatalf("silent point invented cache metrics: %+v", middle.Attr)
 	}
 }
 
@@ -434,6 +516,10 @@ func newAnalyticsWebFixture(t *testing.T) http.Handler {
 }
 
 func newWebFixtureWithUsage(t *testing.T, records []analytics.RequestRecord) http.Handler {
+	return newWebFixtureWithQueryStore(t, records, nil)
+}
+
+func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord, queryStore analytics.QueryStore) http.Handler {
 	t.Helper()
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -465,8 +551,11 @@ func newWebFixtureWithUsage(t *testing.T, records []analytics.RequestRecord) htt
 	if err := registryValue.Reload(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if queryStore == nil {
+		queryStore = database
+	}
 	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Analytics: database, Registry: registryValue, Runtime: webRuntime{},
+		Store: database, Analytics: queryStore, Registry: registryValue, Runtime: webRuntime{},
 		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{4}, 4096)),
 		Now: func() time.Time { return time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC) },
 	})
@@ -478,6 +567,32 @@ func newWebFixtureWithUsage(t *testing.T, records []analytics.RequestRecord) htt
 		t.Fatal(err)
 	}
 	return handler
+}
+
+type dashboardQueryStoreStub struct {
+	dataset        analytics.Dataset
+	page           analytics.RequestPage
+	dashboardCalls int
+	separateCalls  int
+}
+
+func (s *dashboardQueryStoreStub) Analytics(context.Context, analytics.Filter) (analytics.Dataset, error) {
+	s.separateCalls++
+	return analytics.Dataset{}, errors.New("separate Analytics call is not snapshot-safe for SSR")
+}
+
+func (s *dashboardQueryStoreStub) UsageRequests(context.Context, analytics.Filter, int, int) (analytics.RequestPage, error) {
+	s.separateCalls++
+	return analytics.RequestPage{}, errors.New("separate UsageRequests call is not snapshot-safe for SSR")
+}
+
+func (*dashboardQueryStoreStub) StreamUsageRequests(context.Context, analytics.Filter, func(analytics.RequestRecord) error) error {
+	return nil
+}
+
+func (s *dashboardQueryStoreStub) AnalyticsDashboard(context.Context, analytics.Filter, int, int) (analytics.Dataset, analytics.RequestPage, error) {
+	s.dashboardCalls++
+	return s.dataset, s.page, nil
 }
 
 type webRuntime struct{}
@@ -634,10 +749,16 @@ func assertAnalyticsSeriesSource(t *testing.T, document *html.Node) {
 	type point struct {
 		bucket, requests, input, output, cache, ratio string
 	}
-	want := []point{
-		{bucket: "2026-08-26T10:00:00Z", requests: "1", input: "100", output: "20", cache: "40", ratio: "0.4"},
-		{bucket: "2026-08-26T11:00:00Z", requests: "1", input: "50", output: "10"},
+	want := make([]point, 13)
+	firstBucket := time.Date(2026, 8, 26, 9, 59, 59, 123_000_000, time.UTC)
+	for index := range want {
+		want[index] = point{
+			bucket:   firstBucket.Add(time.Duration(index) * 5 * time.Minute).Format(time.RFC3339Nano),
+			requests: "0", input: "0", output: "0",
+		}
 	}
+	want[0] = point{bucket: want[0].bucket, requests: "1", input: "100", output: "20", cache: "40", ratio: "0.4"}
+	want[len(want)-1] = point{bucket: want[len(want)-1].bucket, requests: "1", input: "50", output: "10"}
 	var got []point
 	var visit func(*html.Node)
 	visit = func(node *html.Node) {
