@@ -61,12 +61,84 @@ func TestFetchMetricsHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestRequestResultValidatesExactInjectedFailure(t *testing.T) {
+	valid := requestResult{Status: http.StatusServiceUnavailable, Body: []byte(faultResponseBody)}
+	if err := valid.validateInjectedFailure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		result requestResult
+	}{
+		{name: "wrong status", result: requestResult{Status: http.StatusBadGateway, Body: []byte(faultResponseBody)}},
+		{name: "wrong code", result: requestResult{Status: http.StatusServiceUnavailable, Body: []byte(`{"error":{"type":"server_error","code":"backend_unavailable"}}`)}},
+		{name: "malformed body", result: requestResult{Status: http.StatusServiceUnavailable, Body: []byte(`not-json`)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.result.validateInjectedFailure(); err == nil {
+				t.Fatal("injected failure validation unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestClosedCircuitBaselineRequiresCleanAvailableCircuit(t *testing.T) {
+	baseline := adminBackend{
+		BaseURL: "http://127.0.0.1:45678",
+		Runtime: backendRuntime{
+			Healthy: true, MetricsFresh: true, CircuitState: "closed", CircuitAvailable: true,
+		},
+	}
+	if !isClosedCircuitBaseline(baseline, baseline.BaseURL) {
+		t.Fatal("clean closed circuit was not accepted as a baseline")
+	}
+	for _, mutate := range []func(*adminBackend){
+		func(backend *adminBackend) { backend.BaseURL = "http://127.0.0.1:9999" },
+		func(backend *adminBackend) { backend.Runtime.Healthy = false },
+		func(backend *adminBackend) { backend.Runtime.MetricsFresh = false },
+		func(backend *adminBackend) { backend.Runtime.CircuitState = "open" },
+		func(backend *adminBackend) { backend.Runtime.CircuitAvailable = false },
+		func(backend *adminBackend) { backend.Runtime.CircuitFailures = 1 },
+	} {
+		candidate := baseline
+		mutate(&candidate)
+		if isClosedCircuitBaseline(candidate, baseline.BaseURL) {
+			t.Fatalf("unclean circuit baseline was accepted: %+v", candidate)
+		}
+	}
+}
+
+func TestPoolInflightIsolationDisablesWaitingWithoutMutatingOriginal(t *testing.T) {
+	original := adminPool{
+		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
+	}
+	isolated := isolatePoolGatewayInflight(original, 1)
+	if isolated.MaxGatewayInflight != 1 || isolated.MaxWaiting != 0 {
+		t.Fatalf("isolated pool limits = (%d, %d), want (1, 0)", isolated.MaxGatewayInflight, isolated.MaxWaiting)
+	}
+	if isolated.ID != original.ID || isolated.PublicModelName != original.PublicModelName || isolated.UpstreamModelName != original.UpstreamModelName || isolated.Enabled != original.Enabled {
+		t.Fatalf("isolated pool changed unrelated fields: original=%+v isolated=%+v", original, isolated)
+	}
+	if original.MaxGatewayInflight != 17 || original.MaxWaiting != 9 {
+		t.Fatalf("isolation mutated original pool: %+v", original)
+	}
+	if !samePoolConfiguration(original, original) || samePoolConfiguration(isolated, original) {
+		t.Fatal("pool configuration equality did not distinguish isolated limits from originals")
+	}
+}
+
 func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 	const (
-		healthBody    = `{"status":"ok"}`
-		metricsBody   = "vllm:num_requests_running 1\n"
-		inferenceBody = "data: {\"choices\":[{\"text\":\"hello\"}]}\n\ndata: [DONE]\n\n"
+		healthBody          = `{"status":"ok"}`
+		metricsBody         = "vllm:num_requests_running 1\n"
+		inferenceFirstEvent = "data: {\"choices\":[{\"text\":\"hello\"}]}\n\n"
+		inferenceFinalEvent = "data: [DONE]\n\n"
+		inferenceBody       = inferenceFirstEvent + inferenceFinalEvent
 	)
+	releaseInference := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseInference) }) }
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("X-Upstream", "real-vllm")
 		switch request.URL.Path {
@@ -81,7 +153,12 @@ func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 		case "/v1/completions":
 			writer.Header().Set("Content-Type", "text/event-stream")
 			writer.WriteHeader(http.StatusAccepted)
-			_, _ = io.WriteString(writer, inferenceBody)
+			_, _ = io.WriteString(writer, inferenceFirstEvent)
+			if flusher, ok := writer.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-releaseInference
+			_, _ = io.WriteString(writer, inferenceFinalEvent)
 			if flusher, ok := writer.(http.Flusher); ok {
 				flusher.Flush()
 			}
@@ -105,6 +182,7 @@ func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 			t.Errorf("close fault proxy: %v", err)
 		}
 	})
+	t.Cleanup(release)
 
 	assertForwarded := func(path string, wantStatus int, wantContentType, wantBody string) {
 		t.Helper()
@@ -123,7 +201,43 @@ func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 	}
 	assertForwarded("/health", http.StatusOK, "application/json", healthBody)
 	assertForwarded("/metrics", http.StatusOK, "text/plain; version=0.0.4", metricsBody)
-	assertForwarded("/v1/completions", http.StatusAccepted, "text/event-stream", inferenceBody)
+
+	streamResponse, err := http.Get(proxy.URL() + "/v1/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResponse.Body.Close()
+	if streamResponse.StatusCode != http.StatusAccepted || streamResponse.Header.Get("Content-Type") != "text/event-stream" || streamResponse.Header.Get("X-Upstream") != "real-vllm" {
+		t.Fatalf("stream headers = status %d content-type %q upstream %q", streamResponse.StatusCode, streamResponse.Header.Get("Content-Type"), streamResponse.Header.Get("X-Upstream"))
+	}
+	type streamRead struct {
+		body string
+		err  error
+	}
+	firstRead := make(chan streamRead, 1)
+	go func() {
+		body := make([]byte, len(inferenceFirstEvent))
+		_, err := io.ReadFull(streamResponse.Body, body)
+		firstRead <- streamRead{body: string(body), err: err}
+	}()
+	select {
+	case first := <-firstRead:
+		if first.err != nil || first.body != inferenceFirstEvent {
+			release()
+			t.Fatalf("first streamed event = %q err=%v", first.body, first.err)
+		}
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("fault proxy buffered the first SSE event until upstream completion")
+	}
+	release()
+	remainder, err := io.ReadAll(streamResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := inferenceFirstEvent + string(remainder); got != inferenceBody {
+		t.Fatalf("complete streamed body = %q, want %q", got, inferenceBody)
+	}
 
 	proxy.SetFaulting(true)
 	response, err := http.Get(proxy.URL() + "/v1/completions")
@@ -162,8 +276,13 @@ func TestAdminMutationCleanupRestoresPoolAndBackends(t *testing.T) {
 	backends := []adminBackend{
 		{ID: 21, ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://127.0.0.1:9001", Enabled: true, Draining: false, CapacityHint: 1.5, RunningSoftLimit: 16, UpstreamAPIKeyEnv: "VLLM_A_KEY"},
 		{ID: 22, ModelPoolID: pool.ID, Name: "gpu-b", BaseURL: "http://127.0.0.1:9002", Enabled: true, Draining: true, CapacityHint: 2.5, RunningSoftLimit: 32, UpstreamAPIKeyEnv: "VLLM_B_KEY"},
+		{ID: 23, ModelPoolID: pool.ID, Name: "gpu-c", BaseURL: "http://127.0.0.1:9003", Enabled: true, Draining: false, CapacityHint: 3.5, RunningSoftLimit: 48, UpstreamAPIKeyEnv: "VLLM_C_KEY"},
 	}
-	updater := &recordingAdminUpdater{pool: pool, backends: map[int64]adminBackend{21: backends[0], 22: backends[1]}, failBackendID: 21}
+	updater := &recordingAdminUpdater{
+		pool:           pool,
+		backends:       map[int64]adminBackend{21: backends[0], 22: backends[1], 23: backends[2]},
+		failBackendIDs: map[int64]error{21: errors.New("first injected failure"), 22: errors.New("second injected failure")},
+	}
 	cleanup, err := newAdminMutationCleanup(updater, adminStatus{Pools: []adminPool{pool}, Backends: backends}, pool.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -180,36 +299,49 @@ func TestAdminMutationCleanupRestoresPoolAndBackends(t *testing.T) {
 	mutatedSibling.Draining = false
 	mutatedSibling.RunningSoftLimit = 1
 	updater.backends[22] = mutatedSibling
+	mutatedLater := updater.backends[23]
+	mutatedLater.BaseURL = "http://127.0.0.1:56789"
+	mutatedLater.Draining = true
+	updater.backends[23] = mutatedLater
 
 	err = cleanup.Restore(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "restore backend 21") {
-		t.Fatalf("restore error = %v, want backend 21 failure", err)
+	if err == nil {
+		t.Fatal("restore unexpectedly succeeded")
+	}
+	for _, fragment := range []string{"restore backend 21", "first injected failure", "restore backend 22", "second injected failure"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("restore error %q does not contain %q", err, fragment)
+		}
 	}
 	if !reflect.DeepEqual(updater.pool, pool) {
 		t.Fatalf("restored pool = %+v, want %+v", updater.pool, pool)
 	}
-	for _, backend := range backends {
-		if got := updater.backends[backend.ID]; !reflect.DeepEqual(got, backend) {
-			t.Fatalf("restored backend %d = %+v, want %+v", backend.ID, got, backend)
-		}
+	if got := updater.backends[21]; !reflect.DeepEqual(got, mutatedTarget) {
+		t.Fatalf("failed backend 21 update changed state: got=%+v want mutated=%+v", got, mutatedTarget)
 	}
-	if got := updater.calls; !reflect.DeepEqual(got, []string{"pool:11", "backend:21", "backend:22"}) {
+	if got := updater.backends[22]; !reflect.DeepEqual(got, mutatedSibling) {
+		t.Fatalf("failed backend 22 update changed state: got=%+v want mutated=%+v", got, mutatedSibling)
+	}
+	if got := updater.backends[23]; !reflect.DeepEqual(got, backends[2]) {
+		t.Fatalf("later successful backend 23 was not restored: got=%+v want=%+v", got, backends[2])
+	}
+	if got := updater.calls; !reflect.DeepEqual(got, []string{"pool:11", "backend:21", "backend:22", "backend:23"}) {
 		t.Fatalf("restore calls = %#v", got)
 	}
 	if second := cleanup.Restore(context.Background()); second == nil || second.Error() != err.Error() {
 		t.Fatalf("idempotent restore error = %v, want %v", second, err)
 	}
-	if len(updater.calls) != 3 {
+	if len(updater.calls) != 4 {
 		t.Fatalf("idempotent restore repeated mutations: calls=%#v", updater.calls)
 	}
 }
 
 type recordingAdminUpdater struct {
-	mu            sync.Mutex
-	pool          adminPool
-	backends      map[int64]adminBackend
-	failBackendID int64
-	calls         []string
+	mu             sync.Mutex
+	pool           adminPool
+	backends       map[int64]adminBackend
+	failBackendIDs map[int64]error
+	calls          []string
 }
 
 func (u *recordingAdminUpdater) updatePool(_ context.Context, pool adminPool) (adminPool, error) {
@@ -224,10 +356,10 @@ func (u *recordingAdminUpdater) updateBackend(_ context.Context, backend adminBa
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.calls = append(u.calls, "backend:"+strconv.FormatInt(backend.ID, 10))
-	u.backends[backend.ID] = backend
-	if backend.ID == u.failBackendID {
-		return adminBackend{}, errors.New("injected update failure")
+	if err := u.failBackendIDs[backend.ID]; err != nil {
+		return adminBackend{}, err
 	}
+	u.backends[backend.ID] = backend
 	return backend, nil
 }
 

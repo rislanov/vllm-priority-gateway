@@ -119,13 +119,12 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	critical.requireCompleteStream(t)
 	t.Logf("continuity high_first_byte=%s critical_first_byte=%s", high.FirstByte, critical.FirstByte)
 
-	limitedPool := saturated
-	limitedPool.MaxGatewayInflight = 1
+	limitedPool := isolatePoolGatewayInflight(originalPool, 1)
 	if _, err := h.updatePool(context.Background(), limitedPool); err != nil {
 		t.Fatalf("set priority E2E pool limit: %v", err)
 	}
 	h.waitForPool(func(pool adminPool) bool {
-		return pool.MaxGatewayInflight == 1 && pool.Runtime.GatewayInflight >= 1
+		return pool.MaxGatewayInflight == 1 && pool.MaxWaiting == 0 && pool.Runtime.GatewayInflight >= 1
 	}, cfg.saturationTimeout)
 	h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical probe bounded by pool safety.", MaxTokens: 2,
@@ -133,6 +132,9 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	if _, err := h.updatePool(context.Background(), originalPool); err != nil {
 		t.Fatalf("restore pool limit before continuity probe: %v", err)
 	}
+	h.waitForPool(func(pool adminPool) bool {
+		return samePoolConfiguration(pool, originalPool)
+	}, cfg.saturationTimeout)
 	postLimitCritical := h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical continuity after pool limit restoration.", MaxTokens: 4, Stream: true,
 	})
@@ -233,7 +235,7 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 		t.Fatalf("point circuit backend at fault proxy: %v", err)
 	}
 	h.waitForBackend(target.ID, func(backend adminBackend) bool {
-		return backend.BaseURL == proxy.URL() && backend.Runtime.Healthy && backend.Runtime.MetricsFresh
+		return isClosedCircuitBaseline(backend, proxy.URL())
 	}, cfg.saturationTimeout)
 	for _, backend := range originalStatus.Backends {
 		if backend.ModelPoolID != pool.ID || backend.ID == target.ID || backend.Draining {
@@ -253,7 +255,7 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 			Key: cfg.highKey, Prompt: "Circuit breaker failure injection.", MaxTokens: 2,
 			ExtraHeaders: map[string]string{"X-Request-Id": fmt.Sprintf("e2e-circuit-failure-%d", attempt)},
 		})
-		result.requireStatus(t, http.StatusServiceUnavailable)
+		result.requireInjectedFailure(t)
 	}
 	opened := h.waitForBackend(target.ID, func(backend adminBackend) bool {
 		return backend.Runtime.CircuitState == "open" && backend.Runtime.Healthy && backend.Runtime.MetricsFresh

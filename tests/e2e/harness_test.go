@@ -699,6 +699,31 @@ type requestResult struct {
 	StreamDone bool
 }
 
+func (result requestResult) validateInjectedFailure() error {
+	if result.Status != http.StatusServiceUnavailable {
+		return fmt.Errorf("injected inference status = %d, want 503", result.Status)
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(result.Body, &envelope); err != nil {
+		return fmt.Errorf("decode injected inference error: %w", err)
+	}
+	if envelope.Error.Code != "e2e_injected_failure" {
+		return fmt.Errorf("injected inference error code = %q, want e2e_injected_failure", envelope.Error.Code)
+	}
+	return nil
+}
+
+func (result requestResult) requireInjectedFailure(t *testing.T) {
+	t.Helper()
+	if err := result.validateInjectedFailure(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (h *remoteHarness) completion(parent context.Context, input completionRequest) requestResult {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(parent, h.cfg.probeTimeout)
@@ -762,6 +787,23 @@ func (result requestResult) requireStatus(t *testing.T, want int) {
 	if result.Status != want {
 		t.Fatalf("completion status = %d, want %d; body=%s", result.Status, want, bodyExcerpt(result.Body))
 	}
+}
+
+func isClosedCircuitBaseline(backend adminBackend, baseURL string) bool {
+	return backend.BaseURL == baseURL && backend.Runtime.Healthy && backend.Runtime.MetricsFresh &&
+		backend.Runtime.CircuitState == "closed" && backend.Runtime.CircuitAvailable && backend.Runtime.CircuitFailures == 0
+}
+
+func isolatePoolGatewayInflight(pool adminPool, maximum int) adminPool {
+	pool.MaxGatewayInflight = maximum
+	pool.MaxWaiting = 0
+	return pool
+}
+
+func samePoolConfiguration(left, right adminPool) bool {
+	return left.ID == right.ID && left.PublicModelName == right.PublicModelName &&
+		left.UpstreamModelName == right.UpstreamModelName && left.Enabled == right.Enabled &&
+		left.MaxGatewayInflight == right.MaxGatewayInflight && left.MaxWaiting == right.MaxWaiting
 }
 
 func (result requestResult) requireCompleteStream(t *testing.T) {

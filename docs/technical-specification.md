@@ -1764,15 +1764,15 @@ Final algorithm:
 
 # 45. Production Circuit Breaker
 
-A backend is temporarily excluded from routing upon:
+A backend's inference circuit counts these qualifying failures:
 
 ```text
-connection failures
-timeouts
-5xx bursts
-health failures
-stale metrics
+connection, DNS, TLS, or response-header failures
+upstream 5xx responses
+upstream response-body read failures
 ```
+
+Health-check failure and stale metrics independently remove a backend from routing eligibility and inference readiness. They do not add inference-circuit failures, open or reopen the circuit, or heal it when health/metrics recover.
 
 States:
 
@@ -1793,7 +1793,7 @@ LLMGW_CIRCUIT_OPEN_COOLDOWN=15s
 LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES=1
 ```
 
-In `closed`, qualifying failure timestamps are retained only inside the rolling window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity; a probe success closes and clears failures, a probe failure reopens immediately, and a neutral result only releases its probe slot.
+In `closed`, qualifying failure timestamps are retained only inside the rolling window. A successful closed-state request does not clear that retained history; timestamps age out with the window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity; a probe success closes and clears failures, a probe failure reopens immediately, and a neutral result only releases its probe slot.
 
 Outcome precedence is explicit: connection/DNS/TLS/response-header failures, upstream HTTP `5xx`, and upstream response-body read failures are failures. A completed upstream response below `500`, including `4xx` and `429`, is success because the endpoint responded. Downstream cancellation or write failure is neutral and neither penalizes nor heals. An HTTP `5xx` is forwarded without retry; the existing single retry applies only to a transport failure before downstream response bytes.
 
