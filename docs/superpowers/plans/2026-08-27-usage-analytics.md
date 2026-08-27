@@ -489,3 +489,38 @@
   git add internal/fakevllm/server.go internal/fakevllm/server_test.go cmd/gateway/main_test.go README.md
   git commit -m "test: verify token analytics end to end"
   ```
+
+---
+
+### Task 10: Bound extreme custom-range chart density
+
+**Files:**
+
+- Modify: `internal/store/usage.go`
+- Modify: `internal/store/usage_test.go`
+- Modify: `docs/superpowers/specs/2026-08-27-usage-analytics-design.md`
+
+- [ ] Add a failing direct-store regression using the full RFC 3339 year range with one matching row. Prove the series is non-empty, contains at most 366 points, preserves the complete filter for aggregates, and does not rely on overflowing `time.Duration` arithmetic.
+
+- [ ] Add a failing multi-year regression that derives the expected whole-day multiple independently and proves standard 24-hour, 7-day, and 90-day resolutions remain unchanged.
+
+- [ ] Run:
+
+  ```bash
+  go test ./internal/store -run 'TestAnalytics(BoundsExtremeCustomRangeSeries|UsesAdaptiveWholeDayBucketsForLongRanges|DenseSeriesKeepsStandardPresetPointBounds)' -count=1
+  ```
+
+  Expected: the extreme range attempts an unbounded fine-grained/daily series or the adaptive-width expectations fail.
+
+- [ ] Select bucket width from the exact ceiling-to-millisecond `from`/`to` bounds. Keep the existing 5-minute, 1-hour, and 1-day thresholds, then increase widths in whole-day multiples only when needed to keep the dense series at or below 366 points.
+
+- [ ] Keep summary, breakdown, request rows, CSV filters, cache-known semantics, and truly-empty-range behavior unchanged. Do not impose a hard maximum custom period.
+
+- [ ] Run the focused store tests, the full store/web/httpapi suites, the changed-package race suite, and `git diff --check`.
+
+- [ ] Commit:
+
+  ```bash
+  git add internal/store/usage.go internal/store/usage_test.go docs/superpowers/specs/2026-08-27-usage-analytics-design.md docs/superpowers/plans/2026-08-27-usage-analytics.md
+  git commit -m "fix: bound custom analytics series"
+  ```

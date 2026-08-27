@@ -279,6 +279,56 @@ func TestAnalyticsDenseSeriesKeepsStandardPresetPointBounds(t *testing.T) {
 	}
 }
 
+func TestAnalyticsBoundsExtremeCustomRangeSeries(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(9999, time.December, 31, 23, 59, 59, 999_999_999, time.UTC)
+	occurredAt := time.Date(9999, time.December, 31, 23, 59, 59, 998_000_000, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("extreme-range", occurredAt, 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataset, err := db.Analytics(ctx, analytics.Filter{From: from, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataset.Summary.RequestCount != 1 {
+		t.Fatalf("Analytics().Summary.RequestCount = %d, want 1 for the complete RFC 3339 year range", dataset.Summary.RequestCount)
+	}
+	if len(dataset.Series) == 0 || len(dataset.Series) > 366 {
+		t.Fatalf("Analytics().Series length = %d, want 1 through 366 points", len(dataset.Series))
+	}
+	if dataset.Series[len(dataset.Series)-1].RequestCount != 1 {
+		t.Fatalf("last series point = %+v, want the matching request", dataset.Series[len(dataset.Series)-1])
+	}
+}
+
+func TestAnalyticsUsesAdaptiveWholeDayBucketsForLongRanges(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	from := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2022, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := db.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		analyticsUsageRecord("two-year-range", time.Date(2021, time.June, 1, 0, 0, 0, 0, time.UTC), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataset, err := db.Analytics(ctx, analytics.Filter{From: from, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dataset.Series) != 366 {
+		t.Fatalf("Analytics().Series length = %d, want 366 (731 days rounded up into two-day buckets)", len(dataset.Series))
+	}
+	if got := dataset.Series[1].BucketStart.Sub(dataset.Series[0].BucketStart); got != 48*time.Hour {
+		t.Fatalf("analytics bucket width = %s, want 48h (the smallest whole-day multiple for 731 days)", got)
+	}
+}
+
 func TestAnalyticsEmptyReturnsInitializedSlices(t *testing.T) {
 	db := openTestDB(t)
 	at := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)

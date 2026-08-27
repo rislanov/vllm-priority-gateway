@@ -221,7 +221,7 @@ func (s *SQLite) queryAnalyticsSeries(
 ) ([]analytics.SeriesPoint, error) {
 	fromMS := storedMillisecondCeiling(filter.From)
 	toMS := storedMillisecondCeiling(filter.To)
-	bucketWidthMS := analyticsBucketWidthMilliseconds(filter.To.Sub(filter.From))
+	bucketWidthMS := analyticsBucketWidthMilliseconds(fromMS, toMS)
 	bucketExpression := analyticsBucketExpression(bucketWidthMS)
 	query := `
 		SELECT ` + bucketExpression + ` AS bucket_start_ms,
@@ -664,15 +664,31 @@ func storedMillisecondCeiling(value time.Time) int64 {
 	return milliseconds
 }
 
-func analyticsBucketWidthMilliseconds(rangeWidth time.Duration) int64 {
+func analyticsBucketWidthMilliseconds(fromMS int64, toMS int64) int64 {
+	const (
+		fiveMinutesMS = int64((5 * time.Minute) / time.Millisecond)
+		hourMS        = int64(time.Hour / time.Millisecond)
+		dayMS         = int64((24 * time.Hour) / time.Millisecond)
+		maxPoints     = int64(366)
+	)
+	rangeWidthMS := toMS - fromMS
 	switch {
-	case rangeWidth <= 24*time.Hour:
-		return int64((5 * time.Minute) / time.Millisecond)
-	case rangeWidth <= 7*24*time.Hour:
-		return int64(time.Hour / time.Millisecond)
+	case rangeWidthMS <= 24*hourMS:
+		return fiveMinutesMS
+	case rangeWidthMS <= 7*24*hourMS:
+		return hourMS
 	default:
-		return int64((24 * time.Hour) / time.Millisecond)
+		wholeDays := ceilDividePositive(rangeWidthMS, dayMS)
+		return ceilDividePositive(wholeDays, maxPoints) * dayMS
 	}
+}
+
+func ceilDividePositive(dividend int64, divisor int64) int64 {
+	quotient := dividend / divisor
+	if dividend%divisor != 0 {
+		quotient++
+	}
+	return quotient
 }
 
 func analyticsBucketExpression(bucketWidthMS int64) string {
@@ -689,7 +705,7 @@ func densifyAnalyticsSeries(
 	if len(points) == 0 || fromMS >= toMS {
 		return points, nil
 	}
-	bucketCount := (toMS - fromMS + bucketWidthMS - 1) / bucketWidthMS
+	bucketCount := ceilDividePositive(toMS-fromMS, bucketWidthMS)
 	dense := make([]analytics.SeriesPoint, 0, int(bucketCount))
 	pointIndex := 0
 	for bucketStartMS := fromMS; bucketStartMS < toMS; bucketStartMS += bucketWidthMS {

@@ -160,11 +160,13 @@ The query response contains:
 - Paginated request rows ordered newest first.
 - Available client/model dimensions, including historical names present in the retained ledger.
 
-Time-series resolution is selected automatically to bound chart size:
+Time-series resolution is selected automatically to bound chart size to at most 366 points:
 
 - Range up to 24 hours: 5-minute buckets.
 - More than 24 hours and up to 7 days: 1-hour buckets.
-- More than 7 days: 1-day buckets.
+- More than 7 days: 1-day buckets while that produces at most 366 points; longer ranges use the smallest whole-day multiple that keeps the series at or below 366 points.
+
+Resolution selection uses the exact stored-millisecond bounds rather than `time.Duration`, so the full RFC 3339 year range cannot overflow or accidentally fall back to a fine-grained bucket width. Aggregates, breakdowns, request rows, and CSV still cover the complete selected interval; only chart grouping becomes coarser for multi-year ranges.
 
 Cache hit ratio is `cache_read_tokens / input_tokens` when input tokens are positive and cache data is available. Cache-read tokens are a subset of input tokens and must never be stacked as additional total consumption.
 
