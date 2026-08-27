@@ -141,6 +141,7 @@ func (s *Service) ValidateAPIKey(rawKey string) (domain.Client, *APIError) {
 // CompletePublic records public outcomes that do not enter the forwarding
 // lifecycle, such as model listing and request-envelope rejection.
 func (s *Service) CompletePublic(event RequestEvent) {
+	event.OccurredAt = s.now().UTC()
 	if s.observer != nil {
 		s.observer.Complete(event)
 	}

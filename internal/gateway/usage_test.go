@@ -195,6 +195,27 @@ func TestRequestEventUsagePreModelFailuresDoNotHaveBothLedgerIdentities(t *testi
 	}
 }
 
+func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
+	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
+	observer := &usageRecordingObserver{}
+	service := gateway.New(gateway.Dependencies{
+		Observer: observer,
+		Now:      func() time.Time { return completed },
+	})
+
+	service.CompletePublic(gateway.RequestEvent{
+		OccurredAt: completed.Add(-time.Hour),
+		Status:     http.StatusNotFound,
+		Reason:     "unsupported_endpoint",
+	})
+
+	event := observer.SingleEvent(t)
+	if !event.OccurredAt.Equal(completed.UTC()) || event.OccurredAt.Location() != time.UTC {
+		t.Fatalf("OccurredAt = %s (%s), want authoritative completion time %s UTC",
+			event.OccurredAt, event.OccurredAt.Location(), completed.UTC())
+	}
+}
+
 type usageCaptureForwarder struct {
 	mu      sync.Mutex
 	request proxy.Request
