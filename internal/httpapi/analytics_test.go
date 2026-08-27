@@ -335,6 +335,105 @@ func TestAnalyticsCSVLimitsConcurrentSpoolsWithoutBlocking(t *testing.T) {
 	}
 }
 
+func TestAnalyticsCSVBoundsTemporaryFilesThroughBlockedDelivery(t *testing.T) {
+	// This catches releasing an export permit after local spooling but before
+	// delivery: a third export would be admitted while two full temporary files
+	// are still retained by blocked clients.
+	tempDirectory := t.TempDir()
+	t.Setenv("TMPDIR", tempDirectory)
+
+	thirdSpoolStarted := make(chan struct{})
+	releaseThirdSpool := make(chan struct{})
+	var streamCalls int
+	var streamCallsMu sync.Mutex
+	queryStore := &analyticsQueryStoreStub{}
+	queryStore.stream = func(ctx context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
+		streamCallsMu.Lock()
+		streamCalls++
+		call := streamCalls
+		streamCallsMu.Unlock()
+		if call == 3 {
+			close(thirdSpoolStarted)
+			select {
+			case <-releaseThirdSpool:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return yield(analytics.RequestRecord{ID: int64(call), OccurredAt: time.Unix(int64(call), 0).UTC(), RequestID: "metadata-row"})
+	}
+	handler := newAnalyticsHandler(t, queryStore, time.Now)
+
+	startBlockedDelivery := func() (*blockingAnalyticsResponseWriter, context.CancelFunc, <-chan struct{}) {
+		ctx, cancel := context.WithCancel(context.Background())
+		request := httptest.NewRequest(http.MethodGet, "/admin/api/analytics/export.csv", nil).WithContext(ctx)
+		request.SetBasicAuth(adminUser, adminPassword)
+		writer := newBlockingAnalyticsResponseWriter()
+		done := make(chan struct{})
+		go func() {
+			handler.ServeHTTP(writer, request)
+			close(done)
+		}()
+		return writer, cancel, done
+	}
+
+	firstWriter, firstCancel, firstDone := startBlockedDelivery()
+	secondWriter, secondCancel, secondDone := startBlockedDelivery()
+	var firstRelease, secondRelease, thirdRelease sync.Once
+	t.Cleanup(func() {
+		firstCancel()
+		firstRelease.Do(func() { close(firstWriter.release) })
+		secondCancel()
+		secondRelease.Do(func() { close(secondWriter.release) })
+		thirdRelease.Do(func() { close(releaseThirdSpool) })
+	})
+	awaitAnalyticsSignal(t, firstWriter.writeStarted, "first blocked CSV delivery")
+	awaitAnalyticsSignal(t, secondWriter.writeStarted, "second blocked CSV delivery")
+	if got := analyticsCSVTemporaryFileCount(t, tempDirectory); got != 2 {
+		t.Fatalf("temporary files during two blocked deliveries = %d, want 2", got)
+	}
+
+	thirdDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { thirdDone <- analyticsRequest(t, handler, "/admin/api/analytics/export.csv") }()
+	select {
+	case response := <-thirdDone:
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" ||
+			!strings.Contains(response.Body.String(), "analytics_export_busy") {
+			t.Fatalf("third export response = %d headers=%v body=%s, want controlled busy response", response.Code, response.Header(), response.Body.String())
+		}
+	case <-thirdSpoolStarted:
+		got := analyticsCSVTemporaryFileCount(t, tempDirectory)
+		thirdRelease.Do(func() { close(releaseThirdSpool) })
+		<-thirdDone
+		t.Fatalf("third export was admitted during two blocked deliveries: temporary files = %d, want 2", got)
+	}
+	thirdRelease.Do(func() { close(releaseThirdSpool) })
+	if got := analyticsCSVTemporaryFileCount(t, tempDirectory); got != 2 {
+		t.Fatalf("temporary files after busy response = %d, want 2", got)
+	}
+
+	firstRelease.Do(func() { close(firstWriter.release) })
+	awaitAnalyticsSignal(t, firstDone, "first CSV delivery cleanup")
+	if got := analyticsCSVTemporaryFileCount(t, tempDirectory); got != 1 {
+		t.Fatalf("temporary files after first delivery = %d, want 1", got)
+	}
+
+	secondCancel()
+	secondRelease.Do(func() { close(secondWriter.release) })
+	awaitAnalyticsSignal(t, secondDone, "cancelled CSV delivery cleanup")
+	if got := analyticsCSVTemporaryFileCount(t, tempDirectory); got != 0 {
+		t.Fatalf("temporary files after delivery cleanup = %d, want 0", got)
+	}
+
+	fourth := analyticsRequest(t, handler, "/admin/api/analytics/export.csv")
+	if fourth.Code != http.StatusOK {
+		t.Fatalf("export after cleanup status = %d body=%s", fourth.Code, fourth.Body.String())
+	}
+	if got := analyticsCSVTemporaryFileCount(t, tempDirectory); got != 0 {
+		t.Fatalf("temporary files after permit reuse = %d, want 0", got)
+	}
+}
+
 func TestAnalyticsCSVTemporaryFileIsSecureAndRemovedOnEveryPath(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -693,6 +792,15 @@ func manyAnalyticsCSVRecords(count int) []analytics.RequestRecord {
 		})
 	}
 	return records
+}
+
+func analyticsCSVTemporaryFileCount(t *testing.T, directory string) int {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(directory, "llmgw-usage-analytics-*.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(matches)
 }
 
 func awaitAnalyticsSignal(t *testing.T, signal <-chan struct{}, label string) {

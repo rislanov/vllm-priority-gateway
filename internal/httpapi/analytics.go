@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	defaultAnalyticsLimit               = 100
-	maximumAnalyticsLimit               = 500
-	maximumConcurrentAnalyticsCSVSpools = 2
-	analyticsCSVDeliveryBufferSize      = 32 << 10
+	defaultAnalyticsLimit                = 100
+	maximumAnalyticsLimit                = 500
+	maximumConcurrentAnalyticsCSVExports = 2
+	analyticsCSVDeliveryBufferSize       = 32 << 10
 )
 
 var analyticsQueryNames = map[string]struct{}{
@@ -196,14 +196,14 @@ func analyticsRequestsHandler(service *AdminService) http.HandlerFunc {
 }
 
 func analyticsCSVHandler(service *AdminService) http.HandlerFunc {
-	spoolSlots := make(chan struct{}, maximumConcurrentAnalyticsCSVSpools)
+	exportSlots := make(chan struct{}, maximumConcurrentAnalyticsCSVExports)
 	return func(writer http.ResponseWriter, request *http.Request) {
 		query, ok := analyticsRequestQuery(writer, request, service)
 		if !ok {
 			return
 		}
 		select {
-		case spoolSlots <- struct{}{}:
+		case exportSlots <- struct{}{}:
 		case <-request.Context().Done():
 			return
 		default:
@@ -211,31 +211,31 @@ func analyticsCSVHandler(service *AdminService) http.HandlerFunc {
 			writeAdminJSONError(writer, http.StatusServiceUnavailable, "analytics_export_busy", "Analytics export capacity is temporarily exhausted")
 			return
 		}
-		spoolSlotHeld := true
-		releaseSpoolSlot := func() {
-			if spoolSlotHeld {
-				<-spoolSlots
-				spoolSlotHeld = false
+		exportSlotHeld := true
+		releaseExportSlot := func() {
+			if exportSlotHeld {
+				<-exportSlots
+				exportSlotHeld = false
 			}
 		}
-		defer releaseSpoolSlot()
+		defer releaseExportSlot()
 
-		spool, err := os.CreateTemp("", "llmgw-usage-analytics-*.csv")
+		exportFile, err := os.CreateTemp("", "llmgw-usage-analytics-*.csv")
 		if err != nil {
 			writeAnalyticsExportError(writer, request)
 			return
 		}
-		spoolPath := spool.Name()
+		exportPath := exportFile.Name()
 		defer func() {
-			_ = spool.Close()
-			_ = os.Remove(spoolPath)
+			_ = exportFile.Close()
+			_ = os.Remove(exportPath)
 		}()
-		if err := spool.Chmod(0o600); err != nil {
+		if err := exportFile.Chmod(0o600); err != nil {
 			writeAnalyticsExportError(writer, request)
 			return
 		}
 
-		csvWriter := csv.NewWriter(spool)
+		csvWriter := csv.NewWriter(exportFile)
 		csvWriter.UseCRLF = true
 		if err := csvWriter.Write(analyticsCSVHeader); err != nil {
 			writeAnalyticsExportError(writer, request)
@@ -256,16 +256,15 @@ func analyticsCSVHandler(service *AdminService) http.HandlerFunc {
 			writeAnalyticsExportError(writer, request)
 			return
 		}
-		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		if _, err := exportFile.Seek(0, io.SeekStart); err != nil {
 			writeAnalyticsExportError(writer, request)
 			return
 		}
-		releaseSpoolSlot()
 
 		writer.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		writer.Header().Set("Content-Disposition", `attachment; filename="usage-analytics.csv"`)
 		writer.WriteHeader(http.StatusOK)
-		_ = copyAnalyticsCSV(request.Context(), writer, spool)
+		_ = copyAnalyticsCSV(request.Context(), writer, exportFile)
 	}
 }
 
