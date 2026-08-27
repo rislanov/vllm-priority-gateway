@@ -39,6 +39,12 @@ func (p *ModelPool) Validate() error {
 	if p.UpstreamModelName == "" {
 		return errors.New("upstream model name is required")
 	}
+	if p.MaxGatewayInflight < 0 {
+		return errors.New("max gateway inflight cannot be negative")
+	}
+	if p.MaxWaiting < 0 {
+		return errors.New("max waiting cannot be negative")
+	}
 	return nil
 }
 

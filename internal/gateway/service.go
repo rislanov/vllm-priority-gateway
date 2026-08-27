@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
@@ -29,8 +30,9 @@ type SnapshotProvider interface {
 
 type Runtime interface {
 	PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime
+	AcquirePool(poolID int64, maximum int) (release func(), ok bool)
 	Snapshot(backendID int64, at time.Time) domain.BackendRuntime
-	IncrementInflight(backendID int64) (release func(), ok bool)
+	AcquireBackend(expected domain.Backend, at time.Time) (complete func(domain.InferenceOutcome), ok bool)
 }
 
 type Forwarder interface {
@@ -110,6 +112,44 @@ type ForwardRequest struct {
 	APIKey          string
 	RequestID       string
 	ParentRequestID string
+}
+
+type InferenceReadiness struct {
+	Status              string `json:"status"`
+	Revision            int64  `json:"revision"`
+	PoolAvailability    int    `json:"poolAvailability"`
+	BackendAvailability int    `json:"backendAvailability"`
+}
+
+func (s *Service) InferenceReadiness() InferenceReadiness {
+	snapshot := s.registry.Snapshot()
+	readiness := InferenceReadiness{Status: "unavailable", Revision: snapshot.Revision}
+	at := s.now().UTC()
+	for _, pool := range snapshot.PoolsByID {
+		if !pool.Enabled {
+			continue
+		}
+		poolAvailable := false
+		for _, backend := range snapshot.BackendsByPool[pool.ID] {
+			if !backend.Enabled || backend.Draining {
+				continue
+			}
+			runtime := s.runtime.Snapshot(backend.ID, at)
+			_, secretAvailable := s.upstreamSecret(backend)
+			if !runtime.Healthy || !runtime.MetricsFresh || !runtime.CircuitAvailable || !secretAvailable {
+				continue
+			}
+			readiness.BackendAvailability++
+			poolAvailable = true
+		}
+		if poolAvailable {
+			readiness.PoolAvailability++
+		}
+	}
+	if readiness.PoolAvailability > 0 || readiness.BackendAvailability > 0 {
+		readiness.Status = "ready"
+	}
+	return readiness
 }
 
 func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, domain.Client, *APIError) {
@@ -194,12 +234,12 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
 	}
-	now := s.now().UTC()
-	poolRuntime := s.runtime.PoolSnapshot(pool.ID, now)
+	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
 	event.PoolState = poolRuntime.State
-	if poolRuntime.State == domain.PoolUnavailable {
-		return proxy.Result{}, backendUnavailable(s.retryAfter)
+	if poolErr != nil {
+		return proxy.Result{}, poolErr
 	}
+	defer releasePool()
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
 	lease, ok := s.limiter.Acquire(client.ID, limit)
 	if !ok {
@@ -213,55 +253,65 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	}
 
 	selectTarget := func(exclude map[int64]struct{}) (proxy.Target, error) {
-		currentSnapshot := s.registry.Snapshot()
-		currentPool, poolExists := currentSnapshot.PoolsByID[pool.ID]
-		currentClient, clientExists := currentSnapshot.Clients[client.ID]
-		if !poolExists || !currentPool.Enabled || currentPool.PublicModelName != pool.PublicModelName ||
-			currentPool.UpstreamModelName != pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
-			!currentSnapshot.Access[client.ID][pool.ID] {
-			return proxy.Target{}, routing.ErrNoBackend
+		excluded := make(map[int64]struct{}, len(exclude)+1)
+		for backendID := range exclude {
+			excluded[backendID] = struct{}{}
 		}
-		selectionTime := s.now().UTC()
-		candidates := make([]routing.Candidate, 0, len(currentSnapshot.BackendsByPool[pool.ID]))
-		for _, backend := range currentSnapshot.BackendsByPool[pool.ID] {
-			runtime := s.runtime.Snapshot(backend.ID, selectionTime)
-			_, secretOK := s.upstreamSecret(backend)
-			candidates = append(candidates, routing.Candidate{
-				Backend: backend, Pressure: runtime.Pressure, GatewayInflight: runtime.GatewayInflight,
-				Eligible: runtime.Healthy && runtime.MetricsFresh && secretOK,
-			})
+		for {
+			currentSnapshot := s.registry.Snapshot()
+			currentPool, poolExists := currentSnapshot.PoolsByID[pool.ID]
+			currentClient, clientExists := currentSnapshot.Clients[client.ID]
+			if !poolExists || !currentPool.Enabled || currentPool.PublicModelName != pool.PublicModelName ||
+				currentPool.UpstreamModelName != pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
+				!currentSnapshot.Access[client.ID][pool.ID] {
+				return proxy.Target{}, routing.ErrNoBackend
+			}
+			selectionTime := s.now().UTC()
+			candidates := make([]routing.Candidate, 0, len(currentSnapshot.BackendsByPool[pool.ID]))
+			for _, backend := range currentSnapshot.BackendsByPool[pool.ID] {
+				runtime := s.runtime.Snapshot(backend.ID, selectionTime)
+				_, secretOK := s.upstreamSecret(backend)
+				candidates = append(candidates, routing.Candidate{
+					Backend: backend, Pressure: runtime.Pressure, GatewayInflight: runtime.GatewayInflight,
+					Eligible: runtime.Healthy && runtime.MetricsFresh && runtime.CircuitAvailable && secretOK,
+				})
+			}
+			candidate, err := s.router.SelectWithSessionAffinity(candidates, excluded, affinityKey)
+			if err != nil {
+				return proxy.Target{}, err
+			}
+			completeBackend, acquired := s.runtime.AcquireBackend(candidate.Backend, selectionTime)
+			if !acquired {
+				excluded[candidate.Backend.ID] = struct{}{}
+				continue
+			}
+			secret, _ := s.upstreamSecret(candidate.Backend)
+			backendInflight := inflight
+			backendInflight.Backend = candidate.Backend.Name
+			event.Backend = candidate.Backend.Name
+			event.BackendPressure = candidate.Pressure
+			if s.observer != nil {
+				s.observer.BackendInflight(backendInflight, 1)
+			}
+			var once sync.Once
+			return proxy.Target{
+				Backend: candidate.Backend, UpstreamAPIKey: secret,
+				Complete: func(outcome domain.InferenceOutcome) {
+					once.Do(func() {
+						completeBackend(outcome)
+						if s.observer != nil {
+							s.observer.BackendInflight(backendInflight, -1)
+						}
+					})
+				},
+			}, nil
 		}
-		candidate, err := s.router.SelectWithSessionAffinity(candidates, exclude, affinityKey)
-		if err != nil {
-			return proxy.Target{}, err
-		}
-		secret, _ := s.upstreamSecret(candidate.Backend)
-		return proxy.Target{Backend: candidate.Backend, UpstreamAPIKey: secret}, nil
 	}
 
 	target, err := selectTarget(nil)
 	if err != nil {
 		return proxy.Result{}, backendUnavailable(s.retryAfter)
 	}
-	currentRelease, ok := s.runtime.IncrementInflight(target.Backend.ID)
-	if !ok {
-		return proxy.Result{}, backendUnavailable(s.retryAfter)
-	}
-	currentInflight := inflight
-	currentInflight.Backend = target.Backend.Name
-	event.Backend = target.Backend.Name
-	event.BackendPressure = s.runtime.Snapshot(target.Backend.ID, s.now().UTC()).Pressure
-	if s.observer != nil {
-		s.observer.BackendInflight(currentInflight, 1)
-	}
-	defer func() {
-		if currentRelease != nil {
-			if s.observer != nil {
-				s.observer.BackendInflight(currentInflight, -1)
-			}
-			currentRelease()
-		}
-	}()
 
 	headers := request.Headers.Clone()
 	headers.Del("X-Vllm-Priority")
@@ -272,27 +322,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		RequestID: request.RequestID, Priority: client.VLLMPriority, Target: target,
 	}
 	proxyRequest.SelectAlternate = func(exclude map[int64]struct{}) (proxy.Target, error) {
-		if s.observer != nil {
-			s.observer.BackendInflight(currentInflight, -1)
-		}
-		currentRelease()
-		currentRelease = nil
-		alternate, selectErr := selectTarget(exclude)
-		if selectErr != nil {
-			return proxy.Target{}, selectErr
-		}
-		release, incremented := s.runtime.IncrementInflight(alternate.Backend.ID)
-		if !incremented {
-			return proxy.Target{}, routing.ErrNoBackend
-		}
-		currentRelease = release
-		currentInflight.Backend = alternate.Backend.Name
-		event.Backend = alternate.Backend.Name
-		event.BackendPressure = s.runtime.Snapshot(alternate.Backend.ID, s.now().UTC()).Pressure
-		if s.observer != nil {
-			s.observer.BackendInflight(currentInflight, 1)
-		}
-		return alternate, nil
+		return selectTarget(exclude)
 	}
 	result = s.forwarder.Forward(ctx, writer, proxyRequest)
 	if result.Err != nil && !result.ResponseStarted {
@@ -302,6 +332,51 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 		return result, upstreamError()
 	}
 	return result, nil
+}
+
+func (s *Service) acquirePool(ctx context.Context, clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
+	for {
+		before := s.registry.Snapshot()
+		pool, valid := currentAdmissionPool(before, clientID, original)
+		if !valid {
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+		}
+		runtime := s.runtime.PoolSnapshot(pool.ID, s.now().UTC())
+		if runtime.State == domain.PoolUnavailable {
+			return runtime, nil, backendUnavailable(s.retryAfter)
+		}
+		if pool.MaxWaiting > 0 && runtime.TotalWaiting >= float64(pool.MaxWaiting) {
+			return runtime, nil, overloaded(s.retryAfter)
+		}
+		release, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
+		if !ok {
+			return runtime, nil, overloaded(s.retryAfter)
+		}
+
+		after := s.registry.Snapshot()
+		validatedPool, stillValid := currentAdmissionPool(after, clientID, original)
+		if !stillValid {
+			release()
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+		}
+		if validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
+			release()
+			if ctx.Err() != nil {
+				return runtime, nil, backendUnavailable(s.retryAfter)
+			}
+			continue
+		}
+		return runtime, release, nil
+	}
+}
+
+func currentAdmissionPool(snapshot *registry.Snapshot, clientID int64, original domain.ModelPool) (domain.ModelPool, bool) {
+	pool, poolExists := snapshot.PoolsByID[original.ID]
+	client, clientExists := snapshot.Clients[clientID]
+	valid := poolExists && pool.Enabled && pool.PublicModelName == original.PublicModelName &&
+		pool.UpstreamModelName == original.UpstreamModelName && clientExists && client.Enabled &&
+		snapshot.Access[clientID][pool.ID]
+	return pool, valid
 }
 
 func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIError) {

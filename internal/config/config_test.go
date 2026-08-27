@@ -50,6 +50,9 @@ func TestLoadUsesMVPDefaults(t *testing.T) {
 	if cfg.SessionAffinityMaxPressure != 1 {
 		t.Fatalf("SessionAffinityMaxPressure = %v, want 1", cfg.SessionAffinityMaxPressure)
 	}
+	if cfg.CircuitFailureThreshold != 5 || cfg.CircuitFailureWindow != 30*time.Second || cfg.CircuitOpenCooldown != 15*time.Second || cfg.CircuitHalfOpenMaxProbes != 1 {
+		t.Fatalf("circuit defaults = %+v", cfg)
+	}
 }
 
 func TestLoadRejectsMissingOrWeakSecrets(t *testing.T) {
@@ -101,6 +104,10 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	env["LLMGW_HEALTH_INTERVAL"] = "750ms"
 	env["LLMGW_REQUEST_BODY_LIMIT"] = "2097152"
 	env["LLMGW_SESSION_AFFINITY_MAX_PRESSURE"] = "0.85"
+	env["LLMGW_CIRCUIT_FAILURE_THRESHOLD"] = "7"
+	env["LLMGW_CIRCUIT_FAILURE_WINDOW"] = "45s"
+	env["LLMGW_CIRCUIT_OPEN_COOLDOWN"] = "20s"
+	env["LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES"] = "2"
 
 	cfg, err := config.Load(lookup(env))
 	if err != nil {
@@ -108,6 +115,36 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.ListenAddress != "127.0.0.1:9090" || cfg.HealthInterval != 750*time.Millisecond || cfg.RequestBodyLimit != 2<<20 || cfg.SessionAffinityMaxPressure != .85 {
 		t.Fatalf("overrides not applied: %+v", cfg)
+	}
+	if cfg.CircuitFailureThreshold != 7 || cfg.CircuitFailureWindow != 45*time.Second || cfg.CircuitOpenCooldown != 20*time.Second || cfg.CircuitHalfOpenMaxProbes != 2 {
+		t.Fatalf("circuit overrides not applied: %+v", cfg)
+	}
+}
+
+func TestLoadRejectsInvalidCircuitBreakerSettings(t *testing.T) {
+	tests := []struct {
+		name     string
+		variable string
+		value    string
+	}{
+		{name: "zero failure threshold", variable: "LLMGW_CIRCUIT_FAILURE_THRESHOLD", value: "0"},
+		{name: "negative failure threshold", variable: "LLMGW_CIRCUIT_FAILURE_THRESHOLD", value: "-1"},
+		{name: "zero failure window", variable: "LLMGW_CIRCUIT_FAILURE_WINDOW", value: "0s"},
+		{name: "negative failure window", variable: "LLMGW_CIRCUIT_FAILURE_WINDOW", value: "-1s"},
+		{name: "zero open cooldown", variable: "LLMGW_CIRCUIT_OPEN_COOLDOWN", value: "0s"},
+		{name: "negative open cooldown", variable: "LLMGW_CIRCUIT_OPEN_COOLDOWN", value: "-1s"},
+		{name: "zero half-open max probes", variable: "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", value: "0"},
+		{name: "negative half-open max probes", variable: "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", value: "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := validEnvironment()
+			env[tt.variable] = tt.value
+			if _, err := config.Load(lookup(env)); err == nil {
+				t.Fatalf("Load() accepted %s=%q", tt.variable, tt.value)
+			}
+		})
 	}
 }
 

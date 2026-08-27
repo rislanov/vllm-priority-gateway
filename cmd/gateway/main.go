@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/config"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
@@ -69,6 +70,10 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 		HTTPClient: upstreamClient, HealthInterval: cfg.HealthInterval, HealthTimeout: cfg.HealthTimeout,
 		MetricsInterval: cfg.MetricsInterval, MetricsTimeout: cfg.MetricsTimeout, StaleAfter: cfg.MetricsStaleAfter,
 		UnhealthyAfter: cfg.UnhealthyAfter, RecoveryAfter: cfg.RecoveryAfter,
+		Circuit: circuitbreaker.Options{
+			FailureThreshold: cfg.CircuitFailureThreshold, FailureWindow: cfg.CircuitFailureWindow,
+			OpenCooldown: cfg.CircuitOpenCooldown, HalfOpenMaxProbes: cfg.CircuitHalfOpenMaxProbes,
+		},
 		Limits:     pressure.Limits{QueueSoft: cfg.QueueSoftLimit, KVSoft: cfg.KVSoftLimit, KVHard: cfg.KVHardLimit},
 		EWMAWindow: cfg.EWMAWindow, BusyThreshold: cfg.BusyThreshold, SaturatedThreshold: cfg.SaturatedThreshold,
 		PoolThresholds: pressure.Thresholds{
@@ -128,6 +133,8 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 			"status": "ready", "revision": view.Revision, "backendAvailability": availableBackends(view),
 		})
 	})
+	inferenceReadinessHandler := httpapi.NewInferenceReadinessHandler(service)
+	router.Get("/inference-readyz", inferenceReadinessHandler.ServeHTTP)
 	router.Handle("/metrics", metrics.Handler())
 	router.Handle("/v1", publicHandler)
 	router.Handle("/v1/*", publicHandler)
@@ -190,17 +197,51 @@ func availableBackends(view httpapi.AdminView) int {
 	return count
 }
 
+type runtimeMetrics interface {
+	PoolSnapshot(int64, time.Time) domain.PoolRuntime
+	Snapshot(int64, time.Time) domain.BackendRuntime
+}
+
+func publishRuntimeMetrics(metrics *observability.Metrics, snapshot *registry.Snapshot, runtime runtimeMetrics, at time.Time) {
+	pools := make([]observability.PoolRuntimeMetric, 0, len(snapshot.PoolsByID))
+	for _, pool := range snapshot.PoolsByID {
+		pools = append(pools, observability.PoolRuntimeMetric{
+			Model: pool.PublicModelName, Runtime: runtime.PoolSnapshot(pool.ID, at),
+		})
+	}
+	backends := make([]observability.BackendRuntimeMetric, 0, len(snapshot.BackendsByID))
+	for _, backend := range snapshot.BackendsByID {
+		pool := snapshot.PoolsByID[backend.ModelPoolID]
+		backends = append(backends, observability.BackendRuntimeMetric{
+			Model: pool.PublicModelName, Backend: backend.Name, Runtime: runtime.Snapshot(backend.ID, at),
+		})
+	}
+	inflight := make([]observability.InflightRuntimeLabels, 0)
+	for clientID, access := range snapshot.Access {
+		client, exists := snapshot.Clients[clientID]
+		if !exists || !client.Enabled {
+			continue
+		}
+		for poolID, allowed := range access {
+			pool, exists := snapshot.PoolsByID[poolID]
+			if !allowed || !exists || !pool.Enabled {
+				continue
+			}
+			inflight = append(inflight, observability.InflightRuntimeLabels{
+				Client: client.Name, Model: pool.PublicModelName, PriorityClass: client.PriorityClass,
+			})
+		}
+	}
+	metrics.PublishRuntime(pools, backends, inflight)
+}
+
 func updateBackendMetrics(ctx context.Context, metrics *observability.Metrics, registryValue *registry.Registry, manager *monitor.Manager, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case at := <-ticker.C:
-			snapshot := registryValue.Snapshot()
-			for _, backend := range snapshot.BackendsByID {
-				pool := snapshot.PoolsByID[backend.ModelPoolID]
-				metrics.SetBackend(pool.PublicModelName, backend.Name, manager.Snapshot(backend.ID, at))
-			}
+			publishRuntimeMetrics(metrics, registryValue.Snapshot(), manager, at)
 		case <-ctx.Done():
 			return
 		}

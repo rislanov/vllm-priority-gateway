@@ -11,14 +11,14 @@
 </section>
 <section>
   <h2>Pools</h2>
-  <div class="table-wrap"><table><thead><tr><th>Pool</th><th>State</th><th>Pressure</th><th>Available</th></tr></thead><tbody>
-  {{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong><small>{{.UpstreamModelName}}</small></td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.BestBackendPressure}}</td><td class="mono">{{.Runtime.AvailableBackends}}</td></tr>{{else}}<tr><td colspan="4" class="empty">No model pools configured.</td></tr>{{end}}
+  <div class="table-wrap"><table><thead><tr><th>Pool</th><th>State</th><th>Pressure</th><th>Gateway inflight</th><th>Waiting</th><th>Available</th><th>Max gateway inflight</th><th>Max waiting</th></tr></thead><tbody>
+  {{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong><small>{{.UpstreamModelName}}</small></td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.BestBackendPressure}}</td><td class="mono">{{.Runtime.GatewayInflight}}</td><td class="mono">{{decimal .Runtime.TotalWaiting}}</td><td class="mono">{{.Runtime.AvailableBackends}}</td><td class="mono">{{.MaxGatewayInflight}}</td><td class="mono">{{.MaxWaiting}}</td></tr>{{else}}<tr><td colspan="8" class="empty">No model pools configured.</td></tr>{{end}}
   </tbody></table></div>
 </section>
 <section>
   <h2>Backends</h2>
-  <div class="table-wrap"><table><thead><tr><th>Backend</th><th>State</th><th>Running</th><th>Waiting</th><th>KV cache</th><th>Pressure</th></tr></thead><tbody>
-  {{range .View.Backends}}<tr><td><strong>{{.Name}}</strong><small>{{.ModelPool}}</small></td><td class="{{stateClass .Runtime.State}}">{{if .Draining}}draining{{else}}{{.Runtime.State}}{{end}}</td><td class="mono">{{decimal .Runtime.Running}}</td><td class="mono">{{decimal .Runtime.Waiting}}</td><td class="mono">{{percent .Runtime.KVCacheUsage}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td></tr>{{else}}<tr><td colspan="6" class="empty">No backends configured.</td></tr>{{end}}
+  <div class="table-wrap"><table><thead><tr><th>Backend</th><th>State</th><th>Circuit</th><th>Running</th><th>Waiting</th><th>KV cache</th><th>Pressure</th></tr></thead><tbody>
+  {{range .View.Backends}}<tr><td><strong>{{.Name}}</strong><small>{{.ModelPool}}</small></td><td class="{{stateClass .Runtime.State}}">{{if .Draining}}draining{{else}}{{.Runtime.State}}{{end}}</td><td class="mono">{{.Runtime.CircuitState}}</td><td class="mono">{{decimal .Runtime.Running}}</td><td class="mono">{{decimal .Runtime.Waiting}}</td><td class="mono">{{percent .Runtime.KVCacheUsage}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td></tr>{{else}}<tr><td colspan="7" class="empty">No backends configured.</td></tr>{{end}}
   </tbody></table></div>
 </section>
 {{end}}

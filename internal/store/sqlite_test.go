@@ -3,15 +3,22 @@ package store_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
+	_ "embed"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
+
+//go:embed migrations/001_initial.sql
+var initialMigration string
 
 func openTestDB(t *testing.T) *store.SQLite {
 	t.Helper()
@@ -38,6 +45,9 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
 	}
+	if got := sqliteUserVersion(t, path); got != 2 {
+		t.Fatalf("fresh database user_version = %d, want 2", got)
+	}
 
 	db, err = store.Open(context.Background(), path)
 	if err != nil {
@@ -56,12 +66,266 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	}
 }
 
+func TestSQLiteMigratesVersionOnePoolSafetyDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	createLegacyPoolDatabase(t, path, 1)
+
+	db, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Open() v1 database error = %v", err)
+	}
+	pools, err := db.ListPools(context.Background())
+	if err != nil {
+		t.Fatalf("ListPools() error = %v", err)
+	}
+	if len(pools) != 1 {
+		t.Fatalf("ListPools() length = %d, want 1", len(pools))
+	}
+	pool := pools[0]
+	if pool.PublicModelName != "legacy-public" || pool.UpstreamModelName != "legacy-upstream" {
+		t.Fatalf("migrated pool = %+v", pool)
+	}
+	if pool.MaxGatewayInflight != 0 || pool.MaxWaiting != 0 {
+		t.Fatalf("migrated safety limits = (%d, %d), want (0, 0)", pool.MaxGatewayInflight, pool.MaxWaiting)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() migrated database error = %v", err)
+	}
+	if got := sqliteUserVersion(t, path); got != 2 {
+		t.Fatalf("migrated user_version = %d, want 2", got)
+	}
+
+	db, err = store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("reopen migrated database error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() reopened database error = %v", err)
+	}
+}
+
+func TestSQLiteMigrationRollsBackWhenSecondStatementFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	createLegacyPoolDatabase(t, path, 1)
+
+	legacyDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacyDB.Exec(`
+		ALTER TABLE model_pools ADD COLUMN max_waiting INTEGER NOT NULL DEFAULT 0 CHECK (max_waiting >= 0);
+		UPDATE model_pools SET max_waiting = 23;`); err != nil {
+		legacyDB.Close()
+		t.Fatalf("prepare conflicting v1 schema: %v", err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("close conflicting v1 database: %v", err)
+	}
+
+	if db, err := store.Open(context.Background(), path); err == nil {
+		db.Close()
+		t.Fatal("Open() succeeded despite duplicate max_waiting column")
+	} else if !strings.Contains(err.Error(), "duplicate column name: max_waiting") {
+		t.Fatalf("Open() error = %v, want duplicate max_waiting failure from second ALTER", err)
+	}
+
+	inspectDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open database after failed migration: %v", err)
+	}
+	defer inspectDB.Close()
+
+	var version int
+	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version after failed migration: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("user_version after failed migration = %d, want 1", version)
+	}
+
+	rows, err := inspectDB.Query("PRAGMA table_info(model_pools)")
+	if err != nil {
+		t.Fatalf("inspect model_pools schema: %v", err)
+	}
+	defer rows.Close()
+	var hasMaxGatewayInflight, hasMaxWaiting bool
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan model_pools column: %v", err)
+		}
+		hasMaxGatewayInflight = hasMaxGatewayInflight || name == "max_gateway_inflight"
+		hasMaxWaiting = hasMaxWaiting || name == "max_waiting"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate model_pools schema: %v", err)
+	}
+	if hasMaxGatewayInflight {
+		t.Fatal("max_gateway_inflight persisted despite migration rollback")
+	}
+	if !hasMaxWaiting {
+		t.Fatal("pre-existing max_waiting column was lost after migration rollback")
+	}
+
+	var publicModelName, upstreamModelName string
+	var maxWaiting int
+	if err := inspectDB.QueryRow(`
+		SELECT public_model_name, upstream_model_name, max_waiting
+		FROM model_pools`).Scan(&publicModelName, &upstreamModelName, &maxWaiting); err != nil {
+		t.Fatalf("read legacy pool after failed migration: %v", err)
+	}
+	if publicModelName != "legacy-public" || upstreamModelName != "legacy-upstream" || maxWaiting != 23 {
+		t.Fatalf("legacy pool after failed migration = (%q, %q, %d)", publicModelName, upstreamModelName, maxWaiting)
+	}
+}
+
+func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	db, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("create current database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close current database: %v", err)
+	}
+
+	futureDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open future database: %v", err)
+	}
+	if _, err := futureDB.Exec(`
+		INSERT INTO model_pools (
+			public_model_name, upstream_model_name, enabled,
+			max_gateway_inflight, max_waiting, created_at, updated_at
+		) VALUES (
+			'future-public', 'future-upstream', 1,
+			17, 9, '2026-08-27T00:00:00Z', '2026-08-27T00:00:00Z'
+		);
+		CREATE TABLE future_schema_marker (value TEXT NOT NULL);
+		INSERT INTO future_schema_marker (value) VALUES ('preserve-me');
+		PRAGMA user_version = 3;`); err != nil {
+		futureDB.Close()
+		t.Fatalf("prepare future database: %v", err)
+	}
+	if err := futureDB.Close(); err != nil {
+		t.Fatalf("close future database: %v", err)
+	}
+
+	if opened, err := store.Open(context.Background(), path); err == nil {
+		opened.Close()
+		t.Fatal("Open() succeeded for future schema version 3")
+	} else if !strings.Contains(err.Error(), "SQLite schema version 3 is newer than supported version 2") {
+		t.Fatalf("Open() error = %v, want future schema rejection", err)
+	}
+
+	inspectDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open rejected future database: %v", err)
+	}
+	defer inspectDB.Close()
+
+	var version int
+	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read rejected user_version: %v", err)
+	}
+	if version != 3 {
+		t.Fatalf("rejected user_version = %d, want 3", version)
+	}
+
+	var publicModelName, upstreamModelName, marker string
+	var maxGatewayInflight, maxWaiting int
+	if err := inspectDB.QueryRow(`
+		SELECT public_model_name, upstream_model_name, max_gateway_inflight, max_waiting
+		FROM model_pools WHERE public_model_name = 'future-public'`).Scan(
+		&publicModelName, &upstreamModelName, &maxGatewayInflight, &maxWaiting,
+	); err != nil {
+		t.Fatalf("read pool from rejected future database: %v", err)
+	}
+	if publicModelName != "future-public" || upstreamModelName != "future-upstream" ||
+		maxGatewayInflight != 17 || maxWaiting != 9 {
+		t.Fatalf("future pool after rejection = (%q, %q, %d, %d)",
+			publicModelName, upstreamModelName, maxGatewayInflight, maxWaiting)
+	}
+	if err := inspectDB.QueryRow("SELECT value FROM future_schema_marker").Scan(&marker); err != nil {
+		t.Fatalf("read future schema marker after rejection: %v", err)
+	}
+	if marker != "preserve-me" {
+		t.Fatalf("future schema marker after rejection = %q, want preserve-me", marker)
+	}
+}
+
+func TestSQLiteMigratesLegacyVersionZeroDatabaseWithExistingTables(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	createLegacyPoolDatabase(t, path, 0)
+
+	db, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Open() legacy version-zero database error = %v", err)
+	}
+	defer db.Close()
+	pools, err := db.ListPools(context.Background())
+	if err != nil {
+		t.Fatalf("ListPools() error = %v", err)
+	}
+	if len(pools) != 1 || pools[0].PublicModelName != "legacy-public" {
+		t.Fatalf("legacy pool was not preserved: %+v", pools)
+	}
+	if pools[0].MaxGatewayInflight != 0 || pools[0].MaxWaiting != 0 {
+		t.Fatalf("legacy safety limits = (%d, %d), want (0, 0)", pools[0].MaxGatewayInflight, pools[0].MaxWaiting)
+	}
+	if got := sqliteUserVersion(t, path); got != 2 {
+		t.Fatalf("legacy user_version = %d, want 2", got)
+	}
+}
+
+func createLegacyPoolDatabase(t *testing.T, path string, version int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(initialMigration); err != nil {
+		db.Close()
+		t.Fatalf("apply initial migration: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, created_at, updated_at)
+		VALUES ('legacy-public', 'legacy-upstream', 1, '2026-08-27T00:00:00Z', '2026-08-27T00:00:00Z')`); err != nil {
+		db.Close()
+		t.Fatalf("insert legacy pool: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = " + strconv.Itoa(version)); err != nil {
+		db.Close()
+		t.Fatalf("set legacy user_version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+}
+
+func sqliteUserVersion(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	return version
+}
+
 func TestSQLiteCRUDSnapshotAndRevision(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
 	pool, err := db.CreatePool(ctx, store.CreatePoolParams{
 		PublicModelName: "qwen-coder", UpstreamModelName: "Qwen/Qwen3-Coder-Next", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
 	})
 	if err != nil {
 		t.Fatalf("CreatePool() error = %v", err)
@@ -110,6 +374,9 @@ func TestSQLiteCRUDSnapshotAndRevision(t *testing.T) {
 	}
 	if !data.Backends[0].Draining {
 		t.Fatal("backend draining state was not persisted")
+	}
+	if data.Pools[0].MaxGatewayInflight != 17 || data.Pools[0].MaxWaiting != 9 {
+		t.Fatalf("pool safety snapshot = (%d, %d), want (17, 9)", data.Pools[0].MaxGatewayInflight, data.Pools[0].MaxWaiting)
 	}
 }
 

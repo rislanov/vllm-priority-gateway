@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -36,7 +37,11 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	})
 	metrics.SetBackend("qwen", "gpu-1", domain.BackendRuntime{
 		Pressure: .4, Running: 3, Waiting: 1, KVCacheUsage: .7,
+		CircuitState: domain.CircuitClosed, CircuitFailures: 4,
 	})
+	metrics.SetBackend("qwen", "gpu-open", domain.BackendRuntime{CircuitState: domain.CircuitOpen})
+	metrics.SetBackend("qwen", "gpu-half-open", domain.BackendRuntime{CircuitState: domain.CircuitHalfOpen})
+	metrics.SetPool("qwen", domain.PoolRuntime{GatewayInflight: 3, TotalWaiting: 2.5, AvailableBackends: 2})
 
 	server := httptest.NewServer(metrics.Handler())
 	defer server.Close()
@@ -52,7 +57,9 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		"llmgw_client_inflight", "llmgw_backend_requests_inflight", "llmgw_backend_pressure",
 		"llmgw_backend_running_requests", "llmgw_backend_waiting_requests", "llmgw_backend_kv_cache_usage",
 		"llmgw_request_duration_seconds", "llmgw_ttft_seconds", "llmgw_stream_disconnects_total",
-		"llmgw_backend_failures_total", "llmgw_retries_total",
+		"llmgw_backend_failures_total", "llmgw_retries_total", "llmgw_backend_circuit_state",
+		"llmgw_backend_circuit_failures", "llmgw_pool_gateway_inflight",
+		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends",
 	} {
 		if !strings.Contains(text, family) {
 			t.Fatalf("metrics missing %s:\n%s", family, text)
@@ -61,4 +68,54 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	if strings.Contains(text, "request-id-must-not-be-a-label") || strings.Contains(text, "llmgw_abcd") {
 		t.Fatalf("high-cardinality or secret label leaked:\n%s", text)
 	}
+	for _, sample := range []string{
+		`llmgw_backend_circuit_state{backend="gpu-1",model="qwen"} 0`,
+		`llmgw_backend_circuit_state{backend="gpu-open",model="qwen"} 1`,
+		`llmgw_backend_circuit_state{backend="gpu-half-open",model="qwen"} 2`,
+		`llmgw_backend_circuit_failures{backend="gpu-1",model="qwen"} 4`,
+		`llmgw_pool_gateway_inflight{model="qwen"} 3`,
+		`llmgw_pool_waiting_requests{model="qwen"} 2.5`,
+		`llmgw_pool_available_backends{model="qwen"} 2`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("metrics missing sample %q:\n%s", sample, text)
+		}
+	}
+}
+
+func TestMetricsUnmanagedCircuitEncodingFollowsTopologyLifecycle(t *testing.T) {
+	metrics := observability.NewMetrics()
+	backend := observability.BackendRuntimeMetric{
+		Model: "qwen", Backend: "gpu-disabled", Runtime: domain.BackendRuntime{BackendID: 7},
+	}
+	metrics.PublishRuntime(nil, []observability.BackendRuntimeMetric{backend}, nil)
+	text := scrapeRuntimeMetrics(t, metrics)
+	for _, sample := range []string{
+		`# HELP llmgw_backend_circuit_state Backend circuit state (unmanaged/unknown=-1, closed=0, open=1, half_open=2).`,
+		`llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"} -1`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("unmanaged circuit metrics missing %q:\n%s", sample, text)
+		}
+	}
+
+	metrics.PublishRuntime(nil, nil, nil)
+	text = scrapeRuntimeMetrics(t, metrics)
+	if strings.Contains(text, `llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"}`) {
+		t.Fatalf("removed unmanaged circuit series survived topology cleanup:\n%s", text)
+	}
+
+	backend.Runtime.CircuitState = domain.CircuitClosed
+	metrics.PublishRuntime(nil, []observability.BackendRuntimeMetric{backend}, nil)
+	text = scrapeRuntimeMetrics(t, metrics)
+	if sample := `llmgw_backend_circuit_state{backend="gpu-disabled",model="qwen"} 0`; !strings.Contains(text, sample) {
+		t.Fatalf("recreated managed closed circuit sample missing %q:\n%s", sample, text)
+	}
+}
+
+func scrapeRuntimeMetrics(t *testing.T, metrics *observability.Metrics) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return response.Body.String()
 }

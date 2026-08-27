@@ -17,7 +17,12 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
+	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
+	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
+	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
+	"github.com/rislanov/vllm-priority-gateway/internal/web"
 )
 
 func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
@@ -31,6 +36,274 @@ func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
 	if destination.keyID != 7 || !destination.usedAt.Equal(usedAt) || projection.keyID != 7 || !projection.usedAt.Equal(usedAt) {
 		t.Fatalf("destination=%+v projection=%+v", destination, projection)
 	}
+}
+
+func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
+	metrics := observability.NewMetrics()
+	snapshot := &registry.Snapshot{
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-a", Enabled: true},
+		},
+	}
+	runtime := runtimeMetricsStub{
+		pool: domain.PoolRuntime{PoolID: 10, GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1},
+		backend: domain.BackendRuntime{
+			BackendID: 20, CircuitState: domain.CircuitOpen, CircuitFailures: 5,
+		},
+	}
+	publishRuntimeMetrics(metrics, snapshot, runtime, time.Unix(1_700_000_000, 0))
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text := response.Body.String()
+	for _, sample := range []string{
+		`llmgw_backend_circuit_state{backend="gpu-a",model="qwen"} 1`,
+		`llmgw_backend_circuit_failures{backend="gpu-a",model="qwen"} 5`,
+		`llmgw_pool_gateway_inflight{model="qwen"} 4`,
+		`llmgw_pool_waiting_requests{model="qwen"} 6`,
+		`llmgw_pool_available_backends{model="qwen"} 1`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("published metrics missing %q:\n%s", sample, text)
+		}
+	}
+}
+
+func TestPublishRuntimeMetricsRemovesInflightSeriesObservedBeforeFirstEmptyPublication(t *testing.T) {
+	metrics := observability.NewMetrics()
+	inflight := gateway.InflightEvent{
+		Client: "removed-client", Model: "removed-model", Backend: "removed-backend",
+		PriorityClass: domain.PriorityHigh,
+	}
+	metrics.ClientInflight(inflight, 1)
+	metrics.BackendInflight(inflight, 1)
+	metrics.ClientInflight(inflight, -1)
+	metrics.BackendInflight(inflight, -1)
+
+	publishRuntimeMetrics(metrics, &registry.Snapshot{
+		Clients: map[int64]domain.Client{}, PoolsByID: map[int64]domain.ModelPool{},
+		BackendsByID: map[int64]domain.Backend{}, Access: map[int64]map[int64]bool{},
+	}, runtimeMetricsMapStub{}, time.Unix(1_700_000_000, 0))
+
+	text := scrapeMetrics(t, metrics)
+	for _, stale := range []string{
+		`llmgw_requests_inflight{model="removed-model",priority_class="high"}`,
+		`llmgw_client_inflight{client="removed-client",model="removed-model",priority_class="high"}`,
+		`llmgw_backend_requests_inflight{backend="removed-backend",model="removed-model"}`,
+	} {
+		if strings.Contains(text, stale) {
+			t.Fatalf("pre-publication inflight sample %q survived empty topology:\n%s", stale, text)
+		}
+	}
+}
+
+func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.T) {
+	metrics := observability.NewMetrics()
+	first := &registry.Snapshot{
+		Clients: map[int64]domain.Client{
+			1: {ID: 1, Name: "client-old", Enabled: true, PriorityClass: domain.PriorityHigh},
+			2: {ID: 2, Name: "removed-client", Enabled: true, PriorityClass: domain.PriorityBackground},
+		},
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen-old", Enabled: true},
+			11: {ID: 11, PublicModelName: "removed-pool", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-old", Enabled: true},
+			21: {ID: 21, ModelPoolID: 11, Name: "removed-gpu", Enabled: true},
+		},
+		Access: map[int64]map[int64]bool{
+			1: {10: true},
+			2: {11: true},
+		},
+	}
+	runtime := runtimeMetricsMapStub{
+		pools: map[int64]domain.PoolRuntime{
+			10: {PoolID: 10, GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1},
+			11: {PoolID: 11, GatewayInflight: 2, TotalWaiting: 8},
+		},
+		backends: map[int64]domain.BackendRuntime{
+			20: {BackendID: 20, Pressure: .4, Running: 3, Waiting: 1, KVCacheUsage: .7, CircuitState: domain.CircuitOpen, CircuitFailures: 5},
+			21: {BackendID: 21, CircuitState: domain.CircuitOpen, CircuitFailures: 2},
+		},
+	}
+	at := time.Unix(1_700_000_000, 0)
+	publishRuntimeMetrics(metrics, first, runtime, at)
+	oldClientInflight := gateway.InflightEvent{
+		Client: "client-old", Model: "qwen-old", PriorityClass: domain.PriorityHigh,
+	}
+	removedClientInflight := gateway.InflightEvent{
+		Client: "removed-client", Model: "removed-pool", PriorityClass: domain.PriorityBackground,
+	}
+	metrics.ClientInflight(oldClientInflight, 1)
+	metrics.ClientInflight(removedClientInflight, 1)
+	metrics.ClientInflight(removedClientInflight, -1)
+	oldInflight := gateway.InflightEvent{Model: "qwen-old", Backend: "gpu-old"}
+	metrics.BackendInflight(oldInflight, 1)
+	metrics.Complete(gateway.RequestEvent{
+		Client: "client-a", Model: "qwen-old", Backend: "gpu-old",
+		PriorityClass: domain.PriorityHigh, Status: http.StatusOK, Duration: time.Second,
+	})
+
+	second := &registry.Snapshot{
+		Clients: map[int64]domain.Client{
+			1: {ID: 1, Name: "client-new", Enabled: true, PriorityClass: domain.PriorityNormal},
+		},
+		PoolsByID: map[int64]domain.ModelPool{
+			10: {ID: 10, PublicModelName: "qwen-new", Enabled: true},
+		},
+		BackendsByID: map[int64]domain.Backend{
+			20: {ID: 20, ModelPoolID: 10, Name: "gpu-new", Enabled: true},
+		},
+		Access: map[int64]map[int64]bool{1: {10: true}},
+	}
+	runtime.pools[10] = domain.PoolRuntime{PoolID: 10, GatewayInflight: 1, TotalWaiting: 2, AvailableBackends: 1}
+	runtime.backends[20] = domain.BackendRuntime{
+		BackendID: 20, Pressure: .2, Running: 1, KVCacheUsage: .5,
+		CircuitState: domain.CircuitHalfOpen, CircuitFailures: 1,
+	}
+	publishRuntimeMetrics(metrics, second, runtime, at.Add(time.Second))
+	metrics.ClientInflight(oldClientInflight, -1)
+	metrics.BackendInflight(oldInflight, -1)
+	newInflight := gateway.InflightEvent{Model: "qwen-new", Backend: "gpu-new"}
+	metrics.BackendInflight(newInflight, 1)
+	metrics.BackendInflight(newInflight, -1)
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text := response.Body.String()
+	for _, stale := range []string{
+		`llmgw_requests_inflight{model="qwen-old",priority_class="high"}`,
+		`llmgw_client_inflight{client="client-old",model="qwen-old",priority_class="high"}`,
+		`llmgw_requests_inflight{model="removed-pool",priority_class="background"}`,
+		`llmgw_client_inflight{client="removed-client",model="removed-pool",priority_class="background"}`,
+		`llmgw_backend_requests_inflight{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_pressure{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_running_requests{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_waiting_requests{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_kv_cache_usage{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_circuit_state{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_backend_circuit_failures{backend="gpu-old",model="qwen-old"}`,
+		`llmgw_pool_gateway_inflight{model="qwen-old"}`,
+		`llmgw_pool_waiting_requests{model="qwen-old"}`,
+		`llmgw_pool_available_backends{model="qwen-old"}`,
+		`llmgw_backend_circuit_state{backend="removed-gpu",model="removed-pool"}`,
+		`llmgw_pool_gateway_inflight{model="removed-pool"}`,
+	} {
+		if strings.Contains(text, stale) {
+			t.Fatalf("stale topology sample %q survived rename/removal:\n%s", stale, text)
+		}
+	}
+	for _, current := range []string{
+		`llmgw_requests_inflight{model="qwen-new",priority_class="normal"} 0`,
+		`llmgw_client_inflight{client="client-new",model="qwen-new",priority_class="normal"} 0`,
+		`llmgw_backend_requests_inflight{backend="gpu-new",model="qwen-new"} 0`,
+		`llmgw_backend_pressure{backend="gpu-new",model="qwen-new"} 0.2`,
+		`llmgw_backend_running_requests{backend="gpu-new",model="qwen-new"} 1`,
+		`llmgw_backend_waiting_requests{backend="gpu-new",model="qwen-new"} 0`,
+		`llmgw_backend_kv_cache_usage{backend="gpu-new",model="qwen-new"} 0.5`,
+		`llmgw_backend_circuit_state{backend="gpu-new",model="qwen-new"} 2`,
+		`llmgw_backend_circuit_failures{backend="gpu-new",model="qwen-new"} 1`,
+		`llmgw_pool_gateway_inflight{model="qwen-new"} 1`,
+		`llmgw_pool_waiting_requests{model="qwen-new"} 2`,
+		`llmgw_pool_available_backends{model="qwen-new"} 1`,
+		`llmgw_requests_total{client="client-a",model="qwen-old",priority_class="high",status_class="2xx"} 1`,
+	} {
+		if !strings.Contains(text, current) {
+			t.Fatalf("current or historical sample %q missing after reconciliation:\n%s", current, text)
+		}
+	}
+}
+
+func scrapeMetrics(t *testing.T, metrics *observability.Metrics) string {
+	t.Helper()
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return response.Body.String()
+}
+
+func TestAdminDashboardRendersPoolSafetyAndCircuitRuntime(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	pool, err := database.CreatePool(context.Background(), store.CreatePoolParams{
+		PublicModelName: "qwen", UpstreamModelName: "fake-model", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateBackend(context.Background(), store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://gpu-a.invalid", Enabled: true,
+		CapacityHint: 1, RunningSoftLimit: 16,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := runtimeMetricsStub{
+		pool: domain.PoolRuntime{
+			PoolID: pool.ID, State: domain.PoolBusy, GatewayInflight: 37,
+			TotalWaiting: 41.5, AvailableBackends: 2,
+		},
+		backend: domain.BackendRuntime{
+			State: domain.BackendHealthy, Healthy: true, MetricsFresh: true,
+			CircuitState: domain.CircuitHalfOpen, CircuitAvailable: true,
+		},
+	}
+	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Registry: registryValue, Runtime: runtime,
+		HMACSecret: []byte(strings.Repeat("h", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := web.New(adminService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d body=%s", response.Code, response.Body.String())
+	}
+	text := response.Body.String()
+	for _, fragment := range []string{
+		"Gateway inflight", "Waiting", "Available", ">37<", ">41.50<", ">2<", "Circuit", "half_open",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("dashboard missing server-rendered %q:\n%s", fragment, text)
+		}
+	}
+}
+
+type runtimeMetricsStub struct {
+	pool    domain.PoolRuntime
+	backend domain.BackendRuntime
+}
+
+func (s runtimeMetricsStub) PoolSnapshot(int64, time.Time) domain.PoolRuntime { return s.pool }
+func (s runtimeMetricsStub) Snapshot(int64, time.Time) domain.BackendRuntime  { return s.backend }
+func (runtimeMetricsStub) Reconcile([]domain.Backend) error                   { return nil }
+
+type runtimeMetricsMapStub struct {
+	pools    map[int64]domain.PoolRuntime
+	backends map[int64]domain.BackendRuntime
+}
+
+func (s runtimeMetricsMapStub) PoolSnapshot(id int64, _ time.Time) domain.PoolRuntime {
+	return s.pools[id]
+}
+
+func (s runtimeMetricsMapStub) Snapshot(id int64, _ time.Time) domain.BackendRuntime {
+	return s.backends[id]
 }
 
 func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
@@ -79,6 +352,24 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	readyResponse.Body.Close()
 	if readyResponse.StatusCode != http.StatusOK || readiness.Status != "ready" || readiness.Revision != 0 || readiness.BackendAvailability != 0 {
 		t.Fatalf("readiness = %d %+v", readyResponse.StatusCode, readiness)
+	}
+	inferenceResponse, err := client.Get("http://" + listener.Addr().String() + "/inference-readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inferenceReadiness struct {
+		Status              string `json:"status"`
+		Revision            int64  `json:"revision"`
+		PoolAvailability    int    `json:"poolAvailability"`
+		BackendAvailability int    `json:"backendAvailability"`
+	}
+	if err := json.NewDecoder(inferenceResponse.Body).Decode(&inferenceReadiness); err != nil {
+		t.Fatal(err)
+	}
+	inferenceResponse.Body.Close()
+	if inferenceResponse.StatusCode != http.StatusServiceUnavailable || inferenceReadiness.Status != "unavailable" ||
+		inferenceReadiness.Revision != 0 || inferenceReadiness.PoolAvailability != 0 || inferenceReadiness.BackendAvailability != 0 {
+		t.Fatalf("inference readiness = %d %+v", inferenceResponse.StatusCode, inferenceReadiness)
 	}
 
 	cancel()
