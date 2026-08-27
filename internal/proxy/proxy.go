@@ -127,12 +127,13 @@ func (p *Proxy) forwardOnce(
 
 	buffer := make([]byte, 32<<10)
 	count, readErr := response.Body.Read(buffer)
+	provenReadFailure := readErr != nil && !errors.Is(readErr, io.EOF) && ctx.Err() == nil
 	if count == 0 && readErr != nil && !errors.Is(readErr, io.EOF) {
 		result.Err = readErr
 		if ctx.Err() != nil {
 			result.Err = ctx.Err()
 			result.Cancelled = true
-			return result, false, interruptedOutcome(response.StatusCode, nil, true)
+			return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 		}
 		return result, response.StatusCode >= 200 && response.StatusCode < 300, domain.InferenceFailure
 	}
@@ -152,7 +153,7 @@ func (p *Proxy) forwardOnce(
 			}
 			result.Err = writeErr
 			result.Cancelled = ctx.Err() != nil
-			return result, false, interruptedOutcome(response.StatusCode, readErr, result.Cancelled)
+			return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 		}
 	}
 	if readErr != nil {
@@ -160,7 +161,7 @@ func (p *Proxy) forwardOnce(
 			result.Err = readErr
 			result.Cancelled = ctx.Err() != nil
 			if result.Cancelled {
-				return result, false, interruptedOutcome(response.StatusCode, nil, true)
+				return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 			}
 			return result, false, domain.InferenceFailure
 		}
@@ -169,6 +170,7 @@ func (p *Proxy) forwardOnce(
 
 	for {
 		count, readErr = response.Body.Read(buffer)
+		provenReadFailure = readErr != nil && !errors.Is(readErr, io.EOF) && ctx.Err() == nil
 		if count > 0 {
 			written, writeErr := downstream.Write(buffer[:count])
 			result.BytesSent += int64(written)
@@ -179,7 +181,7 @@ func (p *Proxy) forwardOnce(
 				}
 				result.Err = writeErr
 				result.Cancelled = ctx.Err() != nil
-				return result, false, interruptedOutcome(response.StatusCode, readErr, result.Cancelled)
+				return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 			}
 		}
 		if readErr != nil {
@@ -187,7 +189,7 @@ func (p *Proxy) forwardOnce(
 				result.Err = readErr
 				result.Cancelled = ctx.Err() != nil
 				if result.Cancelled {
-					return result, false, interruptedOutcome(response.StatusCode, nil, true)
+					return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 				}
 				return result, false, domain.InferenceFailure
 			}
@@ -203,8 +205,8 @@ func completedOutcome(status int) domain.InferenceOutcome {
 	return domain.InferenceSuccess
 }
 
-func interruptedOutcome(status int, readErr error, cancelled bool) domain.InferenceOutcome {
-	if status >= http.StatusInternalServerError || (!cancelled && readErr != nil && !errors.Is(readErr, io.EOF)) {
+func interruptedOutcome(status int, provenReadFailure bool) domain.InferenceOutcome {
+	if status >= http.StatusInternalServerError || provenReadFailure {
 		return domain.InferenceFailure
 	}
 	return domain.InferenceNeutral

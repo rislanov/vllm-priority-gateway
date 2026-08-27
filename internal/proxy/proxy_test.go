@@ -267,6 +267,37 @@ func TestForwardClassifiesBodyReadFailureBeforeDownstreamWriteFailureAsFailure(t
 	}
 }
 
+func TestForwardPreservesProvenBodyReadFailureWhenWriteCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       partialReadFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	var selections atomic.Int64
+	result := proxy.New(client).Forward(ctx, &cancelWriteFailWriter{header: make(http.Header), cancel: cancel}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, nil
+		},
+	})
+	if !errors.Is(result.Err, errDownstreamWrite) || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != 0 || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
+	}
+}
+
 func TestForwardClassifiesCompleted4xxAsSuccess(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{HTTPStatus: http.StatusTooManyRequests, HTTPBody: `{"error":"rate limited"}`})
@@ -552,6 +583,21 @@ func (w *writeFailWriter) Header() http.Header { return w.header }
 func (w *writeFailWriter) WriteHeader(status int) { w.status = status }
 
 func (w *writeFailWriter) Write([]byte) (int, error) { return 0, errDownstreamWrite }
+
+type cancelWriteFailWriter struct {
+	header http.Header
+	status int
+	cancel context.CancelFunc
+}
+
+func (w *cancelWriteFailWriter) Header() http.Header { return w.header }
+
+func (w *cancelWriteFailWriter) WriteHeader(status int) { w.status = status }
+
+func (w *cancelWriteFailWriter) Write([]byte) (int, error) {
+	w.cancel()
+	return 0, errDownstreamWrite
+}
 
 func newObservingWriter() *observingWriter {
 	return &observingWriter{header: make(http.Header), firstWrite: make(chan struct{})}
