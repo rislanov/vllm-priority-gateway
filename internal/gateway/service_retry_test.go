@@ -179,17 +179,33 @@ func (r *recordingRuntime) SnapshotTimes() []time.Time {
 }
 
 type retryProbeForwarder struct {
-	beforeAlternate func()
-	initialBackend  int64
-	alternateErr    error
+	beforeAlternate  func()
+	initialBackend   int64
+	alternateBackend int64
+	alternateErr     error
+	result           proxy.Result
 }
 
 func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
 	f.initialBackend = request.Target.Backend.ID
 	f.beforeAlternate()
-	_, f.alternateErr = request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
-	writer.WriteHeader(http.StatusOK)
-	return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
+	alternate, err := request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
+	f.alternateErr = err
+	if err == nil {
+		f.alternateBackend = alternate.Backend.ID
+	}
+	result := f.result
+	if result.Status == 0 {
+		result.Status = http.StatusOK
+	}
+	if result.BackendID == 0 {
+		result.BackendID = request.Target.Backend.ID
+		if f.alternateBackend != 0 {
+			result.BackendID = f.alternateBackend
+		}
+	}
+	writer.WriteHeader(result.Status)
+	return result
 }
 
 func testSnapshot(client domain.Client, key domain.APIKey, pool domain.ModelPool, backends []domain.Backend) *registry.Snapshot {

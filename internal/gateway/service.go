@@ -150,10 +150,13 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	started := time.Now()
 	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
 	defer func() {
+		event.OccurredAt = s.now().UTC()
 		event.Duration = time.Since(started)
 		event.TTFT = result.FirstByte
 		event.Disconnect = result.Cancelled
 		event.RetryCount = result.RetryCount
+		event.Usage = result.Usage
+		event.UsageParseFailure = result.UsageParseFailure
 		if apiErr != nil {
 			event.Status = apiErr.HTTPStatus
 			event.Reason = apiErr.Code
@@ -169,13 +172,14 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if authErr != nil {
 		return proxy.Result{}, authErr
 	}
+	event.ClientID = client.ID
+	event.Client = client.Name
+	event.PriorityClass = client.PriorityClass
+	event.VLLMPriority = client.VLLMPriority
 	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
 	if len(sessionID) > MaxSessionAffinityIDBytes {
 		return proxy.Result{}, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
 	}
-	event.Client = client.Name
-	event.PriorityClass = client.PriorityClass
-	event.VLLMPriority = client.VLLMPriority
 	payload, publicModel, parseErr := rewritePayload(request.Body)
 	if parseErr != nil {
 		return proxy.Result{}, invalidRequest(parseErr.Error())
@@ -185,12 +189,17 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 		return proxy.Result{}, modelNotAllowed()
 	}
+	event.ModelPoolID = pool.ID
 	event.Model = pool.PublicModelName
 	affinityKey := ""
 	if sessionID != "" {
 		affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
 	}
-	payload, err := replaceModel(payload, pool.UpstreamModelName)
+	payload, err := forceStreamingUsage(payload, request.Path)
+	if err != nil {
+		return proxy.Result{}, invalidRequest("Failed to encode the upstream request")
+	}
+	payload, err = replaceModel(payload, pool.UpstreamModelName)
 	if err != nil {
 		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
 	}
@@ -386,6 +395,34 @@ func replaceModel(body []byte, model string) ([]byte, error) {
 		return nil, err
 	}
 	payload["model"] = encodedModel
+	return json.Marshal(payload)
+}
+
+func forceStreamingUsage(body []byte, path string) ([]byte, error) {
+	if path != "/v1/chat/completions" && path != "/v1/completions" {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	var stream bool
+	if encodedStream, exists := payload["stream"]; !exists || json.Unmarshal(encodedStream, &stream) != nil || !stream {
+		return body, nil
+	}
+	options := make(map[string]json.RawMessage)
+	if encodedOptions, exists := payload["stream_options"]; exists {
+		var existing map[string]json.RawMessage
+		if json.Unmarshal(encodedOptions, &existing) == nil && existing != nil {
+			options = existing
+		}
+	}
+	options["include_usage"] = json.RawMessage("true")
+	encodedOptions, err := json.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	payload["stream_options"] = encodedOptions
 	return json.Marshal(payload)
 }
 
