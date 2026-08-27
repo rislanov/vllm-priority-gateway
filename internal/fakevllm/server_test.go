@@ -87,6 +87,90 @@ func TestOrdinaryCompletionRecordsObservableRequest(t *testing.T) {
 	}
 }
 
+func TestChatCompletionEmitsConfiguredUsageAndGeneratedContent(t *testing.T) {
+	cacheRead := int64(7)
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{
+		Tokens: []string{"ordinary-output-sentinel"},
+		Usage: &fakevllm.Usage{
+			InputTokens: 11, OutputTokens: 4, CacheReadTokens: &cacheRead,
+		},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"upstream","messages":[{"role":"user","content":"prompt-sentinel"}]
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	fake.Handler().ServeHTTP(response, request)
+
+	want := `{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"ordinary-output-sentinel","role":"assistant"}}],"id":"fake-response","model":"upstream","object":"chat.completion","usage":{"completion_tokens":4,"prompt_tokens":11,"prompt_tokens_details":{"cached_tokens":7},"total_tokens":15}}`
+	if response.Code != http.StatusOK || response.Body.String() != want {
+		t.Fatalf("ordinary completion = %d %s, want %s", response.Code, response.Body.String(), want)
+	}
+}
+
+func TestStreamingUsageRequiresIncludeUsageAndRecordsRequestOption(t *testing.T) {
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{
+		Tokens: []string{"stream-output-sentinel"},
+		Usage:  &fakevllm.Usage{InputTokens: 13, OutputTokens: 5},
+	})
+
+	for _, test := range []struct {
+		name         string
+		streamOption string
+		wantUsage    bool
+	}{
+		{name: "omitted", wantUsage: false},
+		{name: "included", streamOption: `,"stream_options":{"include_usage":true}`, wantUsage: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+				`{"model":"upstream","stream":true`+test.streamOption+`}`,
+			))
+			response := httptest.NewRecorder()
+			fake.Handler().ServeHTTP(response, request)
+
+			usageFrame := `data: {"choices":[],"usage":{"completion_tokens":5,"prompt_tokens":13,"total_tokens":18}}` + "\n\n"
+			body := response.Body.String()
+			if strings.Contains(body, usageFrame) != test.wantUsage {
+				t.Fatalf("stream usage frame present = %t, want %t: %s", strings.Contains(body, usageFrame), test.wantUsage, body)
+			}
+			if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+				t.Fatalf("stream does not end in [DONE]: %s", body)
+			}
+		})
+	}
+
+	requests := fake.Snapshot().Requests
+	if len(requests) != 2 || requests[0].IncludeUsage || !requests[1].IncludeUsage {
+		t.Fatalf("recorded include_usage values = %+v", requests)
+	}
+}
+
+func TestAdminStateRoundTripsUsageWithUnknownCacheRead(t *testing.T) {
+	fake := fakevllm.New()
+	request := httptest.NewRequest(http.MethodPut, "/admin/state", strings.NewReader(
+		`{"usage":{"inputTokens":9,"outputTokens":3,"cacheReadTokens":null}}`,
+	))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	fake.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("PUT usage state = %d %s", response.Code, response.Body.String())
+	}
+	usage := fake.Snapshot().Usage
+	if usage == nil || usage.InputTokens != 9 || usage.OutputTokens != 3 || usage.CacheReadTokens != nil {
+		t.Fatalf("usage state = %+v", usage)
+	}
+	if !strings.Contains(response.Body.String(), `"usage":{"inputTokens":9,"outputTokens":3,"cacheReadTokens":null}`) {
+		t.Fatalf("usage control response = %s", response.Body.String())
+	}
+}
+
 func TestStreamingFlushesFramesWithDelay(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{TokenDelay: 500 * time.Millisecond, Tokens: []string{"one", "two"}})

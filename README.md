@@ -45,6 +45,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 - Priority-aware admission, bounded `429` errors, least-pressure routing, draining exclusion, and one conservative pre-first-byte retry.
 - Soft session affinity through `X-LLM-Session-Id`: rendezvous hashing improves prefix-cache locality while live pressure, health, freshness, drain state, and retry exclusions retain precedence.
 - Immediate response streaming, downstream cancellation propagation, Prometheus telemetry, and safe JSON completion logs.
+- Metadata-only request and token analytics with server-rendered charts, per-request detail, and CSV export.
 - Basic-authenticated, CSRF-protected JSON Admin API and embedded server-rendered Admin UI.
 - Deterministic fake vLLM controls and repeatable mixed-priority load generation.
 
@@ -94,8 +95,10 @@ Common optional variables:
 | `LLMGW_REQUEST_BODY_LIMIT` | `16777216` |
 | `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` | `1.0` |
 | `LLMGW_SHUTDOWN_GRACE_PERIOD` | `30s` |
+| `LLMGW_ANALYTICS_RETENTION` | `2160h` (90 days) |
 
 Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
+Set `LLMGW_ANALYTICS_RETENTION=0` to disable automatic analytics deletion; collection remains enabled and rows are retained until an operator removes them.
 
 ## Usage: bootstrap and first request
 
@@ -145,9 +148,10 @@ For routine operation, watch `/metrics`, drain a backend before maintenance, and
 
 ## Admin UI and API
 
-The embedded UI has four screens:
+The embedded UI has five screens:
 
 - `/admin`: pool and backend runtime status.
+- `/admin/analytics`: request volume, token/cache charts, filters, per-request metadata, and CSV download.
 - `/admin/clients`: client policy and model access.
 - `/admin/keys`: one-time key generation, expiry/status, last use, and revocation.
 - `/admin/backends`: model pools, endpoints, enablement, pressure, drain, and resume.
@@ -168,10 +172,21 @@ POST   /admin/api/backends
 PUT    /admin/api/backends/{id}
 POST   /admin/api/backends/{id}/drain
 POST   /admin/api/backends/{id}/resume
+GET    /admin/api/analytics
+GET    /admin/api/analytics/requests
+GET    /admin/api/analytics/export.csv
 GET    /admin/api/status
 ```
 
 All Admin routes require Basic auth. Every state-changing request additionally needs the matching CSRF cookie/header or cookie/form token. Responses are non-cacheable and include restrictive CSP, frame, MIME-sniffing, and referrer headers.
+
+### Usage analytics and retention
+
+The Analytics page supports exact UTC ranges plus 1-hour, 24-hour, 7-day, 30-day, and 90-day presets. Results can be filtered by client, public model, and whether upstream token usage was available. The summary, adaptive time series, client/model breakdown, newest-first per-request table, and oldest-first CSV export all apply the same filters. The JSON equivalents are `GET /admin/api/analytics` for aggregates and `GET /admin/api/analytics/requests` for paginated request detail; `GET /admin/api/analytics/export.csv` streams every matching row regardless of page size.
+
+Analytics stores metadata only: UTC time, generated gateway and parent request IDs, configured client/model/backend names and IDs, HTTP/duration/TTFT/retry/disconnect fields, and nullable token counts. Prompts, messages, generated text, request/response bodies, authorization headers, and API-key secrets are not stored. Cache-read tokens are a subset of input tokens. A missing cache-read value means the upstream did not report cache detail; it is unknown, not zero. Cache totals and hit ratios therefore use only the cache-known subset, while input and output totals include every request with usage.
+
+The default `LLMGW_ANALYTICS_RETENTION=2160h` removes rows older than 90 days during periodic cleanup. A value of `0` disables cleanup. Size the state volume and backup retention for request rate times the chosen history: even metadata-only rows and their indexes accumulate, and deletes do not necessarily shrink the SQLite file immediately. SQLite runs in WAL mode, so bursts, analytics writes, and cleanup can also grow `llmgw.db-wal` until a checkpoint. Monitor both the main database and WAL, keep free-space headroom, and use a quiesced backup of the complete state directory rather than copying only `llmgw.db`. Disabling retention requires an explicit archival/deletion and checkpoint policy.
 
 ## Client API
 
@@ -206,8 +221,12 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --scheduling-policy priority \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
   --enable-request-id-headers
 ```
+
+Prefix caching and prompt-token details are recommended together so vLLM can report `prompt_tokens_details.cached_tokens`. The gateway forces `stream_options.include_usage=true` for streaming Chat Completions and Completions, but an upstream may still omit cache detail; that remains an unknown value rather than a zero cache hit.
 
 In current vLLM documentation, lower integer priority values run earlier, and `X-Vllm-Priority` is supported by Chat Completions, Completions, and Responses. Check the [official OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/) when upgrading vLLM.
 
@@ -253,7 +272,7 @@ The report separates successes, intentional `429` overload responses, `5xx`, oth
 
 ## Metrics and logging
 
-`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Labels are bounded to configured names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
+`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Token analytics use `llmgw_input_tokens_total`, `llmgw_output_tokens_total`, and `llmgw_cache_read_tokens_total`, labeled only by configured client and public model. Parser failures use `llmgw_usage_parse_failures_total` with a bounded `format` label of `json` or `sse`, and durable-recorder failures increment `llmgw_usage_persistence_failures_total`. Labels are bounded to configured names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
 
 The gateway writes one JSON record per completed inference request to stderr. Records include correlation IDs, client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies and authorization headers are never logged.
 

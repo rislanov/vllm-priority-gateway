@@ -5,17 +5,24 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
@@ -110,6 +117,276 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("gateway did not shut down within deadline")
+	}
+}
+
+func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
+	const (
+		ordinaryPrompt = "e2e-ordinary-prompt-4f5eb9a7"
+		streamPrompt   = "e2e-stream-prompt-739adb16"
+		ordinaryOutput = "e2e-ordinary-generated-d84c3f02"
+		streamOutput   = "e2e-stream-generated-c9247b51"
+	)
+	sensitive := []string{ordinaryPrompt, streamPrompt, ordinaryOutput, streamOutput}
+	cacheRead := int64(7)
+	fake := fakevllm.New()
+	fake.SetState(fakevllm.State{
+		Tokens: []string{ordinaryOutput},
+		Usage: &fakevllm.Usage{
+			InputTokens: 11, OutputTokens: 4, CacheReadTokens: &cacheRead,
+		},
+	})
+	upstream := httptest.NewServer(fake.Handler())
+	defer upstream.Close()
+
+	databasePath := filepath.Join(t.TempDir(), "gateway.db")
+	seed := seedGatewayDatabaseDetails(t, databasePath, upstream.URL, []byte(strings.Repeat("h", 32)))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	environment := validEnvironment(databasePath)
+	environment["LLMGW_HEALTH_INTERVAL"] = "10ms"
+	environment["LLMGW_METRICS_INTERVAL"] = "10ms"
+	environment["LLMGW_UNHEALTHY_AFTER"] = "1"
+	environment["LLMGW_RECOVERY_AFTER"] = "1"
+	environment["LLMGW_SHUTDOWN_GRACE_PERIOD"] = "2s"
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, mapLookup(environment), listener, &stdout, &stderr) }()
+
+	baseURL := "http://" + listener.Addr().String()
+	waitForGateway(t, 3*time.Second, func() bool {
+		body, status, requestErr := gatewayGET(baseURL+"/admin/api/status", "operator", "correct horse battery staple")
+		if requestErr != nil || status != http.StatusOK {
+			return false
+		}
+		var view struct {
+			Pools []struct {
+				ID      int64 `json:"id"`
+				Runtime struct {
+					State             domain.PoolState `json:"state"`
+					AvailableBackends int              `json:"availableBackends"`
+				} `json:"runtime"`
+			} `json:"pools"`
+		}
+		if json.Unmarshal(body, &view) != nil {
+			return false
+		}
+		for _, pool := range view.Pools {
+			if pool.ID == seed.modelPoolID {
+				return pool.Runtime.State != domain.PoolUnavailable && pool.Runtime.AvailableBackends == 1
+			}
+		}
+		return false
+	})
+
+	ordinaryBody := `{"model":"qwen","messages":[{"role":"user","content":"` + ordinaryPrompt + `"}]}`
+	ordinaryResponse := gatewayPOST(t, baseURL+"/v1/chat/completions", seed.clientKey, "e2e-parent-ordinary", ordinaryBody)
+	ordinaryRequestID := ordinaryResponse.Header.Get("X-Request-Id")
+	assertGatewayRequestID(t, ordinaryRequestID)
+	ordinaryBytes, err := io.ReadAll(ordinaryResponse.Body)
+	ordinaryResponse.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOrdinary := `{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"` + ordinaryOutput + `","role":"assistant"}}],"id":"fake-response","model":"fake-model","object":"chat.completion","usage":{"completion_tokens":4,"prompt_tokens":11,"prompt_tokens_details":{"cached_tokens":7},"total_tokens":15}}`
+	if ordinaryResponse.StatusCode != http.StatusOK || string(ordinaryBytes) != wantOrdinary {
+		t.Fatalf("ordinary client response = %d %s, want %s", ordinaryResponse.StatusCode, ordinaryBytes, wantOrdinary)
+	}
+
+	fake.SetState(fakevllm.State{
+		Tokens: []string{streamOutput},
+		Usage:  &fakevllm.Usage{InputTokens: 13, OutputTokens: 5},
+	})
+	streamBody := `{"model":"qwen","messages":[{"role":"user","content":"` + streamPrompt + `"}],"stream":true}`
+	streamResponse := gatewayPOST(t, baseURL+"/v1/chat/completions", seed.clientKey, "e2e-parent-stream", streamBody)
+	streamRequestID := streamResponse.Header.Get("X-Request-Id")
+	assertGatewayRequestID(t, streamRequestID)
+	if streamRequestID == ordinaryRequestID {
+		t.Fatalf("gateway request IDs are not distinct: %q", streamRequestID)
+	}
+	streamBytes, err := io.ReadAll(streamResponse.Body)
+	streamResponse.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStream := "data: {\"choices\":[{\"delta\":{\"content\":\"" + streamOutput + "\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":13,\"total_tokens\":18}}\n\n" +
+		"data: [DONE]\n\n"
+	if streamResponse.StatusCode != http.StatusOK || string(streamBytes) != wantStream {
+		t.Fatalf("stream client response = %d %q, want %q", streamResponse.StatusCode, streamBytes, wantStream)
+	}
+
+	upstreamRequests := fake.Snapshot().Requests
+	if len(upstreamRequests) != 2 || upstreamRequests[0].RequestID != ordinaryRequestID || upstreamRequests[0].IncludeUsage ||
+		upstreamRequests[1].RequestID != streamRequestID || !upstreamRequests[1].IncludeUsage {
+		t.Fatalf("upstream requests = %+v", upstreamRequests)
+	}
+
+	filter := url.Values{
+		"from":            {time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)},
+		"to":              {time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)},
+		"client_id":       {strconv.FormatInt(seed.clientID, 10)},
+		"model_pool_id":   {strconv.FormatInt(seed.modelPoolID, 10)},
+		"usage_available": {"true"},
+	}
+	var pageBody []byte
+	waitForGateway(t, 3*time.Second, func() bool {
+		values := filter.Clone()
+		values.Set("limit", "10")
+		body, status, requestErr := gatewayGET(baseURL+"/admin/api/analytics/requests?"+values.Encode(), "operator", "correct horse battery staple")
+		if requestErr != nil || status != http.StatusOK {
+			return false
+		}
+		var page analytics.RequestPage
+		if json.Unmarshal(body, &page) != nil || page.Total != 2 || len(page.Requests) != 2 {
+			return false
+		}
+		pageBody = append([]byte(nil), body...)
+		return true
+	})
+
+	metricsBody, status, err := gatewayGET(baseURL+"/metrics", "", "")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("metrics response = %d err=%v body=%s", status, err, metricsBody)
+	}
+	for _, line := range []string{
+		`llmgw_input_tokens_total{client="stream-client",model="qwen"} 24`,
+		`llmgw_output_tokens_total{client="stream-client",model="qwen"} 9`,
+		`llmgw_cache_read_tokens_total{client="stream-client",model="qwen"} 7`,
+	} {
+		if !strings.Contains(string(metricsBody), line+"\n") {
+			t.Fatalf("metrics missing %q:\n%s", line, metricsBody)
+		}
+	}
+
+	summaryBody, status, err := gatewayGET(baseURL+"/admin/api/analytics?"+filter.Encode(), "operator", "correct horse battery staple")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("analytics response = %d err=%v body=%s", status, err, summaryBody)
+	}
+	var dataset analytics.Dataset
+	if err := json.Unmarshal(summaryBody, &dataset); err != nil {
+		t.Fatal(err)
+	}
+	if dataset.Summary.RequestCount != 2 || dataset.Summary.MeteredRequestCount != 2 || dataset.Summary.UsageCoverage != 1 ||
+		dataset.Summary.InputTokens != 24 || dataset.Summary.OutputTokens != 9 ||
+		dataset.Summary.CacheReadTokens == nil || *dataset.Summary.CacheReadTokens != 7 ||
+		dataset.Summary.UncachedInputTokens == nil || *dataset.Summary.UncachedInputTokens != 4 ||
+		dataset.Summary.CacheHitRatio == nil || *dataset.Summary.CacheHitRatio != 7.0/11.0 {
+		t.Fatalf("filtered analytics summary = %+v", dataset.Summary)
+	}
+
+	var requestPage analytics.RequestPage
+	if err := json.Unmarshal(pageBody, &requestPage); err != nil {
+		t.Fatal(err)
+	}
+	if requestPage.Total != 2 || len(requestPage.Requests) != 2 ||
+		requestPage.Requests[0].RequestID != streamRequestID || requestPage.Requests[1].RequestID != ordinaryRequestID {
+		t.Fatalf("filtered request page = %+v", requestPage)
+	}
+	assertUsageRow(t, requestPage.Requests[0], 13, 5, nil)
+	assertUsageRow(t, requestPage.Requests[1], 11, 4, &cacheRead)
+
+	pageValues := filter.Clone()
+	pageValues.Set("limit", "10")
+	htmlBody, status, err := gatewayGET(baseURL+"/admin/analytics?"+pageValues.Encode(), "operator", "correct horse battery staple")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("analytics HTML = %d err=%v body=%s", status, err, htmlBody)
+	}
+	htmlText := string(htmlBody)
+	if !strings.Contains(htmlText, "Usage analytics") || !strings.Contains(htmlText, ordinaryRequestID) || !strings.Contains(htmlText, streamRequestID) ||
+		strings.Index(htmlText, streamRequestID) > strings.Index(htmlText, ordinaryRequestID) ||
+		!strings.Contains(htmlText, ">24</strong>") || !strings.Contains(htmlText, ">9</strong>") || !strings.Contains(htmlText, ">7</strong>") {
+		t.Fatalf("analytics HTML does not agree with filtered data: %s", htmlText)
+	}
+
+	csvBody, status, err := gatewayGET(baseURL+"/admin/api/analytics/export.csv?"+filter.Encode(), "operator", "correct horse battery staple")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("analytics CSV = %d err=%v body=%s", status, err, csvBody)
+	}
+	csvRows, err := csv.NewReader(bytes.NewReader(csvBody)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(csvRows) != 3 || len(csvRows[0]) != 18 || csvRows[1][2] != ordinaryRequestID || csvRows[2][2] != streamRequestID ||
+		csvRows[1][14] != "true" || csvRows[1][15] != "11" || csvRows[1][16] != "4" || csvRows[1][17] != "7" ||
+		csvRows[2][14] != "true" || csvRows[2][15] != "13" || csvRows[2][16] != "5" || csvRows[2][17] != "" {
+		t.Fatalf("filtered CSV rows = %#v", csvRows)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("gateway did not shut down")
+	}
+
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := raw.Query(`
+		SELECT request_id, http_status, input_tokens, output_tokens, cache_read_tokens
+		FROM usage_requests ORDER BY id ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type databaseUsageRow struct {
+		requestID                string
+		status                   int
+		input, output, cacheRead sql.NullInt64
+	}
+	var databaseRows []databaseUsageRow
+	for rows.Next() {
+		var row databaseUsageRow
+		if err := rows.Scan(&row.requestID, &row.status, &row.input, &row.output, &row.cacheRead); err != nil {
+			t.Fatal(err)
+		}
+		databaseRows = append(databaseRows, row)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(databaseRows) != 2 || databaseRows[0].requestID != ordinaryRequestID || databaseRows[0].status != http.StatusOK ||
+		databaseRows[0].input.Int64 != 11 || !databaseRows[0].input.Valid || databaseRows[0].output.Int64 != 4 || !databaseRows[0].output.Valid ||
+		databaseRows[0].cacheRead.Int64 != 7 || !databaseRows[0].cacheRead.Valid ||
+		databaseRows[1].requestID != streamRequestID || databaseRows[1].status != http.StatusOK ||
+		databaseRows[1].input.Int64 != 13 || !databaseRows[1].input.Valid || databaseRows[1].output.Int64 != 5 || !databaseRows[1].output.Valid || databaseRows[1].cacheRead.Valid {
+		t.Fatalf("usage ledger rows = %+v", databaseRows)
+	}
+	if _, err := raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	artifacts := map[string][]byte{
+		"stderr logs": stderr.Bytes(), "metrics": metricsBody, "analytics JSON": summaryBody,
+		"request JSON": pageBody, "analytics HTML": htmlBody, "analytics CSV": csvBody,
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		contents, readErr := os.ReadFile(databasePath + suffix)
+		if readErr != nil {
+			if suffix == "-wal" && os.IsNotExist(readErr) {
+				continue
+			}
+			t.Fatal(readErr)
+		}
+		artifacts["SQLite"+suffix] = contents
+	}
+	for name, contents := range artifacts {
+		for _, sentinel := range sensitive {
+			if bytes.Contains(contents, []byte(sentinel)) {
+				t.Fatalf("%s contains sensitive body sentinel %q", name, sentinel)
+			}
+		}
 	}
 }
 
@@ -295,7 +572,18 @@ func validEnvironment(databasePath string) map[string]string {
 	}
 }
 
+type gatewayDatabaseSeed struct {
+	clientKey   string
+	clientID    int64
+	modelPoolID int64
+}
+
 func seedGatewayDatabase(t *testing.T, path, upstreamURL string, hmacSecret []byte) string {
+	t.Helper()
+	return seedGatewayDatabaseDetails(t, path, upstreamURL, hmacSecret).clientKey
+}
+
+func seedGatewayDatabaseDetails(t *testing.T, path, upstreamURL string, hmacSecret []byte) gatewayDatabaseSeed {
 	t.Helper()
 	database, err := store.Open(context.Background(), path)
 	if err != nil {
@@ -322,7 +610,68 @@ func seedGatewayDatabase(t *testing.T, path, upstreamURL string, hmacSecret []by
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return plain.Value
+	return gatewayDatabaseSeed{clientKey: plain.Value, clientID: client.ID, modelPoolID: pool.ID}
+}
+
+func gatewayPOST(t *testing.T, endpoint, key, parentRequestID, body string) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Request-Id", parentRequestID)
+	response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func gatewayGET(endpoint, username, password string) ([]byte, int, error) {
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if username != "" {
+		request.SetBasicAuth(username, password)
+	}
+	response, err := (&http.Client{Timeout: 500 * time.Millisecond}).Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	return body, response.StatusCode, err
+}
+
+func waitForGateway(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("gateway condition was not met before timeout")
+}
+
+func assertGatewayRequestID(t *testing.T, requestID string) {
+	t.Helper()
+	decoded, err := hex.DecodeString(requestID)
+	if err != nil || len(requestID) != 32 || len(decoded) != 16 {
+		t.Fatalf("gateway request ID %q is not 16-byte lowercase hex", requestID)
+	}
+}
+
+func assertUsageRow(t *testing.T, row analytics.RequestRecord, input, output int64, cacheRead *int64) {
+	t.Helper()
+	if !row.UsageAvailable || row.HTTPStatus != http.StatusOK || row.InputTokens == nil || *row.InputTokens != input ||
+		row.OutputTokens == nil || *row.OutputTokens != output || !reflect.DeepEqual(row.CacheReadTokens, cacheRead) {
+		t.Fatalf("usage row = %+v, want input=%d output=%d cache=%v", row, input, output, cacheRead)
+	}
 }
 
 func mapLookup(values map[string]string) func(string) (string, bool) {

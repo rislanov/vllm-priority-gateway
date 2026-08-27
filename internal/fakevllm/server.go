@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -104,8 +105,11 @@ func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Model         string `json:"model"`
+		Stream        bool   `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
 	if err := decoder.Decode(&request); err != nil {
@@ -115,7 +119,8 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	state := s.beginRequest(RequestRecord{
 		Path: r.URL.Path, Model: request.Model, Stream: request.Stream,
 		Priority: r.Header.Get("X-Vllm-Priority"), RequestID: r.Header.Get("X-Request-Id"),
-		StartedAt: time.Now().UTC(),
+		IncludeUsage: request.StreamOptions.IncludeUsage,
+		StartedAt:    time.Now().UTC(),
 	})
 	defer s.endRequest()
 	cancelled := false
@@ -159,19 +164,28 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if request.Stream {
-		s.stream(w, r, state, markCancelled)
+		s.stream(w, r, state, request.StreamOptions.IncludeUsage, markCancelled)
 		return
 	}
 	body := state.HTTPBody
 	if body == "" {
-		encoded, _ := json.Marshal(map[string]any{"id": "fake-response", "object": "fake.completion", "model": request.Model})
+		payload := map[string]any{"id": "fake-response", "object": "fake.completion", "model": request.Model}
+		if state.Usage != nil {
+			payload["object"] = "chat.completion"
+			payload["choices"] = []any{map[string]any{
+				"finish_reason": "stop", "index": 0,
+				"message": map[string]string{"content": strings.Join(state.Tokens, ""), "role": "assistant"},
+			}}
+			payload["usage"] = qwenUsage(state.Usage)
+		}
+		encoded, _ := json.Marshal(payload)
 		body = string(encoded)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, body)
 }
 
-func (s *Server) stream(w http.ResponseWriter, r *http.Request, state State, markCancelled func()) {
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, state State, includeUsage bool, markCancelled func()) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
@@ -191,6 +205,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, state State, mar
 		if state.ResetMode == ResetAfterChunks && index+1 >= state.ResetAfterChunks {
 			_ = resetConnection(w, true)
 			return
+		}
+	}
+	if includeUsage && state.Usage != nil {
+		frame, _ := json.Marshal(map[string]any{"choices": []any{}, "usage": qwenUsage(state.Usage)})
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", frame); err != nil {
+			markCancelled()
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -254,6 +278,7 @@ func normalizeState(state State) State {
 func cloneState(state State) State {
 	state.Tokens = append([]string(nil), state.Tokens...)
 	state.Models = append([]string(nil), state.Models...)
+	state.Usage = cloneUsage(state.Usage)
 	return state
 }
 
@@ -267,6 +292,10 @@ func validateState(state State) error {
 	if state.HTTPStatus < 100 || state.HTTPStatus > 599 {
 		return errors.New("HTTP status must be between 100 and 599")
 	}
+	if state.Usage != nil && (state.Usage.InputTokens < 0 || state.Usage.OutputTokens < 0 ||
+		(state.Usage.CacheReadTokens != nil && (*state.Usage.CacheReadTokens < 0 || *state.Usage.CacheReadTokens > state.Usage.InputTokens))) {
+		return errors.New("usage tokens must be non-negative and cache-read tokens cannot exceed input tokens")
+	}
 	switch state.ResetMode {
 	case ResetNone, ResetBeforeHeaders, ResetBeforeBody:
 	case ResetAfterChunks:
@@ -277,6 +306,17 @@ func validateState(state State) error {
 		return fmt.Errorf("unsupported reset mode %q", state.ResetMode)
 	}
 	return nil
+}
+
+func qwenUsage(usage *Usage) map[string]any {
+	value := map[string]any{
+		"prompt_tokens": usage.InputTokens, "completion_tokens": usage.OutputTokens,
+		"total_tokens": usage.InputTokens + usage.OutputTokens,
+	}
+	if usage.CacheReadTokens != nil {
+		value["prompt_tokens_details"] = map[string]int64{"cached_tokens": *usage.CacheReadTokens}
+	}
+	return value
 }
 
 func waitContext(r *http.Request, delay time.Duration) bool {
