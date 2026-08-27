@@ -134,7 +134,8 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	})
 	publicHandler := httpapi.NewPublicHandler(service, cfg.RequestBodyLimit, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: registryValue, Runtime: manager, HMACSecret: cfg.APIKeyHMACSecret, Random: rand.Reader,
+		Store: database, Analytics: database, Registry: registryValue, Runtime: manager,
+		HMACSecret: cfg.APIKeyHMACSecret, Random: rand.Reader,
 	})
 	if err != nil {
 		return err

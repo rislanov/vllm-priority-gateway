@@ -199,7 +199,7 @@ func newWebFixture(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: registryValue, Runtime: webRuntime{},
+		Store: database, Analytics: database, Registry: registryValue, Runtime: webRuntime{},
 		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{4}, 4096)),
 		Now: func() time.Time { return time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC) },
 	})
