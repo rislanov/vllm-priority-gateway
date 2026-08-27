@@ -85,12 +85,14 @@ type ClientModelAccess struct {
 }
 
 type ModelPool struct {
-	ID                int64
-	PublicModelName   string
-	UpstreamModelName string
-	Enabled           bool
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                 int64
+	PublicModelName    string
+	UpstreamModelName  string
+	Enabled            bool
+	MaxGatewayInflight int
+	MaxWaiting         int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Backend struct {

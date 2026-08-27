@@ -18,6 +18,14 @@ import (
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
+var migrations = []struct {
+	version int
+	path    string
+}{
+	{version: 1, path: "migrations/001_initial.sql"},
+	{version: 2, path: "migrations/002_pool_safety.sql"},
+}
+
 type SQLite struct {
 	db   *sql.DB
 	path string
@@ -77,20 +85,40 @@ func (s *SQLite) Close() error {
 }
 
 func (s *SQLite) Migrate(ctx context.Context) error {
-	contents, err := migrationFiles.ReadFile("migrations/001_initial.sql")
+	var currentVersion int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&currentVersion); err != nil {
+		return fmt.Errorf("read SQLite schema version: %w", err)
+	}
+	for _, migration := range migrations {
+		if migration.version <= currentVersion {
+			continue
+		}
+		if err := s.applyMigration(ctx, migration.version, migration.path); err != nil {
+			return err
+		}
+		currentVersion = migration.version
+	}
+	return nil
+}
+
+func (s *SQLite) applyMigration(ctx context.Context, version int, path string) error {
+	contents, err := migrationFiles.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read embedded migration: %w", err)
+		return fmt.Errorf("read embedded migration %d: %w", version, err)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin migration: %w", err)
+		return fmt.Errorf("begin migration %d: %w", version, err)
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, string(contents)); err != nil {
-		return fmt.Errorf("apply initial migration: %w", err)
+		return fmt.Errorf("apply migration %d: %w", version, err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		return fmt.Errorf("record migration %d: %w", version, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migration: %w", err)
+		return fmt.Errorf("commit migration %d: %w", version, err)
 	}
 	return nil
 }

@@ -1,5 +1,19 @@
 {{define "content"}}
 <section class="page-heading"><div><h1>Backends</h1><p>Manage model mappings, endpoints, and routing state.</p></div></section>
+<section><h2>Model pools</h2><div class="table-wrap"><table><thead><tr><th>Pool</th><th>Upstream model</th><th>Max gateway inflight</th><th>Max waiting</th><th>Enabled</th><th>Actions</th></tr></thead><tbody>
+{{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong></td><td>{{.UpstreamModelName}}</td><td class="mono">{{.MaxGatewayInflight}}</td><td class="mono">{{.MaxWaiting}}</td><td>{{if .Enabled}}Yes{{else}}No{{end}}</td><td><a class="button secondary small" href="/admin/backends?edit_pool={{.ID}}#pool-editor">Edit</a></td></tr>{{else}}<tr><td colspan="6" class="empty">No model pools configured.</td></tr>{{end}}
+</tbody></table></div></section>
+{{if .EditPool}}
+{{$pool := .EditPool}}<section id="pool-editor" class="editor"><h2>Edit model pool: {{$pool.PublicModelName}}</h2><form method="post" action="/admin/backends" class="form-grid">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="update_pool"><input type="hidden" name="id" value="{{$pool.ID}}">
+  <div><label for="edit-public-model">Public model name</label><input id="edit-public-model" name="public_model_name" value="{{$pool.PublicModelName}}" required></div>
+  <div><label for="edit-upstream-model">Upstream model name</label><input id="edit-upstream-model" name="upstream_model_name" value="{{$pool.UpstreamModelName}}" required></div>
+  <div><label for="edit-max-gateway-inflight">Max gateway inflight</label><input id="edit-max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" step="1" value="{{$pool.MaxGatewayInflight}}" required></div>
+  <div><label for="edit-max-waiting">Max waiting</label><input id="edit-max-waiting" name="max_waiting" type="number" min="0" step="1" value="{{$pool.MaxWaiting}}" required></div>
+  <label class="check" for="edit-pool-enabled"><input id="edit-pool-enabled" name="enabled" type="checkbox"{{if $pool.Enabled}} checked{{end}}>Enabled</label>
+  <div class="form-actions"><a class="button secondary" href="/admin/backends">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
+</form></section>
+{{end}}
 <div class="table-wrap"><table><thead><tr><th>Name</th><th>Model pool</th><th>URL</th><th>State</th><th>Pressure</th><th>Enabled</th><th>Draining</th><th>Actions</th></tr></thead><tbody>
 {{range .View.Backends}}<tr><td><strong>{{.Name}}</strong></td><td>{{.ModelPool}}</td><td class="mono url">{{.BaseURL}}</td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td><td>{{if .Enabled}}Yes{{else}}No{{end}}</td><td>{{if .Draining}}Yes{{else}}No{{end}}</td><td><div class="row-actions"><a class="button secondary small" href="/admin/backends?edit={{.ID}}#backend-editor">Edit</a>
   <form method="post" action="/admin/backends" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="update_backend"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="model_pool_id" value="{{.ModelPoolID}}"><input type="hidden" name="name" value="{{.Name}}"><input type="hidden" name="base_url" value="{{.BaseURL}}"><input type="hidden" name="capacity_hint" value="{{.CapacityHint}}"><input type="hidden" name="running_soft_limit" value="{{.RunningSoftLimit}}"><input type="hidden" name="upstream_api_key_env" value="{{.UpstreamAPIKeyEnv}}">{{if .Draining}}<input type="hidden" name="draining" value="on">{{end}}{{if not .Enabled}}<input type="hidden" name="enabled" value="on">{{end}}<button class="button secondary small" type="submit" data-confirm="Change enabled state for this backend?">{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
@@ -24,6 +38,8 @@
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create_pool">
   <div><label for="public-model">Public model name</label><input id="public-model" name="public_model_name" required></div>
   <div><label for="upstream-model">Upstream model name</label><input id="upstream-model" name="upstream_model_name" required></div>
+  <div><label for="max-gateway-inflight">Max gateway inflight</label><input id="max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" step="1" value="0" required></div>
+  <div><label for="max-waiting">Max waiting</label><input id="max-waiting" name="max_waiting" type="number" min="0" step="1" value="0" required></div>
   <label class="check" for="pool-enabled"><input id="pool-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create pool</button></div>
 </form></section>

@@ -80,7 +80,7 @@ func snapshotKeys(ctx context.Context, tx *sql.Tx) ([]domain.APIKey, error) {
 
 func snapshotPools(ctx context.Context, tx *sql.Tx) ([]domain.ModelPool, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, public_model_name, upstream_model_name, enabled, created_at, updated_at
+		SELECT id, public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at
 		FROM model_pools ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot model pools: %w", err)
