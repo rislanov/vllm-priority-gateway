@@ -585,3 +585,34 @@
   git add internal/httpapi/analytics.go internal/httpapi/analytics_test.go
   git commit -m "fix: bound analytics export lifecycle"
   ```
+
+---
+
+### Task 13: Accept interim null usage in vLLM SSE streams
+
+**Files:**
+
+- Modify: `internal/proxy/usage.go`
+- Modify: `internal/proxy/usage_test.go`
+- Modify: `internal/fakevllm/server.go`
+- Modify: `internal/fakevllm/server_test.go`
+- Modify: `cmd/gateway/main_test.go`
+- Modify: `tests/integration/streaming_retry_test.go`
+- Modify: `docs/superpowers/specs/2026-08-27-usage-analytics-design.md`
+
+- [ ] Add a failing every-byte-split parser regression for ordinary Chat/Completions SSE streams containing one or more content chunks with top-level `usage: null`, followed by a final `choices: []` chunk with valid usage and `[DONE]`.
+
+- [ ] Treat only top-level SSE `usage: null` as an absent interim candidate and continue scanning. A non-null top-level usage object remains authoritative, including fail-closed behavior when malformed. On `response.completed`, inspect nested `response.usage`; null or malformed nested terminal usage remains an authoritative parse failure. If the same completed event has top-level null and valid nested usage, use the nested usage.
+
+- [ ] Preserve byte-exact downstream delivery, flush behavior, bounded inspection, JSON-response behavior, and existing Responses API completion semantics.
+
+- [ ] Make the fake vLLM streaming fixture match the real lifecycle by emitting `usage: null` on content chunks before final usage. Extend the gateway end-to-end regression to prove metrics, the SQLite ledger, filtered JSON analytics, and CSV still receive the final exact token counts without a parse-failure increment. Keep the integration byte-exact expectation aligned with the fixture's include-usage response.
+
+- [ ] Run focused proxy/fake-vLLM/gateway tests, changed-package race tests, the full suite, and `git diff --check`.
+
+- [ ] Commit:
+
+  ```bash
+  git add internal/proxy/usage.go internal/proxy/usage_test.go internal/fakevllm/server.go internal/fakevllm/server_test.go cmd/gateway/main_test.go tests/integration/streaming_retry_test.go docs/superpowers/specs/2026-08-27-usage-analytics-design.md docs/superpowers/plans/2026-08-27-usage-analytics.md
+  git commit -m "fix: accept interim null SSE usage"
+  ```

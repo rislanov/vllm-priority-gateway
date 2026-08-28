@@ -231,6 +231,7 @@ The default `2160h` is 90 days. `0` disables automatic deletion. Negative or mal
 
 - Ordinary JSON usage in arbitrary chunk boundaries.
 - Chat/Completions SSE usage split at every byte boundary.
+- Chat/Completions SSE content chunks may carry top-level `usage: null`; those interim nulls are ignored so a later final usage chunk remains authoritative. A non-null malformed usage candidate, and malformed or null nested usage on a `response.completed` event, remain fail-closed for accounting.
 - Responses API nested completion usage.
 - LF/CRLF, multiple `data:` lines, keep-alives, `[DONE]`, malformed JSON, oversized events, missing fields, negative values, overflow, and cache greater than input.
 - Byte-exact downstream output, flush behavior, TTFT, retry behavior, and cancellation remain unchanged with inspection enabled.

@@ -118,12 +118,13 @@ func TestStreamingUsageRequiresIncludeUsageAndRecordsRequestOption(t *testing.T)
 	})
 
 	for _, test := range []struct {
-		name         string
-		streamOption string
-		wantUsage    bool
+		name            string
+		streamOption    string
+		wantUsage       bool
+		wantInterimNull bool
 	}{
 		{name: "omitted", wantUsage: false},
-		{name: "included", streamOption: `,"stream_options":{"include_usage":true}`, wantUsage: true},
+		{name: "included", streamOption: `,"stream_options":{"include_usage":true}`, wantUsage: true, wantInterimNull: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
@@ -133,9 +134,13 @@ func TestStreamingUsageRequiresIncludeUsageAndRecordsRequestOption(t *testing.T)
 			fake.Handler().ServeHTTP(response, request)
 
 			usageFrame := `data: {"choices":[],"usage":{"completion_tokens":5,"prompt_tokens":13,"total_tokens":18}}` + "\n\n"
+			interimNullFrame := `data: {"choices":[{"delta":{"content":"stream-output-sentinel"}}],"usage":null}` + "\n\n"
 			body := response.Body.String()
 			if strings.Contains(body, usageFrame) != test.wantUsage {
 				t.Fatalf("stream usage frame present = %t, want %t: %s", strings.Contains(body, usageFrame), test.wantUsage, body)
+			}
+			if strings.Contains(body, interimNullFrame) != test.wantInterimNull {
+				t.Fatalf("stream interim null frame present = %t, want %t: %s", strings.Contains(body, interimNullFrame), test.wantInterimNull, body)
 			}
 			if !strings.HasSuffix(body, "data: [DONE]\n\n") {
 				t.Fatalf("stream does not end in [DONE]: %s", body)

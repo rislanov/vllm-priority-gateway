@@ -290,7 +290,7 @@ func findAuthoritativeSSEUsage(root any) (any, bool) {
 	if !ok {
 		return nil, false
 	}
-	if usage, found := object["usage"]; found {
+	if usage, found := object["usage"]; found && usage != nil {
 		return usage, true
 	}
 	if eventType, _ := object["type"].(string); eventType != "response.completed" {

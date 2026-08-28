@@ -215,7 +215,7 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantStream := "data: {\"choices\":[{\"delta\":{\"content\":\"" + streamOutput + "\"}}]}\n\n" +
+	wantStream := "data: {\"choices\":[{\"delta\":{\"content\":\"" + streamOutput + "\"}}],\"usage\":null}\n\n" +
 		"data: {\"choices\":[],\"usage\":{\"completion_tokens\":5,\"prompt_tokens\":13,\"total_tokens\":18}}\n\n" +
 		"data: [DONE]\n\n"
 	if streamResponse.StatusCode != http.StatusOK || string(streamBytes) != wantStream {
@@ -263,6 +263,9 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 		if !strings.Contains(string(metricsBody), line+"\n") {
 			t.Fatalf("metrics missing %q:\n%s", line, metricsBody)
 		}
+	}
+	if strings.Contains(string(metricsBody), `llmgw_usage_parse_failures_total{format="sse"}`) {
+		t.Fatalf("interim null usage registered an SSE parse failure:\n%s", metricsBody)
 	}
 
 	summaryBody, status, err := gatewayGET(baseURL+"/admin/api/analytics?"+filter.Encode(), "operator", "correct horse battery staple")

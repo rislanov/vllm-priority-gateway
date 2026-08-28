@@ -213,6 +213,46 @@ func TestUsageInspectorParsesSSEAtEverySplit(t *testing.T) {
 	}
 }
 
+func TestUsageInspectorSkipsInterimNullChatUsageAtEveryByteBoundary(t *testing.T) {
+	stream := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}],\"usage\":null}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":null}\n\n" +
+		"data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":6,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n" +
+		"data: [DONE]\n\n"
+	want := domain.TokenUsage{InputTokens: 14, OutputTokens: 6, CacheReadTokens: int64Pointer(4)}
+
+	for split := 0; split <= len(stream); split++ {
+		inspector := newUsageInspector("text/event-stream")
+		inspector.Write([]byte(stream[:split]))
+		inspector.Write([]byte(stream[split:]))
+		got, format, failed := inspector.Result()
+		if failed || format != "" || got == nil || !equalTokenUsage(*got, want) {
+			t.Fatalf("split %d: usage=%+v format=%q failed=%v, want %+v", split, got, format, failed, want)
+		}
+	}
+}
+
+func TestUsageInspectorRejectsInvalidNonNullInterimSSEUsage(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":[]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":6}}\n\n"
+	inspector := newUsageInspector("text/event-stream")
+	inspector.Write([]byte(stream))
+	got, format, failed := inspector.Result()
+	if got != nil || !failed || format != "sse" {
+		t.Fatalf("usage=%+v format=%q failed=%v, want nil/sse/true", got, format, failed)
+	}
+}
+
+func TestUsageInspectorUsesNestedCompletedUsageAfterTopLevelNull(t *testing.T) {
+	stream := "data: {\"type\":\"response.completed\",\"usage\":null,\"response\":{\"usage\":{\"input_tokens\":17,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n"
+	want := domain.TokenUsage{InputTokens: 17, OutputTokens: 7, CacheReadTokens: int64Pointer(5)}
+	inspector := newUsageInspector("text/event-stream")
+	inspector.Write([]byte(stream))
+	got, format, failed := inspector.Result()
+	if failed || format != "" || got == nil || !equalTokenUsage(*got, want) {
+		t.Fatalf("usage=%+v format=%q failed=%v, want %+v", got, format, failed, want)
+	}
+}
+
 func TestUsageInspectorWaitsForResponsesCompletedUsageAtEveryByteBoundary(t *testing.T) {
 	stream := "event: response.created\n" +
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"usage\":null}}\n\n" +
@@ -234,11 +274,11 @@ func TestUsageInspectorWaitsForResponsesCompletedUsageAtEveryByteBoundary(t *tes
 	}
 }
 
-func TestUsageInspectorRejectsInvalidResponsesCompletedUsage(t *testing.T) {
+func TestUsageInspectorRejectsInvalidNestedResponsesCompletedUsage(t *testing.T) {
 	for _, usage := range []string{"null", `[]`} {
 		t.Run(usage, func(t *testing.T) {
 			stream := "data: {\"type\":\"response.created\",\"response\":{\"usage\":null}}\n\n" +
-				"data: {\"type\":\"response.completed\",\"response\":{\"usage\":" + usage + "}}\n\n"
+				"data: {\"type\":\"response.completed\",\"usage\":null,\"response\":{\"usage\":" + usage + "}}\n\n"
 			inspector := newUsageInspector("text/event-stream")
 			inspector.Write([]byte(stream))
 			got, format, failed := inspector.Result()
@@ -271,9 +311,8 @@ func TestUsageInspectorScopesSSEUsageToAuthoritativeFields(t *testing.T) {
 			want:   &domain.TokenUsage{InputTokens: 11, OutputTokens: 5},
 		},
 		{
-			name:       "present invalid top-level usage",
-			stream:     "data: {\"usage\":null}\n\n",
-			wantFailed: true,
+			name:   "interim null top-level usage is absent",
+			stream: "data: {\"usage\":null}\n\n",
 		},
 		{
 			name:       "present invalid response usage",

@@ -194,7 +194,11 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, state State, inc
 			markCancelled()
 			return
 		}
-		frame, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{"delta": map[string]string{"content": token}}}})
+		framePayload := map[string]any{"choices": []any{map[string]any{"delta": map[string]string{"content": token}}}}
+		if includeUsage {
+			framePayload["usage"] = nil
+		}
+		frame, _ := json.Marshal(framePayload)
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", frame); err != nil {
 			markCancelled()
 			return
