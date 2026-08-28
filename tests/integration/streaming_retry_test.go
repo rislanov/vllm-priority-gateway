@@ -68,8 +68,8 @@ func TestStreamingIsByteExactAndRetryStopsAfterFirstByte(t *testing.T) {
 		h.waitBackend(backendID, eligible)
 		_, key := h.createClient("stream-client", domain.PriorityHigh, -10, 2, poolID)
 		response, payload := h.public(http.MethodPost, "/v1/completions", key, postBody("qwen", true))
-		want := "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n" +
-			"data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n" +
+		want := "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}],\"usage\":null}\n\n" +
+			"data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}],\"usage\":null}\n\n" +
 			"data: [DONE]\n\n"
 		if response.StatusCode != http.StatusOK || string(payload) != want {
 			t.Fatalf("stream = %d %q, want %q", response.StatusCode, payload, want)

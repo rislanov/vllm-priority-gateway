@@ -33,14 +33,16 @@ type Request struct {
 }
 
 type Result struct {
-	BackendID       int64
-	Status          int
-	BytesSent       int64
-	FirstByte       time.Duration
-	RetryCount      int
-	ResponseStarted bool
-	Cancelled       bool
-	Err             error
+	BackendID         int64
+	Status            int
+	BytesSent         int64
+	FirstByte         time.Duration
+	RetryCount        int
+	ResponseStarted   bool
+	Cancelled         bool
+	Usage             *domain.TokenUsage
+	UsageParseFailure string
+	Err               error
 }
 
 type Proxy struct {
@@ -113,6 +115,7 @@ func (p *Proxy) forwardOnce(
 	}
 	defer response.Body.Close()
 	result.Status = response.StatusCode
+	inspector := newUsageInspector(response.Header.Get("Content-Type"))
 	commit := func() {
 		if !result.ResponseStarted {
 			CopyResponseHeaders(downstream.Header(), response.Header)
@@ -140,6 +143,7 @@ func (p *Proxy) forwardOnce(
 
 	if count == 0 && errors.Is(readErr, io.EOF) {
 		commit()
+		completeUsageInspection(&result, inspector)
 		return result, false, completedOutcome(response.StatusCode)
 	}
 	if count > 0 {
@@ -147,6 +151,7 @@ func (p *Proxy) forwardOnce(
 		written, writeErr := downstream.Write(buffer[:count])
 		result.BytesSent += int64(written)
 		flush(downstream)
+		inspector.Write(buffer[:written])
 		if writeErr != nil || written != count {
 			if writeErr == nil {
 				writeErr = io.ErrShortWrite
@@ -164,6 +169,8 @@ func (p *Proxy) forwardOnce(
 				return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 			}
 			return result, false, domain.InferenceFailure
+		} else {
+			completeUsageInspection(&result, inspector)
 		}
 		return result, false, completedOutcome(response.StatusCode)
 	}
@@ -175,6 +182,7 @@ func (p *Proxy) forwardOnce(
 			written, writeErr := downstream.Write(buffer[:count])
 			result.BytesSent += int64(written)
 			flush(downstream)
+			inspector.Write(buffer[:written])
 			if writeErr != nil || written != count {
 				if writeErr == nil {
 					writeErr = io.ErrShortWrite
@@ -192,9 +200,19 @@ func (p *Proxy) forwardOnce(
 					return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
 				}
 				return result, false, domain.InferenceFailure
+			} else {
+				completeUsageInspection(&result, inspector)
 			}
 			return result, false, completedOutcome(response.StatusCode)
 		}
+	}
+}
+
+func completeUsageInspection(result *Result, inspector *usageInspector) {
+	usage, format, failed := inspector.Result()
+	result.Usage = usage
+	if failed {
+		result.UsageParseFailure = format
 	}
 }
 

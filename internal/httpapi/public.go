@@ -104,6 +104,9 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 		h.completePublic(started, gateway.RequestEvent{Status: http.StatusInternalServerError, Reason: "internal_error"})
 		return
 	}
+	var reservation gateway.ResponseCompleteReservation
+	defer func() { h.service.ResponseComplete(reservation) }()
+	var gatewayError *gateway.APIError
 	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
@@ -132,7 +135,7 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 		h.completePublic(started, event)
 		return
 	}
-	_, gatewayError := h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
+	_, reservation, gatewayError = h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
 		Method: request.Method, Path: request.URL.Path, Headers: request.Header.Clone(), Body: body,
 		APIKey: rawKey, RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id")),
 	})

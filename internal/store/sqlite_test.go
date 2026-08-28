@@ -20,6 +20,9 @@ import (
 //go:embed migrations/001_initial.sql
 var initialMigration string
 
+//go:embed migrations/003_usage_analytics.sql
+var analyticsMigration string
+
 func openTestDB(t *testing.T) *store.SQLite {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "gateway.db")
@@ -45,8 +48,8 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 2 {
-		t.Fatalf("fresh database user_version = %d, want 2", got)
+	if got := sqliteUserVersion(t, path); got != 3 {
+		t.Fatalf("fresh database user_version = %d, want 3", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -91,8 +94,8 @@ func TestSQLiteMigratesVersionOnePoolSafetyDefaults(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() migrated database error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 2 {
-		t.Fatalf("migrated user_version = %d, want 2", got)
+	if got := sqliteUserVersion(t, path); got != 3 {
+		t.Fatalf("migrated user_version = %d, want 3", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -205,7 +208,7 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 		);
 		CREATE TABLE future_schema_marker (value TEXT NOT NULL);
 		INSERT INTO future_schema_marker (value) VALUES ('preserve-me');
-		PRAGMA user_version = 3;`); err != nil {
+		PRAGMA user_version = 4;`); err != nil {
 		futureDB.Close()
 		t.Fatalf("prepare future database: %v", err)
 	}
@@ -215,8 +218,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 
 	if opened, err := store.Open(context.Background(), path); err == nil {
 		opened.Close()
-		t.Fatal("Open() succeeded for future schema version 3")
-	} else if !strings.Contains(err.Error(), "SQLite schema version 3 is newer than supported version 2") {
+		t.Fatal("Open() succeeded for future schema version 4")
+	} else if !strings.Contains(err.Error(), "SQLite schema version 4 is newer than supported version 3") {
 		t.Fatalf("Open() error = %v, want future schema rejection", err)
 	}
 
@@ -230,8 +233,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read rejected user_version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("rejected user_version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("rejected user_version = %d, want 4", version)
 	}
 
 	var publicModelName, upstreamModelName, marker string
@@ -275,8 +278,106 @@ func TestSQLiteMigratesLegacyVersionZeroDatabaseWithExistingTables(t *testing.T)
 	if pools[0].MaxGatewayInflight != 0 || pools[0].MaxWaiting != 0 {
 		t.Fatalf("legacy safety limits = (%d, %d), want (0, 0)", pools[0].MaxGatewayInflight, pools[0].MaxWaiting)
 	}
-	if got := sqliteUserVersion(t, path); got != 2 {
-		t.Fatalf("legacy user_version = %d, want 2", got)
+	if got := sqliteUserVersion(t, path); got != 3 {
+		t.Fatalf("legacy user_version = %d, want 3", got)
+	}
+}
+
+func TestSQLiteMigratesPreVersionedUsageAnalyticsDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open pre-versioned analytics database: %v", err)
+	}
+	if _, err := legacy.Exec(initialMigration); err != nil {
+		legacy.Close()
+		t.Fatalf("apply initial migration: %v", err)
+	}
+	if _, err := legacy.Exec(analyticsMigration); err != nil {
+		legacy.Close()
+		t.Fatalf("apply former analytics migration: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE schema_migrations (
+			filename TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		);
+		INSERT INTO schema_migrations (filename, applied_at) VALUES
+			('001_initial.sql', '2026-08-27T00:00:00Z'),
+			('002_usage_analytics.sql', '2026-08-27T00:00:01Z');
+		INSERT INTO usage_requests (
+			occurred_at_ms, request_id, client_id, client_name, model_pool_id,
+			model_name, backend_name, http_status, duration_ms, retry_count,
+			disconnected, usage_available, input_tokens, output_tokens, cache_read_tokens
+		) VALUES (
+			1787832000000, 'legacy-usage-request', 7, 'legacy-client', 11,
+			'qwen', 'legacy-gpu', 200, 120, 0,
+			0, 1, 100, 25, 40
+		);`); err != nil {
+		legacy.Close()
+		t.Fatalf("seed pre-versioned analytics database: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close pre-versioned analytics database: %v", err)
+	}
+
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() pre-versioned analytics database error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() migrated analytics database error = %v", err)
+	}
+	if got := sqliteUserVersion(t, path); got != 3 {
+		t.Fatalf("migrated analytics user_version = %d, want 3", got)
+	}
+
+	upgraded, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open migrated analytics database: %v", err)
+	}
+	defer upgraded.Close()
+	var inputTokens, outputTokens, cacheReadTokens int
+	if err := upgraded.QueryRowContext(ctx, `
+		SELECT input_tokens, output_tokens, cache_read_tokens
+		FROM usage_requests WHERE request_id = 'legacy-usage-request'`).Scan(
+		&inputTokens, &outputTokens, &cacheReadTokens,
+	); err != nil {
+		t.Fatalf("read preserved usage request: %v", err)
+	}
+	if inputTokens != 100 || outputTokens != 25 || cacheReadTokens != 40 {
+		t.Fatalf("preserved tokens = (%d, %d, %d), want (100, 25, 40)", inputTokens, outputTokens, cacheReadTokens)
+	}
+	assertPoolSafetyColumns(t, upgraded)
+}
+
+func assertPoolSafetyColumns(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query("PRAGMA table_info(model_pools)")
+	if err != nil {
+		t.Fatalf("inspect model_pools schema: %v", err)
+	}
+	defer rows.Close()
+	want := map[string]bool{"max_gateway_inflight": false, "max_waiting": false}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan model_pools column: %v", err)
+		}
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate model_pools schema: %v", err)
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("migrated model_pools is missing %s", name)
+		}
 	}
 }
 

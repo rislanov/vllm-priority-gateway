@@ -46,6 +46,7 @@ SQLite owns durable configuration. Immutable indexed registry snapshots, health/
 - Per-backend inference circuit breakers and per-pool gateway-inflight/waiting safety limits, with explicit inference readiness.
 - Soft session affinity through `X-LLM-Session-Id`: rendezvous hashing improves prefix-cache locality while live pressure, health, freshness, drain state, and retry exclusions retain precedence.
 - Immediate response streaming, downstream cancellation propagation, Prometheus telemetry, and safe JSON completion logs.
+- Metadata-only request and token analytics with server-rendered charts, per-request detail, and CSV export.
 - Basic-authenticated, CSRF-protected JSON Admin API and embedded server-rendered Admin UI.
 - Deterministic fake vLLM controls and repeatable mixed-priority load generation.
 
@@ -99,8 +100,10 @@ Common optional variables:
 | `LLMGW_CIRCUIT_OPEN_COOLDOWN` | `15s` |
 | `LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES` | `1` |
 | `LLMGW_SHUTDOWN_GRACE_PERIOD` | `30s` |
+| `LLMGW_ANALYTICS_RETENTION` | `2160h` (90 days) |
 
 Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
+Set `LLMGW_ANALYTICS_RETENTION=0` to disable automatic analytics deletion; collection remains enabled and rows are retained until an operator removes them.
 
 ## Usage: bootstrap and first request
 
@@ -152,17 +155,18 @@ For routine operation, watch `/metrics`, drain a backend before maintenance, and
 
 Each managed backend has a process-local inference circuit. Five qualifying failures inside the rolling 30-second window open it for 15 seconds; after cooldown, one half-open probe may run. A completed response below HTTP 500, including `4xx` and `429`, is a success: it closes and clears a half-open circuit, but in closed state it does not erase retained failures, which age out of the rolling window. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against it. Downstream cancellation/write failure is neutral. An upstream `5xx` is forwarded and is not retried; only the existing pre-first-byte transport retry remains.
 
-`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by additive SQLite schema migration version 2; reopening a current database is a no-op.
+`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by additive SQLite schema migration version 2; usage analytics is added by version 3. Reopening a current database is a no-op.
 
-A gateway binary with the forward-version guard rejects a `PRAGMA user_version` newer than its latest embedded migration (currently version 2) before running migrations or changing the logical schema version, schema, or data. Opening the SQLite connection still applies the configured file permission and WAL pragmas, so this is not a byte-for-byte file or metadata immutability guarantee. The immediate pre-versioning `d6787d2` binary behaves differently: it does not inspect `user_version`, re-runs the idempotent `001_initial.sql`, and uses explicit-column pool CRUD. It therefore accepts and preserves the additive version-2 columns through rollback, but silently ignores their values and does not enforce either pool limit. Only later version-aware binaries with this guard reject future recorded versions. That compatibility is specific to this additive schema and binary, not a general downgrade guarantee; use a quiesced backup for other rollbacks rather than editing `user_version` manually.
+A gateway binary with the forward-version guard rejects a `PRAGMA user_version` newer than its latest embedded migration (currently version 3) before running migrations or changing the logical schema version, schema, or data. Opening the SQLite connection still applies the configured file permission and WAL pragmas, so this is not a byte-for-byte file or metadata immutability guarantee. The immediate pre-versioning `d6787d2` binary behaves differently: it does not inspect `user_version`, re-runs the idempotent `001_initial.sql`, and uses explicit-column pool CRUD. It therefore accepts and preserves the additive version-2 columns through rollback, but silently ignores their values and does not enforce either pool limit. Only later version-aware binaries with this guard reject future recorded versions. That compatibility is specific to this additive schema and binary, not a general downgrade guarantee; use a quiesced backup for other rollbacks rather than editing `user_version` manually.
 
 Circuit availability contributes to `/inference-readyz`, but transient pool congestion does not: removing a gateway from service cannot create GPU capacity. `/readyz` remains independent so operators retain Admin access during a total inference outage. Circuit and pool leases are in memory and correct only for the documented single gateway replica.
 
 ## Admin UI and API
 
-The embedded UI has four screens:
+The embedded UI has five screens:
 
 - `/admin`: pool gateway in-flight/waiting/available counts and per-backend health, pressure, and circuit state.
+- `/admin/analytics`: request volume, token/cache charts, filters, per-request metadata, and CSV download.
 - `/admin/clients`: client policy and model access.
 - `/admin/keys`: one-time key generation, expiry/status, last use, and revocation.
 - `/admin/backends`: model-pool `MaxGatewayInflight`/`MaxWaiting`, endpoints, enablement, pressure, drain, and resume.
@@ -183,10 +187,21 @@ POST   /admin/api/backends
 PUT    /admin/api/backends/{id}
 POST   /admin/api/backends/{id}/drain
 POST   /admin/api/backends/{id}/resume
+GET    /admin/api/analytics
+GET    /admin/api/analytics/requests
+GET    /admin/api/analytics/export.csv
 GET    /admin/api/status
 ```
 
 All Admin routes require Basic auth. Every state-changing request additionally needs the matching CSRF cookie/header or cookie/form token. Responses are non-cacheable and include restrictive CSP, frame, MIME-sniffing, and referrer headers.
+
+### Usage analytics and retention
+
+The Analytics page supports exact UTC ranges plus 1-hour, 24-hour, 7-day, 30-day, and 90-day presets. Results can be filtered by client, public model, and whether upstream token usage was available. The summary, adaptive time series, client/model breakdown, newest-first per-request table, and oldest-first CSV export all apply the same filters. The JSON equivalents are `GET /admin/api/analytics` for aggregates and `GET /admin/api/analytics/requests` for paginated request detail; `GET /admin/api/analytics/export.csv` streams every matching row regardless of page size.
+
+Analytics stores metadata only: UTC time, generated gateway and parent request IDs, configured client/model/backend names and IDs, HTTP/duration/TTFT/retry/disconnect fields, and nullable token counts. Prompts, messages, generated text, request/response bodies, authorization headers, and API-key secrets are not stored. Cache-read tokens are a subset of input tokens. A missing cache-read value means the upstream did not report cache detail; it is unknown, not zero. Cache totals and hit ratios therefore use only the cache-known subset, while input and output totals include every request with usage.
+
+The default `LLMGW_ANALYTICS_RETENTION=2160h` removes rows older than 90 days during periodic cleanup. A value of `0` disables cleanup. Size the state volume and backup retention for request rate times the chosen history: even metadata-only rows and their indexes accumulate, and deletes do not necessarily shrink the SQLite file immediately. SQLite runs in WAL mode, so bursts, analytics writes, and cleanup can also grow `llmgw.db-wal` until a checkpoint. Monitor both the main database and WAL, keep free-space headroom, and use a quiesced backup of the complete state directory rather than copying only `llmgw.db`. Disabling retention requires an explicit archival/deletion and checkpoint policy.
 
 ## Client API
 
@@ -221,8 +236,12 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
   --host 0.0.0.0 \
   --port 8000 \
   --scheduling-policy priority \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
   --enable-request-id-headers
 ```
+
+Prefix caching and prompt-token details are recommended together so vLLM can report `prompt_tokens_details.cached_tokens`. The gateway forces `stream_options.include_usage=true` for streaming Chat Completions and Completions, but an upstream may still omit cache detail; that remains an unknown value rather than a zero cache hit.
 
 In current vLLM documentation, lower integer priority values run earlier, and `X-Vllm-Priority` is supported by Chat Completions, Completions, and Responses. Check the [official OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/) when upgrading vLLM.
 
@@ -268,7 +287,7 @@ The report separates successes, intentional `429` overload responses, `5xx`, oth
 
 ## Metrics and logging
 
-`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`unmanaged/unknown=-1`, `closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Labels are bounded to configured model/backend names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
+`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`unmanaged/unknown=-1`, `closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Token analytics use `llmgw_input_tokens_total`, `llmgw_output_tokens_total`, and `llmgw_cache_read_tokens_total`, labeled only by configured client and public model. Parser failures use `llmgw_usage_parse_failures_total` with a bounded `format` label of `json` or `sse`, and durable-recorder failures increment `llmgw_usage_persistence_failures_total`. Labels are bounded to configured names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
 
 The gateway writes one JSON record per completed inference request to stderr. Records include correlation IDs, client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies and authorization headers are never logged.
 

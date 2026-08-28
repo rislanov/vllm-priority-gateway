@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
@@ -51,6 +52,7 @@ type AdminRuntime interface {
 
 type AdminDependencies struct {
 	Store      AdminStore
+	Analytics  analytics.QueryStore
 	Registry   AdminRegistry
 	Runtime    AdminRuntime
 	HMACSecret []byte
@@ -60,6 +62,7 @@ type AdminDependencies struct {
 
 type AdminService struct {
 	store      AdminStore
+	analytics  analytics.QueryStore
 	registry   AdminRegistry
 	runtime    AdminRuntime
 	hmacSecret []byte
@@ -72,8 +75,8 @@ type AdminService struct {
 }
 
 func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
-	if dependencies.Store == nil || dependencies.Registry == nil || dependencies.Runtime == nil {
-		return nil, errors.New("admin store, registry, and runtime are required")
+	if dependencies.Store == nil || dependencies.Analytics == nil || dependencies.Registry == nil || dependencies.Runtime == nil {
+		return nil, errors.New("admin store, analytics, registry, and runtime are required")
 	}
 	if len(dependencies.HMACSecret) < 32 {
 		return nil, errors.New("admin API-key HMAC secret must contain at least 32 bytes")
@@ -87,7 +90,7 @@ func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
 		now = time.Now
 	}
 	return &AdminService{
-		store: dependencies.Store, registry: dependencies.Registry, runtime: dependencies.Runtime,
+		store: dependencies.Store, analytics: dependencies.Analytics, registry: dependencies.Registry, runtime: dependencies.Runtime,
 		hmacSecret: append([]byte(nil), dependencies.HMACSecret...), random: randomSource, now: now,
 	}, nil
 }
@@ -419,6 +422,9 @@ func (s *AdminService) backend(id int64) AdminBackend {
 func NewAdminAPI(service *AdminService) http.Handler {
 	router := chi.NewRouter()
 	router.Route("/admin/api", func(router chi.Router) {
+		router.Get("/analytics", analyticsHandler(service))
+		router.Get("/analytics/requests", analyticsRequestsHandler(service))
+		router.Get("/analytics/export.csv", analyticsCSVHandler(service))
 		router.Get("/clients", func(writer http.ResponseWriter, _ *http.Request) {
 			writeAdminJSON(writer, http.StatusOK, map[string]any{"revision": service.View().Revision, "clients": service.View().Clients})
 		})

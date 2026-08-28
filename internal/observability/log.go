@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"log/slog"
+	"sync"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 )
@@ -42,33 +43,121 @@ func (l *Logger) Complete(event gateway.RequestEvent) {
 	)
 }
 
-type observers []gateway.Observer
+type observers struct {
+	values []gateway.Observer
+}
+
+type reservedPeer struct {
+	observer    gateway.ResponseCompleteObserver
+	reservation gateway.ResponseCompleteReservation
+	rollback    func()
+}
+
+type responseCompleteReservation struct {
+	owner    *observers
+	mu       sync.Mutex
+	peers    []reservedPeer
+	staged   bool
+	finished bool
+}
 
 // Multi combines observers in declaration order and skips nil entries.
 func Multi(values ...gateway.Observer) gateway.Observer {
-	combined := make(observers, 0, len(values))
+	combined := make([]gateway.Observer, 0, len(values))
 	for _, observer := range values {
 		if observer != nil {
 			combined = append(combined, observer)
 		}
 	}
-	return combined
+	return &observers{values: combined}
 }
 
-func (o observers) ClientInflight(event gateway.InflightEvent, delta int) {
-	for _, observer := range o {
+func (o *observers) ClientInflight(event gateway.InflightEvent, delta int) {
+	for _, observer := range o.values {
 		observer.ClientInflight(event, delta)
 	}
 }
 
-func (o observers) BackendInflight(event gateway.InflightEvent, delta int) {
-	for _, observer := range o {
+func (o *observers) BackendInflight(event gateway.InflightEvent, delta int) {
+	for _, observer := range o.values {
 		observer.BackendInflight(event, delta)
 	}
 }
 
-func (o observers) Complete(event gateway.RequestEvent) {
-	for _, observer := range o {
+func (o *observers) Complete(event gateway.RequestEvent) {
+	for _, observer := range o.values {
 		observer.Complete(event)
+	}
+}
+
+func (o *observers) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*responseCompleteReservation)
+	if !ok || reservation.owner != o {
+		return
+	}
+	reservation.complete()
+}
+
+func (o *observers) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	reservation := &responseCompleteReservation{owner: o, peers: make([]reservedPeer, 0, len(o.values))}
+	for _, observer := range o.values {
+		reserver, ok := observer.(gateway.ResponseCompleteReserver)
+		if !ok {
+			continue
+		}
+		peerReservation, rollback, reserved := reserver.ReserveResponseComplete(ctx, requestID)
+		if !reserved || peerReservation == nil {
+			if rollback != nil {
+				rollback()
+			}
+			reservation.rollback()
+			return nil, nil, false
+		}
+		if rollback == nil {
+			rollback = func() {}
+		}
+		reservation.peers = append(reservation.peers, reservedPeer{
+			observer: reserver, reservation: peerReservation, rollback: rollback,
+		})
+	}
+	return reservation, reservation.rollback, true
+}
+
+func (r *responseCompleteReservation) StageResponseComplete(event gateway.RequestEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.staged || r.finished {
+		return
+	}
+	r.staged = true
+	for _, peer := range r.peers {
+		peer.reservation.StageResponseComplete(event)
+	}
+}
+
+func (r *responseCompleteReservation) complete() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	for _, peer := range r.peers {
+		peer.observer.ResponseComplete(peer.reservation)
+	}
+}
+
+func (r *responseCompleteReservation) rollback() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	for index := len(r.peers) - 1; index >= 0; index-- {
+		r.peers[index].rollback()
 	}
 }

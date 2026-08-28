@@ -110,7 +110,8 @@ func newHarness(t *testing.T) *harness {
 	})
 	publicHandler := httpapi.NewPublicHandler(service, 1<<20, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: registryValue, Runtime: manager, HMACSecret: hmacSecret, Random: rand.Reader,
+		Store: database, Analytics: database, Registry: registryValue, Runtime: manager,
+		HMACSecret: hmacSecret, Random: rand.Reader,
 	})
 	if err != nil {
 		t.Fatal(err)

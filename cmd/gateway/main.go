@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/config"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -42,7 +43,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, stdout, stderr io.Writer) error {
+func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, stdout, stderr io.Writer) (runErr error) {
 	cfg, err := config.Load(getenv)
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
@@ -51,7 +52,12 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	if err != nil {
 		return err
 	}
-	defer database.Close()
+	databaseOwnedByRun := true
+	defer func() {
+		if databaseOwnedByRun {
+			runErr = errors.Join(runErr, database.Close())
+		}
+	}()
 
 	registryValue := registry.New(database)
 	if err := registryValue.Reload(ctx); err != nil {
@@ -90,8 +96,36 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	metrics := observability.NewMetrics()
-	usage := newUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
-	defer usage.Close()
+	apiKeyUsage := newAPIKeyUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
+	apiKeyUsageClosed := false
+	closeAPIKeyUsage := func() {
+		if !apiKeyUsageClosed {
+			apiKeyUsageClosed = true
+			apiKeyUsage.Close()
+		}
+	}
+	defer closeAPIKeyUsage()
+	requestRecorder := analytics.NewRecorder(database, cfg.AnalyticsRetention, metrics.UsagePersistenceFailure, logger)
+	databaseOwnedByRun = false
+	requestRecorderClosed := false
+	closeRequestRecorder := func(closeCtx context.Context) error {
+		if requestRecorderClosed {
+			return nil
+		}
+		requestRecorderClosed = true
+		closeAPIKeyUsage()
+		return closeRecorderStore(closeCtx, requestRecorder, database)
+	}
+	defer func() {
+		if requestRecorderClosed {
+			return
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
+		defer cancel()
+		if err := closeRequestRecorder(closeCtx); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("drain usage recorder: %w", err))
+		}
+	}()
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Limiter: admission.NewLimiter(),
 		Runtime: manager, Router: routing.NewWithSessionAffinity(
@@ -99,13 +133,14 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 			cfg.SessionAffinityMaxPressure,
 			routing.NewRandomSource(time.Now().UnixNano()),
 		),
-		Forwarder: proxy.New(upstreamClient), Usage: usage,
-		Observer: observability.Multi(metrics, observability.NewLogger(logger)), LookupEnv: getenv,
+		Forwarder: proxy.New(upstreamClient), Usage: apiKeyUsage,
+		Observer: observability.Multi(metrics, observability.NewLogger(logger), requestRecorder), LookupEnv: getenv,
 		RetryAfter: cfg.RetryAfter,
 	})
 	publicHandler := httpapi.NewPublicHandler(service, cfg.RequestBodyLimit, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: registryValue, Runtime: manager, HMACSecret: cfg.APIKeyHMACSecret, Random: rand.Reader,
+		Store: database, Analytics: database, Registry: registryValue, Runtime: manager,
+		HMACSecret: cfg.APIKeyHMACSecret, Random: rand.Reader,
 	})
 	if err != nil {
 		return err
@@ -168,15 +203,44 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
 	defer cancel()
+	var shutdownErr error
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		_ = server.Close()
-		return fmt.Errorf("graceful HTTP shutdown: %w", err)
+		shutdownErr = fmt.Errorf("graceful HTTP shutdown: %w", err)
 	}
 	err = <-serveError
+	var serveErr error
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve gateway: %w", err)
+		serveErr = fmt.Errorf("serve gateway: %w", err)
 	}
-	return nil
+	var recorderErr error
+	if err := closeRequestRecorder(shutdownCtx); err != nil {
+		recorderErr = fmt.Errorf("drain usage recorder: %w", err)
+	}
+	return errors.Join(shutdownErr, serveErr, recorderErr)
+}
+
+type recorderStoreLifecycle interface {
+	Close(context.Context) error
+	Done() <-chan struct{}
+}
+
+type closeStore interface {
+	Close() error
+}
+
+func closeRecorderStore(ctx context.Context, recorder recorderStoreLifecycle, destination closeStore) error {
+	recorderErr := recorder.Close(ctx)
+	select {
+	case <-recorder.Done():
+		return errors.Join(recorderErr, destination.Close())
+	default:
+		go func() {
+			<-recorder.Done()
+			_ = destination.Close()
+		}()
+		return recorderErr
+	}
 }
 
 func backends(snapshot *registry.Snapshot) []domain.Backend {
@@ -275,20 +339,20 @@ func (s projectedKeyUsageStore) TouchKeyLastUsed(ctx context.Context, keyID int6
 	return nil
 }
 
-type usageEvent struct {
+type apiKeyUsageEvent struct {
 	keyID int64
 	at    time.Time
 }
 
-type usageRecorder struct {
+type apiKeyUsageRecorder struct {
 	cancel context.CancelFunc
 	done   chan struct{}
-	events chan usageEvent
+	events chan apiKeyUsageEvent
 }
 
-func newUsageRecorder(parent context.Context, destination keyUsageStore) *usageRecorder {
+func newAPIKeyUsageRecorder(parent context.Context, destination keyUsageStore) *apiKeyUsageRecorder {
 	ctx, cancel := context.WithCancel(parent)
-	recorder := &usageRecorder{cancel: cancel, done: make(chan struct{}), events: make(chan usageEvent, 256)}
+	recorder := &apiKeyUsageRecorder{cancel: cancel, done: make(chan struct{}), events: make(chan apiKeyUsageEvent, 256)}
 	go func() {
 		defer close(recorder.done)
 		last := make(map[int64]time.Time)
@@ -309,14 +373,14 @@ func newUsageRecorder(parent context.Context, destination keyUsageStore) *usageR
 	return recorder
 }
 
-func (r *usageRecorder) Record(keyID int64, usedAt time.Time) {
+func (r *apiKeyUsageRecorder) Record(keyID int64, usedAt time.Time) {
 	select {
-	case r.events <- usageEvent{keyID: keyID, at: usedAt}:
+	case r.events <- apiKeyUsageEvent{keyID: keyID, at: usedAt}:
 	default:
 	}
 }
 
-func (r *usageRecorder) Close() {
+func (r *apiKeyUsageRecorder) Close() {
 	r.cancel()
 	<-r.done
 }

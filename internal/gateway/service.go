@@ -181,24 +181,59 @@ func (s *Service) ValidateAPIKey(rawKey string) (domain.Client, *APIError) {
 // CompletePublic records public outcomes that do not enter the forwarding
 // lifecycle, such as model listing and request-envelope rejection.
 func (s *Service) CompletePublic(event RequestEvent) {
+	event.OccurredAt = s.now().UTC()
 	if s.observer != nil {
 		s.observer.Complete(event)
 	}
 }
 
-func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (result proxy.Result, apiErr *APIError) {
+// ResponseComplete signals observer peers for the exact reserved lifecycle
+// after the handler or upstream proxy finishes writing and before the public
+// handler returns to net/http.
+func (s *Service) ResponseComplete(reservation ResponseCompleteReservation) {
+	if reservation == nil {
+		return
+	}
+	if observer, ok := s.observer.(ResponseCompleteObserver); ok {
+		observer.ResponseComplete(reservation)
+	}
+}
+
+func (s *Service) Forward(
+	ctx context.Context,
+	writer http.ResponseWriter,
+	request ForwardRequest,
+) (result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
 	started := time.Now()
 	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
+	var reservationRollback func()
+	// Register before event finalization so panics from forwarding or deferred
+	// observer delivery both release an acquired lifecycle before propagating.
 	defer func() {
+		if reservationRollback == nil {
+			return
+		}
+		if panicValue := recover(); panicValue != nil {
+			reservationRollback()
+			panic(panicValue)
+		}
+	}()
+	defer func() {
+		event.OccurredAt = s.now().UTC()
 		event.Duration = time.Since(started)
 		event.TTFT = result.FirstByte
 		event.Disconnect = result.Cancelled
 		event.RetryCount = result.RetryCount
+		event.Usage = result.Usage
+		event.UsageParseFailure = result.UsageParseFailure
 		if apiErr != nil {
 			event.Status = apiErr.HTTPStatus
 			event.Reason = apiErr.Code
 		} else {
 			event.Status = result.Status
+		}
+		if reservation != nil {
+			reservation.StageResponseComplete(event)
 		}
 		if s.observer != nil {
 			s.observer.Complete(event)
@@ -207,43 +242,66 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 
 	client, _, authErr := s.authenticate(request.APIKey)
 	if authErr != nil {
-		return proxy.Result{}, authErr
+		return proxy.Result{}, nil, authErr
 	}
-	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
-	if len(sessionID) > MaxSessionAffinityIDBytes {
-		return proxy.Result{}, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
-	}
+	event.ClientID = client.ID
 	event.Client = client.Name
 	event.PriorityClass = client.PriorityClass
 	event.VLLMPriority = client.VLLMPriority
+	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
+	if len(sessionID) > MaxSessionAffinityIDBytes {
+		return proxy.Result{}, nil, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
+	}
 	payload, publicModel, parseErr := rewritePayload(request.Body)
 	if parseErr != nil {
-		return proxy.Result{}, invalidRequest(parseErr.Error())
+		return proxy.Result{}, nil, invalidRequest(parseErr.Error())
 	}
 	snapshot := s.registry.Snapshot()
 	pool, exists := snapshot.PoolsByName[publicModel]
-	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
-		return proxy.Result{}, modelNotAllowed()
+	if !exists {
+		return proxy.Result{}, nil, modelNotAllowed()
 	}
+	event.ModelPoolID = pool.ID
 	event.Model = pool.PublicModelName
+	if reserver, ok := s.observer.(ResponseCompleteReserver); ok {
+		reservedLifecycle, rollback, reserved := reserver.ReserveResponseComplete(ctx, request.RequestID)
+		if !reserved || reservedLifecycle == nil {
+			if rollback != nil {
+				rollback()
+			}
+			if reservationErr := ctx.Err(); reservationErr != nil {
+				return proxy.Result{Cancelled: true, Err: reservationErr}, nil, nil
+			}
+			return proxy.Result{}, nil, gatewayUnavailable(s.retryAfter)
+		}
+		reservation = reservedLifecycle
+		reservationRollback = rollback
+	}
+	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
+		return proxy.Result{}, reservation, modelNotAllowed()
+	}
 	affinityKey := ""
 	if sessionID != "" {
 		affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
 	}
-	payload, err := replaceModel(payload, pool.UpstreamModelName)
+	payload, err := forceStreamingUsage(payload, request.Path)
 	if err != nil {
-		return proxy.Result{}, invalidRequest("Failed to encode the upstream model")
+		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream request")
+	}
+	payload, err = replaceModel(payload, pool.UpstreamModelName)
+	if err != nil {
+		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
 	}
 	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
 	event.PoolState = poolRuntime.State
 	if poolErr != nil {
-		return proxy.Result{}, poolErr
+		return proxy.Result{}, reservation, poolErr
 	}
 	defer releasePool()
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
 	lease, ok := s.limiter.Acquire(client.ID, limit)
 	if !ok {
-		return proxy.Result{}, overloaded(s.retryAfter)
+		return proxy.Result{}, reservation, overloaded(s.retryAfter)
 	}
 	defer lease.Release()
 	inflight := InflightEvent{Client: client.Name, Model: publicModel, PriorityClass: client.PriorityClass}
@@ -310,7 +368,7 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 
 	target, err := selectTarget(nil)
 	if err != nil {
-		return proxy.Result{}, backendUnavailable(s.retryAfter)
+		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter)
 	}
 
 	headers := request.Headers.Clone()
@@ -327,11 +385,11 @@ func (s *Service) Forward(ctx context.Context, writer http.ResponseWriter, reque
 	result = s.forwarder.Forward(ctx, writer, proxyRequest)
 	if result.Err != nil && !result.ResponseStarted {
 		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
-			return result, nil
+			return result, reservation, nil
 		}
-		return result, upstreamError()
+		return result, reservation, upstreamError()
 	}
-	return result, nil
+	return result, reservation, nil
 }
 
 func (s *Service) acquirePool(ctx context.Context, clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
@@ -464,6 +522,34 @@ func replaceModel(body []byte, model string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+func forceStreamingUsage(body []byte, path string) ([]byte, error) {
+	if path != "/v1/chat/completions" && path != "/v1/completions" {
+		return body, nil
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	var stream bool
+	if encodedStream, exists := payload["stream"]; !exists || json.Unmarshal(encodedStream, &stream) != nil || !stream {
+		return body, nil
+	}
+	options := make(map[string]json.RawMessage)
+	if encodedOptions, exists := payload["stream_options"]; exists {
+		var existing map[string]json.RawMessage
+		if json.Unmarshal(encodedOptions, &existing) == nil && existing != nil {
+			options = existing
+		}
+	}
+	options["include_usage"] = json.RawMessage("true")
+	encodedOptions, err := json.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	payload["stream_options"] = encodedOptions
+	return json.Marshal(payload)
+}
+
 func invalidAPIKey() *APIError {
 	return &APIError{HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
 }
@@ -482,6 +568,16 @@ func overloaded(retryAfter time.Duration) *APIError {
 
 func backendUnavailable(retryAfter time.Duration) *APIError {
 	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter}
+}
+
+func gatewayUnavailable(retryAfter time.Duration) *APIError {
+	return &APIError{
+		HTTPStatus: http.StatusServiceUnavailable,
+		Message:    "The gateway is temporarily unable to accept requests",
+		Type:       "server_error",
+		Code:       "gateway_unavailable",
+		RetryAfter: retryAfter,
+	}
 }
 
 func upstreamError() *APIError {

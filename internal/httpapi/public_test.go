@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +17,16 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
+	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
 
 var testNow = time.Unix(1_700_000_000, 0).UTC()
@@ -317,6 +322,42 @@ func TestPublicControlledErrors(t *testing.T) {
 	}
 }
 
+func TestLiveCompletionReservationRefusalReturnsControlledRetryableError(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &refusingReservationObserver{}
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, observer: observer, forwarder: forwarder,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s, want 503", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2", got)
+	}
+	var envelope httpapi.ErrorEnvelope
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode refusal error: %v; body=%s", err, response.Body.String())
+	}
+	if envelope.Error.Code != "gateway_unavailable" || envelope.Error.Type != "server_error" ||
+		envelope.Error.Message != "The gateway is temporarily unable to accept requests" {
+		t.Fatalf("refusal error = %+v", envelope.Error)
+	}
+	if forwarder.Calls() != 0 {
+		t.Fatalf("reservation refusal reached upstream forwarder %d time(s)", forwarder.Calls())
+	}
+	if got := observer.Snapshot(); got.reservations != 1 || got.terminals != 0 ||
+		len(got.events) != 1 || got.events[0].Status != http.StatusServiceUnavailable || got.events[0].Reason != "gateway_unavailable" {
+		t.Fatalf("reservation refusal lifecycle = %+v", got)
+	}
+}
+
 func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	raw, key := testKey(t)
 	handler, _ := newFixture(t, fixtureOptions{
@@ -329,6 +370,115 @@ func TestConfiguredRetryAfterIsUsedForAdmissionErrors(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "7" {
 		t.Fatalf("status=%d Retry-After=%q", response.Code, response.Header().Get("Retry-After"))
+	}
+}
+
+func TestResolvedRejectionBodyReachesEOFBeforeBlockedAnalyticsStoreRelease(t *testing.T) {
+	raw, key := testKey(t)
+	recorder, store, release := newBlockedAnalyticsRecorder(t)
+	gate := newCompletionGate("finalized-429")
+	releaseGate := sync.OnceFunc(func() { close(gate.release) })
+	observer := observability.Multi(recorder, gate)
+	handler, _ := newFixture(t, fixtureOptions{
+		client: backgroundClient(), key: key, poolState: domain.PoolSaturated, observer: observer,
+		generateID: func() (string, error) { return "finalized-429", nil },
+	})
+	server := httptest.NewServer(handler)
+	defer func() {
+		releaseGate()
+		release()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
+	}()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+raw)
+	result := make(chan completedHTTPResponse, 1)
+	go func() {
+		result <- readHTTPResponse(server.Client(), request)
+	}()
+	awaitSignal(t, gate.entered, "target completion staging")
+	filled := fillRecorderBehindReservedRequest(t, recorder, "json-queued")
+	releaseGate()
+
+	select {
+	case response := <-result:
+		if response.err != nil {
+			t.Fatalf("read generated response through EOF: %v", response.err)
+		}
+		if response.status != http.StatusTooManyRequests {
+			t.Fatalf("status = %d body=%s", response.status, response.body)
+		}
+		assertErrorCode(t, response.body, "gateway_overloaded")
+	case <-time.After(time.Second):
+		t.Fatal("generated response did not reach EOF while the analytics store remained blocked")
+	}
+	if filled != 1023 {
+		t.Fatalf("queued completions behind target reservation = %d, want 1023", filled)
+	}
+	select {
+	case <-store.releaseInsert:
+		t.Fatal("analytics store was released before JSON response finalization was proved")
+	default:
+	}
+}
+
+func TestStreamingResponseBodyReachesChunkedEOFBeforeBlockedAnalyticsStoreRelease(t *testing.T) {
+	raw, key := testKey(t)
+	recorder, store, release := newBlockedAnalyticsRecorder(t)
+	gate := newCompletionGate("finalized-sse")
+	releaseGate := sync.OnceFunc(func() { close(gate.release) })
+	observer := observability.Multi(recorder, gate)
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, observer: observer, forwarder: streamingForwarder{},
+		generateID: func() (string, error) { return "finalized-sse", nil },
+	})
+	server := httptest.NewServer(handler)
+	defer func() {
+		releaseGate()
+		release()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
+	}()
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+raw)
+	result := make(chan completedHTTPResponse, 1)
+	go func() {
+		result <- readHTTPResponse(server.Client(), request)
+	}()
+	awaitSignal(t, gate.entered, "stream completion staging")
+	filled := fillRecorderBehindReservedRequest(t, recorder, "sse-queued")
+	releaseGate()
+
+	select {
+	case response := <-result:
+		if response.err != nil {
+			t.Fatalf("read streaming response through chunked EOF: %v", response.err)
+		}
+		if response.status != http.StatusOK {
+			t.Fatalf("status = %d body=%s", response.status, response.body)
+		}
+		if got := strings.Join(response.transferEncoding, ","); got != "chunked" {
+			t.Fatalf("stream transfer encoding = %q, want chunked", got)
+		}
+		if want := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"; string(response.body) != want {
+			t.Fatalf("stream body = %q, want %q", response.body, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("streaming response did not reach chunked EOF while the analytics store remained blocked")
+	}
+	if filled != 1023 {
+		t.Fatalf("queued completions behind target reservation = %d, want 1023", filled)
+	}
+	select {
+	case <-store.releaseInsert:
+		t.Fatal("analytics store was released before chunked EOF was proved")
+	default:
 	}
 }
 
@@ -432,6 +582,159 @@ func TestServiceObserverDoesNotRecordAttackerControlledModel(t *testing.T) {
 	}
 }
 
+func TestDuplicateRequestIDRefusalCannotConsumeOriginalRecorderLifecycle(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	recorder := analytics.NewRecorder(database, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	raw, key := testKey(t)
+	forwarder := newOriginalLifecycleForwarder()
+	releaseForwarder := sync.OnceFunc(func() { close(forwarder.release) })
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder,
+		observer: observability.Multi(recorder),
+		generateID: func() (string, error) {
+			return "duplicate-lifecycle-id", nil
+		},
+	})
+	server := httptest.NewServer(handler)
+	defer func() {
+		releaseForwarder()
+		server.Close()
+		closeAnalyticsRecorder(t, recorder)
+	}()
+
+	firstRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRequest.Header.Set("Authorization", "Bearer "+raw)
+	firstRequest.Header.Set("X-Request-Id", "original-parent")
+	firstResult := make(chan completedHTTPResponse, 1)
+	go func() {
+		firstResult <- readHTTPResponse(server.Client(), firstRequest)
+	}()
+	awaitSignal(t, forwarder.started, "original request forwarding")
+
+	secondRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest.Header.Set("Authorization", "Bearer "+raw)
+	secondRequest.Header.Set("X-Request-Id", "rejected-parent")
+	second := readHTTPResponse(server.Client(), secondRequest)
+	if second.err != nil {
+		t.Errorf("read duplicate refusal: %v", second.err)
+	} else {
+		if second.status != http.StatusServiceUnavailable {
+			t.Errorf("duplicate refusal status = %d body=%s, want 503", second.status, second.body)
+		}
+		var envelope httpapi.ErrorEnvelope
+		if err := json.Unmarshal(second.body, &envelope); err != nil {
+			t.Errorf("decode duplicate refusal: %v; body=%s", err, second.body)
+		} else if envelope.Error.Code != "gateway_unavailable" {
+			t.Errorf("duplicate refusal code = %q, want gateway_unavailable", envelope.Error.Code)
+		}
+	}
+
+	releaseForwarder()
+	select {
+	case first := <-firstResult:
+		if first.err != nil {
+			t.Fatalf("read original response: %v", first.err)
+		}
+		if first.status != http.StatusCreated || string(first.body) != `{"original":true}` {
+			t.Fatalf("original response = status %d body=%s", first.status, first.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original request did not finish after release")
+	}
+	if got := forwarder.Calls(); got != 1 {
+		t.Fatalf("upstream forward calls = %d, want original only", got)
+	}
+
+	closeAnalyticsRecorder(t, recorder)
+	page, err := database.UsageRequests(context.Background(), analytics.Filter{
+		From: testNow.Add(-time.Millisecond), To: testNow.Add(time.Millisecond),
+	}, 100, 0)
+	if err != nil {
+		t.Fatalf("UsageRequests() error = %v", err)
+	}
+	if page.Total != 1 || len(page.Requests) != 1 {
+		t.Fatalf("duplicate lifecycle rows = %+v, want exactly the original", page)
+	}
+	record := page.Requests[0]
+	if record.RequestID != "duplicate-lifecycle-id" || record.ParentRequestID != "original-parent" ||
+		record.ClientID != 1 || record.ModelPoolID != 10 || record.ClientName != "client" ||
+		record.ModelName != "public-model" || record.BackendName != "gpu" ||
+		record.HTTPStatus != http.StatusCreated || record.Disconnected {
+		t.Fatalf("durable original lifecycle row = %+v", record)
+	}
+}
+
+func TestKnownModelPolicyDenialsAreDurablyRecordedButUnknownModelsAreNot(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	recorder := analytics.NewRecorder(database, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = recorder.Close(ctx)
+	})
+
+	raw, key := testKey(t)
+	nextID := 0
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, extraPools: true,
+		observer: observability.Multi(recorder),
+		generateID: func() (string, error) {
+			nextID++
+			return "policy-request-" + strconv.Itoa(nextID), nil
+		},
+	})
+	for _, model := range []string{"disabled-model", "not-allowed", "attacker-controlled-model"} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":`+strconv.Quote(model)+`}`))
+		request.Header.Set("Authorization", "Bearer "+raw)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("model %q status = %d body=%s", model, response.Code, response.Body.String())
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("Recorder.Close() error = %v", err)
+	}
+	page, err := database.UsageRequests(context.Background(), analytics.Filter{
+		From: testNow.Add(-time.Millisecond), To: testNow.Add(time.Millisecond),
+	}, 100, 0)
+	if err != nil {
+		t.Fatalf("UsageRequests() error = %v", err)
+	}
+	if page.Total != 2 || len(page.Requests) != 2 {
+		t.Fatalf("durable policy-denial rows = %+v, want exactly two known models", page)
+	}
+	wantModels := map[int64]string{11: "disabled-model", 12: "not-allowed"}
+	for _, record := range page.Requests {
+		if record.ClientID != 1 || record.HTTPStatus != http.StatusForbidden || record.UsageAvailable ||
+			wantModels[record.ModelPoolID] != record.ModelName {
+			t.Fatalf("policy-denial row = %+v, want resolved 403 unavailable metadata", record)
+		}
+		delete(wantModels, record.ModelPoolID)
+	}
+	if len(wantModels) != 0 {
+		t.Fatalf("missing known policy-denial models: %+v", wantModels)
+	}
+}
+
 func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
 	raw, key := testKey(t)
 	observer := &recordingObserver{}
@@ -510,6 +813,7 @@ type fixtureOptions struct {
 	sessionAffinityBackends bool
 	observer                gateway.Observer
 	retryAfter              time.Duration
+	generateID              httpapi.IDGenerator
 }
 
 func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStub) {
@@ -574,7 +878,11 @@ func newFixture(t *testing.T, options fixtureOptions) (http.Handler, *runtimeStu
 		RetryAfter: options.retryAfter,
 		Now:        func() time.Time { return testNow }, LookupEnv: func(string) (string, bool) { return "", false },
 	})
-	handler := httpapi.NewPublicHandler(service, 1024*1024, func() (string, error) { return "fixed-gateway-id", nil })
+	generateID := options.generateID
+	if generateID == nil {
+		generateID = func() (string, error) { return "fixed-gateway-id", nil }
+	}
+	handler := httpapi.NewPublicHandler(service, 1024*1024, generateID)
 	return handler, runtime
 }
 
@@ -685,11 +993,242 @@ type blockingForwarder struct {
 	once    sync.Once
 }
 
+type originalLifecycleForwarder struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	calls   int
+}
+
+func newOriginalLifecycleForwarder() *originalLifecycleForwarder {
+	return &originalLifecycleForwarder{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (f *originalLifecycleForwarder) Forward(ctx context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.mu.Unlock()
+	if call > 1 {
+		writer.WriteHeader(http.StatusAccepted)
+		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusAccepted}
+	}
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-f.release:
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusCreated)
+		written, _ := writer.Write([]byte(`{"original":true}`))
+		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusCreated, BytesSent: int64(written)}
+	case <-ctx.Done():
+		return proxy.Result{BackendID: request.Target.Backend.ID, Cancelled: true, Err: ctx.Err()}
+	}
+}
+
+func (f *originalLifecycleForwarder) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 type recordingObserver struct {
 	mu            sync.Mutex
 	events        []gateway.RequestEvent
 	clientDeltas  []int
 	backendDeltas []int
+}
+
+type refusingReservationObserver struct {
+	mu           sync.Mutex
+	reservations int
+	terminals    int
+	events       []gateway.RequestEvent
+}
+
+type refusingReservationSnapshot struct {
+	reservations int
+	terminals    int
+	events       []gateway.RequestEvent
+}
+
+func (*refusingReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*refusingReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+
+func (o *refusingReservationObserver) Complete(event gateway.RequestEvent) {
+	o.mu.Lock()
+	o.events = append(o.events, event)
+	o.mu.Unlock()
+}
+
+func (o *refusingReservationObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	o.mu.Lock()
+	o.reservations++
+	o.mu.Unlock()
+	return nil, nil, false
+}
+
+func (o *refusingReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {
+	o.mu.Lock()
+	o.terminals++
+	o.mu.Unlock()
+}
+
+func (o *refusingReservationObserver) Snapshot() refusingReservationSnapshot {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return refusingReservationSnapshot{
+		reservations: o.reservations,
+		terminals:    o.terminals,
+		events:       append([]gateway.RequestEvent(nil), o.events...),
+	}
+}
+
+type blockingAnalyticsStore struct {
+	insertStarted chan struct{}
+	releaseInsert chan struct{}
+}
+
+func (s *blockingAnalyticsStore) InsertUsageBatch(context.Context, []analytics.RequestRecord) error {
+	select {
+	case s.insertStarted <- struct{}{}:
+	default:
+	}
+	<-s.releaseInsert
+	return nil
+}
+
+func (*blockingAnalyticsStore) DeleteUsageBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func resolvedEvent(requestID string) gateway.RequestEvent {
+	return gateway.RequestEvent{
+		OccurredAt: time.Unix(1_800_000_000, 0).UTC(), RequestID: requestID,
+		ClientID: 1, ModelPoolID: 10, Client: "client", Model: "public-model", Status: http.StatusOK,
+	}
+}
+
+type completionGate struct {
+	requestID string
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func newCompletionGate(requestID string) *completionGate {
+	return &completionGate{requestID: requestID, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (*completionGate) ClientInflight(gateway.InflightEvent, int)  {}
+func (*completionGate) BackendInflight(gateway.InflightEvent, int) {}
+
+func (g *completionGate) Complete(event gateway.RequestEvent) {
+	if event.RequestID != g.requestID {
+		return
+	}
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+}
+
+type completedHTTPResponse struct {
+	status           int
+	transferEncoding []string
+	body             []byte
+	err              error
+}
+
+func readHTTPResponse(client *http.Client, request *http.Request) completedHTTPResponse {
+	response, err := client.Do(request)
+	if err != nil {
+		return completedHTTPResponse{err: err}
+	}
+	body, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	transferEncoding := append([]string(nil), response.TransferEncoding...)
+	if readErr != nil {
+		return completedHTTPResponse{status: response.StatusCode, transferEncoding: transferEncoding, body: body, err: readErr}
+	}
+	return completedHTTPResponse{status: response.StatusCode, transferEncoding: transferEncoding, body: body, err: closeErr}
+}
+
+func newBlockedAnalyticsRecorder(t *testing.T) (*analytics.Recorder, *blockingAnalyticsStore, func()) {
+	t.Helper()
+	store := &blockingAnalyticsStore{insertStarted: make(chan struct{}, 1), releaseInsert: make(chan struct{})}
+	recorder := analytics.NewRecorder(store, 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	release := sync.OnceFunc(func() { close(store.releaseInsert) })
+	for index := 0; index < 64; index++ {
+		reserveAndCompleteAnalytics(t, recorder, "writer-"+strconv.Itoa(index))
+	}
+	awaitSignal(t, store.insertStarted, "recorder writer blocked in store")
+	return recorder, store, release
+}
+
+func fillRecorderBehindReservedRequest(t *testing.T, recorder *analytics.Recorder, prefix string) int {
+	t.Helper()
+	filled := 0
+	for index := 0; index < 1024; index++ {
+		requestID := prefix + "-" + strconv.Itoa(index)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		reservation, _, reserved := recorder.ReserveResponseComplete(ctx, requestID)
+		cancel()
+		if !reserved {
+			break
+		}
+		reservation.StageResponseComplete(resolvedEvent(requestID))
+		recorder.ResponseComplete(reservation)
+		filled++
+	}
+	return filled
+}
+
+func reserveAndCompleteAnalytics(t *testing.T, recorder *analytics.Recorder, requestID string) {
+	t.Helper()
+	reservation, _, reserved := recorder.ReserveResponseComplete(context.Background(), requestID)
+	if !reserved {
+		t.Fatalf("analytics reservation refused for %q", requestID)
+	}
+	reservation.StageResponseComplete(resolvedEvent(requestID))
+	recorder.ResponseComplete(reservation)
+}
+
+func closeAnalyticsRecorder(t *testing.T, recorder *analytics.Recorder) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("Recorder.Close() error = %v", err)
+	}
+}
+
+func awaitSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+type streamingForwarder struct{}
+
+func (streamingForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	const body = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.WriteHeader(http.StatusOK)
+	written, _ := writer.Write([]byte(body))
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return proxy.Result{
+		BackendID: request.Target.Backend.ID, Status: http.StatusOK,
+		ResponseStarted: true, BytesSent: int64(written),
+	}
 }
 
 func (o *recordingObserver) ClientInflight(_ gateway.InflightEvent, delta int) {

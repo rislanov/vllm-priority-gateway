@@ -54,7 +54,7 @@ func TestServicePoolMaxWaitingRejectsBeforePoolAndClientAcquisition(t *testing.T
 		forwarder: &poolCompletionForwarder{},
 	})
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" || apiErr.RetryAfter <= 0 {
 		t.Fatalf("waiting rejection API error = %+v, want bounded 429 with Retry-After", apiErr)
 	}
@@ -77,7 +77,7 @@ func TestServiceRevalidatesMaxGatewayInflightAfterConcurrentPoolUpdate(t *testin
 		t.Fatal("failed to establish existing pool lease")
 	}
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" {
 		heldRelease()
 		t.Fatalf("concurrent max-inflight update API error = %+v, want pool-safety 429", apiErr)
@@ -106,7 +106,7 @@ func TestServiceRevalidatesMaxWaitingAfterConcurrentPoolUpdate(t *testing.T) {
 		publishPoolOnSnapshot: &updatedPool,
 	})
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" {
 		t.Fatalf("concurrent max-waiting update API error = %+v, want pool-safety 429", apiErr)
 	}
@@ -127,7 +127,7 @@ func TestServiceIgnoresUnrelatedRegistryRevisionDuringPoolAdmission(t *testing.T
 		publishPoolOnSnapshot: &unchangedPool,
 	})
 
-	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil || result.Status != http.StatusOK {
 		t.Fatalf("unrelated registry revision result=%+v API error=%+v, want admitted request", result, apiErr)
 	}
@@ -229,7 +229,7 @@ func TestServicePoolLeaseSpansRetrySelection(t *testing.T) {
 		},
 	})
 
-	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil || result.Status != http.StatusOK {
 		t.Fatalf("retry request result=%+v API error=%+v", result, apiErr)
 	}
@@ -247,7 +247,7 @@ func TestServiceReleasesPoolLeaseOnEveryAdmittedExit(t *testing.T) {
 			{BackendID: 20, Healthy: false, MetricsFresh: true, CircuitAvailable: true},
 		})
 		service, request, _ := newPoolService(t, poolServiceOptions{maximum: 1, runtime: runtime, forwarder: &poolCompletionForwarder{}})
-		_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+		_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 		if apiErr == nil || apiErr.HTTPStatus != http.StatusServiceUnavailable {
 			t.Fatalf("selection failure API error = %+v", apiErr)
 		}
@@ -256,7 +256,7 @@ func TestServiceReleasesPoolLeaseOnEveryAdmittedExit(t *testing.T) {
 
 	t.Run("upstream error", func(t *testing.T) {
 		service, request, runtime := newPoolService(t, poolServiceOptions{maximum: 1, forwarder: poolErrorForwarder{}})
-		_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+		_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 		if apiErr == nil || apiErr.HTTPStatus != http.StatusBadGateway {
 			t.Fatalf("upstream error API error = %+v", apiErr)
 		}
@@ -290,7 +290,7 @@ func TestServiceReleasesPoolLeaseWhenClientLimiterRejects(t *testing.T) {
 	})
 	firstDone := forwardPoolAsync(service, context.Background(), request)
 	forwarder.waitStarted(t)
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests {
 		forwarder.releaseAll()
 		<-firstDone
@@ -637,7 +637,7 @@ type poolForwardResult struct {
 func forwardPoolAsync(service *gateway.Service, ctx context.Context, request gateway.ForwardRequest) <-chan poolForwardResult {
 	done := make(chan poolForwardResult, 1)
 	go func() {
-		result, apiErr := service.Forward(ctx, httptest.NewRecorder(), request)
+		result, _, apiErr := service.Forward(ctx, httptest.NewRecorder(), request)
 		done <- poolForwardResult{result: result, apiErr: apiErr}
 	}()
 	return done

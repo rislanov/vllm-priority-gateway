@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -36,3 +37,148 @@ func TestStructuredLoggerWritesSafeCompletionRecord(t *testing.T) {
 		}
 	}
 }
+
+func TestMultiCompletesReservedPeersThroughProductionTerminalPath(t *testing.T) {
+	var calls []string
+	first := &reservationObserver{name: "first", calls: &calls, accept: true}
+	second := &reservationObserver{name: "second", calls: &calls, accept: true}
+	combined := observability.Multi(observability.NewLogger(nil), first, second)
+	reserver, ok := combined.(gateway.ResponseCompleteReserver)
+	if !ok {
+		t.Fatal("Multi does not expose response-completion reservation capability")
+	}
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("Multi did not return a complete reservation lifecycle")
+	}
+	reservation.StageResponseComplete(gateway.RequestEvent{RequestID: "request-1"})
+	reserver.ResponseComplete(reservation)
+	reserver.ResponseComplete(reservation)
+	rollback()
+
+	if got := strings.Join(calls, ","); got != "reserve:first,reserve:second,stage:first,stage:second,complete:first,complete:second" {
+		t.Fatalf("reserved production terminal lifecycle = %q", got)
+	}
+}
+
+func TestMultiRollsBackEarlierReservationWhenLaterPeerRefuses(t *testing.T) {
+	var calls []string
+	first := &reservationObserver{name: "first", calls: &calls, accept: true}
+	second := &reservationObserver{name: "second", calls: &calls, accept: true, refuseCanceled: true}
+	third := &reservationObserver{name: "third", calls: &calls, accept: true}
+	combined := observability.Multi(first, observability.NewLogger(nil), second, third)
+	reserver, ok := combined.(gateway.ResponseCompleteReserver)
+	if !ok {
+		t.Fatal("Multi does not expose response-completion reservation capability")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(ctx, "request-1")
+	if reserved {
+		t.Fatal("reservation succeeded after a capable peer refused it")
+	}
+	if reservation != nil || rollback != nil {
+		t.Fatal("failed aggregate reservation returned lifecycle handles")
+	}
+	if got := strings.Join(calls, ","); got != "reserve:first,reserve:second,rollback:first" {
+		t.Fatalf("reservation lifecycle = %q", got)
+	}
+
+	calls = nil
+	combined = observability.Multi(first, third)
+	reserver = combined.(gateway.ResponseCompleteReserver)
+	reservation, rollback, reserved = reserver.ReserveResponseComplete(context.Background(), "request-2")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("successful aggregate reservation did not return its rollback handle")
+	}
+	rollback()
+	rollback()
+	if got := strings.Join(calls, ","); got != "reserve:first,reserve:third,rollback:third,rollback:first" {
+		t.Fatalf("successful reservation rollback lifecycle = %q", got)
+	}
+}
+
+func TestMultiDoesNotReservePeerWithoutTerminalCapability(t *testing.T) {
+	peer := &reservationOnlyObserver{}
+	combined := observability.Multi(peer)
+	reserver, ok := combined.(gateway.ResponseCompleteReserver)
+	if !ok {
+		t.Fatal("Multi does not expose response-completion reservation capability")
+	}
+
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("aggregate without complete reservation peers did not return an inert reservation")
+	}
+	rollback()
+	combined.Complete(gateway.RequestEvent{RequestID: "request-1"})
+
+	if peer.reservations != 0 {
+		t.Fatalf("reservation-only peer received %d reservation(s), want none", peer.reservations)
+	}
+	if peer.completions != 1 {
+		t.Fatalf("reservation-only peer received %d ordinary completion(s), want one", peer.completions)
+	}
+}
+
+type reservationObserver struct {
+	name           string
+	calls          *[]string
+	accept         bool
+	refuseCanceled bool
+}
+
+type reservationOnlyObserver struct {
+	reservations int
+	completions  int
+}
+
+func (*reservationOnlyObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*reservationOnlyObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (o *reservationOnlyObserver) Complete(gateway.RequestEvent) {
+	o.completions++
+}
+
+func (o *reservationOnlyObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	o.reservations++
+	return inertResponseReservation{}, func() {}, true
+}
+
+func (*reservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*reservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*reservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *reservationObserver) ReserveResponseComplete(
+	ctx context.Context,
+	_ string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	*o.calls = append(*o.calls, "reserve:"+o.name)
+	if !o.accept || (o.refuseCanceled && ctx.Err() != nil) {
+		return nil, nil, false
+	}
+	return &reservationProbe{owner: o}, func() { *o.calls = append(*o.calls, "rollback:"+o.name) }, true
+}
+
+func (o *reservationObserver) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*reservationProbe)
+	if !ok || reservation.owner != o {
+		return
+	}
+	*o.calls = append(*o.calls, "complete:"+o.name)
+}
+
+type reservationProbe struct {
+	owner *reservationObserver
+}
+
+func (r *reservationProbe) StageResponseComplete(gateway.RequestEvent) {
+	*r.owner.calls = append(*r.owner.calls, "stage:"+r.owner.name)
+}
+
+type inertResponseReservation struct{}
+
+func (inertResponseReservation) StageResponseComplete(gateway.RequestEvent) {}

@@ -1,0 +1,566 @@
+package gateway_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
+	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
+	"github.com/rislanov/vllm-priority-gateway/internal/domain"
+	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
+	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
+	"github.com/rislanov/vllm-priority-gateway/internal/registry"
+	"github.com/rislanov/vllm-priority-gateway/internal/routing"
+)
+
+func TestStreamingUsageIsForcedOnlyForSupportedStreamingEndpoints(t *testing.T) {
+	tests := []struct {
+		name                string
+		path                string
+		body                string
+		wantIncludeUsage    bool
+		wantUnrelatedOption any
+	}{
+		{
+			name: "chat completions adds omitted stream options", path: "/v1/chat/completions",
+			body: `{"model":"public-model","stream":true,"top_level":"keep"}`, wantIncludeUsage: true,
+		},
+		{
+			name: "completions overrides false and preserves unrelated option", path: "/v1/completions",
+			body:             `{"model":"public-model","stream":true,"stream_options":{"include_usage":false,"trace":"keep"},"top_level":"keep"}`,
+			wantIncludeUsage: true, wantUnrelatedOption: "keep",
+		},
+		{
+			name: "chat completions replaces non object stream options", path: "/v1/chat/completions",
+			body: `{"model":"public-model","stream":true,"stream_options":["malformed"],"top_level":"keep"}`, wantIncludeUsage: true,
+		},
+		{
+			name: "completions replaces null stream options", path: "/v1/completions",
+			body: `{"model":"public-model","stream":true,"stream_options":null,"top_level":"keep"}`, wantIncludeUsage: true,
+		},
+		{
+			name: "non streaming completions does not gain include usage", path: "/v1/completions",
+			body:                `{"model":"public-model","stream":false,"stream_options":{"trace":"keep"},"top_level":"keep"}`,
+			wantUnrelatedOption: "keep",
+		},
+		{
+			name: "responses endpoint does not gain stream options", path: "/v1/responses",
+			body: `{"model":"public-model","stream":true,"top_level":"keep"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			forwarder := &usageCaptureForwarder{result: proxy.Result{Status: http.StatusOK}}
+			service, rawKey := newUsageTestService(t, forwarder, nil, nil, nil)
+
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+				Method: http.MethodPost, Path: test.path, Headers: make(http.Header), Body: []byte(test.body), APIKey: rawKey,
+			})
+			if apiErr != nil {
+				t.Fatalf("Forward() API error = %+v", apiErr)
+			}
+
+			var got map[string]any
+			if err := json.Unmarshal(forwarder.Request().Body, &got); err != nil {
+				t.Fatalf("decode upstream body: %v", err)
+			}
+			if got["top_level"] != "keep" {
+				t.Fatalf("top_level = %#v, want preserved value", got["top_level"])
+			}
+			options, hasOptions := got["stream_options"].(map[string]any)
+			if test.wantIncludeUsage {
+				if !hasOptions || options["include_usage"] != true {
+					t.Fatalf("stream_options = %#v, want include_usage=true", got["stream_options"])
+				}
+			} else if hasOptions {
+				if _, exists := options["include_usage"]; exists {
+					t.Fatalf("stream_options = %#v, want no include_usage", options)
+				}
+			} else if _, exists := got["stream_options"]; exists {
+				t.Fatalf("stream_options = %#v, want absent or unchanged object", got["stream_options"])
+			}
+			if test.wantUnrelatedOption != nil && options["trace"] != test.wantUnrelatedOption {
+				t.Fatalf("stream_options.trace = %#v, want %#v", options["trace"], test.wantUnrelatedOption)
+			}
+		})
+	}
+}
+
+func TestRequestEventUsageContainsStableLedgerAndProxyOutcome(t *testing.T) {
+	started := time.Date(2026, time.August, 27, 17, 10, 0, 0, time.FixedZone("CEST", 2*60*60))
+	completed := started.Add(3 * time.Second)
+	clock := &mutableClock{current: started}
+	cacheRead := int64(8)
+	observer := &usageRecordingObserver{}
+	forwarder := &retryProbeForwarder{
+		beforeAlternate: func() {
+			time.Sleep(time.Millisecond)
+			clock.Set(completed)
+		},
+		result: proxy.Result{
+			Status: http.StatusCreated, FirstByte: 17 * time.Millisecond, RetryCount: 1, Cancelled: true,
+			Usage: &domain.TokenUsage{InputTokens: 13, OutputTokens: 5, CacheReadTokens: &cacheRead},
+		},
+	}
+	service, rawKey := newUsageTestService(t, forwarder, observer, clock, []domain.Backend{
+		{ID: 20, ModelPoolID: 10, Name: "gpu-20", BaseURL: "http://gpu-20.invalid", Enabled: true, CapacityHint: 1, RunningSoftLimit: 8},
+		{ID: 21, ModelPoolID: 10, Name: "gpu-21", BaseURL: "http://gpu-21.invalid", Enabled: true, CapacityHint: 1, RunningSoftLimit: 8},
+	})
+
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/chat/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model","stream":true}`), APIKey: rawKey,
+		RequestID: "request-id", ParentRequestID: "parent-id",
+	})
+	if apiErr != nil {
+		t.Fatalf("Forward() API error = %+v", apiErr)
+	}
+
+	event := observer.SingleEvent(t)
+	if !event.OccurredAt.Equal(completed.UTC()) || event.OccurredAt.Location() != time.UTC {
+		t.Fatalf("OccurredAt = %s (%s), want %s UTC", event.OccurredAt, event.OccurredAt.Location(), completed.UTC())
+	}
+	if event.ClientID != 1 || event.ModelPoolID != 10 {
+		t.Fatalf("ledger IDs = client %d pool %d, want 1 and 10", event.ClientID, event.ModelPoolID)
+	}
+	if event.Client != "public-client" || event.Model != "public-model" || event.Backend != "gpu-21" {
+		t.Fatalf("snapshot names = client %q model %q backend %q", event.Client, event.Model, event.Backend)
+	}
+	if event.RequestID != "request-id" || event.ParentRequestID != "parent-id" {
+		t.Fatalf("request IDs = %q/%q", event.RequestID, event.ParentRequestID)
+	}
+	if event.Status != http.StatusCreated || event.Duration <= 0 || event.TTFT != 17*time.Millisecond || !event.Disconnect || event.RetryCount != 1 {
+		t.Fatalf("proxy outcome = status %d duration %s ttft %s disconnect %t retries %d",
+			event.Status, event.Duration, event.TTFT, event.Disconnect, event.RetryCount)
+	}
+	if event.Usage == nil || event.Usage.InputTokens != 13 || event.Usage.OutputTokens != 5 ||
+		event.Usage.CacheReadTokens == nil || *event.Usage.CacheReadTokens != 8 || event.UsageParseFailure != "" {
+		t.Fatalf("usage = %+v parse failure = %q", event.Usage, event.UsageParseFailure)
+	}
+}
+
+func TestRequestEventUsageContainsParseFailureFormat(t *testing.T) {
+	observer := &usageRecordingObserver{}
+	forwarder := &usageCaptureForwarder{result: proxy.Result{Status: http.StatusOK, UsageParseFailure: "shape"}}
+	service, rawKey := newUsageTestService(t, forwarder, observer, nil, nil)
+
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
+	})
+	if apiErr != nil {
+		t.Fatalf("Forward() API error = %+v", apiErr)
+	}
+	event := observer.SingleEvent(t)
+	if event.Usage != nil || event.UsageParseFailure != "shape" {
+		t.Fatalf("usage = %+v parse failure = %q, want nil/shape", event.Usage, event.UsageParseFailure)
+	}
+}
+
+func TestRequestEventUsagePreModelFailuresDoNotHaveBothLedgerIdentities(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiKey     string
+		body       string
+		wantStatus int
+		wantClient int64
+	}{
+		{name: "authentication", apiKey: "invalid", body: `{"model":"public-model"}`, wantStatus: http.StatusUnauthorized},
+		{name: "body validation", body: `not-json`, wantStatus: http.StatusBadRequest, wantClient: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observer := &usageRecordingObserver{}
+			service, rawKey := newUsageTestService(t, &usageCaptureForwarder{}, observer, nil, nil)
+			if test.apiKey != "" {
+				rawKey = test.apiKey
+			}
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+				Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(test.body), APIKey: rawKey,
+			})
+			if apiErr == nil || apiErr.HTTPStatus != test.wantStatus {
+				t.Fatalf("Forward() API error = %+v, want status %d", apiErr, test.wantStatus)
+			}
+			event := observer.SingleEvent(t)
+			if event.ClientID != test.wantClient || event.ModelPoolID != 0 {
+				t.Fatalf("ledger IDs = client %d pool %d, want client %d and no pool", event.ClientID, event.ModelPoolID, test.wantClient)
+			}
+		})
+	}
+}
+
+func TestRequestEventUsageRecordsIdentityForKnownModelPolicyDenials(t *testing.T) {
+	tests := []struct {
+		name          string
+		model         string
+		configure     func(*registry.Snapshot)
+		wantModelID   int64
+		wantModelName string
+	}{
+		{
+			name:  "disabled model is resolved before policy rejection",
+			model: "public-model",
+			configure: func(snapshot *registry.Snapshot) {
+				pool := snapshot.PoolsByName["public-model"]
+				pool.Enabled = false
+				snapshot.PoolsByName[pool.PublicModelName] = pool
+				snapshot.PoolsByID[pool.ID] = pool
+			},
+			wantModelID: 10, wantModelName: "public-model",
+		},
+		{
+			name:  "ungranted model is resolved before policy rejection",
+			model: "public-model",
+			configure: func(snapshot *registry.Snapshot) {
+				delete(snapshot.Access[1], int64(10))
+			},
+			wantModelID: 10, wantModelName: "public-model",
+		},
+		{name: "unknown model remains unresolved", model: "attacker-controlled-model"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observer := &usageRecordingObserver{}
+			forwarder := &usageCaptureForwarder{}
+			service, rawKey := newUsageTestServiceWithSnapshot(t, forwarder, observer, nil, nil, test.configure)
+			_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+				Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+				Body: []byte(`{"model":` + strconv.Quote(test.model) + `}`), APIKey: rawKey,
+			})
+			if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+				t.Fatalf("Forward() API error = %+v, want 403", apiErr)
+			}
+			event := observer.SingleEvent(t)
+			if event.ClientID != 1 || event.ModelPoolID != test.wantModelID || event.Model != test.wantModelName {
+				t.Fatalf("ledger identity = client %d pool %d model %q, want client 1 pool %d model %q",
+					event.ClientID, event.ModelPoolID, event.Model, test.wantModelID, test.wantModelName)
+			}
+			if forwarder.Request().Method != "" {
+				t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
+			}
+		})
+	}
+}
+
+func TestForwardReservesCompletionAfterStableIdentityBeforePolicyRejection(t *testing.T) {
+	observer := &usageReservationObserver{accept: true}
+	forwarder := &usageCaptureForwarder{}
+	service, rawKey := newUsageTestServiceWithSnapshot(t, forwarder, observer, nil, nil, func(snapshot *registry.Snapshot) {
+		pool := snapshot.PoolsByName["public-model"]
+		pool.Enabled = false
+		snapshot.PoolsByName[pool.PublicModelName] = pool
+		snapshot.PoolsByID[pool.ID] = pool
+	})
+
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "policy-request",
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("Forward() API error = %+v, want 403", apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request" {
+		t.Fatalf("completion reservations = %v, want resolved policy request", got)
+	}
+	if forwarder.Request().Method != "" {
+		t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
+	}
+	_, _, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"attacker-controlled-model"}`), APIKey: rawKey, RequestID: "unknown-request",
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("unknown-model Forward() API error = %+v, want 403", apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request" {
+		t.Fatalf("completion reservations after unknown model = %v, want known model only", got)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, _, apiErr := service.Forward(canceledCtx, httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "canceled-request",
+	})
+	if apiErr != nil || !result.Cancelled || !errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("canceled reservation result/API error = %+v/%+v", result, apiErr)
+	}
+	if got := observer.Reservations(); strings.Join(got, ",") != "policy-request,canceled-request" {
+		t.Fatalf("completion reservation attempts after cancellation = %v", got)
+	}
+	if forwarder.Request().Method != "" {
+		t.Fatalf("canceled reservation reached upstream forwarder: %+v", forwarder.Request())
+	}
+}
+
+func TestForwardPanicRollsBackCompletionReservation(t *testing.T) {
+	store := &panicUsageStore{}
+	recorder := analytics.NewRecorder(store, 0, nil, nil)
+	observer := &rollbackTrackingRecorder{Recorder: recorder}
+	t.Cleanup(func() {
+		observer.RollbackAll()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := recorder.Close(ctx); err != nil {
+			t.Errorf("cleanup Recorder.Close() error = %v", err)
+		}
+		select {
+		case <-recorder.Done():
+		default:
+			t.Error("cleanup returned before Recorder.Done closed")
+		}
+	})
+
+	panicValue := errors.New("panic after completion reservation")
+	service, rawKey := newUsageTestService(t, panickingUsageForwarder{value: panicValue}, observer, nil, nil)
+	const requestID = "panicking-request"
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _, _ = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+			Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: requestID,
+		})
+	}()
+	if recovered != panicValue {
+		t.Errorf("recovered panic = %#v, want original panic %#v", recovered, panicValue)
+	}
+
+	_, reusedRollback, reused := recorder.ReserveResponseComplete(context.Background(), requestID)
+	if !reused {
+		t.Error("panic leaked the completion reservation; request ID was not reusable")
+	} else {
+		reusedRollback()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := recorder.Close(ctx); err != nil {
+		t.Errorf("Recorder.Close() after recovered panic = %v", err)
+	}
+	select {
+	case <-recorder.Done():
+	default:
+		t.Error("Recorder.Done remained open after recovered panic")
+	}
+	if records := store.Records(); len(records) != 0 {
+		t.Fatalf("panic staged durable usage rows = %+v, want none", records)
+	}
+}
+
+func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
+	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
+	observer := &usageRecordingObserver{}
+	service := gateway.New(gateway.Dependencies{
+		Observer: observer,
+		Now:      func() time.Time { return completed },
+	})
+
+	service.CompletePublic(gateway.RequestEvent{
+		OccurredAt: completed.Add(-time.Hour),
+		Status:     http.StatusNotFound,
+		Reason:     "unsupported_endpoint",
+	})
+
+	event := observer.SingleEvent(t)
+	if !event.OccurredAt.Equal(completed.UTC()) || event.OccurredAt.Location() != time.UTC {
+		t.Fatalf("OccurredAt = %s (%s), want authoritative completion time %s UTC",
+			event.OccurredAt, event.OccurredAt.Location(), completed.UTC())
+	}
+}
+
+type usageCaptureForwarder struct {
+	mu      sync.Mutex
+	request proxy.Request
+	result  proxy.Result
+}
+
+type panickingUsageForwarder struct {
+	value any
+}
+
+func (f panickingUsageForwarder) Forward(context.Context, http.ResponseWriter, proxy.Request) proxy.Result {
+	panic(f.value)
+}
+
+type rollbackTrackingRecorder struct {
+	*analytics.Recorder
+	mu        sync.Mutex
+	rollbacks []func()
+}
+
+func (r *rollbackTrackingRecorder) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	reservation, rollback, reserved := r.Recorder.ReserveResponseComplete(ctx, requestID)
+	if reserved && rollback != nil {
+		r.mu.Lock()
+		r.rollbacks = append(r.rollbacks, rollback)
+		r.mu.Unlock()
+	}
+	return reservation, rollback, reserved
+}
+
+func (r *rollbackTrackingRecorder) RollbackAll() {
+	r.mu.Lock()
+	rollbacks := append([]func(){}, r.rollbacks...)
+	r.mu.Unlock()
+	for _, rollback := range rollbacks {
+		rollback()
+	}
+}
+
+type panicUsageStore struct {
+	mu      sync.Mutex
+	records []analytics.RequestRecord
+}
+
+func (s *panicUsageStore) InsertUsageBatch(_ context.Context, records []analytics.RequestRecord) error {
+	s.mu.Lock()
+	s.records = append(s.records, records...)
+	s.mu.Unlock()
+	return nil
+}
+
+func (*panicUsageStore) DeleteUsageBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (s *panicUsageStore) Records() []analytics.RequestRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]analytics.RequestRecord(nil), s.records...)
+}
+
+func (f *usageCaptureForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	f.mu.Lock()
+	f.request = request
+	f.mu.Unlock()
+	return f.result
+}
+
+func (f *usageCaptureForwarder) Request() proxy.Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.request
+}
+
+type usageRecordingObserver struct {
+	mu     sync.Mutex
+	events []gateway.RequestEvent
+}
+
+type usageReservationObserver struct {
+	usageRecordingObserver
+	accept       bool
+	reservations []string
+}
+
+func (o *usageReservationObserver) ReserveResponseComplete(
+	ctx context.Context,
+	requestID string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	o.mu.Lock()
+	o.reservations = append(o.reservations, requestID)
+	o.mu.Unlock()
+	if !o.accept || ctx.Err() != nil {
+		return nil, nil, false
+	}
+	return usageResponseReservation{}, func() {}, true
+}
+
+func (*usageReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {}
+
+type usageResponseReservation struct{}
+
+func (usageResponseReservation) StageResponseComplete(gateway.RequestEvent) {}
+
+func (o *usageReservationObserver) Reservations() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.reservations...)
+}
+
+func (*usageRecordingObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*usageRecordingObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (o *usageRecordingObserver) Complete(event gateway.RequestEvent) {
+	o.mu.Lock()
+	o.events = append(o.events, event)
+	o.mu.Unlock()
+}
+
+func (o *usageRecordingObserver) SingleEvent(t *testing.T) gateway.RequestEvent {
+	t.Helper()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.events) != 1 {
+		t.Fatalf("completed events = %d, want 1", len(o.events))
+	}
+	return o.events[0]
+}
+
+func newUsageTestService(
+	t *testing.T,
+	forwarder gateway.Forwarder,
+	observer gateway.Observer,
+	clock *mutableClock,
+	backends []domain.Backend,
+) (*gateway.Service, string) {
+	return newUsageTestServiceWithSnapshot(t, forwarder, observer, clock, backends, nil)
+}
+
+func newUsageTestServiceWithSnapshot(
+	t *testing.T,
+	forwarder gateway.Forwarder,
+	observer gateway.Observer,
+	clock *mutableClock,
+	backends []domain.Backend,
+	configure func(*registry.Snapshot),
+) (*gateway.Service, string) {
+	t.Helper()
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{
+		ID: 1, Name: "public-client", Enabled: true, PriorityClass: domain.PriorityHigh, VLLMPriority: -20, MaxConcurrency: 2,
+	}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	if len(backends) == 0 {
+		backends = []domain.Backend{{
+			ID: 20, ModelPoolID: pool.ID, Name: "gpu-20", BaseURL: "http://gpu-20.invalid",
+			Enabled: true, CapacityHint: 1, RunningSoftLimit: 8,
+		}}
+	}
+	values := make(map[int64]domain.BackendRuntime, len(backends))
+	for index, backend := range backends {
+		values[backend.ID] = domain.BackendRuntime{
+			BackendID: backend.ID, Healthy: true, MetricsFresh: true, Pressure: float64(index+1) / 10,
+			CircuitState: domain.CircuitClosed, CircuitAvailable: true,
+		}
+	}
+	provider := &mutableSnapshotProvider{}
+	snapshot := testSnapshot(client, key, pool, backends)
+	if configure != nil {
+		configure(snapshot)
+	}
+	provider.Set(snapshot)
+	if clock == nil {
+		clock = &mutableClock{current: time.Date(2026, time.August, 27, 15, 0, 0, 0, time.UTC)}
+	}
+	return gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Limiter: admission.NewLimiter(), Runtime: &recordingRuntime{values: values},
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+		Observer: observer, Now: clock.Now,
+	}), rawKey
+}

@@ -24,6 +24,7 @@ var migrations = []struct {
 }{
 	{version: 1, path: "migrations/001_initial.sql"},
 	{version: 2, path: "migrations/002_pool_safety.sql"},
+	{version: 3, path: "migrations/003_usage_analytics.sql"},
 }
 
 type SQLite struct {

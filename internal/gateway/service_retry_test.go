@@ -52,7 +52,7 @@ func TestRetrySelectionUsesCurrentRegistryAndTime(t *testing.T) {
 	})
 	response := httptest.NewRecorder()
 
-	_, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
 	})
@@ -101,7 +101,7 @@ func TestRetrySelectionRejectsPoolModelReconfiguration(t *testing.T) {
 	})
 	response := httptest.NewRecorder()
 
-	_, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
+	_, _, apiErr := service.Forward(context.Background(), response, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
 		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
 	})
@@ -126,7 +126,7 @@ func TestForwardSkipsCircuitOpenBackend(t *testing.T) {
 	forwarder := &completionForwarder{}
 	service, request := retryService(backends, runtime, forwarder, nil, time.Now)
 
-	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil || result.Err != nil {
 		t.Fatalf("Forward() result=%+v API error=%+v", result, apiErr)
 	}
@@ -153,7 +153,7 @@ func TestForwardRetriesSelectionWhenBackendAcquisitionRaces(t *testing.T) {
 	forwarder := &completionForwarder{}
 	service, request := retryService(backends, runtime, forwarder, nil, time.Now)
 
-	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil || result.Err != nil {
 		t.Fatalf("Forward() result=%+v API error=%+v", result, apiErr)
 	}
@@ -179,7 +179,7 @@ func TestForwardRejectsPublishedBackendUntilMatchingRuntimeIsHealthy(t *testing.
 	forwarder := &completionForwarder{}
 	service, request := retryService([]domain.Backend{newBackend}, runtime, forwarder, nil, time.Now)
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.Code != "backend_unavailable" {
 		t.Fatalf("identity mismatch API error = %+v, want backend_unavailable", apiErr)
 	}
@@ -191,7 +191,7 @@ func TestForwardRejectsPublishedBackendUntilMatchingRuntimeIsHealthy(t *testing.
 	}
 
 	runtime.SetBackend(newBackend, domain.BackendRuntime{BackendID: 20, CircuitAvailable: true})
-	_, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr = service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.Code != "backend_unavailable" {
 		t.Fatalf("unhealthy reconciled runtime API error = %+v, want backend_unavailable", apiErr)
 	}
@@ -202,7 +202,7 @@ func TestForwardRejectsPublishedBackendUntilMatchingRuntimeIsHealthy(t *testing.
 	runtime.SetBackend(newBackend, domain.BackendRuntime{
 		BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true,
 	})
-	result, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil || result.Status != http.StatusOK {
 		t.Fatalf("healthy reconciled result=%+v API error=%+v", result, apiErr)
 	}
@@ -224,7 +224,7 @@ func TestForwardCompletesFailedBackendBeforeSelectingAlternateAndBalancesObserve
 	forwarder := &retryProbeForwarder{beforeAlternate: func() {}}
 	service, request := retryService(backends, runtime, forwarder, observer, time.Now)
 
-	_, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr != nil {
 		t.Fatalf("Forward() API error = %+v", apiErr)
 	}
@@ -252,7 +252,7 @@ func TestForwardRecordsHTTP5xxFailureWithoutRetry(t *testing.T) {
 	service, request := retryService([]domain.Backend{backend}, runtime, proxy.New(server.Client()), nil, time.Now)
 	response := httptest.NewRecorder()
 
-	result, apiErr := service.Forward(context.Background(), response, request)
+	result, _, apiErr := service.Forward(context.Background(), response, request)
 	if apiErr != nil || result.Err != nil || result.Status != http.StatusServiceUnavailable || result.RetryCount != 0 {
 		t.Fatalf("Forward() result=%+v API error=%+v", result, apiErr)
 	}
@@ -284,7 +284,7 @@ func TestForwardRecordsCancellationNeutralAndBalancesObserver(t *testing.T) {
 		err    *gateway.APIError
 	}, 1)
 	go func() {
-		result, apiErr := service.Forward(ctx, httptest.NewRecorder(), request)
+		result, _, apiErr := service.Forward(ctx, httptest.NewRecorder(), request)
 		finished <- struct {
 			result proxy.Result
 			err    *gateway.APIError
@@ -451,9 +451,11 @@ func (r *recordingRuntime) Inflight(backendID int64) int {
 }
 
 type retryProbeForwarder struct {
-	beforeAlternate func()
-	initialBackend  int64
-	alternateErr    error
+	beforeAlternate  func()
+	initialBackend   int64
+	alternateBackend int64
+	alternateErr     error
+	result           proxy.Result
 }
 
 func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
@@ -463,10 +465,21 @@ func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWri
 	alternate, err := request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
 	f.alternateErr = err
 	if err == nil {
+		f.alternateBackend = alternate.Backend.ID
 		alternate.Complete(domain.InferenceSuccess)
 	}
-	writer.WriteHeader(http.StatusOK)
-	return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
+	result := f.result
+	if result.Status == 0 {
+		result.Status = http.StatusOK
+	}
+	if result.BackendID == 0 {
+		result.BackendID = request.Target.Backend.ID
+		if f.alternateBackend != 0 {
+			result.BackendID = f.alternateBackend
+		}
+	}
+	writer.WriteHeader(result.Status)
+	return result
 }
 
 type completionForwarder struct {

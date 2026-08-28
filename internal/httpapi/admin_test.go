@@ -242,7 +242,7 @@ func TestRevocationPublishesAfterRequestCancellation(t *testing.T) {
 	runtime := &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)}
 	wrapper := &cancellingStore{SQLite: database}
 	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: wrapper, Registry: registryValue, Runtime: runtime,
+		Store: wrapper, Analytics: wrapper, Registry: registryValue, Runtime: runtime,
 		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
 	})
 	if err != nil {
@@ -281,7 +281,7 @@ func TestRevocationRemainsFailClosedWhenReloadFails(t *testing.T) {
 	}
 	failingRegistry := &reloadFailureRegistry{Registry: registryValue}
 	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: failingRegistry,
+		Store: database, Analytics: database, Registry: failingRegistry,
 		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
 		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
 	})
@@ -329,7 +329,7 @@ func newAdminFixture(t *testing.T) (http.Handler, *registry.Registry, *adminRunt
 	}
 	runtime := &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)}
 	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
-		Store: database, Registry: registryValue, Runtime: runtime,
+		Store: database, Analytics: database, Registry: registryValue, Runtime: runtime,
 		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 4096)),
 		Now: func() time.Time { return time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC) },
 	})
