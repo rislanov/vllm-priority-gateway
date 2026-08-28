@@ -111,6 +111,12 @@ ReadWritePaths=/var/lib/llmgw
 WantedBy=multi-user.target
 ```
 
+Validate the installed unit before enabling it:
+
+```bash
+sudo systemd-analyze verify /etc/systemd/system/llmgw.service
+```
+
 Start the service:
 
 ```bash
@@ -118,6 +124,59 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now llmgw
 sudo systemctl status llmgw
 ```
+
+## Configure gateway state
+
+A fresh database starts with revision `0`. At that point `/healthz` and management readiness work, but `/inference-readyz` correctly remains HTTP 503 until an enabled model pool and at least one eligible backend have been created. A usable inference request additionally requires a client and its API key.
+
+Backends may run on the gateway host or on remote serving hosts. Before registering them, verify every upstream from the gateway host itself, using the same addresses that will be stored in Admin:
+
+```bash
+export VLLM_A_URL='http://inference-a.internal:8000'
+export VLLM_B_URL='http://inference-b.internal:8000'
+
+for upstream in "$VLLM_A_URL" "$VLLM_B_URL"; do
+  curl -fsS "$upstream/health" >/dev/null
+  curl -fsS "$upstream/v1/models" | jq -e '.data | length > 0'
+  curl -fsS "$upstream/metrics" \
+    | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)' >/dev/null
+done
+```
+
+Add the configured upstream authorization header to these probes when vLLM API-key authentication is enabled.
+
+Restrict remote vLLM ingress to the gateway hosts at the network boundary; do not publish unauthenticated serving ports broadly. Then use the Admin UI through the intended authenticated ingress, or an SSH tunnel to the loopback listener, to create:
+
+1. an enabled public model pool mapped to the exact upstream served-model name;
+2. every backend with its gateway-reachable base URL and an appropriate `runningSoftLimit`;
+3. each client with its allowed pool, class, vLLM priority, and concurrency limit;
+4. a distinct API key for each client, storing the returned secret when it is shown once.
+
+The Admin UI performs CSRF handling automatically. Scripts using the JSON Admin API must first make an authenticated GET to receive the `llmgw_csrf` cookie, then send both that cookie and the matching `X-CSRF-Token` header on every state-changing request. Basic authentication alone is intentionally rejected with HTTP 403. This example creates one model pool; apply the same session pattern to backend, client, and key requests:
+
+```bash
+export LLMGW_ADMIN_URL='http://127.0.0.1:8080'
+export LLMGW_ADMIN_USERNAME='operator'
+
+admin_cookie_jar=$(mktemp)
+trap 'rm -f "$admin_cookie_jar"' EXIT
+
+curl -fsS --user "$LLMGW_ADMIN_USERNAME" \
+  -c "$admin_cookie_jar" \
+  "$LLMGW_ADMIN_URL/admin/api/status" >/dev/null
+
+csrf_token=$(awk '$6 == "llmgw_csrf" { print $7 }' "$admin_cookie_jar")
+test -n "$csrf_token"
+
+curl -fsS --user "$LLMGW_ADMIN_USERNAME" \
+  -b "$admin_cookie_jar" \
+  -H "X-CSRF-Token: $csrf_token" \
+  -H 'Content-Type: application/json' \
+  -d '{"publicModelName":"qwen","upstreamModelName":"qwen-test","enabled":true,"maxGatewayInflight":0,"maxWaiting":0}' \
+  "$LLMGW_ADMIN_URL/admin/api/pools" | jq .
+```
+
+Do not continue to deployment verification until Admin shows the intended inventory and every enabled, non-draining backend is healthy with fresh metrics.
 
 ## Post-deployment verification
 

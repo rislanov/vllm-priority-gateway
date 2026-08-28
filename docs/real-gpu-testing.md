@@ -31,7 +31,11 @@ export ADMIN_USER='operator'
 export ADMIN_PASSWORD='replace-with-your-password'
 ```
 
-Start vLLM A (and B on another GPU/host when available):
+Run the health, model, and metrics probes below from the gateway host. `VLLM_A` and `VLLM_B` may point to remote serving groups, provided the network policy allows only the intended gateway hosts to reach them.
+
+The native commands below are a two-GPU example. On a single GPU, prefer the canonical Docker Compose topology; if manually sharing the device between native processes, set and calibrate an explicit `--gpu-memory-utilization` for each process rather than referencing a nonexistent second device.
+
+Start vLLM A and B on separate GPUs or serving hosts when available:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" --host 127.0.0.1 --port 8001 \
@@ -40,6 +44,21 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" --host 127.0.0.1 --port 8001 \
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL" --host 127.0.0.1 --port 8002 \
   --scheduling-policy priority --enable-request-id-headers
 ```
+
+These commands bind loopback for a same-host deployment. On a separate serving host, bind the intended private interface instead and restrict its ingress to the gateway hosts.
+
+Confirm the exact upstream URLs from the gateway host before registering them:
+
+```bash
+for upstream in "$VLLM_A" "$VLLM_B"; do
+  curl -fsS "$upstream/health" >/dev/null
+  curl -fsS "$upstream/v1/models" | jq -e '.data | length > 0'
+  curl -fsS "$upstream/metrics" \
+    | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)' >/dev/null
+done
+```
+
+Add the configured upstream authorization header to these probes when vLLM API-key authentication is enabled.
 
 Register the pool/backends and clients in the Admin UI. Wait for Dashboard to show healthy, fresh metrics. Capture baseline evidence:
 
@@ -249,7 +268,7 @@ Run the isolated resilience scenario from the same host as the gateway:
 LLMGW_E2E_MODE=resilience make test-real-vllm
 ```
 
-Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires a loopback gateway URL, captures the target URL, all sibling drain states, all backend update fields, and both pool limits, and attempts to restore every captured value. Cleanup reports all failed updates and continues trying later resources; a resource whose update fails may remain mutated and must be restored manually. The loopback fault proxy faults only supported inference routes. Do not run this mode against production traffic.
+Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires the test process and gateway on the same host with a loopback gateway URL; the selected vLLM backend itself may be remote. The test captures the target URL, all sibling drain states, all backend update fields, and both pool limits, and attempts to restore every captured value. Cleanup reports all failed updates and continues trying later resources; a resource whose update fails may remain mutated and must be restored manually. The loopback fault proxy faults only supported inference routes. Do not run this mode against production traffic.
 
 Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open → half_open → closed`, `/readyz` remaining HTTP 200, `/inference-readyz` changing `200 → 503 → 200`, and the five Prometheus families `llmgw_backend_circuit_state`, `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Also retain the complete recovery stream timing and the cleanup status. Do not claim a target-host gate until its real-vLLM command has actually run and its required artifacts have been retained.
 

@@ -60,7 +60,7 @@ vllm serve Qwen/Qwen3-0.6B \
 
 ### Linux with NVIDIA GPUs
 
-Use the vLLM installation appropriate for the CUDA host, then start one serving process per GPU or independently scheduled serving group:
+Use the vLLM installation appropriate for the CUDA host. The commands below are a two-GPU example with one serving process per GPU or independently scheduled serving group:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B \
@@ -78,14 +78,23 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B \
   --generation-config vllm
 ```
 
-Verify both nodes before configuring the gateway:
+For a single NVIDIA GPU, the canonical and tested reference topology is the repository's Docker Compose quick start. It runs two deliberately small `Qwen/Qwen3-0.6B` workers with explicit per-worker GPU memory fractions. If you instead share one GPU between manually managed native vLLM processes, set and calibrate `--gpu-memory-utilization` for every process so their total leaves runtime headroom; do not copy the second `CUDA_VISIBLE_DEVICES=1` command onto a host without a second GPU.
+
+The gateway and vLLM do not need to share a host. Set the URLs to the exact addresses that the gateway will use, then verify both nodes from the gateway host before configuring Admin:
 
 ```bash
-curl -fsS http://127.0.0.1:8001/health
-curl -fsS http://127.0.0.1:8002/health
-curl -fsS http://127.0.0.1:8001/metrics \
-  | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)'
+export VLLM_A_URL='http://inference-a.internal:8000'
+export VLLM_B_URL='http://inference-b.internal:8000'
+
+for upstream in "$VLLM_A_URL" "$VLLM_B_URL"; do
+  curl -fsS "$upstream/health" >/dev/null
+  curl -fsS "$upstream/v1/models" | jq -e 'any(.data[]; .id == "qwen-test")'
+  curl -fsS "$upstream/metrics" \
+    | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)' >/dev/null
+done
 ```
+
+Add the configured upstream authorization header to these probes when vLLM API-key authentication is enabled.
 
 ## 2. Configure the gateway test identities
 
@@ -106,6 +115,8 @@ Create these clients and one key for each client:
 | `low-3` | Background | `102` | `4` |
 
 Every row must be a separate configured client with a distinct API key. In particular, the High and Critical probes must not reuse a High load key: otherwise a per-client concurrency lease may be exhausted by the load itself and the test would exercise the wrong rejection path. The test rejects duplicate key values without printing the secrets.
+
+The Admin UI handles CSRF automatically. Direct JSON Admin API provisioning must bootstrap the `llmgw_csrf` cookie with an authenticated GET and include both the cookie and matching `X-CSRF-Token` header on every mutation; see [Native Linux deployment](deployment.md#configure-gateway-state) for a shell example.
 
 ## 3. Run the production-safe smoke check
 
@@ -201,7 +212,7 @@ export LLMGW_E2E_PROBE_TIMEOUT=60s
 go test -count=1 -v -timeout 10m ./tests/e2e -run TestCircuitBreakerRecoveryWithRealVLLM
 ```
 
-The scenario captures originals before mutation, starts a loopback reverse proxy to the selected real-vLLM URL, sets both pool safety limits to unlimited for fault isolation, updates the target URL, and waits for a clean baseline: `CircuitState=closed`, circuit available, zero circuit failures, healthy, and metrics-fresh. It then drains every sibling. The proxy passes `/health`, `/metrics`, and all non-faulting inference headers, statuses, bytes, and streaming through to real vLLM. While faulting, only `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` return deterministic OpenAI-shaped HTTP 503 with error code `e2e_injected_failure`; health and metrics continue to come from real vLLM.
+The scenario captures originals before mutation, starts a loopback reverse proxy to the selected real-vLLM URL, sets both pool safety limits to unlimited for fault isolation, updates the target URL, and waits for a clean baseline: `CircuitState=closed`, circuit available, zero circuit failures, healthy, and metrics-fresh. The test process and gateway must share a host because this proxy listens on loopback; the original vLLM target may be remote as long as that host can reach it. The test then drains every sibling. The proxy passes `/health`, `/metrics`, and all non-faulting inference headers, statuses, bytes, and streaming through to real vLLM. While faulting, only `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` return deterministic OpenAI-shaped HTTP 503 with error code `e2e_injected_failure`; health and metrics continue to come from real vLLM.
 
 Each configured failure has a distinct `X-Request-Id`, and every response must have HTTP 503 plus the exact OpenAI error code `e2e_injected_failure`. Pass criteria are: target Admin runtime remains healthy/fresh and reaches `CircuitState=open`; `/inference-readyz` becomes HTTP 503 `unavailable`; after fault disable and the configured cooldown, Admin exposes half-open probe capacity and pool availability; one complete stream closes the circuit; `/inference-readyz` returns HTTP 200 `ready`. Cleanup attempts the original target URL, every sibling drain state, all other backend fields, and both original pool limits before stopping the proxy. It reports all failed updates and continues later restores; any resource whose restore update fails may remain mutated and requires manual recovery. No API-key or Basic-auth value is included in test errors or logs.
 
