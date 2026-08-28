@@ -17,6 +17,23 @@ type PublicHandler struct {
 	router     http.Handler
 }
 
+type InferenceReadinessProvider interface {
+	InferenceReadiness() gateway.InferenceReadiness
+}
+
+func NewInferenceReadinessHandler(provider InferenceReadinessProvider) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		readiness := provider.InferenceReadiness()
+		status := http.StatusOK
+		if readiness.PoolAvailability == 0 && readiness.BackendAvailability == 0 {
+			status = http.StatusServiceUnavailable
+		}
+		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+		writer.WriteHeader(status)
+		_ = json.NewEncoder(writer).Encode(readiness)
+	})
+}
+
 func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGenerator) http.Handler {
 	if generateID == nil {
 		generateID = generateRequestID

@@ -162,6 +162,73 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	}
 }
 
+func TestAdminPoolSafetyJSONRoundTripAndValidation(t *testing.T) {
+	handler, _, _ := newAdminFixture(t)
+	csrf := fetchCSRF(t, handler)
+
+	created := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "qwen-72b", "upstreamModelName": "Qwen/Qwen2.5-72B-Instruct", "enabled": true,
+		"maxGatewayInflight": 17, "maxWaiting": 9,
+	}, http.StatusCreated)
+	poolID := jsonInt64(t, created, "id")
+	assertJSONNumber(t, created, "maxGatewayInflight", 17)
+	assertJSONNumber(t, created, "maxWaiting", 9)
+
+	updated := adminJSON(t, handler, csrf, http.MethodPut, "/admin/api/pools/"+strconv.FormatInt(poolID, 10), map[string]any{
+		"publicModelName": "qwen-72b-updated", "upstreamModelName": "Qwen/Qwen2.5-72B-Instruct", "enabled": true,
+		"maxGatewayInflight": 17, "maxWaiting": 9,
+	}, http.StatusOK)
+	assertJSONNumber(t, updated, "maxGatewayInflight", 17)
+	assertJSONNumber(t, updated, "maxWaiting", 9)
+
+	compatible := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "legacy-client", "upstreamModelName": "legacy-upstream", "enabled": true,
+	}, http.StatusCreated)
+	assertJSONNumber(t, compatible, "maxGatewayInflight", 0)
+	assertJSONNumber(t, compatible, "maxWaiting", 0)
+
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/pools", nil)
+	request.SetBasicAuth(adminUser, adminPassword)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET pools = %d body=%s", response.Code, response.Body.String())
+	}
+	var listed struct {
+		Pools []map[string]any `json:"pools"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	pools := listed.Pools
+	if len(pools) != 2 {
+		t.Fatalf("GET pools length = %d, want 2", len(pools))
+	}
+	var viewed map[string]any
+	for _, pool := range pools {
+		if pool["id"] == float64(poolID) {
+			viewed = pool
+		}
+	}
+	if viewed == nil {
+		t.Fatalf("updated pool missing from JSON: %#v", pools)
+	}
+	assertJSONNumber(t, viewed, "maxGatewayInflight", 17)
+	assertJSONNumber(t, viewed, "maxWaiting", 9)
+
+	createError := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "invalid-create", "upstreamModelName": "upstream", "enabled": true,
+		"maxGatewayInflight": -1, "maxWaiting": 0,
+	}, http.StatusBadRequest)
+	assertAdminValidationError(t, createError, "max gateway inflight cannot be negative")
+
+	updateError := adminJSON(t, handler, csrf, http.MethodPut, "/admin/api/pools/"+strconv.FormatInt(poolID, 10), map[string]any{
+		"publicModelName": "invalid-update", "upstreamModelName": "upstream", "enabled": true,
+		"maxGatewayInflight": 0, "maxWaiting": -1,
+	}, http.StatusBadRequest)
+	assertAdminValidationError(t, updateError, "max waiting cannot be negative")
+}
+
 func TestRevocationPublishesAfterRequestCancellation(t *testing.T) {
 	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {
@@ -327,6 +394,22 @@ func jsonInt64(t *testing.T, value map[string]any, key string) int64 {
 		t.Fatalf("%s missing from %#v", key, value)
 	}
 	return int64(number)
+}
+
+func assertJSONNumber(t *testing.T, value map[string]any, key string, want float64) {
+	t.Helper()
+	got, ok := value[key].(float64)
+	if !ok || got != want {
+		t.Fatalf("%s = %#v, want %v in %#v", key, value[key], want, value)
+	}
+}
+
+func assertAdminValidationError(t *testing.T, value map[string]any, wantMessage string) {
+	t.Helper()
+	errorValue, ok := value["error"].(map[string]any)
+	if !ok || errorValue["code"] != "validation_error" || errorValue["message"] != wantMessage {
+		t.Fatalf("validation error = %#v, want code validation_error and message %q", value, wantMessage)
+	}
 }
 
 func assertRevision(t *testing.T, registryValue *registry.Registry, revision *int64) {

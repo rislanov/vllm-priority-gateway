@@ -486,6 +486,116 @@ func TestBackendEditPageAndEnableToggle(t *testing.T) {
 	}
 }
 
+func TestPoolSafetyFormsRenderAndPrefillExistingLimits(t *testing.T) {
+	handler := newWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"max_gateway_inflight", "max_waiting"} {
+		if !hasInput(document, name, "number", "0", "0") {
+			t.Fatalf("create form is missing min=0 number input %q: %s", name, response.Body.String())
+		}
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit_pool=1", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Edit model pool: qwen-72b") {
+		t.Fatalf("pool edit response = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err = html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasInput(document, "max_gateway_inflight", "number", "0", "17") || !hasInput(document, "max_waiting", "number", "0", "9") {
+		t.Fatalf("pool edit form did not prefill 17/9: %s", response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin", nil))
+	if !strings.Contains(response.Body.String(), "Max gateway inflight") || !strings.Contains(response.Body.String(), "Max waiting") || !strings.Contains(response.Body.String(), ">17<") || !strings.Contains(response.Body.String(), ">9<") {
+		t.Fatalf("dashboard does not expose configured pool limits: %s", response.Body.String())
+	}
+}
+
+func TestPoolSafetyFormsParseCreateUpdateAndRejectNegatives(t *testing.T) {
+	handler := newWebFixture(t)
+
+	createForm := "action=create_pool&public_model_name=new-model&upstream_model_name=new-upstream&enabled=on&max_gateway_inflight=17&max_waiting=9"
+	request := httptest.NewRequest(http.MethodPost, "/admin/backends", strings.NewReader(createForm))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("create pool status = %d body=%s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit_pool=2", nil))
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasInput(document, "max_gateway_inflight", "number", "0", "17") || !hasInput(document, "max_waiting", "number", "0", "9") {
+		t.Fatalf("created pool limits were not persisted: %s", response.Body.String())
+	}
+
+	updateForm := "action=update_pool&id=1&public_model_name=qwen-72b&upstream_model_name=Qwen%2FQwen2.5-72B-Instruct&enabled=on&max_gateway_inflight=8&max_waiting=4"
+	request = httptest.NewRequest(http.MethodPost, "/admin/backends", strings.NewReader(updateForm))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("update pool status = %d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit_pool=1", nil))
+	document, err = html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasInput(document, "max_gateway_inflight", "number", "0", "8") || !hasInput(document, "max_waiting", "number", "0", "4") {
+		t.Fatalf("updated pool limits were not persisted: %s", response.Body.String())
+	}
+
+	for _, test := range []struct {
+		name string
+		form string
+		want string
+	}{
+		{
+			name: "negative gateway inflight on create",
+			form: "action=create_pool&public_model_name=bad-create&upstream_model_name=upstream&max_gateway_inflight=-1&max_waiting=0",
+			want: "max gateway inflight cannot be negative",
+		},
+		{
+			name: "negative waiting on update",
+			form: "action=update_pool&id=1&public_model_name=qwen-72b&upstream_model_name=upstream&max_gateway_inflight=0&max_waiting=-1",
+			want: "max waiting cannot be negative",
+		},
+		{
+			name: "non-integer gateway inflight",
+			form: "action=create_pool&public_model_name=bad-parse&upstream_model_name=upstream&max_gateway_inflight=many&max_waiting=0",
+			want: "max gateway inflight must be an integer",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/admin/backends", strings.NewReader(test.form))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), test.want) {
+				t.Fatalf("response = %d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func newWebFixture(t *testing.T) http.Handler {
 	return newWebFixtureWithUsage(t, nil)
 }
@@ -532,7 +642,10 @@ func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord
 	if err := database.InsertUsageBatch(context.Background(), records); err != nil {
 		t.Fatal(err)
 	}
-	pool, err := database.CreatePool(context.Background(), store.CreatePoolParams{PublicModelName: "qwen-72b", UpstreamModelName: "Qwen/Qwen2.5-72B-Instruct", Enabled: true})
+	pool, err := database.CreatePool(context.Background(), store.CreatePoolParams{
+		PublicModelName: "qwen-72b", UpstreamModelName: "Qwen/Qwen2.5-72B-Instruct", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,6 +903,24 @@ func assertAnalyticsSeriesSource(t *testing.T, document *html.Node) {
 func nodeHasAttr(node *html.Node, name string) bool {
 	for _, attribute := range node.Attr {
 		if attribute.Key == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInput(node *html.Node, name, inputType, min, value string) bool {
+	if node.Type == html.ElementNode && node.Data == "input" {
+		attributes := make(map[string]string, len(node.Attr))
+		for _, attribute := range node.Attr {
+			attributes[attribute.Key] = attribute.Val
+		}
+		if attributes["name"] == name && attributes["type"] == inputType && attributes["min"] == min && attributes["value"] == value {
+			return true
+		}
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if hasInput(child, name, inputType, min, value) {
 			return true
 		}
 	}

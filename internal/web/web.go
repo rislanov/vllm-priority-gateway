@@ -43,6 +43,7 @@ type pageData struct {
 	CSRF        string
 	View        httpapi.AdminView
 	EditClient  *httpapi.AdminClient
+	EditPool    *httpapi.AdminPool
 	EditBackend *httpapi.AdminBackend
 	Secret      string
 	Error       string
@@ -487,8 +488,10 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 		} else {
 			switch request.Form.Get("action") {
 			case "create_pool", "update_pool":
-				input := httpapi.PoolInput{PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"), Enabled: request.Form.Get("enabled") == "on"}
-				if request.Form.Get("action") == "update_pool" {
+				input, err := poolInput(request)
+				if err != nil {
+					data.Error = err.Error()
+				} else if request.Form.Get("action") == "update_pool" {
 					id, err := positiveID(request.Form.Get("id"))
 					if err != nil {
 						data.Error = err.Error()
@@ -524,6 +527,17 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
+	}
+	if rawID := request.URL.Query().Get("edit_pool"); rawID != "" {
+		if id, err := positiveID(rawID); err == nil {
+			for _, pool := range h.service.View().Pools {
+				if pool.ID == id {
+					copy := pool
+					data.EditPool = &copy
+					break
+				}
+			}
+		}
 	}
 	if rawID := request.URL.Query().Get("edit"); rawID != "" {
 		if id, err := positiveID(rawID); err == nil {
@@ -571,6 +585,32 @@ func clientInput(request *http.Request) (httpapi.ClientInput, error) {
 		input.ModelPoolIDs = append(input.ModelPoolIDs, id)
 	}
 	return input, nil
+}
+
+func poolInput(request *http.Request) (httpapi.PoolInput, error) {
+	maxGatewayInflight, err := optionalFormInt(request.Form.Get("max_gateway_inflight"), "max gateway inflight")
+	if err != nil {
+		return httpapi.PoolInput{}, err
+	}
+	maxWaiting, err := optionalFormInt(request.Form.Get("max_waiting"), "max waiting")
+	if err != nil {
+		return httpapi.PoolInput{}, err
+	}
+	return httpapi.PoolInput{
+		PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"),
+		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, MaxWaiting: maxWaiting,
+	}, nil
+}
+
+func optionalFormInt(raw, label string) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", label)
+	}
+	return value, nil
 }
 
 func backendInput(request *http.Request) (httpapi.BackendInput, error) {

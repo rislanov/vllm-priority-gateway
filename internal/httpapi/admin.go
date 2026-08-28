@@ -105,9 +105,11 @@ type ClientInput struct {
 }
 
 type PoolInput struct {
-	PublicModelName   string `json:"publicModelName"`
-	UpstreamModelName string `json:"upstreamModelName"`
-	Enabled           bool   `json:"enabled"`
+	PublicModelName    string `json:"publicModelName"`
+	UpstreamModelName  string `json:"upstreamModelName"`
+	Enabled            bool   `json:"enabled"`
+	MaxGatewayInflight int    `json:"maxGatewayInflight"`
+	MaxWaiting         int    `json:"maxWaiting"`
 }
 
 type BackendInput struct {
@@ -149,11 +151,13 @@ type AdminKey struct {
 }
 
 type AdminPool struct {
-	ID                int64              `json:"id"`
-	PublicModelName   string             `json:"publicModelName"`
-	UpstreamModelName string             `json:"upstreamModelName"`
-	Enabled           bool               `json:"enabled"`
-	Runtime           domain.PoolRuntime `json:"runtime"`
+	ID                 int64              `json:"id"`
+	PublicModelName    string             `json:"publicModelName"`
+	UpstreamModelName  string             `json:"upstreamModelName"`
+	Enabled            bool               `json:"enabled"`
+	MaxGatewayInflight int                `json:"maxGatewayInflight"`
+	MaxWaiting         int                `json:"maxWaiting"`
+	Runtime            domain.PoolRuntime `json:"runtime"`
 }
 
 type AdminBackend struct {
@@ -229,7 +233,8 @@ func (s *AdminService) View() AdminView {
 	for _, pool := range snapshot.PoolsByID {
 		view.Pools = append(view.Pools, AdminPool{
 			ID: pool.ID, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
-			Enabled: pool.Enabled, Runtime: s.runtime.PoolSnapshot(pool.ID, at),
+			Enabled: pool.Enabled, MaxGatewayInflight: pool.MaxGatewayInflight, MaxWaiting: pool.MaxWaiting,
+			Runtime: s.runtime.PoolSnapshot(pool.ID, at),
 		})
 	}
 	for _, backend := range snapshot.BackendsByID {

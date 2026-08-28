@@ -24,6 +24,10 @@ type Config struct {
 	MetricsStaleAfter          time.Duration
 	UnhealthyAfter             int
 	RecoveryAfter              int
+	CircuitFailureThreshold    int
+	CircuitFailureWindow       time.Duration
+	CircuitOpenCooldown        time.Duration
+	CircuitHalfOpenMaxProbes   int
 	QueueSoftLimit             float64
 	KVSoftLimit                float64
 	KVHardLimit                float64
@@ -58,6 +62,10 @@ func Load(lookup LookupFunc) (Config, error) {
 		MetricsStaleAfter:          5 * time.Second,
 		UnhealthyAfter:             3,
 		RecoveryAfter:              2,
+		CircuitFailureThreshold:    5,
+		CircuitFailureWindow:       30 * time.Second,
+		CircuitOpenCooldown:        15 * time.Second,
+		CircuitHalfOpenMaxProbes:   1,
 		QueueSoftLimit:             2,
 		KVSoftLimit:                .80,
 		KVHardLimit:                .95,
@@ -107,6 +115,18 @@ func Load(lookup LookupFunc) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RecoveryAfter, err = intValue(lookup, "LLMGW_RECOVERY_AFTER", cfg.RecoveryAfter); err != nil {
+		return Config{}, err
+	}
+	if cfg.CircuitFailureThreshold, err = intValue(lookup, "LLMGW_CIRCUIT_FAILURE_THRESHOLD", cfg.CircuitFailureThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.CircuitFailureWindow, err = durationValue(lookup, "LLMGW_CIRCUIT_FAILURE_WINDOW", cfg.CircuitFailureWindow); err != nil {
+		return Config{}, err
+	}
+	if cfg.CircuitOpenCooldown, err = durationValue(lookup, "LLMGW_CIRCUIT_OPEN_COOLDOWN", cfg.CircuitOpenCooldown); err != nil {
+		return Config{}, err
+	}
+	if cfg.CircuitHalfOpenMaxProbes, err = intValue(lookup, "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", cfg.CircuitHalfOpenMaxProbes); err != nil {
 		return Config{}, err
 	}
 	if cfg.QueueSoftLimit, err = floatValue(lookup, "LLMGW_QUEUE_SOFT_LIMIT", cfg.QueueSoftLimit); err != nil {
@@ -196,6 +216,7 @@ func (c Config) validate() error {
 		"health interval": c.HealthInterval, "health timeout": c.HealthTimeout,
 		"metrics interval": c.MetricsInterval, "metrics timeout": c.MetricsTimeout,
 		"metrics stale after": c.MetricsStaleAfter, "EWMA window": c.EWMAWindow,
+		"circuit failure window": c.CircuitFailureWindow, "circuit open cooldown": c.CircuitOpenCooldown,
 		"overload enter window": c.OverloadEnterWindow, "overload recovery window": c.OverloadRecoveryWindow,
 		"retry after": c.RetryAfter, "dial timeout": c.DialTimeout,
 		"TLS handshake timeout": c.TLSHandshakeTimeout, "response header timeout": c.ResponseHeaderTimeout,
@@ -210,6 +231,9 @@ func (c Config) validate() error {
 	}
 	if c.AnalyticsRetention < 0 {
 		return errors.New("analytics retention must be non-negative")
+	}
+	if c.CircuitFailureThreshold <= 0 || c.CircuitHalfOpenMaxProbes <= 0 {
+		return errors.New("circuit breaker counts must be positive")
 	}
 	if !finitePositive(c.QueueSoftLimit) {
 		return errors.New("queue soft limit must be positive")

@@ -11,7 +11,7 @@ import (
 func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domain.ModelPool, error) {
 	pool := domain.ModelPool{
 		PublicModelName: params.PublicModelName, UpstreamModelName: params.UpstreamModelName,
-		Enabled: params.Enabled,
+		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, MaxWaiting: params.MaxWaiting,
 	}
 	if err := pool.Validate(); err != nil {
 		return domain.ModelPool{}, err
@@ -24,9 +24,9 @@ func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domai
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), timestamp(now), timestamp(now),
+		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(now), timestamp(now),
 	)
 	if err != nil {
 		return domain.ModelPool{}, fmt.Errorf("insert model pool: %w", err)
@@ -45,7 +45,10 @@ func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domai
 }
 
 func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolParams) (domain.ModelPool, error) {
-	pool := domain.ModelPool{ID: id, PublicModelName: params.PublicModelName, UpstreamModelName: params.UpstreamModelName, Enabled: params.Enabled}
+	pool := domain.ModelPool{
+		ID: id, PublicModelName: params.PublicModelName, UpstreamModelName: params.UpstreamModelName,
+		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, MaxWaiting: params.MaxWaiting,
+	}
 	if err := pool.Validate(); err != nil {
 		return domain.ModelPool{}, err
 	}
@@ -64,8 +67,8 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 	}
 	pool.UpdatedAt = s.now().UTC()
 	result, err := tx.ExecContext(ctx, `
-		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, updated_at = ?
-		WHERE id = ?`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), timestamp(pool.UpdatedAt), id)
+		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, updated_at = ?
+		WHERE id = ?`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(pool.UpdatedAt), id)
 	if err != nil {
 		return domain.ModelPool{}, fmt.Errorf("update model pool: %w", err)
 	}
@@ -83,7 +86,7 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 
 func (s *SQLite) ListPools(ctx context.Context) ([]domain.ModelPool, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, public_model_name, upstream_model_name, enabled, created_at, updated_at
+		SELECT id, public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at
 		FROM model_pools ORDER BY public_model_name`)
 	if err != nil {
 		return nil, fmt.Errorf("list model pools: %w", err)
@@ -107,7 +110,7 @@ func scanPool(row scanner) (domain.ModelPool, error) {
 	var pool domain.ModelPool
 	var enabled int
 	var created, updated string
-	if err := row.Scan(&pool.ID, &pool.PublicModelName, &pool.UpstreamModelName, &enabled, &created, &updated); err != nil {
+	if err := row.Scan(&pool.ID, &pool.PublicModelName, &pool.UpstreamModelName, &enabled, &pool.MaxGatewayInflight, &pool.MaxWaiting, &created, &updated); err != nil {
 		return domain.ModelPool{}, fmt.Errorf("scan model pool: %w", err)
 	}
 	pool.Enabled = enabled != 0

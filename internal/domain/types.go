@@ -4,6 +4,22 @@ import "time"
 
 type PriorityClass string
 
+type InferenceOutcome string
+
+const (
+	InferenceSuccess InferenceOutcome = "success"
+	InferenceFailure InferenceOutcome = "failure"
+	InferenceNeutral InferenceOutcome = "neutral"
+)
+
+type CircuitState string
+
+const (
+	CircuitClosed   CircuitState = "closed"
+	CircuitOpen     CircuitState = "open"
+	CircuitHalfOpen CircuitState = "half_open"
+)
+
 const (
 	PriorityCritical   PriorityClass = "critical"
 	PriorityHigh       PriorityClass = "high"
@@ -69,12 +85,14 @@ type ClientModelAccess struct {
 }
 
 type ModelPool struct {
-	ID                int64
-	PublicModelName   string
-	UpstreamModelName string
-	Enabled           bool
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                 int64
+	PublicModelName    string
+	UpstreamModelName  string
+	Enabled            bool
+	MaxGatewayInflight int
+	MaxWaiting         int
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Backend struct {
@@ -92,20 +110,25 @@ type Backend struct {
 }
 
 type BackendRuntime struct {
-	BackendID          int64
-	State              BackendState
-	Healthy            bool
-	MetricsFresh       bool
-	Running            float64
-	Waiting            float64
-	KVCacheUsage       float64
-	RawPressure        float64
-	Pressure           float64
-	GatewayInflight    int
-	LastHealthAt       time.Time
-	LastMetricsAt      time.Time
-	ConsecutiveFailure int
-	ConsecutiveSuccess int
+	BackendID             int64
+	State                 BackendState
+	CircuitState          CircuitState
+	CircuitFailures       int
+	CircuitRetryAt        time.Time
+	CircuitProbesInFlight int
+	CircuitAvailable      bool
+	Healthy               bool
+	MetricsFresh          bool
+	Running               float64
+	Waiting               float64
+	KVCacheUsage          float64
+	RawPressure           float64
+	Pressure              float64
+	GatewayInflight       int
+	LastHealthAt          time.Time
+	LastMetricsAt         time.Time
+	ConsecutiveFailure    int
+	ConsecutiveSuccess    int
 }
 
 type PoolRuntime struct {
@@ -114,4 +137,6 @@ type PoolRuntime struct {
 	BestBackendPressure float64
 	AvailableBackends   int
 	AllBackendsWaiting  bool
+	GatewayInflight     int
+	TotalWaiting        float64
 }

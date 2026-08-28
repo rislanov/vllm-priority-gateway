@@ -62,6 +62,15 @@ type harnessUsage struct {
 	registry *registry.Registry
 }
 
+func TestHarnessCreatePoolWithSafetyLimits(t *testing.T) {
+	h := newHarness(t)
+	poolID := h.createPoolWithLimits("limited", 17, 9)
+	pool := h.registry.Snapshot().PoolsByID[poolID]
+	if pool.MaxGatewayInflight != 17 || pool.MaxWaiting != 9 {
+		t.Fatalf("harness pool safety limits = (%d, %d), want (17, 9)", pool.MaxGatewayInflight, pool.MaxWaiting)
+	}
+}
+
 func (u harnessUsage) Record(keyID int64, usedAt time.Time) {
 	if u.database.TouchKeyLastUsed(context.Background(), keyID, usedAt) == nil {
 		u.registry.MarkKeyUsed(keyID, usedAt)
@@ -219,9 +228,14 @@ func (h *harness) adminObject(method, path string, input any, wantStatus int) ma
 }
 
 func (h *harness) createPool(publicName string) int64 {
+	return h.createPoolWithLimits(publicName, 0, 0)
+}
+
+func (h *harness) createPoolWithLimits(publicName string, maxGatewayInflight, maxWaiting int) int64 {
 	h.t.Helper()
 	output := h.adminObject(http.MethodPost, "/admin/api/pools", map[string]any{
 		"publicModelName": publicName, "upstreamModelName": "fake-model", "enabled": true,
+		"maxGatewayInflight": maxGatewayInflight, "maxWaiting": maxWaiting,
 	}, http.StatusCreated)
 	return numberID(h.t, output["id"])
 }

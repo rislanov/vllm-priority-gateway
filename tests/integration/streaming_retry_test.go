@@ -111,3 +111,44 @@ func TestStreamingIsByteExactAndRetryStopsAfterFirstByte(t *testing.T) {
 		}
 	})
 }
+
+func TestHTTP5xxOpensCircuitAndRoutesNextRequestToHealthyBackend(t *testing.T) {
+	h := newHarness(t)
+	poolID := h.createPool("qwen")
+	failing, failingID := h.addFake(poolID, "gpu-a", fakevllm.State{
+		HTTPStatus: http.StatusServiceUnavailable, HTTPBody: `{"error":"busy"}`,
+	})
+	healthy, healthyID := h.addFake(poolID, "gpu-b", fakevllm.State{Waiting: 4})
+	h.waitBackend(failingID, eligible)
+	h.waitBackend(healthyID, eligible)
+	_, key := h.createClient("circuit-client", domain.PriorityHigh, -10, 2, poolID)
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		response, payload := h.public(http.MethodPost, "/v1/completions", key, postBody("qwen", false))
+		if response.StatusCode != http.StatusServiceUnavailable || string(payload) != `{"error":"busy"}` {
+			t.Fatalf("attempt %d = %d %q", attempt, response.StatusCode, payload)
+		}
+		if got := len(failing.Snapshot().Requests); got != attempt {
+			t.Fatalf("failing backend requests after attempt %d = %d", attempt, got)
+		}
+		if got := len(healthy.Snapshot().Requests); got != 0 {
+			t.Fatalf("healthy backend received %d request(s) before circuit opened", got)
+		}
+	}
+	eventually(t, time.Second, func() bool {
+		runtime := h.manager.Snapshot(failingID, time.Now())
+		pool := h.manager.PoolSnapshot(poolID, time.Now())
+		return runtime.CircuitState == domain.CircuitOpen && runtime.CircuitFailures == 5 && runtime.GatewayInflight == 0 && pool.AvailableBackends == 1
+	})
+
+	response, payload := h.public(http.MethodPost, "/v1/completions", key, postBody("qwen", false))
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("request after circuit opened = %d %s", response.StatusCode, payload)
+	}
+	if got := len(failing.Snapshot().Requests); got != 5 {
+		t.Fatalf("open backend received another request: %d", got)
+	}
+	if got := len(healthy.Snapshot().Requests); got != 1 {
+		t.Fatalf("healthy backend requests = %d, want 1", got)
+	}
+}

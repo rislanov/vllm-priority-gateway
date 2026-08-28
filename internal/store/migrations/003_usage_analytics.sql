@@ -1,4 +1,4 @@
-CREATE TABLE usage_requests (
+CREATE TABLE IF NOT EXISTS usage_requests (
     id INTEGER PRIMARY KEY,
     occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
     request_id TEXT NOT NULL UNIQUE,
@@ -25,6 +25,6 @@ CREATE TABLE usage_requests (
     CHECK (cache_read_tokens IS NULL OR cache_read_tokens <= input_tokens)
 );
 
-CREATE INDEX idx_usage_requests_occurred_at ON usage_requests(occurred_at_ms DESC);
-CREATE INDEX idx_usage_requests_client_time ON usage_requests(client_id, occurred_at_ms DESC);
-CREATE INDEX idx_usage_requests_model_time ON usage_requests(model_pool_id, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_requests_occurred_at ON usage_requests(occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_requests_client_time ON usage_requests(client_id, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_requests_model_time ON usage_requests(model_pool_id, occurred_at_ms DESC);

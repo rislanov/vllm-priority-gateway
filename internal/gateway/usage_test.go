@@ -546,6 +546,7 @@ func newUsageTestServiceWithSnapshot(
 	for index, backend := range backends {
 		values[backend.ID] = domain.BackendRuntime{
 			BackendID: backend.ID, Healthy: true, MetricsFresh: true, Pressure: float64(index+1) / 10,
+			CircuitState: domain.CircuitClosed, CircuitAvailable: true,
 		}
 	}
 	provider := &mutableSnapshotProvider{}

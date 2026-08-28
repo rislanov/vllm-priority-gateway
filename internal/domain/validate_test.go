@@ -70,6 +70,42 @@ func TestModelPoolValidateRequiresBothNames(t *testing.T) {
 	}
 }
 
+func TestModelPoolValidateAcceptsNonNegativeSafetyLimits(t *testing.T) {
+	for _, limits := range []struct {
+		maxGatewayInflight int
+		maxWaiting         int
+	}{
+		{maxGatewayInflight: 0, maxWaiting: 0},
+		{maxGatewayInflight: 17, maxWaiting: 9},
+	} {
+		pool := domain.ModelPool{
+			PublicModelName: "public", UpstreamModelName: "upstream",
+			MaxGatewayInflight: limits.maxGatewayInflight, MaxWaiting: limits.maxWaiting,
+		}
+		if err := pool.Validate(); err != nil {
+			t.Fatalf("Validate(%+v) error = %v", pool, err)
+		}
+	}
+}
+
+func TestModelPoolValidateRejectsNegativeSafetyLimits(t *testing.T) {
+	for _, limits := range []struct {
+		maxGatewayInflight int
+		maxWaiting         int
+	}{
+		{maxGatewayInflight: -1, maxWaiting: 0},
+		{maxGatewayInflight: 0, maxWaiting: -1},
+	} {
+		pool := domain.ModelPool{
+			PublicModelName: "public", UpstreamModelName: "upstream",
+			MaxGatewayInflight: limits.maxGatewayInflight, MaxWaiting: limits.maxWaiting,
+		}
+		if err := pool.Validate(); err == nil {
+			t.Fatalf("Validate(%+v) unexpectedly succeeded", pool)
+		}
+	}
+}
+
 func TestModelPoolValidateRejectsUnusablePublicName(t *testing.T) {
 	pool := domain.ModelPool{
 		PublicModelName:   strings.Repeat("x", domain.MaxPublicModelNameBytes+1),

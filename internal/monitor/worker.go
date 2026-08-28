@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
@@ -23,6 +24,7 @@ type Options struct {
 	StaleAfter         time.Duration
 	UnhealthyAfter     int
 	RecoveryAfter      int
+	Circuit            circuitbreaker.Options
 	Limits             pressure.Limits
 	EWMAWindow         time.Duration
 	BusyThreshold      float64
@@ -36,6 +38,9 @@ func (o Options) validate() error {
 	}
 	if o.UnhealthyAfter <= 0 || o.RecoveryAfter <= 0 {
 		return errors.New("monitor transition counts must be positive")
+	}
+	if _, err := circuitbreaker.New(o.Circuit); err != nil {
+		return fmt.Errorf("circuit breaker options: %w", err)
 	}
 	if err := o.Limits.Validate(); err != nil {
 		return err
