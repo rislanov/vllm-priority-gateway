@@ -1,179 +1,263 @@
+[English](README.md) | [Русский](README.ru.md)
+
 # Lightweight vLLM Priority Gateway
 
-## Purpose
+## Contents
 
-Lightweight vLLM Priority Gateway is a single-process Go gateway for a small, static pool of vLLM OpenAI-compatible servers. It authenticates clients, enforces centrally configured priority and concurrency policy, combines soft session affinity with live-pressure routing, and sheds lower-priority traffic before critical traffic when inference capacity is scarce.
+- [What it is](#what-it-is)
+- [Key capabilities](#key-capabilities)
+- [Production quick start](#production-quick-start)
+- [Admin UI](#admin-ui)
+- [Client API behavior](#client-api-behavior)
+- [Operations and deployment](#operations-and-deployment)
+- [Admin API](#admin-api)
+- [Development and testing](#development-and-testing)
+- [Current scope and limitations](#current-scope-and-limitations)
+- [Documentation](#documentation)
 
-The repository also ships a deterministic fake vLLM server and a load generator. The MVP is intentionally operationally small: one gateway binary, one SQLite file, and no Redis, PostgreSQL, message broker, Kubernetes controller, or frontend build chain.
+## What it is
 
-Status: the implementation and deterministic acceptance suite are code-complete. The opt-in real-vLLM black-box smoke, priority/pool-safety, and circuit-resilience modes passed locally on Apple M4 with vLLM-Metal on 2026-08-27. That is non-CUDA development evidence; threshold calibration and final sign-off still need to be repeated on the selected production models and GPU hardware.
+Lightweight vLLM Priority Gateway is a small control and routing layer for a static pool of [vLLM](https://docs.vllm.ai/) OpenAI-compatible servers. It lets application teams use ordinary OpenAI clients while operators centrally own priority, concurrency, model access, routing, and overload policy.
 
-## Architecture
+Without the gateway, every client can reach vLLM directly and potentially choose its own priority. With the gateway, clients receive scoped API keys, request a public model name, and cannot raise their own priority. The gateway rewrites the model and priority, admits the request according to policy, selects a healthy backend using live GPU pressure, and streams the response back immediately.
 
 ```text
 OpenAI client
     │ Bearer llmgw_* key
     ▼
 ┌──────────────────────────────────────────────────────────┐
-│ Go gateway                                               │
+│ Lightweight vLLM Priority Gateway                       │
 │ auth → model access → admission → affinity/live routing │
-│ streaming proxy │ monitor workers │ Admin API/UI         │
-│ Prometheus      │ JSON logs       │ SQLite registry      │
+│ streaming proxy │ health/pressure │ Admin UI/API        │
+│ analytics       │ Prometheus      │ SQLite registry     │
 └───────────────────────────┬──────────────────────────────┘
-                            │ X-Vllm-Priority + request ID
+                            │ controlled X-Vllm-Priority
                    ┌────────┴────────┐
                    ▼                 ▼
               vLLM backend A    vLLM backend B
 ```
 
-SQLite owns durable configuration. Immutable indexed registry snapshots, health/pressure state, admission leases, and gateway in-flight counts live in memory. Fake vLLM and the load generator are separate commands in the same Go module.
+The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small, operator-managed backend pool; it does not require Redis, PostgreSQL, a message broker, a Kubernetes controller, or a frontend build chain.
 
-## Documentation
-
-- [Technical specification (English)](docs/technical-specification.md) — complete MVP and Production V1 requirements translated from the original project brief.
-- [Real-GPU test plan](docs/real-gpu-testing.md) — hardware validation procedure for vLLM compatibility, cancellation, priority, pressure, and recovery.
-- [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md) — reproducible Mac M4/Linux setup and opt-in smoke, saturation, pool-safety, drain, and circuit-recovery suite.
-- [Acceptance evidence](docs/acceptance-evidence.md) — mapping from MVP acceptance criteria to automated or manual evidence.
-
-## Implemented in the MVP
+## Key capabilities
 
 - OpenAI-compatible `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, and `POST /v1/responses`.
-- High-entropy client keys stored as an HMAC-SHA-256 digest, never as plaintext.
-- Client enablement, four priority classes, server-controlled integer vLLM priority, maximum concurrency, and explicit model access.
+- High-entropy client keys stored as HMAC-SHA-256 digests, never as plaintext.
+- Per-client enablement, priority class, integer vLLM priority, concurrency limit, and explicit model access.
 - Public-to-upstream model rewriting and static multi-backend model pools.
-- Independent health and Prometheus scraping with EWMA pressure and hysteretic pool states.
-- Priority-aware admission, bounded `429` errors, least-pressure routing, draining exclusion, and one conservative pre-first-byte retry.
-- Per-backend inference circuit breakers and per-pool gateway-inflight/waiting safety limits, with explicit inference readiness.
-- Soft session affinity through `X-LLM-Session-Id`: rendezvous hashing improves prefix-cache locality while live pressure, health, freshness, drain state, and retry exclusions retain precedence.
-- Immediate response streaming, downstream cancellation propagation, Prometheus telemetry, and safe JSON completion logs.
-- Metadata-only request and token analytics with server-rendered charts, per-request detail, and CSV export.
-- Basic-authenticated, CSRF-protected JSON Admin API and embedded server-rendered Admin UI.
-- Deterministic fake vLLM controls and repeatable mixed-priority load generation.
+- Independent backend health and Prometheus polling with EWMA pressure and hysteretic pool states.
+- Priority-aware admission, bounded `429` errors, least-pressure routing, soft session affinity, draining, and one conservative pre-first-byte retry.
+- Per-backend circuit breakers and per-pool gateway-inflight/waiting safety limits.
+- Immediate streaming and downstream cancellation propagation.
+- Metadata-only request/token analytics with charts, filters, request detail, and CSV export.
+- Embedded Basic-authenticated, CSRF-protected Admin UI and JSON Admin API.
+- Prometheus metrics and structured JSON completion logs.
 
-## Requirements
+## Production quick start
 
-- Go 1.27 for local builds.
-- macOS or Linux for development; the delivery target is static Linux x86-64 (`linux/amd64`).
-- A writable directory for SQLite.
-- One or more reachable vLLM endpoints, or the bundled fake server.
-- `curl` for the examples; `jq` is useful for Admin API and validation commands.
+This path connects the gateway to a real vLLM server and produces the first authenticated inference request. It uses Docker for the gateway; see the [deployment guide](docs/deployment.md) for native systemd installation, reverse-proxy requirements, production verification, and backup/restore.
 
-## Quick start (local development)
+### Prerequisites
+
+- A Linux host with Docker for the gateway.
+- A production vLLM endpoint reachable over the private network.
+- A trusted TLS reverse proxy before exposing the gateway to client networks.
+- `curl`; `jq` is useful for the verification commands.
+
+The examples use:
+
+- upstream model: `Qwen/Qwen2.5-7B-Instruct`;
+- public model exposed to clients: `qwen`;
+- private vLLM URL reachable from the gateway container: `http://vllm.internal:8000`;
+- gateway listener on the Docker host: `http://127.0.0.1:8080`.
+
+Replace all four values for your environment. In particular, `127.0.0.1` inside the gateway container refers to the gateway container itself, not to vLLM on the Docker host.
+
+### 1. Start vLLM with priority scheduling
+
+If vLLM is already managed by your inference platform, verify the equivalent flags and skip to the next step.
 
 ```bash
-export LLMGW_ADMIN_USERNAME=operator
-export LLMGW_ADMIN_PASSWORD='replace-with-at-least-16-bytes'
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --scheduling-policy priority \
+  --enable-prefix-caching \
+  --enable-prompt-tokens-details \
+  --enable-request-id-headers
+```
+
+vLLM handles lower integer priority values earlier. `--enable-prompt-tokens-details` allows cache-read analytics when the model/backend reports them. Check the current [vLLM serve CLI](https://docs.vllm.ai/en/latest/cli/serve/) and [OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/) when pinning or upgrading vLLM.
+
+Keep the vLLM port private. Clients should reach only the gateway.
+
+### 2. Build and start the gateway
+
+```bash
+git clone https://github.com/rislanov/vllm-priority-gateway.git
+cd vllm-priority-gateway
+
+umask 077
+export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
 export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-export LLMGW_DATABASE_PATH="$PWD/data/llmgw.db"
+# Save both generated values in the approved secret store now.
 
-go run ./cmd/gateway
+docker build --platform linux/amd64 -t vllm-priority-gateway:local .
+docker volume create llmgw-data
+docker run -d --name llmgw --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v llmgw-data:/data \
+  -e LLMGW_ADMIN_USERNAME=operator \
+  -e LLMGW_ADMIN_PASSWORD \
+  -e LLMGW_API_KEY_HMAC_SECRET \
+  vllm-priority-gateway:local
 ```
 
-Open `http://127.0.0.1:8080/admin`, authenticate with the configured administrator credential, then create a model pool, backend, client, and API key. The full client key is shown once.
-
-Required environment variables:
-
-| Variable | Meaning |
-|---|---|
-| `LLMGW_ADMIN_USERNAME` | Admin Basic-auth username |
-| `LLMGW_ADMIN_PASSWORD` | Admin password, at least 16 bytes |
-| `LLMGW_API_KEY_HMAC_SECRET` | Server-side key hashing secret, at least 32 bytes |
-
-Common optional variables:
-
-| Variable | Default |
-|---|---:|
-| `LLMGW_LISTEN_ADDRESS` | `:8080` |
-| `LLMGW_DATABASE_PATH` | `./data/llmgw.db` |
-| `LLMGW_HEALTH_INTERVAL` / `LLMGW_HEALTH_TIMEOUT` | `2s` / `1s` |
-| `LLMGW_METRICS_INTERVAL` / `LLMGW_METRICS_TIMEOUT` | `1s` / `1s` |
-| `LLMGW_METRICS_STALE_AFTER` | `5s` |
-| `LLMGW_UNHEALTHY_AFTER` / `LLMGW_RECOVERY_AFTER` | `3` / `2` |
-| `LLMGW_QUEUE_SOFT_LIMIT` | `2` |
-| `LLMGW_KV_SOFT_LIMIT` / `LLMGW_KV_HARD_LIMIT` | `0.80` / `0.95` |
-| `LLMGW_EWMA_WINDOW` | `4s` |
-| `LLMGW_OVERLOAD_ENTER_WINDOW` / `LLMGW_OVERLOAD_RECOVERY_WINDOW` | `3s` / `10s` |
-| `LLMGW_REQUEST_BODY_LIMIT` | `16777216` |
-| `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` | `1.0` |
-| `LLMGW_CIRCUIT_FAILURE_THRESHOLD` | `5` |
-| `LLMGW_CIRCUIT_FAILURE_WINDOW` | `30s` |
-| `LLMGW_CIRCUIT_OPEN_COOLDOWN` | `15s` |
-| `LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES` | `1` |
-| `LLMGW_SHUTDOWN_GRACE_PERIOD` | `30s` |
-| `LLMGW_ANALYTICS_RETENTION` | `2160h` (90 days) |
-
-Threshold, recovery, dial, TLS, response-header, retry, and routing-epsilon values are also configurable with the `LLMGW_*` variables defined in `internal/config/config.go`. Startup rejects incomplete secrets and inconsistent threshold ordering.
-Set `LLMGW_ANALYTICS_RETENTION=0` to disable automatic analytics deletion; collection remains enabled and rows are retained until an operator removes them.
-
-## Usage: bootstrap and first request
-
-The Admin UI is the simplest bootstrap path. Create resources in this order:
-
-1. A model pool with a public client-facing name, the exact upstream vLLM model name, and optional non-negative `MaxGatewayInflight` and `MaxWaiting` limits. Zero means unlimited/disabled.
-2. At least one enabled backend using an absolute `http://` or `https://` base URL.
-3. A client with priority class, integer vLLM priority, concurrency limit, and explicit pool access.
-4. An API key for that client; copy the returned secret immediately.
-
-For JSON automation, first obtain the double-submit CSRF cookie:
+Verify process and registry readiness:
 
 ```bash
-curl -sS -u "$LLMGW_ADMIN_USERNAME:$LLMGW_ADMIN_PASSWORD" \
-  -c /tmp/llmgw-cookies http://127.0.0.1:8080/admin/api/status | jq
-CSRF_TOKEN="$(awk '$6 == "llmgw_csrf" {print $7}' /tmp/llmgw-cookies)"
+curl -fsS http://127.0.0.1:8080/healthz | jq
+curl -fsS http://127.0.0.1:8080/readyz | jq
 ```
 
-Then send both the cookie and `X-CSRF-Token` header:
+`/readyz` confirms management-plane readiness. It deliberately remains healthy when inference capacity is zero; `/inference-readyz` becomes ready after the pool and backend are configured and monitored successfully.
+
+### 3. Configure the gateway in Admin
+
+Open `http://127.0.0.1:8080/admin` through an operator-only path and authenticate as `operator` with `LLMGW_ADMIN_PASSWORD`.
+
+Create resources in this order:
+
+1. Open **Backends → Create model pool**:
+   - **Public model name:** `qwen`
+   - **Upstream model name:** `Qwen/Qwen2.5-7B-Instruct`
+   - **Max gateway inflight:** `32`
+   - **Max waiting:** `8`
+   - **Enabled:** checked
+2. On the same page, create a backend:
+   - **Name:** `gpu-a`
+   - **Model pool:** `qwen`
+   - **URL:** `http://vllm.internal:8000`
+   - **Capacity hint:** `1`
+   - **Running soft limit:** `16`
+   - **Enabled:** checked
+3. Open **Clients → Create client**:
+   - **Name:** `production-app`
+   - **Priority class:** `normal`
+   - **vLLM priority:** `0`
+   - **Max concurrency:** `8`
+   - **Model access:** check `qwen`
+   - **Enabled:** checked
+4. Open **API Keys**, select `production-app`, optionally set an expiry date, and choose **Generate API key**. Copy the full `llmgw_*` value immediately; it is shown only once.
+
+The numeric limits above are illustrative values for validating the workflow, not universal production sizing. Calibrate them against the selected model, GPU, vLLM `--max-num-seqs`, latency objective, and saturation tests before enabling client traffic. Zero disables the corresponding pool limit.
+
+If vLLM uses `--api-key`, enter only the gateway environment-variable name, such as `VLLM_GPU_A_KEY`, in **Upstream API key environment variable** and inject that variable into the gateway container. Never paste the upstream secret into Admin.
+
+### 4. Verify capacity and make real requests
+
+Wait for backend health and metrics polling, then require inference readiness:
 
 ```bash
-curl -sS -u "$LLMGW_ADMIN_USERNAME:$LLMGW_ADMIN_PASSWORD" \
-  -b /tmp/llmgw-cookies -H "X-CSRF-Token: $CSRF_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"publicModelName":"qwen","upstreamModelName":"Qwen/Qwen2.5-7B-Instruct","enabled":true,"maxGatewayInflight":0,"maxWaiting":0}' \
-  http://127.0.0.1:8080/admin/api/pools | jq
+curl -fsS http://127.0.0.1:8080/inference-readyz \
+  | jq -e '.status == "ready" and .backendAvailability > 0'
 ```
 
-Every committed mutation increments the SQLite configuration revision, publishes a new registry snapshot, and reconciles backend monitor workers.
-
-After creating the API key, export the one-time secret and verify the client path:
+Export the one-time client key:
 
 ```bash
+export LLMGW_URL='http://127.0.0.1:8080'
 export LLMGW_CLIENT_KEY='llmgw_copy-the-one-time-value-here'
-
-curl -sS http://127.0.0.1:8080/v1/models \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
-
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H 'X-LLM-Session-Id: coding-agent-run-8f0d' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-For routine operation, watch `/metrics`, drain a backend before maintenance, and resume it after the backend is healthy. `/readyz` is management-plane readiness and deliberately remains HTTP 200 when inference capacity is zero. `/inference-readyz` is the load-balancer signal: it returns HTTP 200 with `status: "ready"` when at least one pool/backend is eligible for inference, or HTTP 503 with `status: "unavailable"` otherwise. The gateway reloads committed Admin changes without a process restart.
+List the models available to this client:
 
-### Circuit breaker, pool safety, and readiness
+```bash
+curl -fsS "$LLMGW_URL/v1/models" \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
+```
 
-Each managed backend has a process-local inference circuit. Five qualifying failures inside the rolling 30-second window open it for 15 seconds; after cooldown, one half-open probe may run. A completed response below HTTP 500, including `4xx` and `429`, is a success: it closes and clears a half-open circuit, but in closed state it does not erase retained failures, which age out of the rolling window. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against it. Downstream cancellation/write failure is neutral. An upstream `5xx` is forwarded and is not retried; only the existing pre-first-byte transport retry remains.
+Send a streaming Chat Completions request:
 
-`MaxGatewayInflight` atomically bounds admitted requests across all clients in one model pool. `MaxWaiting` rejects when the latest healthy/fresh, enabled, non-draining aggregate vLLM waiting count is at or above the configured limit. Both return the same bounded `429 gateway_overloaded` envelope before per-client priority can bypass the pool guard. Zero disables the corresponding limit while gateway in-flight telemetry is still counted. These fields are persisted by additive SQLite schema migration version 2; usage analytics is added by version 3. Reopening a current database is a no-op.
+```bash
+curl -fsS -N "$LLMGW_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  -H 'X-LLM-Session-Id: production-agent-42' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen",
+    "messages": [{"role": "user", "content": "Explain priority scheduling in one sentence."}],
+    "max_tokens": 64,
+    "stream": true
+  }'
+```
 
-A gateway binary with the forward-version guard rejects a `PRAGMA user_version` newer than its latest embedded migration (currently version 3) before running migrations or changing the logical schema version, schema, or data. Opening the SQLite connection still applies the configured file permission and WAL pragmas, so this is not a byte-for-byte file or metadata immutability guarantee. The immediate pre-versioning `d6787d2` binary behaves differently: it does not inspect `user_version`, re-runs the idempotent `001_initial.sql`, and uses explicit-column pool CRUD. It therefore accepts and preserves the additive version-2 columns through rollback, but silently ignores their values and does not enforce either pool limit. Only later version-aware binaries with this guard reject future recorded versions. That compatibility is specific to this additive schema and binary, not a general downgrade guarantee; use a quiesced backup for other rollbacks rather than editing `user_version` manually.
+The client sends the public model name `qwen`. The gateway authenticates the key, enforces the stored client policy, rewrites the model to `Qwen/Qwen2.5-7B-Instruct`, applies the server-controlled vLLM priority, selects an eligible backend, and streams the upstream response.
 
-Circuit availability contributes to `/inference-readyz`, but transient pool congestion does not: removing a gateway from service cannot create GPU capacity. `/readyz` remains independent so operators retain Admin access during a total inference outage. Circuit and pool leases are in memory and correct only for the documented single gateway replica.
+## Admin UI
 
-## Admin UI and API
+The embedded Admin UI is served by the gateway; there is no separate frontend deployment. The screenshots below use synthetic sample traffic and contain no production credentials.
 
-The embedded UI has five screens:
+### Gateway and backend status
 
-- `/admin`: pool gateway in-flight/waiting/available counts and per-backend health, pressure, and circuit state.
-- `/admin/analytics`: request volume, token/cache charts, filters, per-request metadata, and CSV download.
-- `/admin/clients`: client policy and model access.
-- `/admin/keys`: one-time key generation, expiry/status, last use, and revocation.
-- `/admin/backends`: model-pool `MaxGatewayInflight`/`MaxWaiting`, endpoints, enablement, pressure, drain, and resume.
+The Dashboard shows configuration readiness, pool pressure and capacity guards, and backend health, circuit, running/waiting, and KV-cache state.
 
-The JSON API exposes:
+![Gateway dashboard with one healthy pool and backend](docs/images/admin-dashboard.jpg)
+
+### Issue and revoke API keys
+
+Create the client and grant model access first. Then open **API Keys**, choose the client and optional expiry, and select **Generate API key**. The full secret appears once; the table retains only its prefix, status, expiry, and last-use time. Revocation takes effect immediately.
+
+![API key list and generation form](docs/images/admin-api-keys.jpg)
+
+### View usage analytics
+
+After inference requests complete, open **Analytics**. Use UTC presets or an exact range, filter by client/model/usage availability, inspect request and token charts, review per-request metadata, or download the same filtered dataset as CSV.
+
+![Usage analytics request, token, and cache charts](docs/images/admin-analytics.jpg)
+
+Analytics stores operational metadata and token counts only. Prompts, messages, generated text, bodies, authorization headers, and API-key secrets are not stored.
+
+## Client API behavior
+
+Supported client routes:
 
 ```text
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/completions
+POST /v1/responses
+```
+
+Clients cannot raise their priority: the gateway removes inbound `X-Vllm-Priority` and JSON `priority`, rewrites the public model name, and applies policy from SQLite. Unsupported `/v1/*` routes and gateway failures use an OpenAI-shaped error envelope.
+
+For prefix-cache locality, send the same opaque `X-LLM-Session-Id` on consecutive requests from one agent or conversation. The value is limited to 256 bytes, never logged or used as a metric label, and stripped before forwarding to vLLM. Health, drain state, metrics freshness, circuit state, and live pressure always take precedence over affinity.
+
+## Operations and deployment
+
+- [Production deployment](docs/deployment.md): Docker and native systemd installation, reverse-proxy requirements, post-deployment verification, backup, and restore.
+- [Operations guide](docs/operations.md): readiness semantics, routing, drain/resume, circuit breakers, pool safety, analytics retention, metrics, logs, and the security boundary.
+- [Real-vLLM E2E runbook](docs/real-vllm-priority-e2e.md): production-safe smoke mode plus isolated priority, saturation, drain, and resilience tests.
+- [Real-GPU test plan](docs/real-gpu-testing.md): final hardware/model compatibility and threshold calibration.
+
+Common runtime endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `/healthz` | Process liveness |
+| `/readyz` | SQLite and registry readiness |
+| `/inference-readyz` | Usable inference capacity; HTTP `503` when unavailable |
+| `/metrics` | Prometheus telemetry |
+| `/admin` | Operator UI |
+
+The gateway reloads committed Admin changes without a process restart. Drain a backend before maintenance and resume it only after health and metrics are fresh.
+
+## Admin API
+
+All Admin routes require Basic auth. Every state-changing request also requires the matching double-submit CSRF cookie/header or cookie/form token.
+
+```text
+GET    /admin/api/status
 GET    /admin/api/clients
 POST   /admin/api/clients
 PUT    /admin/api/clients/{id}
@@ -190,359 +274,11 @@ POST   /admin/api/backends/{id}/resume
 GET    /admin/api/analytics
 GET    /admin/api/analytics/requests
 GET    /admin/api/analytics/export.csv
-GET    /admin/api/status
 ```
 
-All Admin routes require Basic auth. Every state-changing request additionally needs the matching CSRF cookie/header or cookie/form token. Responses are non-cacheable and include restrictive CSP, frame, MIME-sniffing, and referrer headers.
+## Development and testing
 
-### Usage analytics and retention
-
-The Analytics page supports exact UTC ranges plus 1-hour, 24-hour, 7-day, 30-day, and 90-day presets. Results can be filtered by client, public model, and whether upstream token usage was available. The summary, adaptive time series, client/model breakdown, newest-first per-request table, and oldest-first CSV export all apply the same filters. The JSON equivalents are `GET /admin/api/analytics` for aggregates and `GET /admin/api/analytics/requests` for paginated request detail; `GET /admin/api/analytics/export.csv` streams every matching row regardless of page size.
-
-Analytics stores metadata only: UTC time, generated gateway and parent request IDs, configured client/model/backend names and IDs, HTTP/duration/TTFT/retry/disconnect fields, and nullable token counts. Prompts, messages, generated text, request/response bodies, authorization headers, and API-key secrets are not stored. Cache-read tokens are a subset of input tokens. A missing cache-read value means the upstream did not report cache detail; it is unknown, not zero. Cache totals and hit ratios therefore use only the cache-known subset, while input and output totals include every request with usage.
-
-The default `LLMGW_ANALYTICS_RETENTION=2160h` removes rows older than 90 days during periodic cleanup. A value of `0` disables cleanup. Size the state volume and backup retention for request rate times the chosen history: even metadata-only rows and their indexes accumulate, and deletes do not necessarily shrink the SQLite file immediately. SQLite runs in WAL mode, so bursts, analytics writes, and cleanup can also grow `llmgw.db-wal` until a checkpoint. Monitor both the main database and WAL, keep free-space headroom, and use a quiesced backup of the complete state directory rather than copying only `llmgw.db`. Disabling retention requires an explicit archival/deletion and checkpoint policy.
-
-## Client API
-
-Use the one-time client key as a Bearer credential:
-
-```bash
-curl -sS http://127.0.0.1:8080/v1/models \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
-
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
-
-Clients cannot raise their own priority: the gateway removes an inbound `X-Vllm-Priority` header and JSON `priority`, rewrites the model, and applies policy from SQLite. Unsupported `/v1/*` routes and gateway failures use an OpenAI-shaped error envelope.
-
-### Soft session affinity and KV cache locality
-
-Send the same opaque `X-LLM-Session-Id` value on consecutive requests from one agent or conversation. The gateway rendezvous-hashes the authenticated client ID, model-pool ID, and session ID, so unrelated clients or models do not share an affinity key. The rendezvous winner is computed over backends that are enabled, non-draining, healthy, metrics-fresh, have their configured upstream secret, and are not excluded by a retry. If that winner's pressure is below `LLMGW_SESSION_AFFINITY_MAX_PRESSURE` (default `1.0`), it is preferred; otherwise the request falls back to normal least-pressure routing.
-
-The identifier is trimmed, must be at most 256 bytes, is never logged or used as a metrics label, and is stripped before the request reaches vLLM. Omitting it preserves the original least-pressure behavior. Use stable opaque IDs rather than prompts or user data.
-
-This is locality-aware routing, not a distributed KV block index: the gateway does not inspect cached token blocks, cache hits, eviction, or prefix contents. vLLM KV-cache utilization remains an aggregate pressure input. Rendezvous hashing minimizes remapping when the eligible backend set changes: an ineligible winner rehashes to the next eligible backend, while overload deliberately switches to least-pressure routing. Either case can move a session and warm a different replica.
-
-## vLLM setup flags
-
-Start each vLLM server with priority scheduling. Request-ID headers are recommended for end-to-end correlation:
-
-```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --scheduling-policy priority \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details \
-  --enable-request-id-headers
-```
-
-Prefix caching and prompt-token details are recommended together so vLLM can report `prompt_tokens_details.cached_tokens`. The gateway forces `stream_options.include_usage=true` for streaming Chat Completions and Completions, but an upstream may still omit cache detail; that remains an unknown value rather than a zero cache hit.
-
-In current vLLM documentation, lower integer priority values run earlier, and `X-Vllm-Priority` is supported by Chat Completions, Completions, and Responses. Check the [official OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/) when upgrading vLLM.
-
-If an upstream uses `--api-key`, configure only the environment-variable name in the backend record, for example `VLLM_GPU_A_KEY`, and set that variable in the gateway process. The secret is never stored in SQLite or returned by the Admin API.
-
-## Fake vLLM
-
-```bash
-go run ./cmd/fake-vllm -listen 127.0.0.1:8002
-```
-
-Point a backend at `http://127.0.0.1:8002`. Inspect or modify deterministic state through the simulator-only endpoint:
-
-```bash
-curl -sS http://127.0.0.1:8002/admin/state | jq
-curl -sS -X PUT http://127.0.0.1:8002/admin/state \
-  -H 'Content-Type: application/json' \
-  -d '{"running":12,"waiting":3,"kvCacheUsage":0.88,"ttftMs":40,"tokenDelayMs":10,"tokens":["one","two"]}' | jq
-```
-
-The control surface can also set HTTP failures, health failures, legacy KV metrics, and connection reset modes before headers, before body, or after a selected number of chunks.
-
-## Load generation
-
-Single client:
-
-```bash
-go run ./cmd/loadgen -- \
-  -url http://127.0.0.1:8080 -key "$LLMGW_CLIENT_KEY" -model qwen \
-  -parallelism 16 -requests 500 -prompt-size 512 -max-tokens 64 -stream
-```
-
-Deterministic mixed priority traffic:
-
-```bash
-go run ./cmd/loadgen -- \
-  -url http://127.0.0.1:8080 -model qwen -parallelism 32 -requests 1000 -seed 42 \
-  -class-keys "critical=$CRITICAL_KEY,high=$HIGH_KEY,normal=$NORMAL_KEY,background=$BACKGROUND_KEY" \
-  -mix critical=10,high=20,normal=40,background=30 -json
-```
-
-The report separates successes, intentional `429` overload responses, `5xx`, other HTTP failures, and transport failures. TTFT and latency percentiles include successful generations only and are reported both in aggregate and by priority class, so fast rejections cannot make inference latency look better. A transport failure returns a non-zero process status; expected `429` responses do not.
-
-## Metrics and logging
-
-`GET /metrics` exposes the `llmgw_*` request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, backend-failure, and retry families. Resilience gauges are `llmgw_backend_circuit_state` (`unmanaged/unknown=-1`, `closed=0`, `open=1`, `half_open=2`), `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Token analytics use `llmgw_input_tokens_total`, `llmgw_output_tokens_total`, and `llmgw_cache_read_tokens_total`, labeled only by configured client and public model. Parser failures use `llmgw_usage_parse_failures_total` with a bounded `format` label of `json` or `sse`, and durable-recorder failures increment `llmgw_usage_persistence_failures_total`. Labels are bounded to configured names and enums; request IDs, key prefixes, URLs, prompts, and generated text are not labels.
-
-The gateway writes one JSON record per completed inference request to stderr. Records include correlation IDs, client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies and authorization headers are never logged.
-
-`GET /healthz` reports process liveness. `GET /readyz` reports database/registry management readiness without becoming unavailable when inference capacity is zero. `GET /inference-readyz` returns HTTP 200/503 for usable inference capacity and includes `revision`, `poolAvailability`, and `backendAvailability`.
-
-## Security
-
-- Client keys contain 32 random bytes after the `llmgw_` prefix. SQLite stores a short lookup prefix and `HMAC-SHA-256(server secret, full key)` only.
-- Invalid, revoked, expired, and disabled-client keys share the same public `401` response.
-- Admin credentials come only from required environment variables and are compared in constant time.
-- State-changing Admin requests require double-submit CSRF protection; cookies are `HttpOnly` and `SameSite=Strict`.
-- The gateway strips client authorization and hop-by-hop headers before proxying. An upstream authorization header is constructed only from the named gateway environment variable.
-- Session-affinity IDs are bounded, excluded from logs and metric labels, and removed before upstream forwarding.
-- Keep vLLM endpoints on a private network. The gateway is the client-facing policy boundary.
-- Terminate TLS and apply network allowlists at a trusted reverse proxy. The MVP does not implement TLS, OIDC, RBAC, or an audit log.
-
-## macOS development
-
-Install Go 1.27 for Apple Silicon or Intel macOS, then run:
-
-```bash
-go test ./...
-go test -race ./...
-go vet ./...
-go build ./cmd/...
-```
-
-The SQLite driver is pure Go, so local development and Linux cross-compilation do not need Xcode command-line C tooling or CGO.
-
-## Deployment
-
-The MVP is a single-replica service. Run exactly one gateway process against its local SQLite state directory. Put client and Admin traffic behind a trusted TLS reverse proxy and keep vLLM backends on a private network.
-
-The reverse proxy must terminate TLS, disable response buffering for streaming routes, use read/write timeouts longer than the longest permitted generation, propagate client disconnects, and avoid retrying inference `POST` requests. Expose only `/v1/*` to client networks. Restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, and `/inference-readyz` to an operator, monitoring, or load-balancer network; metrics contain configured client, model, pool, and backend labels.
-
-### Native Linux x86-64
-
-```bash
-make build-linux-amd64
-file dist/*
-```
-
-This produces static `gateway-linux-amd64`, `fake-vllm-linux-amd64`, and `loadgen-linux-amd64` executables. The equivalent direct command is:
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/gateway-linux-amd64 ./cmd/gateway
-```
-
-Copy the gateway to the Linux host and create a dedicated service account and state directory:
-
-```bash
-sudo useradd --system --home-dir /var/lib/llmgw --shell /usr/sbin/nologin llmgw
-sudo install -o root -g root -m 0755 dist/gateway-linux-amd64 /usr/local/bin/llmgw
-sudo install -d -o llmgw -g llmgw -m 0750 /var/lib/llmgw
-sudo install -d -o root -g llmgw -m 0750 /etc/llmgw
-```
-
-Generate separate random values for the Admin password and HMAC secret, save them in an approved secret store, then create `/etc/llmgw/llmgw.env`. Never deploy the placeholders below. Protect the file with `root:llmgw` ownership and mode `0640`:
-
-```dotenv
-LLMGW_LISTEN_ADDRESS=127.0.0.1:8080
-LLMGW_DATABASE_PATH=/var/lib/llmgw/llmgw.db
-LLMGW_ADMIN_USERNAME=operator
-LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-bytes
-LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
-LLMGW_SESSION_AFFINITY_MAX_PRESSURE=1.0
-```
-
-```bash
-sudo chown root:llmgw /etc/llmgw/llmgw.env
-sudo chmod 0640 /etc/llmgw/llmgw.env
-```
-
-Install `/etc/systemd/system/llmgw.service`:
-
-```ini
-[Unit]
-Description=Lightweight vLLM Priority Gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=llmgw
-Group=llmgw
-EnvironmentFile=/etc/llmgw/llmgw.env
-ExecStart=/usr/local/bin/llmgw
-Restart=on-failure
-RestartSec=2s
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/llmgw
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Start the service and verify process/registry readiness:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now llmgw
-sudo systemctl status llmgw
-curl -fsS http://127.0.0.1:8080/healthz
-curl -fsS http://127.0.0.1:8080/readyz | jq
-```
-
-After bootstrapping a pool, backend, client, and key, require inference capacity and make an authenticated client-path check before enabling proxy traffic:
-
-```bash
-curl -fsS http://127.0.0.1:8080/inference-readyz | jq -e '.status == "ready" and .backendAvailability > 0'
-curl -fsS http://127.0.0.1:8080/v1/models \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
-```
-
-### Post-deployment production verification
-
-The two checks above are necessary but not sufficient: `/readyz` deliberately remains HTTP 200 when inference capacity is zero, and `/v1/models` proves authorization/configuration without proving that a model can generate. Before enabling client traffic after a new deployment, restart, configuration change, or restore, run the following from an operator network against the same ingress path clients will use.
-
-Set the public model and gateway URL without placing credentials in shell history or source control:
-
-```bash
-export LLMGW_VERIFY_URL='https://gateway.example.internal'
-export LLMGW_VERIFY_MODEL='qwen'
-export LLMGW_VERIFY_EXPECTED_BACKENDS=2
-export LLMGW_VERIFY_REQUEST_ID="deployment-verify-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-# Inject LLMGW_ADMIN_USERNAME, LLMGW_ADMIN_PASSWORD, and LLMGW_CLIENT_KEY
-# from the deployment secret mechanism.
-```
-
-1. Verify liveness, management readiness, a loaded registry revision, and non-zero inference capacity:
-
-```bash
-curl -fsS "$LLMGW_VERIFY_URL/healthz" | jq -e '.status == "alive"'
-curl -fsS "$LLMGW_VERIFY_URL/readyz" | jq -e '.status == "ready" and .revision > 0'
-curl -fsS "$LLMGW_VERIFY_URL/inference-readyz" \
-  | jq -e --argjson expected "$LLMGW_VERIFY_EXPECTED_BACKENDS" \
-      '.status == "ready" and .revision > 0 and .poolAvailability > 0 and .backendAvailability >= $expected'
-```
-
-2. Verify that enabled, non-draining backends are healthy and their vLLM metrics are fresh:
-
-The manual command prompts for the Admin password so it is not exposed in the process argument list. Do not append the password to `--user`.
-
-```bash
-curl -fsS --user "$LLMGW_ADMIN_USERNAME" \
-  "$LLMGW_VERIFY_URL/admin/api/status" \
-  | jq -e --argjson expected "$LLMGW_VERIFY_EXPECTED_BACKENDS" '
-      [.backends[] | select(.enabled and (.draining | not))] as $eligible
-      | ($eligible | length) >= $expected
-        and all($eligible[]; .runtime.Healthy and .runtime.MetricsFresh)
-        and any(.pools[]; .enabled and .runtime.AvailableBackends >= $expected)'
-```
-
-3. Verify model visibility and one complete streaming inference. Consuming the entire stream confirms the first-byte path, continued streaming, and the terminal `[DONE]` event:
-
-```bash
-curl -fsS "$LLMGW_VERIFY_URL/v1/models" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  | jq -e --arg model "$LLMGW_VERIFY_MODEL" 'any(.data[]; .id == $model)'
-
-curl -fsS -N "$LLMGW_VERIFY_URL/v1/completions" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H "X-Request-Id: $LLMGW_VERIFY_REQUEST_ID" \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$LLMGW_VERIFY_MODEL\",\"prompt\":\"Production verification.\",\"max_tokens\":4,\"stream\":true}" \
-  | awk '{ sub(/\r$/, ""); if ($0 == "data: [DONE]") done=1 } END { exit(done ? 0 : 1) }'
-```
-
-4. Verify telemetry and correlate the probe with a successful completion log:
-
-```bash
-(
-  set -e
-  LLMGW_VERIFY_METRICS="$(curl -fsS "$LLMGW_VERIFY_URL/metrics")"
-  for family in llmgw_requests_total llmgw_backend_pressure llmgw_backend_running_requests \
-    llmgw_backend_circuit_state llmgw_backend_circuit_failures llmgw_pool_gateway_inflight \
-    llmgw_pool_waiting_requests llmgw_pool_available_backends; do
-    printf '%s\n' "$LLMGW_VERIFY_METRICS" | grep -qE "^(# HELP )?$family([ {])"
-  done
-
-  ssh gateway-host "sudo journalctl -u llmgw --since='-5 minutes' -o cat" \
-    | jq -Rse --arg request_id "$LLMGW_VERIFY_REQUEST_ID" '
-      [split("\n")[] | fromjson?
-       | select(.msg == "request completed"
-           and .parentRequestId == $request_id
-           and .status == 200
-           and (.backend // "") != "")]
-      | if length > 0 then .
-        else error("no successful completion log for the verification request")
-        end'
-)
-```
-
-The example reads logs over SSH from the systemd gateway host. If the shell is already on that host, replace the `ssh ...` command with `sudo journalctl -u llmgw --since '-5 minutes' -o cat`. With centralized logging, query the same exact `parentRequestId`, require `status=200`, and require a non-empty `backend` field. The `jq` expression exits non-zero if no matching completion exists.
-
-For a repeatable assertion-based version, run the safe E2E smoke test from an operator workstation:
-
-```bash
-LLMGW_E2E_MODE=smoke \
-LLMGW_E2E_GATEWAY_URL="$LLMGW_VERIFY_URL" \
-LLMGW_E2E_ADMIN_USERNAME="$LLMGW_ADMIN_USERNAME" \
-LLMGW_E2E_ADMIN_PASSWORD="$LLMGW_ADMIN_PASSWORD" \
-LLMGW_E2E_MODEL="$LLMGW_VERIFY_MODEL" \
-LLMGW_E2E_HIGH_KEY="$LLMGW_CLIENT_KEY" \
-LLMGW_E2E_EXPECTED_BACKENDS="$LLMGW_VERIFY_EXPECTED_BACKENDS" \
-go test -count=1 -v -timeout 2m ./tests/e2e -run TestProductionSmoke
-```
-
-Pass criteria: all commands exit zero; Admin status shows the expected healthy/fresh capacity; the stream reaches `[DONE]`; Prometheus exposes gateway/backend series; and the matching completion log records status `200` and a selected backend. Do not run the intentional saturation test against live production traffic. Follow [the real-vLLM priority E2E runbook](docs/real-vllm-priority-e2e.md) only in an isolated environment or an approved capacity-test window.
-
-SQLite runs in WAL mode. Do not copy only `llmgw.db` while the gateway is running: committed data may still be in `llmgw.db-wal`. Use a quiesced backup of the complete state directory, for example:
-
-```bash
-sudo systemctl stop llmgw
-sudo tar -C /var/lib/llmgw -czf /secure-backups/llmgw-state.tgz .
-sudo systemctl start llmgw
-```
-
-Keep `/etc/llmgw/llmgw.env` out of source control and escrow it securely with the state backup. Losing or changing `LLMGW_API_KEY_HMAC_SECRET` immediately invalidates every existing client key; the MVP has no dual-secret migration path. HMAC-secret rotation therefore requires a planned cutover that regenerates and redistributes every client key. Test restore into an isolated instance and verify Admin login, configuration, `backendAvailability`, and an authenticated `/v1/models` request before relying on a backup.
-
-### Docker
-
-```bash
-umask 077
-export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-# Persist both values in an approved secret store before starting the container.
-
-docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker volume create llmgw-data
-docker run -d --name llmgw --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 -v llmgw-data:/data \
-  -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD \
-  -e LLMGW_API_KEY_HMAC_SECRET \
-  vllm-priority-gateway:local
-
-curl -fsS http://127.0.0.1:8080/healthz
-curl -fsS http://127.0.0.1:8080/readyz | jq
-```
-
-The runtime image is `scratch`, contains only CA certificates and the static gateway, and runs as numeric UID/GID `65532`.
-The image initializes `/data` with that ownership, so a fresh named or anonymous volume is writable. For a Linux bind mount, create the directory and grant UID/GID `65532` write access before starting the container; Docker Desktop for macOS applies its own host-file sharing rules.
-Treat `llmgw-data` and the exact HMAC secret as one recoverable state set. Stop the container before snapshotting or restoring the complete volume, restart it afterward, and perform the same restore verification described for the native deployment. Privileged Docker users can inspect container environment variables; use the deployment platform's secret injection mechanism when stronger isolation is required.
-
-With a running Docker daemon, exercise the exact image, fresh-volume, non-root, SQLite, and health path with:
-
-```bash
-make container-smoke
-```
-
-## Testing
+Requirements: Go 1.27 and macOS or Linux. The SQLite driver is pure Go; builds do not require CGO.
 
 ```bash
 make test
@@ -554,30 +290,28 @@ make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
-Tests cover domain validation, key security, SQLite migrations and CRUD, registry snapshots, pressure/EWMA/hysteresis, admission, least-pressure and rendezvous routing, session-affinity fallback/exclusion/header handling, monitoring, fake-vLLM controls, proxy streaming/cancellation/retry, public and Admin HTTP contracts, UI semantics, telemetry, process lifecycle, load statistics, and black-box acceptance behavior.
+The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the production quick start.
 
-## Real-GPU validation
+The implementation and deterministic acceptance suite are code-complete. The opt-in real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on Apple M4 with vLLM-Metal on 2026-08-27. Repeat compatibility, saturation, and threshold calibration on the selected production model and GPU before sign-off.
 
-Run `make test-real-vllm` with `LLMGW_E2E_MODE=smoke`, `priority`, or `resilience` and the environment documented in [`docs/real-vllm-priority-e2e.md`](docs/real-vllm-priority-e2e.md). The modes cover production-safe inference readiness/streaming, intentional priority and pool-safety saturation, and isolated real-vLLM circuit recovery respectively. All three passed on the recorded 2026-08-27 Apple M4/vLLM-Metal development topology; see [`docs/acceptance-evidence.md`](docs/acceptance-evidence.md) for the exact durable summary and its raw-log limitation. Follow [`docs/real-gpu-testing.md`](docs/real-gpu-testing.md) for broader compatibility, cancellation, routing, and target hardware calibration. Fake-backend and Apple Silicon results prove gateway mechanics but cannot sign off the scheduler behavior or thresholds of a selected CUDA model/hardware combination.
+## Current scope and limitations
 
-## Not implemented in the MVP
+- Exactly one gateway replica; admission leases and backend runtime state are process-local.
+- Static operator-managed backend registration; no service discovery or autoscaling.
+- No distributed rate limits, token budgets, billing, or GPU/NVML scheduling.
+- Priority admission rejects new lower-priority work but does not preempt an admitted generation.
+- Soft session affinity improves locality without inspecting KV blocks or prefix contents.
+- Basic auth is the current management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external responsibilities.
+- Capacity hints are persisted for forward compatibility but do not currently weight routing.
 
-- One gateway replica; concurrency leases and backend runtime state are process-local.
-- Operator-managed backend registration and SQLite persistence only; there is no automatic service discovery.
-- No distributed rate limits, token budgets, billing, autoscaling, discovery, KV-block/prefix-index routing, or GPU/NVML scheduling. Circuit and pool-safety state is process-local; soft session affinity is implemented without inspecting cache contents.
-- Priority admission rejects new lower-priority requests; it does not preempt an already admitted generation.
-- Basic auth is the MVP management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external or future responsibilities.
-- Capacity hints are persisted for forward compatibility but do not yet weight routing.
-- Automated fake-backend acceptance and the opt-in real-vLLM test harness are complete, but the real-vLLM suite and threshold calibration must still pass on the selected production model/GPU combination before production use.
+See the [technical specification](docs/technical-specification.md) for the broader Production V1 target.
 
-## Remaining work for Production V1
+## Documentation
 
-The package boundaries allow SQLite to be replaced with PostgreSQL, local leases with a distributed store, and static backend configuration with discovery. Production V1 still needs:
-
-- Real-GPU validation and calibrated pressure/admission thresholds for the selected models and hardware.
-- Multi-replica gateway HA with coordinated configuration revisions and distributed concurrency/rate/token budgets.
-- PostgreSQL for durable configuration and a defined degraded-mode policy for the distributed coordination store.
-- Orchestrated drain-aware rolling shutdown, capacity-weighted routing, and optional KV-block/prefix-aware routing beyond the current soft affinity.
-- OIDC-based Admin authentication, RBAC, audit logging, secret-manager integration, and managed TLS/network policy.
-- OpenTelemetry traces, production dashboards and alerts, configuration migration/versioning, and Kubernetes deployment/discovery where required.
-- Load, failure, upgrade, backup/restore, and security validation against the Production V1 acceptance criteria in the technical specification.
+- [Production deployment](docs/deployment.md)
+- [Operations guide](docs/operations.md)
+- [Technical specification](docs/technical-specification.md)
+- [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md)
+- [Real-GPU test plan](docs/real-gpu-testing.md)
+- [Acceptance evidence](docs/acceptance-evidence.md)
+- [Russian README](README.ru.md)
