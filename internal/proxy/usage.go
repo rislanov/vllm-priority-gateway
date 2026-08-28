@@ -298,12 +298,12 @@ func findAuthoritativeSSEUsage(root any) (any, bool) {
 	}
 	response, ok := object["response"].(map[string]any)
 	if !ok {
-		return nil, false
+		return nil, true
 	}
 	if usage, found := response["usage"]; found {
 		return usage, true
 	}
-	return nil, false
+	return nil, true
 }
 
 func normalizeTokenUsage(value any) (*domain.TokenUsage, bool, bool) {

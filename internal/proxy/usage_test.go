@@ -289,6 +289,39 @@ func TestUsageInspectorRejectsInvalidNestedResponsesCompletedUsage(t *testing.T)
 	}
 }
 
+func TestUsageInspectorRejectsResponsesCompletedWithoutNestedUsage(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stream string
+	}{
+		{
+			name:   "missing response container",
+			stream: "data: {\"type\":\"response.completed\",\"usage\":null}\n\n",
+		},
+		{
+			name:   "null response container",
+			stream: "data: {\"type\":\"response.completed\",\"usage\":null,\"response\":null}\n\n",
+		},
+		{
+			name:   "array response container",
+			stream: "data: {\"type\":\"response.completed\",\"usage\":null,\"response\":[]}\n\n",
+		},
+		{
+			name:   "missing nested usage",
+			stream: "data: {\"type\":\"response.completed\",\"usage\":null,\"response\":{\"id\":\"resp-1\"}}\n\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inspector := newUsageInspector("text/event-stream")
+			inspector.Write([]byte(test.stream))
+			got, format, failed := inspector.Result()
+			if got != nil || !failed || format != "sse" {
+				t.Fatalf("usage=%+v format=%q failed=%v, want nil/sse/true", got, format, failed)
+			}
+		})
+	}
+}
+
 func TestUsageInspectorScopesSSEUsageToAuthoritativeFields(t *testing.T) {
 	tests := []struct {
 		name       string
