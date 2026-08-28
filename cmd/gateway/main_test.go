@@ -36,6 +36,33 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/web"
 )
 
+func TestGatewayHealthcheckRequiresHTTP200(t *testing.T) {
+	t.Run("healthy", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := checkGatewayHealth(ctx, server.URL); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("unhealthy", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			http.Error(writer, "not ready", http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		err := checkGatewayHealth(ctx, server.URL)
+		if err == nil || !strings.Contains(err.Error(), "HTTP 503") {
+			t.Fatalf("healthcheck error = %v, want HTTP 503", err)
+		}
+	})
+}
+
 func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
 	destination := &keyUsageStoreStub{}
 	projection := &keyUsageRegistryStub{}

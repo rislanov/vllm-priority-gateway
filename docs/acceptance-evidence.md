@@ -73,6 +73,33 @@ LLMGW_E2E_MODE=resilience make test-real-vllm
 
 ## Real-GPU evidence
 
+### Recorded RTX 4070 Ti Docker run — 2026-08-28
+
+The canonical Docker Quick Start and all three opt-in real-vLLM modes passed on the repository working tree based at commit `a138ab8`. The host GPU was an NVIDIA GeForce RTX 4070 Ti with 12,282 MiB VRAM and driver `610.47`. Docker `29.1.2` and Compose `2.40.3` ran Linux containers. The inference stack used two private `vllm/vllm-openai:v0.28.0` services with `Qwen/Qwen3-0.6B`, `max-model-len=1024`, `max-num-seqs=1`, priority scheduling, prefix caching, prompt-token details, and request-ID headers. Each service used `--gpu-memory-utilization 0.32`; Compose reserved the NVIDIA device, and only the gateway was published to host loopback. No credentials are recorded here.
+
+Representative non-secret command shapes were:
+
+```console
+docker compose config --quiet
+docker compose run --rm --no-deps --entrypoint nvidia-smi vllm-a
+docker compose up -d --build --wait --wait-timeout 900
+go test -count=1 -v -timeout 10m ./tests/e2e -run '^TestProductionSmoke$'
+go test -count=1 -v -timeout 10m ./tests/e2e -run '^TestPriorityIsolationWithRealVLLM$'
+docker run --rm --network container:vllm-priority-gateway-gateway-1 ... golang:1.27-alpine go test -count=1 -v -timeout 10m ./tests/e2e -run '^TestCircuitBreakerRecoveryWithRealVLLM$'
+docker run --rm -v /path/to/repository:/src:ro -w /src golang:1.27-alpine go test -count=1 ./...
+docker run --rm -v /path/to/repository:/src:ro -w /src golang:1.27-alpine go vet ./...
+```
+
+Observed evidence:
+
+- The documented Compose configuration, GPU probe, build/wait, management readiness, two-backend inference readiness, model listing, and checked-in SSE request passed. Compose waited for the gateway binary's HTTP healthcheck. The stream used upstream model `qwen-test`, reported vLLM `0.28.0`, and ended with `[DONE]`.
+- Smoke saw one available pool, two healthy and metrics-fresh backends, all required metric families, and `240.6163ms` first byte. After restarting only the gateway, revision `63`, Admin state, the rotated client key, and two-backend readiness persisted; the repeated smoke first byte was `242.46ms`.
+- The priority profile used four independent High-load clients with four 768-token requests each. Saturation reached `GatewayInflight=16`, `TotalWaiting=14`, pressure `0.7902`, and `AllBackendsWaiting=true`. Three Low probes—including body/header priority spoofing and session affinity—were rejected while High/Critical streams continued. The temporary pool-wide limit rejected Critical, one-backend drain preserved High admission, and cleanup restored the exact pool/backend state. Recovery reached `busy` in `14.0900556s` and `normal` in `24.9508766s`; the test passed in `47.93s`.
+- Resilience opened backend `1` after exactly five injected failures while health and metrics remained good, changed inference readiness to HTTP 503, then recovered through half-open to a closed circuit and HTTP 200. The recovery stream first byte was `368.449514ms`; the test passed in `17.75s`. Final state was pool `normal` with limits `32/8`, two available backends at `http://vllm-a:8000` and `http://vllm-b:8000`, neither draining, both healthy/fresh, and both circuits closed.
+- The Compose contract test passed on the host. The complete `go test -count=1 ./...` suite and `go vet ./...` passed in `golang:1.27-alpine`; the Docker Compose gateway image also rebuilt successfully from the tested working tree.
+
+Only this summarized result is durable; raw process logs are not an artifact archive. The run proves the small-model CUDA/Docker topology and gateway scenarios above. It does not calibrate a production model, multi-GPU serving groups, production thresholds, or production TTFT targets.
+
 ### Recorded Apple Silicon development run — 2026-08-27
 
 All three opt-in real-vLLM modes passed in one isolated local run. The gateway commit at execution was `6b7a29b`. The host was a MacBook Air `Mac16,13` with Apple M4 and 24 GB unified memory. The inference stack was vLLM `0.28.0+cpu` with vLLM-Metal `0.3.0.dev20260827104907`; two loopback `Qwen/Qwen3-0.6B` serving processes each used `max-num-seqs=1`. The resilience profile set the gateway failure threshold and injected failure count to `3` and the open cooldown to `3s`. No credentials are recorded here.
@@ -93,15 +120,14 @@ Observed evidence:
 
 Only this summarized result is durable. Raw gateway, vLLM, and terminal process logs from the run were ephemeral and were not retained, so this is not a raw-log artifact archive. The run proves the exercised Apple Silicon/vLLM-Metal topology; it does not sign off CUDA behavior, the selected production model, or production threshold/TTFT calibration. Docker container smoke was also not run because the daemon was unavailable.
 
-### Pending target-hardware evidence
+### Remaining production-calibration evidence
 
-The following production claims remain pending until the three automated modes and the broader manual plan pass on the selected CUDA host/model:
+The small-model CUDA/Docker gate above is complete. The following production claims remain pending until the broader manual plan passes with the selected production model and topology:
 
 - current vLLM wire compatibility for all three generation endpoints on the selected production vLLM version;
 - calibrated priority scheduling and TTFT isolation under the target GPU queue contention;
 - cancellation reaching a live model engine and releasing GPU work;
-- threshold calibration and TTFT isolation on the target RTX 4070 Ti;
-- one-versus-two real serving-group routing behavior.
-- inference circuit open/half-open/closed timing and recovery through the loopback fault proxy on the selected CUDA vLLM build.
+- production threshold and TTFT calibration for the selected model;
+- one-versus-two independently provisioned serving-group routing behavior.
 
 Use [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md) for the automated gate and [real-gpu-testing.md](real-gpu-testing.md) to collect the additional versioned commands, status snapshots, Prometheus data, gateway logs, vLLM logs, and load-generator reports required for target-hardware sign-off.

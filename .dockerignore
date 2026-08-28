@@ -1,6 +1,9 @@
 .git
 .tools
 .worktrees
+.env
+.env.*
+!.env.example
 data
 dist
 *.db

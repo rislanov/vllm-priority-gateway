@@ -37,10 +37,35 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		healthCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := checkGatewayHealth(healthCtx, "http://127.0.0.1:8080/healthz"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(ctx, os.LookupEnv, nil, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func checkGatewayHealth(ctx context.Context, endpoint string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create gateway healthcheck request: %w", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("request gateway health: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("gateway healthcheck returned HTTP %d", response.StatusCode)
+	}
+	return nil
 }
 
 func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, stdout, stderr io.Writer) (runErr error) {

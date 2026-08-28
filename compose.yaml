@@ -1,0 +1,100 @@
+name: vllm-priority-gateway
+
+x-vllm-common: &vllm-common
+  image: "${VLLM_IMAGE:-vllm/vllm-openai:v0.28.0}"
+  restart: unless-stopped
+  init: true
+  shm_size: "${VLLM_SHM_SIZE:-4gb}"
+  environment:
+    HF_TOKEN: "${HF_TOKEN:-}"
+    VLLM_USE_V2_MODEL_RUNNER: "${VLLM_USE_V2_MODEL_RUNNER:-0}"
+  volumes:
+    - huggingface-cache:/root/.cache/huggingface
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  command:
+    - "${VLLM_MODEL:-Qwen/Qwen3-0.6B}"
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8000"
+    - --max-model-len
+    - "${VLLM_MAX_MODEL_LEN:-1024}"
+    - --max-num-seqs
+    - "${VLLM_MAX_NUM_SEQS:-1}"
+    - --scheduling-policy
+    - priority
+    - --served-model-name
+    - "${VLLM_SERVED_MODEL:-qwen-test}"
+    - --generation-config
+    - vllm
+    - --gpu-memory-utilization
+    - "${VLLM_GPU_MEMORY_UTILIZATION:-0.32}"
+    - --enable-prefix-caching
+    - --enable-prompt-tokens-details
+    - --enable-request-id-headers
+  healthcheck:
+    test:
+      - CMD
+      - python3
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10m
+
+services:
+  vllm-a:
+    <<: *vllm-common
+
+  vllm-b:
+    <<: *vllm-common
+    depends_on:
+      vllm-a:
+        condition: service_healthy
+
+  gateway:
+    build:
+      context: .
+    image: vllm-priority-gateway:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 35s
+    depends_on:
+      vllm-a:
+        condition: service_healthy
+      vllm-b:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LLMGW_PORT:-8080}:8080"
+    volumes:
+      - gateway-data:/data
+    environment:
+      LLMGW_ADMIN_USERNAME: "${LLMGW_ADMIN_USERNAME:-operator}"
+      LLMGW_ADMIN_PASSWORD: "${LLMGW_ADMIN_PASSWORD:?Set LLMGW_ADMIN_PASSWORD in .env}"
+      LLMGW_API_KEY_HMAC_SECRET: "${LLMGW_API_KEY_HMAC_SECRET:?Set LLMGW_API_KEY_HMAC_SECRET in .env}"
+    healthcheck:
+      test: [CMD, /gateway, healthcheck]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  probe:
+    image: curlimages/curl:8.17.0
+    profiles: [tools]
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      - ./examples/quickstart-chat.json:/requests/chat.json:ro,z
+
+volumes:
+  gateway-data:
+  huggingface-cache:

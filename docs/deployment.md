@@ -1,6 +1,6 @@
 # Production deployment
 
-This guide contains the detailed deployment and post-deployment procedures for Lightweight vLLM Priority Gateway. For the shortest path from a running vLLM server to the first inference request, start with the [production quick start](../README.md#production-quick-start).
+This guide contains the detailed deployment and post-deployment procedures for Lightweight vLLM Priority Gateway. For the tested first run with two real vLLM servers, start with the canonical [Docker quick start](../README.md#docker-quick-start).
 
 ## Supported topology
 
@@ -26,39 +26,23 @@ The reverse proxy must:
 
 ## Docker deployment
 
-Generate and escrow the administrator password and HMAC secret before starting the container. The HMAC secret is part of the durable credential state: changing or losing it invalidates every existing client key.
+Use the repository's canonical [`compose.yaml`](../compose.yaml) for Docker deployment. It is the tested source of truth for Linux Docker Engine and Docker Desktop: Compose builds the gateway, starts two pinned vLLM services, creates their private DNS/network, and owns the SQLite and model-cache volumes.
 
-```bash
-umask 077
-export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-# Persist both values in the approved secret store now.
+Create `.env` from [`.env.example`](../.env.example), replace both blank secrets, and escrow them before starting the stack. The HMAC secret is part of durable credential state: changing or losing it invalidates every existing client key.
 
-docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker volume create llmgw-data
-docker run -d --name llmgw --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v llmgw-data:/data \
-  -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD \
-  -e LLMGW_API_KEY_HMAC_SECRET \
-  vllm-priority-gateway:local
+```console
+docker compose config --quiet
+docker compose up -d --build --wait --wait-timeout 900
+docker compose ps
 ```
 
-The runtime image is `scratch`, contains only CA certificates and the static gateway, runs as numeric UID/GID `65532`, and stores SQLite state under `/data`. A fresh named volume is initialized with the correct ownership. For a Linux bind mount, create the directory and grant UID/GID `65532` write access before starting the container.
+The gateway runtime image is `scratch`, contains only CA certificates and the static binary, runs as numeric UID/GID `65532`, and stores SQLite under `/data`. The named `gateway-data` volume is initialized with the correct ownership. The Compose stack publishes only `127.0.0.1:8080`; vLLM remains private on the Compose-managed network at `http://vllm-a:8000` and `http://vllm-b:8000`.
 
-The backend URL entered in Admin must be reachable **from the gateway container**. `127.0.0.1` inside the container refers to the gateway container itself, not to a vLLM process on the Docker host. Prefer private DNS or a shared container network, for example `http://vllm.internal:8000`.
+For an externally managed vLLM pool, replace the Compose vLLM services with private DNS endpoints reachable from the gateway service. Do not publish unauthenticated vLLM ports to client networks.
 
-If vLLM requires an upstream API key, store only its environment-variable name in the backend record and inject the value into the gateway container:
+If vLLM requires an upstream API key, add its value to the deployment secret mechanism, map that variable into the gateway service's `environment`, and store only the variable name in the backend Admin record. Do not put the upstream secret itself in SQLite or in the Admin form.
 
-```bash
-export VLLM_GPU_A_KEY='secret-from-your-secret-store'
-docker run ... -e VLLM_GPU_A_KEY ...
-```
-
-Do not put the upstream secret itself in SQLite or in the Admin form.
-
-Verify the image, fresh-volume, non-root, SQLite, and health path with a running Docker daemon:
+Verify the image, fresh-volume, non-root, SQLite, and health path separately with a running Docker daemon:
 
 ```bash
 make container-smoke

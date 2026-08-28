@@ -6,7 +6,7 @@
 
 - [What it is](#what-it-is)
 - [Key capabilities](#key-capabilities)
-- [Production quick start](#production-quick-start)
+- [Docker quick start](#docker-quick-start)
 - [Admin UI](#admin-ui)
 - [Client API behavior](#client-api-behavior)
 - [Operations and deployment](#operations-and-deployment)
@@ -53,94 +53,75 @@ The deployment footprint is one static Go binary and one SQLite state directory.
 - Embedded Basic-authenticated, CSRF-protected Admin UI and JSON Admin API.
 - Prometheus metrics and structured JSON completion logs.
 
-## Production quick start
+## Docker quick start
 
-This path connects the gateway to a real vLLM server and produces the first authenticated inference request. It uses Docker for the gateway; see the [deployment guide](docs/deployment.md) for native systemd installation, reverse-proxy requirements, production verification, and backup/restore.
+This is the canonical first-run path. The same `compose.yaml` launches the gateway and two real `Qwen/Qwen3-0.6B` vLLM servers on Linux Docker Engine and Docker Desktop. Compose creates the private network, service DNS, SQLite volume, and shared model cache; only the gateway is published, on `127.0.0.1:8080`.
+
+The tested defaults deliberately run two small-capacity vLLM processes on one NVIDIA GPU with at least 12 GiB VRAM. They are suitable for validating routing and priority behavior, not production sizing. See the [deployment guide](docs/deployment.md) before exposing the gateway outside the Docker host.
 
 ### Prerequisites
 
-- A Linux host with Docker for the gateway.
-- A production vLLM endpoint reachable over the private network.
-- A trusted TLS reverse proxy before exposing the gateway to client networks.
-- `curl`; `jq` is useful for the verification commands.
+- Docker Engine with Docker Compose v2, or Docker Desktop using Linux containers.
+- An NVIDIA GPU visible to Docker and a Docker daemon configured for [Compose GPU reservations](https://docs.docker.com/compose/how-tos/gpu-support/).
+- Approximately 25 GiB free disk space for the pinned vLLM image, model weights, and caches.
+- Access to Hugging Face for the public Qwen model. `HF_TOKEN` is optional but avoids anonymous download rate limits.
 
-The examples use:
+### 1. Set local secrets and validate Docker
 
-- upstream model: `Qwen/Qwen2.5-7B-Instruct`;
-- public model exposed to clients: `qwen`;
-- private vLLM URL reachable from the gateway container: `http://vllm.internal:8000`;
-- gateway listener on the Docker host: `http://127.0.0.1:8080`.
+Clone the repository and open its directory. Create `.env` next to `compose.yaml` from [`.env.example`](.env.example), then fill both blank secrets with independently generated random values:
 
-Replace all four values for your environment. In particular, `127.0.0.1` inside the gateway container refers to the gateway container itself, not to vLLM on the Docker host.
-
-### 1. Start vLLM with priority scheduling
-
-If vLLM is already managed by your inference platform, verify the equivalent flags and skip to the next step.
-
-```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --scheduling-policy priority \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details \
-  --enable-request-id-headers
+```dotenv
+LLMGW_ADMIN_USERNAME=operator
+LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
+LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+LLMGW_PORT=8080
 ```
 
-vLLM handles lower integer priority values earlier. `--enable-prompt-tokens-details` allows cache-read analytics when the model/backend reports them. Check the current [vLLM serve CLI](https://docs.vllm.ai/en/latest/cli/serve/) and [OpenAI-compatible server documentation](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/) when pinning or upgrading vLLM.
+Keep `.env` readable only by the operator account and never commit it; the repository already ignores it. The remaining values in `.env.example` pin the tested vLLM image, Qwen model, memory fraction, and compatibility runner. Change capacity settings only after the first successful run.
 
-Keep the vLLM port private. Clients should reach only the gateway.
+These commands are identical in Bash and PowerShell:
 
-### 2. Build and start the gateway
-
-```bash
-git clone https://github.com/rislanov/vllm-priority-gateway.git
-cd vllm-priority-gateway
-
-umask 077
-export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-# Save both generated values in the approved secret store now.
-
-docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker volume create llmgw-data
-docker run -d --name llmgw --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v llmgw-data:/data \
-  -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD \
-  -e LLMGW_API_KEY_HMAC_SECRET \
-  vllm-priority-gateway:local
+```console
+docker compose config --quiet
+docker compose run --rm --no-deps --entrypoint nvidia-smi vllm-a
 ```
 
-Verify process and registry readiness:
+The first command must finish silently. The second must show the intended NVIDIA GPU from inside the pinned vLLM container.
 
-```bash
-curl -fsS http://127.0.0.1:8080/healthz | jq
-curl -fsS http://127.0.0.1:8080/readyz | jq
+### 2. Build and start the complete stack
+
+```console
+docker compose up -d --build --wait --wait-timeout 900
+docker compose ps
 ```
 
-`/readyz` confirms management-plane readiness. It deliberately remains healthy when inference capacity is zero; `/inference-readyz` becomes ready after the pool and backend are configured and monitored successfully.
+`vllm-a` downloads and compiles the model first; `vllm-b` starts after A is healthy and reuses the named Hugging Face cache. The gateway starts only after both inference servers pass `/health`. On a cold machine the image pull and first model initialization can take several minutes.
+
+The optional `probe` service provides a pinned curl client inside the private Compose network, so host curl, jq, shell variables, and platform-specific quoting are not required:
+
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/healthz
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/readyz
+```
+
+`/readyz` confirms management-plane readiness. It deliberately remains healthy before model pools are configured.
 
 ### 3. Configure the gateway in Admin
 
-Open `http://127.0.0.1:8080/admin` through an operator-only path and authenticate as `operator` with `LLMGW_ADMIN_PASSWORD`.
+Open `http://127.0.0.1:8080/admin` and authenticate with the Admin username and password from `.env`.
 
 Create resources in this order:
 
 1. Open **Backends → Create model pool**:
    - **Public model name:** `qwen`
-   - **Upstream model name:** `Qwen/Qwen2.5-7B-Instruct`
+   - **Upstream model name:** `qwen-test`
    - **Max gateway inflight:** `32`
    - **Max waiting:** `8`
    - **Enabled:** checked
-2. On the same page, create a backend:
-   - **Name:** `gpu-a`
-   - **Model pool:** `qwen`
-   - **URL:** `http://vllm.internal:8000`
-   - **Capacity hint:** `1`
-   - **Running soft limit:** `16`
-   - **Enabled:** checked
+2. Create two backends in the same pool:
+   - **Name:** `vllm-a`; **URL:** `http://vllm-a:8000`
+   - **Name:** `vllm-b`; **URL:** `http://vllm-b:8000`
+   - For both: **Capacity hint:** `1`; **Running soft limit:** `1`; **Enabled:** checked
 3. Open **Clients → Create client**:
    - **Name:** `production-app`
    - **Priority class:** `normal`
@@ -150,49 +131,39 @@ Create resources in this order:
    - **Enabled:** checked
 4. Open **API Keys**, select `production-app`, optionally set an expiry date, and choose **Generate API key**. Copy the full `llmgw_*` value immediately; it is shown only once.
 
-The numeric limits above are illustrative values for validating the workflow, not universal production sizing. Calibrate them against the selected model, GPU, vLLM `--max-num-seqs`, latency objective, and saturation tests before enabling client traffic. Zero disables the corresponding pool limit.
+The service names above are Compose DNS records, not host aliases. vLLM has no published host port and remains reachable only by other services in this stack.
 
-If vLLM uses `--api-key`, enter only the gateway environment-variable name, such as `VLLM_GPU_A_KEY`, in **Upstream API key environment variable** and inject that variable into the gateway container. Never paste the upstream secret into Admin.
+### 4. Verify real inference
 
-### 4. Verify capacity and make real requests
+After the monitor has polled both backends, inference readiness must return HTTP 200 and report two available backends:
 
-Wait for backend health and metrics polling, then require inference readiness:
-
-```bash
-curl -fsS http://127.0.0.1:8080/inference-readyz \
-  | jq -e '.status == "ready" and .backendAvailability > 0'
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
 ```
 
-Export the one-time client key:
+Replace the placeholder below with the one-time client key and list the public models:
 
-```bash
-export LLMGW_URL='http://127.0.0.1:8080'
-export LLMGW_CLIENT_KEY='llmgw_copy-the-one-time-value-here'
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
 ```
 
-List the models available to this client:
+Send the checked-in streaming request body from [`examples/quickstart-chat.json`](examples/quickstart-chat.json):
 
-```bash
-curl -fsS "$LLMGW_URL/v1/models" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
+```console
+docker compose run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
 ```
 
-Send a streaming Chat Completions request:
+The stream must end with `data: [DONE]`. The client uses public model `qwen`; the gateway authenticates it, applies the stored priority, rewrites the upstream model to `qwen-test`, and selects one of the two healthy vLLM services.
 
-```bash
-curl -fsS -N "$LLMGW_URL/v1/chat/completions" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H 'X-LLM-Session-Id: production-agent-42' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen",
-    "messages": [{"role": "user", "content": "Explain priority scheduling in one sentence."}],
-    "max_tokens": 64,
-    "stream": true
-  }'
+Useful lifecycle commands are also host-independent:
+
+```console
+docker compose logs -f gateway
+docker compose stop
+docker compose down
 ```
 
-The client sends the public model name `qwen`. The gateway authenticates the key, enforces the stored client policy, rewrites the model to `Qwen/Qwen2.5-7B-Instruct`, applies the server-controlled vLLM priority, selects an eligible backend, and streams the upstream response.
+`docker compose down` preserves the SQLite and cache volumes. Use `docker compose down --volumes` only when intentionally deleting all Quick Start state and cached model data.
 
 ## Admin UI
 
@@ -290,9 +261,9 @@ make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
-The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the production quick start.
+The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the Docker quick start.
 
-The implementation and deterministic acceptance suite are code-complete. The opt-in real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on Apple M4 with vLLM-Metal on 2026-08-27. Repeat compatibility, saturation, and threshold calibration on the selected production model and GPU before sign-off.
+The implementation and deterministic acceptance suite are code-complete. The canonical Docker Quick Start and the real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on an RTX 4070 Ti with two `Qwen/Qwen3-0.6B` services on 2026-08-28. Repeat compatibility, saturation, and threshold calibration with the selected production model and topology before sign-off.
 
 ## Current scope and limitations
 

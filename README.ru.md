@@ -6,7 +6,7 @@
 
 - [Что это за продукт](#что-это-за-продукт)
 - [Основные возможности](#основные-возможности)
-- [Быстрый запуск в production](#быстрый-запуск-в-production)
+- [Docker Quick Start](#docker-quick-start)
 - [Админка](#админка)
 - [Поведение клиентского API](#поведение-клиентского-api)
 - [Эксплуатация и развёртывание](#эксплуатация-и-развёртывание)
@@ -53,94 +53,75 @@ OpenAI-клиент
 - Встроенные Admin UI и JSON Admin API с Basic auth и CSRF-защитой.
 - Метрики Prometheus и структурированные JSON-логи завершённых запросов.
 
-## Быстрый запуск в production
+## Docker Quick Start
 
-Этот сценарий подключает gateway к реальному vLLM и доводит настройку до первого авторизованного inference-запроса. Для gateway используется Docker. Нативная установка с systemd, требования к reverse proxy, production-проверки и backup/restore описаны в [подробном руководстве](docs/deployment.md).
+Это канонический сценарий первого запуска. Один и тот же `compose.yaml` поднимает gateway и два реальных vLLM с `Qwen/Qwen3-0.6B` в Linux Docker Engine и Docker Desktop. Compose сам создаёт приватную сеть, DNS сервисов, volume SQLite и общий кэш модели; наружу публикуется только gateway на `127.0.0.1:8080`.
+
+Проверенные значения намеренно запускают два маломощных процесса vLLM на одной NVIDIA GPU с минимум 12 ГиБ VRAM. Они подходят для проверки маршрутизации и приоритетов, но не являются production sizing. Перед публикацией gateway за пределы Docker-хоста изучите [руководство по развёртыванию](docs/deployment.md).
 
 ### Требования
 
-- Linux-хост с Docker для gateway.
-- Production endpoint vLLM, доступный по приватной сети.
-- Доверенный TLS reverse proxy перед публикацией gateway в клиентскую сеть.
-- `curl`; для проверок также удобен `jq`.
+- Docker Engine с Docker Compose v2 или Docker Desktop с Linux-контейнерами.
+- NVIDIA GPU, доступная Docker, и daemon с поддержкой [GPU reservations в Compose](https://docs.docker.com/compose/how-tos/gpu-support/).
+- Около 25 ГиБ свободного места для зафиксированного образа vLLM, весов модели и кэшей.
+- Доступ к Hugging Face для публичной модели Qwen. `HF_TOKEN` необязателен, но снимает ограничения анонимной загрузки.
 
-В примерах используются:
+### 1. Задайте локальные секреты и проверьте Docker
 
-- upstream-модель: `Qwen/Qwen2.5-7B-Instruct`;
-- публичная модель для клиентов: `qwen`;
-- приватный URL vLLM, доступный из контейнера gateway: `http://vllm.internal:8000`;
-- адрес gateway на Docker-хосте: `http://127.0.0.1:8080`.
+Клонируйте репозиторий и откройте его каталог. Создайте рядом с `compose.yaml` файл `.env` на основе [`.env.example`](.env.example), затем заполните оба пустых секрета независимо сгенерированными случайными значениями:
 
-Замените все четыре значения под своё окружение. Важно: `127.0.0.1` внутри контейнера gateway указывает на сам контейнер, а не на процесс vLLM на Docker-хосте.
-
-### 1. Запустите vLLM с priority scheduling
-
-Если vLLM уже управляется вашей inference-платформой, проверьте эквивалентность параметров и переходите к следующему шагу.
-
-```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --scheduling-policy priority \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details \
-  --enable-request-id-headers
+```dotenv
+LLMGW_ADMIN_USERNAME=operator
+LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
+LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+LLMGW_PORT=8080
 ```
 
-В vLLM меньшие целочисленные значения priority обслуживаются раньше. Флаг `--enable-prompt-tokens-details` позволяет строить аналитику cache-read, когда модель и backend возвращают эти данные. При фиксации или обновлении версии сверяйтесь с актуальными страницами [vLLM serve CLI](https://docs.vllm.ai/en/latest/cli/serve/) и [OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/).
+Файл `.env` должен читаться только операторской учётной записью и не должен попадать в Git; репозиторий уже игнорирует его. Остальные значения в `.env.example` фиксируют проверенные образ vLLM, модель Qwen, долю памяти и compatibility runner. Меняйте параметры capacity только после первого успешного запуска.
 
-Порт vLLM должен оставаться в приватной сети. Клиенты должны обращаться только к gateway.
+Эти команды одинаковы в Bash и PowerShell:
 
-### 2. Соберите и запустите gateway
-
-```bash
-git clone https://github.com/rislanov/vllm-priority-gateway.git
-cd vllm-priority-gateway
-
-umask 077
-export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-# Сразу сохраните оба значения в утверждённом хранилище секретов.
-
-docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker volume create llmgw-data
-docker run -d --name llmgw --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v llmgw-data:/data \
-  -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD \
-  -e LLMGW_API_KEY_HMAC_SECRET \
-  vllm-priority-gateway:local
+```console
+docker compose config --quiet
+docker compose run --rm --no-deps --entrypoint nvidia-smi vllm-a
 ```
 
-Проверьте, что процесс запущен, а SQLite и registry готовы:
+Первая команда должна завершиться без вывода. Вторая должна показать нужную NVIDIA GPU из зафиксированного контейнера vLLM.
 
-```bash
-curl -fsS http://127.0.0.1:8080/healthz | jq
-curl -fsS http://127.0.0.1:8080/readyz | jq
+### 2. Соберите и запустите весь стек
+
+```console
+docker compose up -d --build --wait --wait-timeout 900
+docker compose ps
 ```
 
-`/readyz` проверяет management plane и намеренно остаётся доступным при нулевой inference capacity. `/inference-readyz` станет готов после настройки пула и успешных проверок backend.
+Сначала `vllm-a` скачивает и компилирует модель; после его готовности запускается `vllm-b` и использует общий именованный Hugging Face cache. Gateway запускается только после успешного `/health` обоих inference-серверов. На чистой машине загрузка образа и первый запуск модели могут занять несколько минут.
 
-### 3. Настройте gateway в админке
+Опциональный сервис `probe` содержит зафиксированный curl-клиент внутри приватной Compose-сети. Поэтому host curl, jq, shell-переменные и platform-specific quoting не нужны:
 
-Откройте `http://127.0.0.1:8080/admin` через доступный только операторам маршрут и войдите как `operator`, используя `LLMGW_ADMIN_PASSWORD`.
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/healthz
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/readyz
+```
+
+`/readyz` проверяет management plane и намеренно остаётся доступным до настройки пулов моделей.
+
+### 3. Настройте gateway в Admin
+
+Откройте `http://127.0.0.1:8080/admin` и войдите с Admin username/password из `.env`.
 
 Создайте сущности в следующем порядке:
 
 1. Откройте **Backends → Create model pool**:
    - **Public model name:** `qwen`
-   - **Upstream model name:** `Qwen/Qwen2.5-7B-Instruct`
+   - **Upstream model name:** `qwen-test`
    - **Max gateway inflight:** `32`
    - **Max waiting:** `8`
    - **Enabled:** включено
-2. На той же странице создайте backend:
-   - **Name:** `gpu-a`
-   - **Model pool:** `qwen`
-   - **URL:** `http://vllm.internal:8000`
-   - **Capacity hint:** `1`
-   - **Running soft limit:** `16`
-   - **Enabled:** включено
+2. Создайте два backend в одном пуле:
+   - **Name:** `vllm-a`; **URL:** `http://vllm-a:8000`
+   - **Name:** `vllm-b`; **URL:** `http://vllm-b:8000`
+   - Для обоих: **Capacity hint:** `1`; **Running soft limit:** `1`; **Enabled:** включено
 3. Откройте **Clients → Create client**:
    - **Name:** `production-app`
    - **Priority class:** `normal`
@@ -150,49 +131,39 @@ curl -fsS http://127.0.0.1:8080/readyz | jq
    - **Enabled:** включено
 4. Откройте **API Keys**, выберите `production-app`, при необходимости задайте срок действия и нажмите **Generate API key**. Сразу скопируйте полное значение `llmgw_*`: оно показывается только один раз.
 
-Числовые лимиты выше — стартовый пример для проверки сценария, а не универсальный production sizing. Перед включением клиентского трафика откалибруйте их под модель, GPU, значение vLLM `--max-num-seqs`, требования к задержке и результаты saturation-тестов. Ноль отключает соответствующий лимит пула.
+Имена сервисов выше — это DNS-записи Compose, а не host aliases. Порты vLLM не публикуются на хост и доступны только другим сервисам этого стека.
 
-Если vLLM запущен с `--api-key`, в поле **Upstream API key environment variable** укажите только имя переменной gateway, например `VLLM_GPU_A_KEY`, и передайте эту переменную контейнеру. Не вставляйте сам upstream-секрет в Admin UI.
+### 4. Проверьте реальный inference
 
-### 4. Проверьте capacity и отправьте реальные запросы
+После опроса обоих backend readiness должен вернуть HTTP 200 и показать два доступных backend:
 
-Дождитесь health- и metrics-проверок backend, затем проверьте inference readiness:
-
-```bash
-curl -fsS http://127.0.0.1:8080/inference-readyz \
-  | jq -e '.status == "ready" and .backendAvailability > 0'
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
 ```
 
-Экспортируйте одноразово показанный клиентский ключ:
+Подставьте одноразовый клиентский ключ вместо placeholder и получите список публичных моделей:
 
-```bash
-export LLMGW_URL='http://127.0.0.1:8080'
-export LLMGW_CLIENT_KEY='llmgw_copy-the-one-time-value-here'
+```console
+docker compose run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
 ```
 
-Получите список доступных клиенту моделей:
+Отправьте потоковый запрос из [`examples/quickstart-chat.json`](examples/quickstart-chat.json):
 
-```bash
-curl -fsS "$LLMGW_URL/v1/models" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
+```console
+docker compose run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
 ```
 
-Отправьте потоковый Chat Completions запрос:
+Поток должен завершиться строкой `data: [DONE]`. Клиент использует публичную модель `qwen`; gateway проверяет ключ, применяет сохранённый приоритет, заменяет upstream-модель на `qwen-test` и выбирает один из двух здоровых vLLM.
 
-```bash
-curl -fsS -N "$LLMGW_URL/v1/chat/completions" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H 'X-LLM-Session-Id: production-agent-42' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen",
-    "messages": [{"role": "user", "content": "Explain priority scheduling in one sentence."}],
-    "max_tokens": 64,
-    "stream": true
-  }'
+Команды управления также не зависят от host shell:
+
+```console
+docker compose logs -f gateway
+docker compose stop
+docker compose down
 ```
 
-Клиент отправляет публичное имя `qwen`. Gateway проверяет ключ, применяет политику клиента, заменяет модель на `Qwen/Qwen2.5-7B-Instruct`, устанавливает управляемый сервером приоритет vLLM, выбирает подходящий backend и передаёт потоковый ответ.
+`docker compose down` сохраняет volumes SQLite и кэша. Используйте `docker compose down --volumes` только для намеренного удаления всего состояния Quick Start и закэшированной модели.
 
 ## Админка
 
@@ -290,9 +261,9 @@ make build-e2e-linux-amd64
 make container-smoke  # нужен запущенный Docker daemon
 ```
 
-В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть production quick start.
+В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть Docker Quick Start.
 
-Реализация и детерминированный acceptance suite завершены. Опциональные real-vLLM режимы smoke, priority/pool-safety и circuit-resilience прошли на Apple M4 с vLLM-Metal 27 августа 2026 года. Перед production sign-off повторите compatibility, saturation и threshold calibration на выбранной модели и GPU.
+Реализация и детерминированный acceptance suite завершены. Канонический Docker Quick Start и real-vLLM режимы smoke, priority/pool-safety и circuit-resilience прошли 28 августа 2026 года на RTX 4070 Ti с двумя сервисами `Qwen/Qwen3-0.6B`. Перед production sign-off повторите compatibility, saturation и threshold calibration на выбранной production-модели и топологии.
 
 ## Текущие ограничения
 
