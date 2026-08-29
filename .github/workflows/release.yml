@@ -57,7 +57,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          git fetch --force --tags origin
+          git fetch --force --prune --prune-tags --tags origin
           git fetch --no-tags origin main:refs/remotes/origin/main
 
           tag_commit="$(git rev-list -n 1 "$TAG")"
@@ -77,7 +77,7 @@ jobs:
               latest_stable_tag="$candidate"
               break
             fi
-          done < <(git tag --list 'v*' --sort=-version:refname)
+          done < <(git tag --merged origin/main --list 'v*' --sort=-version:refname)
           if [[ "$TAG" != "$latest_stable_tag" ]]; then
             echo "$TAG is not the newest stable SemVer tag ($latest_stable_tag)" >&2
             exit 1
@@ -171,31 +171,6 @@ jobs:
           rm -rf dist/staging
           (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
 
-      - name: Create or refresh draft GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_STATE: ${{ steps.release.outputs.state }}
-          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          if [[ "$RELEASE_STATE" == "absent" ]]; then
-            gh release create "$TAG" \
-              dist/*.tar.gz dist/SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --target "$SOURCE_COMMIT" \
-              --generate-notes \
-              --title "$TAG" \
-              --draft
-          else
-            gh release upload "$TAG" \
-              dist/*.tar.gz dist/SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
-          fi
-
       - name: Set image name
         id: image
         shell: bash
@@ -244,6 +219,31 @@ jobs:
             exit 1
           fi
 
+      - name: Create or refresh draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_STATE: ${{ steps.release.outputs.state }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_STATE" == "absent" ]]; then
+            gh release create "$TAG" \
+              dist/*.tar.gz dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --target "$SOURCE_COMMIT" \
+              --generate-notes \
+              --title "$TAG" \
+              --draft
+          else
+            gh release upload "$TAG" \
+              dist/*.tar.gz dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          fi
+
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
@@ -259,6 +259,32 @@ jobs:
             org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
+      - name: Verify remote tag before image publication
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_object=""
+          remote_commit=""
+          while read -r commit ref; do
+            if [[ "$ref" == *'^{}' ]]; then
+              remote_commit="$commit"
+            else
+              tag_object="$commit"
+            fi
+          done < <(git ls-remote --tags origin \
+            "refs/tags/$TAG" "refs/tags/${TAG}^{}")
+
+          if [[ -z "$remote_commit" ]]; then
+            remote_commit="$tag_object"
+          fi
+          if [[ -z "$remote_commit" || "$remote_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "remote tag $TAG moved or disappeared during publication" >&2
+            exit 1
+          fi
+
       - name: Build and push Docker image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -270,7 +296,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify remote tag is unchanged
+      - name: Verify remote tag before release publication
         shell: bash
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
