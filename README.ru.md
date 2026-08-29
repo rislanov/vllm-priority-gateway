@@ -12,6 +12,7 @@
 - [Эксплуатация и развёртывание](#эксплуатация-и-развёртывание)
 - [Admin API](#admin-api)
 - [Разработка и тестирование](#разработка-и-тестирование)
+- [CI и релизы](#ci-и-релизы)
 - [Текущие ограничения](#текущие-ограничения)
 - [Документация](#документация)
 
@@ -264,6 +265,21 @@ make container-smoke  # нужен запущенный Docker daemon
 В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть Docker Quick Start.
 
 Реализация и детерминированный acceptance suite завершены. Канонический Docker Quick Start и real-vLLM режимы smoke, priority/pool-safety и circuit-resilience прошли 28 августа 2026 года на RTX 4070 Ti с двумя сервисами `Qwen/Qwen3-0.6B`. Перед production sign-off повторите compatibility, saturation и threshold calibration на выбранной production-модели и топологии.
+
+## CI и релизы
+
+Для pull request и push в `main` автоматически запускаются unit-тесты, `go vet`, сборка бинарника gateway и сборка Docker-образа. Артефакты и образы при этом не публикуются.
+
+Релиз запускается вручную и использует существующий стабильный SemVer-тег, достижимый из `main`:
+
+```bash
+git tag -a v1.2.3 -m "v1.2.3"
+git push origin v1.2.3
+```
+
+В GitHub откройте **Actions → Release → Run workflow**, укажите тег и запустите workflow. В GitHub Release будут опубликованы архивы gateway для Linux `amd64` и `arm64`, а также `SHA256SUMS`. Multi-platform образ получит имена `ghcr.io/rislanov/vllm-priority-gateway:1.2.3`, `:1.2`, `:1` и `:latest`. Номера версий всегда вычисляются только из выбранного тега.
+
+После первой публикации пакет в GitHub Container Registry может быть приватным. Если образ должен скачиваться без авторизации, один раз переключите visibility пакета на public в его настройках.
 
 ## Текущие ограничения
 
