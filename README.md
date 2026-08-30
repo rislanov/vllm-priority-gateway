@@ -73,14 +73,14 @@ The tested defaults deliberately run two small-capacity vLLM processes on one NV
 Clone the repository and open its directory. Create `.env` next to `compose.yaml` from [`.env.example`](.env.example), then fill both blank secrets with independently generated random values:
 
 ```dotenv
-LLMGW_VERSION=0.1.0
+LLMGW_VERSION=0.2.0
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
 LLMGW_PORT=8080
 ```
 
-`LLMGW_VERSION` is the image/archive version without the leading `v`; the corresponding Git tag is `v0.1.0`. Keep `.env` readable only by the operator account and never commit it; the repository already ignores it. The remaining values in `.env.example` pin the tested vLLM image, Qwen model, memory fraction, and compatibility runner. Change capacity settings only after the first successful run.
+`LLMGW_VERSION` is the image/archive version without the leading `v`; the corresponding Git tag is `v0.2.0`. Keep `.env` readable only by the operator account and never commit it; the repository already ignores it. The remaining values in `.env.example` pin the tested vLLM image, Qwen model, memory fraction, and compatibility runner. Change capacity settings only after the first successful run.
 
 These commands are identical in Bash and PowerShell:
 
@@ -128,7 +128,7 @@ docker compose --env-file .env -f compose.yaml -f compose.native.yaml ps
 Download the archive for the current Linux architecture and verify it against the release manifest before extraction:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;

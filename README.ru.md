@@ -73,14 +73,14 @@ OpenAI-клиент
 Клонируйте репозиторий и откройте его каталог. Создайте рядом с `compose.yaml` файл `.env` на основе [`.env.example`](.env.example), затем заполните оба пустых секрета независимо сгенерированными случайными значениями:
 
 ```dotenv
-LLMGW_VERSION=0.1.0
+LLMGW_VERSION=0.2.0
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
 LLMGW_PORT=8080
 ```
 
-`LLMGW_VERSION` — версия образа или архива без начальной `v`; соответствующий Git-тег — `v0.1.0`. Файл `.env` должен читаться только операторской учётной записью и не должен попадать в Git; репозиторий уже игнорирует его. Остальные значения в `.env.example` фиксируют проверенные образ vLLM, модель Qwen, долю памяти и compatibility runner. Меняйте параметры capacity только после первого успешного запуска.
+`LLMGW_VERSION` — версия образа или архива без начальной `v`; соответствующий Git-тег — `v0.2.0`. Файл `.env` должен читаться только операторской учётной записью и не должен попадать в Git; репозиторий уже игнорирует его. Остальные значения в `.env.example` фиксируют проверенные образ vLLM, модель Qwen, долю памяти и compatibility runner. Меняйте параметры capacity только после первого успешного запуска.
 
 Эти команды одинаковы в Bash и PowerShell:
 
@@ -128,7 +128,7 @@ docker compose --env-file .env -f compose.yaml -f compose.native.yaml ps
 Скачайте архив для текущей Linux-архитектуры и до распаковки проверьте его по релизному manifest:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.2.0
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
