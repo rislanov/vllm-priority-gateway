@@ -199,7 +199,9 @@ export LLMGW_E2E_DRAIN_BACKEND_ID=1
 go test -count=1 -v -timeout 10m ./tests/e2e -run TestPriorityIsolationWithRealVLLM
 ```
 
-Before the first mutation, the test captures the pool fields and every backend field/drain state in the selected pool. It drains the chosen backend, confirms that Low remains rejected and a complete High stream still succeeds through remaining capacity, then resumes the backend and waits until `draining=false`. Best-effort, idempotent cleanup attempts the exact captured pool limits and every backend value even after an assertion failure. It joins every failed update and continues with later resources; any resource whose update fails may remain mutated and must be restored manually.
+Before the first mutation, the test captures the pool fields and the selected backend fields/drain state. It drains the chosen backend, confirms that Low remains rejected and a complete High stream still succeeds through remaining capacity, then resumes the backend and waits until `draining=false`. Best-effort, idempotent cleanup restores the exact captured pool limits and the selected backend after an assertion failure. When the drain case is disabled, priority-mode cleanup does not rewrite unchanged backends. Any resource whose update fails may remain mutated and must be restored manually.
+
+During the class-isolation phase the test temporarily sets the pool's global waiting limit to unlimited. This prevents `pool_waiting_limit` from masking the more specific `priority_concurrency_limit` decision under deep real-vLLM queues. The independent pool-safety phase still sets `maxGatewayInflight=1`, proves that Critical cannot bypass it, returns to the load-test configuration while work is active, and restores the exact original limits during final cleanup.
 
 ## 5. Run isolated circuit recovery
 

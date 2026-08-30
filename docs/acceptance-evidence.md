@@ -88,6 +88,23 @@ LLMGW_E2E_MODE=resilience make test-real-vllm
 
 ## Real-GPU evidence
 
+### Recorded gateway-decision telemetry run — 2026-08-30
+
+The decision-telemetry stack at commit `f4cc474` was validated on an NVIDIA GeForce RTX 4070 Ti with 12,282 MiB VRAM and driver `616.56`. Two `vllm/vllm-openai:v0.28.0` containers served `Qwen/Qwen3-0.6B` with `max-num-seqs=1` and priority scheduling. Prometheus `3.14.0`, Grafana `13.2.0`, and the locally built gateway ran from the checked-in Compose overlay; the Prometheus gateway target was `up`, the provisioned datasource health was `OK`, and dashboard UID `llmgw-gateway-decisions` loaded successfully. No credential or generated API-key value is retained here.
+
+The retained Grafana/Prometheus window was `2026-08-30T17:24:47Z` through `2026-08-30T17:25:21Z`. Four isolated saturation clients were temporarily assigned Background priority and each submitted four 128-token streams. The profile deliberately used lower-priority load so that the dashboard's High series contained only the protected probe rather than the load itself. The E2E harness temporarily disabled the pool's global waiting limit during class isolation, exercised `maxGatewayInflight=1` separately, and restored the original `32/8` limits after load removal. Temporary client classes and API keys were also restored/revoked.
+
+Observed evidence on the aligned window:
+
+- pool state reached `saturated`; `llmgw_pool_pressure{model="qwen"}` rose from approximately zero to `0.7293` and returned to `0.00188` by the end of the window;
+- gateway logs and the Prometheus counter both recorded exactly four Background rejections with `decisionReason="priority_concurrency_limit"` (three attack-resistant Low probes plus the immediate hysteresis probe), while the unrelated `pool_waiting_limit` rate remained zero;
+- `llmgw_backend_selected_total` increased by `22` selections across both backends;
+- the High probe remained admitted: first byte moved from `186.9918ms` at baseline to `560.7569ms` under saturation (ratio `2.999`), while request duration moved from `218ms` to `575ms`; Grafana rendered request-duration and TTFT p95 at `975ms`, below one second for the calibrated local profile;
+- High gateway queue-wait p95 was `4.75ms`, separating gateway decision time from the remaining upstream GPU wait;
+- recovery reached `busy` after `11.5818242s` and `normal` after `23.610879s`; `TestPriorityIsolationWithRealVLLM` passed in `30.83s` (`go test` package time `31.845s`) including cleanup.
+
+The rendered dashboard was checked in the in-app browser at the exact window. Its first row displayed, in order, `GPU pool pressure rises` (max `0.729`), `Low receives 429 decisions` (`priority_concurrency_limit`, total `4.00 req/s` over the short event window), `High latency stays stable` (request/TTFT p95 `975ms`), and `High gateway queue wait` (`4.75ms`). The same view also showed the pool state timeline, per-client inflight, request rates, and backend selection. This is a development-sized observability and isolation gate, not a production-model latency SLO.
+
 ### Recorded RTX 4070 Ti Docker run — 2026-08-28
 
 The canonical Docker Quick Start and all three opt-in real-vLLM modes passed on the repository working tree based at commit `a138ab8`. The host GPU was an NVIDIA GeForce RTX 4070 Ti with 12,282 MiB VRAM and driver `610.47`. Docker `29.1.2` and Compose `2.40.3` ran Linux containers. The inference stack used two private `vllm/vllm-openai:v0.28.0` services with `Qwen/Qwen3-0.6B`, `max-model-len=1024`, `max-num-seqs=1`, priority scheduling, prefix caching, prompt-token details, and request-ID headers. Each service used `--gpu-memory-utilization 0.32`; Compose reserved the NVIDIA device, and only the gateway was published to host loopback. No credentials are recorded here.

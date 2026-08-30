@@ -12,6 +12,12 @@ The exact documented `docker compose config`, container GPU probe, `up --build -
 
 The representative non-secret commands and durable summary are in [acceptance-evidence.md](acceptance-evidence.md). This is a development-sized CUDA/Docker gate, not production-model sizing or latency calibration. The broader endpoint, cancellation, affinity, and retained-artifact procedure below remains available when those claims are required.
 
+## Recorded decision-telemetry evidence
+
+On 2026-08-30 commit `f4cc474` passed the real-vLLM priority scenario with the Prometheus/Grafana overlay on the same RTX 4070 Ti (driver `616.56`). A calibrated four-client Background workload of four 128-token streams per client reached `saturated`; pool pressure peaked at `0.7293`, four exact `priority_concurrency_limit` Low rejections were visible, and backend selections increased by `22`. The protected High probe stayed admitted with first byte `186.9918ms` before load and `560.7569ms` under load; the aligned Grafana window rendered High request/TTFT p95 at `975ms` and gateway queue-wait p95 at `4.75ms`. Recovery reached `busy` after `11.5818242s` and `normal` after `23.610879s`, and cleanup restored the original pool and client configuration. The exact window, measurements, and dashboard checks are recorded in [acceptance-evidence.md](acceptance-evidence.md).
+
+Use a lower-priority saturation workload when the evidence target is the causal dashboard story. A High-class saturation workload is a valid harsher admission test, but it also contributes its own long requests to the High histogram and therefore cannot demonstrate a stable protected-High percentile. Calibrate request length so the pressure EWMA remains saturated long enough to scrape without turning the local small-model run into a production SLO claim.
+
 ## Recorded v0.1.0 release-artifact evidence
 
 On 2026-08-30 the [release quick start](../README.md#release-quick-start) was validated independently with both published gateway artifacts against two real `vllm/vllm-openai:v0.28.0` services serving `Qwen/Qwen3-0.6B` on the same RTX 4070 Ti. The Docker path pulled `ghcr.io/rislanov/vllm-priority-gateway:0.1.0` without a source build. The native path downloaded the GitHub Release Linux `amd64` archive inside a clean Ubuntu 24.04 container and verified it with the published `SHA256SUMS` before extraction. Each path used separate SQLite state, reached two healthy and metrics-fresh backends, completed a streaming chat request through the gateway with `data: [DONE]`, and retained its configuration and inference readiness after restarting only the gateway.
@@ -42,7 +48,7 @@ docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up 
 curl -fsS http://127.0.0.1:9090/-/ready
 ```
 
-Confirm the `vllm-priority-gateway` target at `http://127.0.0.1:9090/targets`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The first row must be captured over one aligned interval: GPU pool pressure, Low 429 decisions by exact reason, High p95 duration/TTFT, and High selected queue-wait p95. The Grafana `admin` / `admin` default is for loopback development only; override both Grafana credential variables anywhere else.
+Confirm the `vllm-priority-gateway` target at `http://127.0.0.1:9090/targets`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The first row must be captured over one aligned interval: GPU pool pressure, Low 429 decisions by exact reason, High p95 duration/TTFT, and High selected queue-wait p95. Use lower-priority traffic to create pressure when this row is the evidence target, otherwise the saturation workload itself contaminates the High percentile. The Grafana `admin` / `admin` default is for loopback development only; override both Grafana credential variables anywhere else.
 
 Run the health, model, and metrics probes below from the gateway host. `VLLM_A` and `VLLM_B` may point to remote serving groups, provided the network policy allows only the intended gateway hosts to reach them.
 
