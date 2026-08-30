@@ -74,7 +74,7 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	h := newRemoteHarness(t, cfg)
 	originalStatus := h.adminStatus()
 	originalPool := originalStatus.requirePool(t, cfg.model)
-	mutationCleanup, err := newAdminMutationCleanup(h, originalStatus, originalPool.ID)
+	mutationCleanup, err := newAdminMutationCleanup(h, priorityCleanupStatus(originalStatus, cfg.drainBackendID), originalPool.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +85,15 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 			t.Errorf("restore priority E2E Admin mutations: %v", err)
 		}
 	})
+	priorityLoadPool := preparePoolForPriorityLoad(originalPool)
+	if !samePoolConfiguration(priorityLoadPool, originalPool) {
+		if _, err := h.updatePool(context.Background(), priorityLoadPool); err != nil {
+			t.Fatalf("disable global waiting limit for priority isolation: %v", err)
+		}
+		h.waitForPool(func(pool adminPool) bool {
+			return samePoolConfiguration(pool, priorityLoadPool)
+		}, cfg.saturationTimeout)
+	}
 	baselineHigh := h.completion(context.Background(), completionRequest{
 		Key: cfg.highKey, Prompt: "High-priority latency baseline.", MaxTokens: 4, Stream: true,
 	})
@@ -140,7 +149,7 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	t.Logf("continuity baseline_high_first_byte=%s loaded_high_first_byte=%s ratio=%.3f critical_first_byte=%s",
 		baselineHigh.FirstByte, high.FirstByte, float64(high.FirstByte)/float64(baselineHigh.FirstByte), critical.FirstByte)
 
-	limitedPool := isolatePoolGatewayInflight(originalPool, 1)
+	limitedPool := isolatePoolGatewayInflight(priorityLoadPool, 1)
 	if _, err := h.updatePool(context.Background(), limitedPool); err != nil {
 		t.Fatalf("set priority E2E pool limit: %v", err)
 	}
@@ -150,11 +159,11 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical probe bounded by pool safety.", MaxTokens: 2,
 	}).requireOverloaded(t)
-	if _, err := h.updatePool(context.Background(), originalPool); err != nil {
+	if _, err := h.updatePool(context.Background(), priorityLoadPool); err != nil {
 		t.Fatalf("restore pool limit before continuity probe: %v", err)
 	}
 	h.waitForPool(func(pool adminPool) bool {
-		return samePoolConfiguration(pool, originalPool)
+		return samePoolConfiguration(pool, priorityLoadPool)
 	}, cfg.saturationTimeout)
 	postLimitCritical := h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical continuity after pool limit restoration.", MaxTokens: 4, Stream: true,

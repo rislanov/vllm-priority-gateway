@@ -923,6 +923,11 @@ func isolatePoolGatewayInflight(pool adminPool, maximum int) adminPool {
 	return pool
 }
 
+func preparePoolForPriorityLoad(pool adminPool) adminPool {
+	pool.MaxWaiting = 0
+	return pool
+}
+
 func samePoolConfiguration(left, right adminPool) bool {
 	return left.ID == right.ID && left.PublicModelName == right.PublicModelName &&
 		left.UpstreamModelName == right.UpstreamModelName && left.Enabled == right.Enabled &&
@@ -1152,6 +1157,21 @@ type adminMutationCleanup struct {
 	backends []adminBackend
 	once     sync.Once
 	err      error
+}
+
+func priorityCleanupStatus(status adminStatus, drainBackendID int64) adminStatus {
+	filtered := status
+	filtered.Backends = nil
+	if drainBackendID <= 0 {
+		return filtered
+	}
+	for _, backend := range status.Backends {
+		if backend.ID == drainBackendID {
+			filtered.Backends = append(filtered.Backends, backend)
+			break
+		}
+	}
+	return filtered
 }
 
 func newAdminMutationCleanup(updater adminStateUpdater, status adminStatus, poolID int64) (*adminMutationCleanup, error) {
