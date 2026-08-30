@@ -60,7 +60,8 @@ func TestProductionSmoke(t *testing.T) {
 	for _, family := range []string{
 		"llmgw_requests_total", "llmgw_backend_pressure", "llmgw_backend_running_requests",
 		"llmgw_backend_circuit_state", "llmgw_backend_circuit_failures", "llmgw_pool_gateway_inflight",
-		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends",
+		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends", "llmgw_pool_pressure",
+		"llmgw_pool_state", "llmgw_backend_selected_total", "llmgw_queue_wait_seconds",
 	} {
 		if !metrics.containsFamily(family) {
 			t.Fatalf("/metrics does not expose %s", family)
@@ -84,6 +85,11 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 			t.Errorf("restore priority E2E Admin mutations: %v", err)
 		}
 	})
+	baselineHigh := h.completion(context.Background(), completionRequest{
+		Key: cfg.highKey, Prompt: "High-priority latency baseline.", MaxTokens: 4, Stream: true,
+	})
+	baselineHigh.requireCompleteStream(t)
+	beforeMetrics := h.metrics()
 
 	loadCtx, cancelLoad := context.WithCancel(context.Background())
 	load := h.startHighLoad(loadCtx)
@@ -117,7 +123,22 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 		Key: cfg.criticalKey, Prompt: "Critical-priority continuity probe.", MaxTokens: 4, Stream: true,
 	})
 	critical.requireCompleteStream(t)
-	t.Logf("continuity high_first_byte=%s critical_first_byte=%s", high.FirstByte, critical.FirstByte)
+	loadedMetrics := h.metrics()
+	requireMetricIncrease(t, beforeMetrics, loadedMetrics, "llmgw_requests_rejected_total", map[string]string{
+		"model": cfg.model, "priority_class": "background", "reason": "priority_concurrency_limit",
+	}, 3)
+	requireMetricIncrease(t, beforeMetrics, loadedMetrics, "llmgw_backend_selected_total", map[string]string{"model": cfg.model}, 1)
+	requireHistogramIncrease(t, beforeMetrics, loadedMetrics, "llmgw_request_duration_seconds", map[string]string{
+		"model": cfg.model, "priority_class": "high", "status_class": "2xx",
+	}, 1)
+	requireHistogramIncrease(t, beforeMetrics, loadedMetrics, "llmgw_queue_wait_seconds", map[string]string{
+		"model": cfg.model, "priority_class": "high", "outcome": "selected",
+	}, 1)
+	if pressure, ok := loadedMetrics.value("llmgw_pool_pressure", map[string]string{"model": cfg.model}); !ok || pressure <= 0 {
+		t.Fatalf("loaded pool pressure = %.4f, present=%t; want positive sample", pressure, ok)
+	}
+	t.Logf("continuity baseline_high_first_byte=%s loaded_high_first_byte=%s ratio=%.3f critical_first_byte=%s",
+		baselineHigh.FirstByte, high.FirstByte, float64(high.FirstByte)/float64(baselineHigh.FirstByte), critical.FirstByte)
 
 	limitedPool := isolatePoolGatewayInflight(originalPool, 1)
 	if _, err := h.updatePool(context.Background(), limitedPool); err != nil {

@@ -19,6 +19,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
@@ -328,6 +331,39 @@ func numberID(t *testing.T, value any) int64 {
 		t.Fatalf("ID value = %#v", value)
 	}
 	return int64(number)
+}
+
+func metricCounterDelta(before, after []byte, name string, labels map[string]string) float64 {
+	return metricCounterTotal(after, name, labels) - metricCounterTotal(before, name, labels)
+}
+
+func metricCounterTotal(payload []byte, name string, labels map[string]string) float64 {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(payload))
+	if err != nil {
+		panic(fmt.Sprintf("parse Prometheus metrics: %v", err))
+	}
+	family := families[name]
+	if family == nil {
+		return 0
+	}
+	var total float64
+	for _, metric := range family.Metric {
+		if metricLabelsMatch(metric, labels) && metric.Counter != nil {
+			total += metric.Counter.GetValue()
+		}
+	}
+	return total
+}
+
+func metricLabelsMatch(metric *dto.Metric, want map[string]string) bool {
+	matched := 0
+	for _, pair := range metric.Label {
+		if value, exists := want[pair.GetName()]; exists && value == pair.GetValue() {
+			matched++
+		}
+	}
+	return matched == len(want)
 }
 
 func databaseBytes(t *testing.T, path string) []byte {
