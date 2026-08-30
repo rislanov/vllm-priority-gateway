@@ -1,6 +1,6 @@
 # Production deployment
 
-This guide contains the detailed deployment and post-deployment procedures for Lightweight vLLM Priority Gateway. For the tested first run with two real vLLM servers, start with the canonical [Docker quick start](../README.md#docker-quick-start).
+This guide contains the detailed deployment and post-deployment procedures for Lightweight vLLM Priority Gateway. For the tested first run with two real vLLM servers, start with the canonical [release quick start](../README.md#release-quick-start).
 
 ## Supported topology
 
@@ -26,14 +26,15 @@ The reverse proxy must:
 
 ## Docker deployment
 
-Use the repository's canonical [`compose.yaml`](../compose.yaml) for Docker deployment. It is the tested source of truth for Linux Docker Engine and Docker Desktop: Compose builds the gateway, starts two pinned vLLM services, creates their private DNS/network, and owns the SQLite and model-cache volumes.
+Use the repository's canonical [`compose.yaml`](../compose.yaml) with [`compose.release.yaml`](../compose.release.yaml) for release deployment. This tested topology works with Linux Docker Engine and Docker Desktop: Compose pulls the selected gateway image from GHCR, starts two pinned vLLM services, creates their private DNS/network, and owns the SQLite and model-cache volumes. Docker Compose 2.24.4 or newer is required for the override file's [reset merge tag](https://docs.docker.com/reference/compose-file/merge/#reset-value).
 
 Create `.env` from [`.env.example`](../.env.example), replace both blank secrets, and escrow them before starting the stack. The HMAC secret is part of durable credential state: changing or losing it invalidates every existing client key.
 
 ```console
-docker compose config --quiet
-docker compose up -d --build --wait --wait-timeout 900
-docker compose ps
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml config --quiet
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml pull gateway
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml up -d --no-build --wait --wait-timeout 900
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml ps
 ```
 
 The gateway runtime image is `scratch`, contains only CA certificates and the static binary, runs as numeric UID/GID `65532`, and stores SQLite under `/data`. The named `gateway-data` volume is initialized with the correct ownership. The Compose stack publishes only `127.0.0.1:8080`; vLLM remains private on the Compose-managed network at `http://vllm-a:8000` and `http://vllm-b:8000`.

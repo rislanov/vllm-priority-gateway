@@ -26,6 +26,7 @@ type renderedService struct {
 	Networks    map[string]any                `json:"networks"`
 	Ports       []renderedPort                `json:"ports"`
 	Profiles    []string                      `json:"profiles"`
+	PullPolicy  string                        `json:"pull_policy"`
 	Volumes     []renderedVolume              `json:"volumes"`
 }
 
@@ -192,6 +193,121 @@ func TestComposeQuickStartRendersPortableStack(t *testing.T) {
 	}
 	if len(sharedNetworks) == 0 {
 		t.Error("gateway and both vLLM services do not share a Compose-managed network")
+	}
+}
+
+func TestReleaseComposeUsesPublishedGatewayImageWithoutBuildingSource(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not installed")
+	}
+	if err := exec.Command("docker", "compose", "version").Run(); err != nil {
+		t.Skip("docker compose is not available")
+	}
+
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(t.TempDir(), "compose.env")
+	const environment = "LLMGW_ADMIN_USERNAME=operator\n" +
+		"LLMGW_ADMIN_PASSWORD=compose-contract-admin-password\n" +
+		"LLMGW_API_KEY_HMAC_SECRET=compose-contract-hmac-secret-at-least-32-bytes\n" +
+		"LLMGW_PORT=18080\n" +
+		"LLMGW_VERSION=0.1.0\n"
+	if err := os.WriteFile(envPath, []byte(environment), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(
+		"docker", "compose",
+		"--project-name", "llmgw-release-contract",
+		"--project-directory", repositoryRoot,
+		"--env-file", envPath,
+		"-f", filepath.Join(repositoryRoot, "compose.yaml"),
+		"-f", filepath.Join(repositoryRoot, "compose.release.yaml"),
+		"config", "--format", "json",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render release Compose stack: %v\n%s", err, output)
+	}
+
+	var config renderedCompose
+	if err := json.Unmarshal(output, &config); err != nil {
+		t.Fatalf("decode rendered release Compose configuration: %v\n%s", err, output)
+	}
+	gateway := config.Services["gateway"]
+	if gateway.Image != "ghcr.io/rislanov/vllm-priority-gateway:0.1.0" {
+		t.Errorf("gateway image = %q, want published v0.1.0 image", gateway.Image)
+	}
+	if len(gateway.Build) != 0 && string(gateway.Build) != "null" {
+		t.Errorf("release gateway unexpectedly has a build configuration: %s", gateway.Build)
+	}
+	if gateway.PullPolicy != "always" {
+		t.Errorf("release gateway pull policy = %q, want always", gateway.PullPolicy)
+	}
+	if len(gateway.Ports) != 1 || gateway.Ports[0].HostIP != "127.0.0.1" || gateway.Ports[0].Target != 8080 || gateway.Ports[0].Published != "18080" {
+		t.Errorf("release gateway ports = %#v, want 127.0.0.1:18080 -> 8080", gateway.Ports)
+	}
+	for _, dependency := range []string{"vllm-a", "vllm-b"} {
+		if gateway.DependsOn[dependency].Condition != "service_healthy" {
+			t.Errorf("gateway dependency %s condition = %q, want service_healthy", dependency, gateway.DependsOn[dependency].Condition)
+		}
+	}
+	if !slices.Equal(gateway.Healthcheck.Test, []string{"CMD", "/gateway", "healthcheck"}) {
+		t.Errorf("gateway healthcheck = %#v, want gateway healthcheck command", gateway.Healthcheck.Test)
+	}
+	assertVolume(t, gateway.Volumes, "volume", "gateway-data", "/data", false, "")
+	for _, name := range []string{"vllm-a", "vllm-b"} {
+		if ports := config.Services[name].Ports; len(ports) != 0 {
+			t.Errorf("release %s publishes host ports: %#v", name, ports)
+		}
+	}
+}
+
+func TestNativeLinuxComposePublishesVLLMOnlyOnLoopback(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not installed")
+	}
+	if err := exec.Command("docker", "compose", "version").Run(); err != nil {
+		t.Skip("docker compose is not available")
+	}
+
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(t.TempDir(), "compose.env")
+	const environment = "LLMGW_ADMIN_USERNAME=operator\n" +
+		"LLMGW_ADMIN_PASSWORD=compose-contract-admin-password\n" +
+		"LLMGW_API_KEY_HMAC_SECRET=compose-contract-hmac-secret-at-least-32-bytes\n"
+	if err := os.WriteFile(envPath, []byte(environment), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(
+		"docker", "compose",
+		"--project-name", "llmgw-native-contract",
+		"--project-directory", repositoryRoot,
+		"--env-file", envPath,
+		"-f", filepath.Join(repositoryRoot, "compose.yaml"),
+		"-f", filepath.Join(repositoryRoot, "compose.native.yaml"),
+		"config", "--format", "json",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render native Linux Compose support: %v\n%s", err, output)
+	}
+
+	var config renderedCompose
+	if err := json.Unmarshal(output, &config); err != nil {
+		t.Fatalf("decode rendered native Linux Compose configuration: %v\n%s", err, output)
+	}
+	for serviceName, published := range map[string]string{"vllm-a": "8001", "vllm-b": "8002"} {
+		ports := config.Services[serviceName].Ports
+		if len(ports) != 1 || ports[0].HostIP != "127.0.0.1" || ports[0].Published != published || ports[0].Target != 8000 {
+			t.Errorf("%s ports = %#v, want 127.0.0.1:%s -> 8000", serviceName, ports, published)
+		}
 	}
 }
 
