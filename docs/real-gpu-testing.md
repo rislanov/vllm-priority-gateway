@@ -12,6 +12,12 @@ The exact documented `docker compose config`, container GPU probe, `up --build -
 
 The representative non-secret commands and durable summary are in [acceptance-evidence.md](acceptance-evidence.md). This is a development-sized CUDA/Docker gate, not production-model sizing or latency calibration. The broader endpoint, cancellation, affinity, and retained-artifact procedure below remains available when those claims are required.
 
+## Recorded decision-telemetry evidence
+
+On 2026-08-30 commit `f4cc474` passed the real-vLLM priority scenario with the Prometheus/Grafana overlay on the same RTX 4070 Ti (driver `616.56`). A calibrated four-client Background workload of four 128-token streams per client reached `saturated`; pool pressure peaked at `0.7293`, four exact `priority_concurrency_limit` Low rejections were visible, and backend selections increased by `22`. The protected High probe stayed admitted with first byte `186.9918ms` before load and `560.7569ms` under load; the aligned Grafana window rendered High request/TTFT p95 at `975ms` and gateway queue-wait p95 at `4.75ms`. Recovery reached `busy` after `11.5818242s` and `normal` after `23.610879s`, and cleanup restored the original pool and client configuration. The exact window, measurements, and dashboard checks are recorded in [acceptance-evidence.md](acceptance-evidence.md).
+
+Use a lower-priority saturation workload when the evidence target is the causal dashboard story. A High-class saturation workload is a valid harsher admission test, but it also contributes its own long requests to the High histogram and therefore cannot demonstrate a stable protected-High percentile. Calibrate request length so the pressure EWMA remains saturated long enough to scrape without turning the local small-model run into a production SLO claim.
+
 ## Recorded v0.1.0 release-artifact evidence
 
 On 2026-08-30 the [release quick start](../README.md#release-quick-start) was validated independently with both published gateway artifacts against two real `vllm/vllm-openai:v0.28.0` services serving `Qwen/Qwen3-0.6B` on the same RTX 4070 Ti. The Docker path pulled `ghcr.io/rislanov/vllm-priority-gateway:0.1.0` without a source build. The native path downloaded the GitHub Release Linux `amd64` archive inside a clean Ubuntu 24.04 container and verified it with the published `SHA256SUMS` before extraction. Each path used separate SQLite state, reached two healthy and metrics-fresh backends, completed a streaming chat request through the gateway with `data: [DONE]`, and retained its configuration and inference readiness after restarting only the gateway.
@@ -34,6 +40,15 @@ export VLLM_B='http://127.0.0.1:8002'
 export ADMIN_USER='operator'
 export ADMIN_PASSWORD='replace-with-your-password'
 ```
+
+For the canonical local Compose topology, enable live decision telemetry from the same checkout:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+curl -fsS http://127.0.0.1:9090/-/ready
+```
+
+Confirm the `vllm-priority-gateway` target at `http://127.0.0.1:9090/targets`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The first row must be captured over one aligned interval: GPU pool pressure, Low 429 decisions by exact reason, High p95 duration/TTFT, and High selected queue-wait p95. Use lower-priority traffic to create pressure when this row is the evidence target, otherwise the saturation workload itself contaminates the High percentile. The Grafana `admin` / `admin` default is for loopback development only; override both Grafana credential variables anywhere else.
 
 Run the health, model, and metrics probes below from the gateway host. `VLLM_A` and `VLLM_B` may point to remote serving groups, provided the network policy allows only the intended gateway hosts to reach them.
 
@@ -184,10 +199,10 @@ kill -0 "$LOAD_PID"
   -class-keys "critical=$CRITICAL_KEY,high=$HIGH_KEY,normal=$NORMAL_KEY,background=$BACKGROUND_KEY" \
   -mix critical=10,high=20,normal=30,background=40 -json | tee /tmp/mixed-priority.json
 
-curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds)'
+curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds|pool_pressure|pool_state|backend_selected_total|queue_wait_seconds)'
 ```
 
-Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
+Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; `priority_concurrency_limit` increases for Low while backend selections and both High histograms increase; accepted high-priority requests retain materially better TTFT than queued background traffic. Record the pre-load and loaded High first-byte values and ratio rather than applying an uncalibrated universal threshold.
 
 ## 6. Hysteresis, recovery, and health transitions
 
@@ -278,4 +293,4 @@ Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open 
 
 ## 8. Evidence to retain
 
-Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.
+Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Also retain the Prometheus target state and one Grafana time-window capture that shows pressure rising, Low `priority_concurrency_limit` 429s, and High duration/TTFT plus queue-wait on the same time axis. Record the baseline/loaded High first-byte measurements and ratio. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.

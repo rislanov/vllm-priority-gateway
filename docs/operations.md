@@ -62,22 +62,74 @@ Cache-read tokens are a subset of input tokens. Missing cache detail means the u
 
 ## Metrics and logs
 
-`GET /metrics` exposes request, rejection, in-flight, backend pressure/running/waiting/KV, duration, TTFT, disconnect, failure, retry, circuit, pool-safety, and token-usage series under the `llmgw_*` namespace.
+`GET /metrics` exposes request, decision, in-flight, pool/backend pressure, duration, queue wait, TTFT, circuit, failure/retry, and token-usage series under the `llmgw_*` namespace. The decision-focused contract is:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `llmgw_requests_total` | `client`, `model`, `priority_class`, `status_class` | Completed public requests. |
+| `llmgw_requests_rejected_total` | `client`, `model`, `priority_class`, `reason` | Gateway-owned terminal rejections using the bounded decision vocabulary below. |
+| `llmgw_request_duration_seconds` | `model`, `backend`, `priority_class`, `status_class` | End-to-end public request duration histogram. |
+| `llmgw_requests_inflight` | `model`, `priority_class` | Requests admitted and currently in flight. |
+| `llmgw_client_inflight` | `client`, `model`, `priority_class` | The same admitted work split by configured client. |
+| `llmgw_pool_pressure` | `model` | Best eligible backend pressure used for pool admission. |
+| `llmgw_pool_state` | `model`, `state` | One-hot `normal`, `busy`, `saturated`, `emergency`, or `unavailable` pool state. |
+| `llmgw_backend_pressure` | `model`, `backend` | Smoothed backend pressure. |
+| `llmgw_backend_selected_total` | `model`, `backend` | Backend leases selected by the gateway; an alternate retry lease counts again. |
+| `llmgw_backend_circuit_state` | `model`, `backend` | Circuit encoding: unmanaged/unknown `-1`, closed `0`, open `1`, half-open `2`. |
+| `llmgw_queue_wait_seconds` | `model`, `priority_class`, `outcome` | Gateway admission-to-first-selection or admission-to-terminal-rejection histogram. |
+
+`llmgw_queue_wait_seconds` starts only after authentication, stable model resolution, policy/access validation, and payload rewriting. It ends when the first backend lease is selected (`outcome="selected"`) or admission/selection returns a gateway API error (`outcome="rejected"`). Pre-admission authentication, request-shape, and model-policy failures have no queue sample. A retry does not emit a second queue observation.
+
+Rejection `reason` is deliberately independent of the public API error code:
+
+| Decision reason | Public result |
+|---|---|
+| `pool_waiting_limit` | `429 gateway_overloaded` |
+| `pool_inflight_limit` | `429 gateway_overloaded` |
+| `priority_concurrency_limit` | `429 gateway_overloaded` |
+| `pool_unavailable` | `503 backend_unavailable` |
+| `no_eligible_backend` | `503 backend_unavailable` |
+| `gateway_backpressure` | `503 gateway_unavailable` |
+| `model_not_allowed` | `403 model_not_allowed` |
+| `invalid_request` | `400 invalid_request_error` |
+| `invalid_api_key` | `401 invalid_api_key` |
+| `upstream_failure` | `502 upstream_error` |
+| `internal_error` | `500 internal_error` before a forwarding lifecycle can be established |
+
+The public error envelopes remain compatible. Existing PromQL matching `reason="gateway_overloaded"` must migrate to `reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"`.
 
 Important capacity signals include:
 
+- `llmgw_pool_pressure`
+- `llmgw_pool_state`
 - `llmgw_backend_pressure`
 - `llmgw_backend_running_requests`
 - `llmgw_backend_waiting_requests`
 - `llmgw_backend_kv_cache_usage`
+- `llmgw_backend_selected_total`
 - `llmgw_backend_circuit_state`
 - `llmgw_pool_gateway_inflight`
 - `llmgw_pool_waiting_requests`
 - `llmgw_pool_available_backends`
+- `llmgw_queue_wait_seconds`
 
-The gateway writes one JSON record per completed inference request to stderr. It includes correlation IDs, configured client/model policy, selected backend, pressure/state, status, duration, TTFT, disconnect, and retry count. Bodies, prompts, generated text, authorization headers, and API-key secrets are never logged.
+The five query expressions behind the four causal dashboard panels are:
 
-Metric labels are bounded to configured names and enums. Request IDs, key prefixes, URLs, prompts, and generated text are not labels.
+```promql
+max by (model) (llmgw_pool_pressure{model=~"$model"})
+sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background",reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"}[$__rate_interval]))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_ttft_seconds_bucket{model=~"$model",priority_class="high"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
+```
+
+The rejection panel intentionally allowlists only gateway overload decisions that return HTTP 429. Every causal query retains `model`, so selecting `All` shows separate pool series instead of correlating pressure from one model with decisions or latency from another.
+
+For a local GPU stack, add `compose.observability.yaml`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. Prometheus listens on `127.0.0.1:9090`; both ports are configurable. The overlay defaults Grafana to `admin` / `admin`, which is acceptable only for a loopback development host and must be overridden elsewhere.
+
+The gateway writes one JSON record per completed inference request to stderr. It includes correlation IDs, configured client/model policy, selected backend, pressure/state, status, `decisionReason`, `queueOutcome`, `queueWaitMs`, duration, TTFT, disconnect, and retry count. Bodies, prompts, generated text, authorization headers, and API-key secrets are never logged.
+
+Metric labels are bounded to configured names and enums. Request IDs, key prefixes, URLs, prompts, and generated text are not labels. Current-topology gauges are removed when configured pools, backends, clients, or label identities disappear; historical counters and histograms remain queryable.
 
 ## Security boundary
 

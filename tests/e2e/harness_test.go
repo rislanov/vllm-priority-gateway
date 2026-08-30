@@ -20,6 +20,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
 
 type e2eMode string
@@ -496,6 +500,21 @@ func (models modelsResponse) contains(model string) bool {
 
 type metricsResponse string
 
+func TestMetricsResponseLookup(t *testing.T) {
+	fixture := metricsResponse("# TYPE llmgw_pool_pressure gauge\n" +
+		"llmgw_pool_pressure{model=\"qwen\"} 1.4\n" +
+		"# TYPE llmgw_queue_wait_seconds histogram\n" +
+		"llmgw_queue_wait_seconds_count{model=\"qwen\",priority_class=\"high\",outcome=\"selected\"} 3\n")
+	if got, ok := fixture.value("llmgw_pool_pressure", map[string]string{"model": "qwen"}); !ok || got != 1.4 {
+		t.Fatalf("pool pressure = %v, %t", got, ok)
+	}
+	if got := fixture.histogramCount("llmgw_queue_wait_seconds", map[string]string{
+		"model": "qwen", "priority_class": "high", "outcome": "selected",
+	}); got != 3 {
+		t.Fatalf("queue wait count = %d, want 3", got)
+	}
+}
+
 func (metrics metricsResponse) containsFamily(family string) bool {
 	for _, line := range strings.Split(string(metrics), "\n") {
 		if strings.HasPrefix(line, "# HELP "+family+" ") || strings.HasPrefix(line, family+"{") || strings.HasPrefix(line, family+" ") {
@@ -503,6 +522,110 @@ func (metrics metricsResponse) containsFamily(family string) bool {
 		}
 	}
 	return false
+}
+
+func (metrics metricsResponse) value(name string, labels map[string]string) (float64, bool) {
+	families, ok := metrics.metricFamilies()
+	if !ok {
+		return 0, false
+	}
+	family := families[name]
+	if family == nil {
+		return 0, false
+	}
+	var total float64
+	found := false
+	for _, metric := range family.Metric {
+		if !metricMatches(metric, labels) {
+			continue
+		}
+		switch {
+		case metric.Counter != nil:
+			total += metric.Counter.GetValue()
+		case metric.Gauge != nil:
+			total += metric.Gauge.GetValue()
+		case metric.Untyped != nil:
+			total += metric.Untyped.GetValue()
+		default:
+			continue
+		}
+		found = true
+	}
+	return total, found
+}
+
+func (metrics metricsResponse) histogramCount(name string, labels map[string]string) uint64 {
+	families, ok := metrics.metricFamilies()
+	if ok {
+		if family := families[name]; family != nil {
+			var total uint64
+			for _, metric := range family.Metric {
+				if metricMatches(metric, labels) && metric.Histogram != nil {
+					total += metric.Histogram.GetSampleCount()
+				}
+			}
+			if total > 0 {
+				return total
+			}
+		}
+	}
+	value, found := metrics.value(name+"_count", labels)
+	if !found || value < 0 {
+		return 0
+	}
+	return uint64(value)
+}
+
+func (metrics metricsResponse) metricFamilies() (map[string]*dto.MetricFamily, bool) {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(string(metrics)))
+	return families, err == nil
+}
+
+func metricMatches(metric *dto.Metric, want map[string]string) bool {
+	matched := 0
+	for _, pair := range metric.Label {
+		if value, exists := want[pair.GetName()]; exists && value == pair.GetValue() {
+			matched++
+		}
+	}
+	return matched == len(want)
+}
+
+func requireMetricIncrease(
+	t *testing.T,
+	before, after metricsResponse,
+	name string,
+	labels map[string]string,
+	minimum float64,
+) {
+	t.Helper()
+	beforeValue, _ := before.value(name, labels)
+	afterValue, found := after.value(name, labels)
+	if delta := afterValue - beforeValue; !found || delta < minimum {
+		t.Fatalf("%s%v delta = %v (before=%v after=%v present=%t), want at least %v",
+			name, labels, delta, beforeValue, afterValue, found, minimum)
+	}
+}
+
+func requireHistogramIncrease(
+	t *testing.T,
+	before, after metricsResponse,
+	name string,
+	labels map[string]string,
+	minimum uint64,
+) {
+	t.Helper()
+	beforeCount := before.histogramCount(name, labels)
+	afterCount := after.histogramCount(name, labels)
+	var delta uint64
+	if afterCount >= beforeCount {
+		delta = afterCount - beforeCount
+	}
+	if afterCount < beforeCount || delta < minimum {
+		t.Fatalf("%s_count%v delta = %d (before=%d after=%d), want at least %d",
+			name, labels, delta, beforeCount, afterCount, minimum)
+	}
 }
 
 type remoteHarness struct {
@@ -800,6 +923,11 @@ func isolatePoolGatewayInflight(pool adminPool, maximum int) adminPool {
 	return pool
 }
 
+func preparePoolForPriorityLoad(pool adminPool) adminPool {
+	pool.MaxWaiting = 0
+	return pool
+}
+
 func samePoolConfiguration(left, right adminPool) bool {
 	return left.ID == right.ID && left.PublicModelName == right.PublicModelName &&
 		left.UpstreamModelName == right.UpstreamModelName && left.Enabled == right.Enabled &&
@@ -1029,6 +1157,21 @@ type adminMutationCleanup struct {
 	backends []adminBackend
 	once     sync.Once
 	err      error
+}
+
+func priorityCleanupStatus(status adminStatus, drainBackendID int64) adminStatus {
+	filtered := status
+	filtered.Backends = nil
+	if drainBackendID <= 0 {
+		return filtered
+	}
+	for _, backend := range status.Backends {
+		if backend.ID == drainBackendID {
+			filtered.Backends = append(filtered.Backends, backend)
+			break
+		}
+	}
+	return filtered
 }
 
 func newAdminMutationCleanup(updater adminStateUpdater, status adminStatus, poolID int64) (*adminMutationCleanup, error) {

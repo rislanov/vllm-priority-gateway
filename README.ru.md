@@ -296,6 +296,18 @@ POST /v1/responses
 | `/metrics` | Метрики Prometheus |
 | `/admin` | Интерфейс оператора |
 
+### Локальные Prometheus и Grafana (опционально)
+
+Версионируемый observability overlay запускает Prometheus и автоматически добавляет dashboard **Gateway Decisions** в Grafana:
+
+```console
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+```
+
+Grafana доступна по адресу `http://127.0.0.1:3000/d/llmgw-gateway-decisions`, Prometheus — `http://127.0.0.1:9090`. Первая строка dashboard намеренно показывает причинную цепочку: pressure пула → решения 429 для Low (`background`) с точной причиной → latency/TTFT успешных High-запросов → ожидание High внутри gateway. Доступны фильтры по модели, backend, клиенту и приоритету.
+
+Локальные значения Grafana по умолчанию — `admin` / `admin`. Перед любым использованием за пределами development-хоста с loopback задайте `LLMGW_GRAFANA_ADMIN_USER` и `LLMGW_GRAFANA_ADMIN_PASSWORD`. `LLMGW_PROMETHEUS_PORT` и `LLMGW_GRAFANA_PORT` переопределяют loopback-порты. Для опубликованного образа gateway добавьте `compose.release.yaml` перед `compose.observability.yaml` и оставьте `--no-build`.
+
 Gateway применяет подтверждённые изменения Admin UI без перезапуска. Перед обслуживанием переведите backend в drain и возобновляйте его только после восстановления health и свежих метрик.
 
 ## Admin API

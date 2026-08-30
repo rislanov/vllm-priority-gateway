@@ -20,6 +20,7 @@ type Metrics struct {
 	rejected               *prometheus.CounterVec
 	clientInflight         *prometheus.GaugeVec
 	backendInflight        *prometheus.GaugeVec
+	backendSelected        *prometheus.CounterVec
 	backendPressure        *prometheus.GaugeVec
 	backendRunning         *prometheus.GaugeVec
 	backendWaiting         *prometheus.GaugeVec
@@ -29,7 +30,10 @@ type Metrics struct {
 	poolGatewayInflight    *prometheus.GaugeVec
 	poolWaiting            *prometheus.GaugeVec
 	poolAvailableBackends  *prometheus.GaugeVec
+	poolPressure           *prometheus.GaugeVec
+	poolState              *prometheus.GaugeVec
 	duration               *prometheus.HistogramVec
+	queueWait              *prometheus.HistogramVec
 	ttft                   *prometheus.HistogramVec
 	disconnects            *prometheus.CounterVec
 	backendFailures        *prometheus.CounterVec
@@ -108,6 +112,7 @@ func NewMetrics() *Metrics {
 	m.rejected = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_requests_rejected_total", Help: "Requests rejected by the gateway."}, []string{"client", "model", "priority_class", "reason"})
 	m.clientInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_client_inflight", Help: "Admitted requests currently in flight by client."}, []string{"client", "model", "priority_class"})
 	m.backendInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_requests_inflight", Help: "Gateway requests currently assigned to a backend."}, []string{"model", "backend"})
+	m.backendSelected = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_backend_selected_total", Help: "Backend leases selected by the gateway, including retries."}, []string{"model", "backend"})
 	m.backendPressure = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_pressure", Help: "Smoothed backend pressure."}, []string{"model", "backend"})
 	m.backendRunning = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_running_requests", Help: "Running requests reported by vLLM."}, []string{"model", "backend"})
 	m.backendWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_backend_waiting_requests", Help: "Waiting requests reported by vLLM."}, []string{"model", "backend"})
@@ -117,7 +122,10 @@ func NewMetrics() *Metrics {
 	m.poolGatewayInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_gateway_inflight", Help: "Gateway requests currently holding a pool lease."}, []string{"model"})
 	m.poolWaiting = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_waiting_requests", Help: "Aggregate waiting requests reported by healthy, metrics-fresh, non-draining pool backends."}, []string{"model"})
 	m.poolAvailableBackends = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_available_backends", Help: "Backends currently available to accept inference traffic."}, []string{"model"})
+	m.poolPressure = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_pressure", Help: "Best eligible backend pressure used for pool admission."}, []string{"model"})
+	m.poolState = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_pool_state", Help: "One-hot gateway pool admission state."}, []string{"model", "state"})
 	m.duration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_request_duration_seconds", Help: "End-to-end public request duration.", Buckets: prometheus.DefBuckets}, []string{"model", "backend", "priority_class", "status_class"})
+	m.queueWait = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_queue_wait_seconds", Help: "Gateway admission-to-selection or admission-to-rejection time.", Buckets: prometheus.DefBuckets}, []string{"model", "priority_class", "outcome"})
 	m.ttft = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_ttft_seconds", Help: "Time to first upstream response byte.", Buckets: prometheus.DefBuckets}, []string{"model", "backend", "priority_class"})
 	m.disconnects = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_stream_disconnects_total", Help: "Streaming requests cancelled by a disconnected downstream."}, []string{"model", "backend", "priority_class"})
 	m.backendFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_backend_failures_total", Help: "Requests that failed at a selected backend."}, []string{"model", "backend", "reason"})
@@ -128,10 +136,10 @@ func NewMetrics() *Metrics {
 	m.usageParseFails = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_usage_parse_failures_total", Help: "Upstream usage metadata parse failures."}, []string{"format"})
 	m.usagePersistFail = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_usage_persistence_failures_total", Help: "Usage records that failed to persist."})
 	m.registry.MustRegister(
-		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight,
+		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight, m.backendSelected,
 		m.backendPressure, m.backendRunning, m.backendWaiting, m.backendKV, m.duration,
 		m.backendCircuitState, m.backendCircuitFailures, m.poolGatewayInflight, m.poolWaiting,
-		m.poolAvailableBackends, m.ttft, m.disconnects, m.backendFailures, m.retries,
+		m.poolAvailableBackends, m.poolPressure, m.poolState, m.queueWait, m.ttft, m.disconnects, m.backendFailures, m.retries,
 		m.inputTokens, m.outputTokens, m.cacheReadTokens, m.usageParseFails, m.usagePersistFail,
 	)
 	return m
@@ -181,6 +189,9 @@ func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
 	m.runtimeMu.Lock()
 	defer m.runtimeMu.Unlock()
 
+	if delta > 0 {
+		m.backendSelected.WithLabelValues(labels.model, labels.backend).Inc()
+	}
 	m.observedBackendLabels[labels] = struct{}{}
 	inflight := updateInflightValue(m.backendInflightValues, labels, delta)
 	if m.runtimeTopologyKnown {
@@ -201,8 +212,15 @@ func (m *Metrics) Complete(event gateway.RequestEvent) {
 	backend := value(event.Backend)
 	m.requests.WithLabelValues(client, model, priority, status).Inc()
 	m.duration.WithLabelValues(model, backend, priority, status).Observe(event.Duration.Seconds())
-	if event.Reason != "" {
-		m.rejected.WithLabelValues(client, model, priority, value(event.Reason)).Inc()
+	reason := event.Reason
+	if event.DecisionReason != "" {
+		reason = string(event.DecisionReason)
+	}
+	if reason != "" {
+		m.rejected.WithLabelValues(client, model, priority, value(reason)).Inc()
+	}
+	if event.QueueOutcome != "" {
+		m.queueWait.WithLabelValues(model, priority, string(event.QueueOutcome)).Observe(event.QueueWait.Seconds())
 	}
 	if event.TTFT > 0 {
 		m.ttft.WithLabelValues(model, backend, priority).Observe(event.TTFT.Seconds())
@@ -265,6 +283,14 @@ func (m *Metrics) setPool(model string, runtime domain.PoolRuntime) {
 	m.poolGatewayInflight.WithLabelValues(label).Set(float64(runtime.GatewayInflight))
 	m.poolWaiting.WithLabelValues(label).Set(runtime.TotalWaiting)
 	m.poolAvailableBackends.WithLabelValues(label).Set(float64(runtime.AvailableBackends))
+	m.poolPressure.WithLabelValues(label).Set(runtime.BestBackendPressure)
+	for _, state := range poolStates {
+		stateValue := 0.0
+		if runtime.State == state {
+			stateValue = 1
+		}
+		m.poolState.WithLabelValues(label, string(state)).Set(stateValue)
+	}
 }
 
 // PublishRuntime replaces the bounded current-topology gauge label set and
@@ -303,6 +329,10 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		m.poolGatewayInflight.DeleteLabelValues(labels)
 		m.poolWaiting.DeleteLabelValues(labels)
 		m.poolAvailableBackends.DeleteLabelValues(labels)
+		m.poolPressure.DeleteLabelValues(labels)
+		for _, state := range poolStates {
+			m.poolState.DeleteLabelValues(labels, string(state))
+		}
 	}
 	for labels := range m.knownBackendLabels {
 		if _, current := currentBackends[labels]; current {
@@ -374,6 +404,14 @@ func updateInflightValue[K comparable](values map[K]int, labels K, delta int) in
 	}
 	values[labels] = inflight
 	return inflight
+}
+
+var poolStates = [...]domain.PoolState{
+	domain.PoolNormal,
+	domain.PoolBusy,
+	domain.PoolSaturated,
+	domain.PoolEmergency,
+	domain.PoolUnavailable,
 }
 
 func (m *Metrics) deleteBackendRuntimeLabels(labels backendMetricLabels) {

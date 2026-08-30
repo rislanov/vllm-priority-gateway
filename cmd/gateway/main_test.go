@@ -106,7 +106,10 @@ func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
 		},
 	}
 	runtime := runtimeMetricsStub{
-		pool: domain.PoolRuntime{PoolID: 10, GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1},
+		pool: domain.PoolRuntime{
+			PoolID: 10, State: domain.PoolEmergency, BestBackendPressure: 1.6,
+			GatewayInflight: 4, TotalWaiting: 6, AvailableBackends: 1,
+		},
 		backend: domain.BackendRuntime{
 			BackendID: 20, CircuitState: domain.CircuitOpen, CircuitFailures: 5,
 		},
@@ -122,6 +125,9 @@ func TestPublishRuntimeMetricsSetsBackendAndPoolGauges(t *testing.T) {
 		`llmgw_pool_gateway_inflight{model="qwen"} 4`,
 		`llmgw_pool_waiting_requests{model="qwen"} 6`,
 		`llmgw_pool_available_backends{model="qwen"} 1`,
+		`llmgw_pool_pressure{model="qwen"} 1.6`,
+		`llmgw_pool_state{model="qwen",state="emergency"} 1`,
+		`llmgw_pool_state{model="qwen",state="busy"} 0`,
 	} {
 		if !strings.Contains(text, sample) {
 			t.Fatalf("published metrics missing %q:\n%s", sample, text)
@@ -247,8 +253,12 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 		`llmgw_pool_gateway_inflight{model="qwen-old"}`,
 		`llmgw_pool_waiting_requests{model="qwen-old"}`,
 		`llmgw_pool_available_backends{model="qwen-old"}`,
+		`llmgw_pool_pressure{model="qwen-old"}`,
+		`llmgw_pool_state{model="qwen-old"`,
 		`llmgw_backend_circuit_state{backend="removed-gpu",model="removed-pool"}`,
 		`llmgw_pool_gateway_inflight{model="removed-pool"}`,
+		`llmgw_pool_pressure{model="removed-pool"}`,
+		`llmgw_pool_state{model="removed-pool"`,
 	} {
 		if strings.Contains(text, stale) {
 			t.Fatalf("stale topology sample %q survived rename/removal:\n%s", stale, text)
@@ -267,6 +277,8 @@ func TestPublishRuntimeMetricsRemovesRenamedAndDeletedTopologySeries(t *testing.
 		`llmgw_pool_gateway_inflight{model="qwen-new"} 1`,
 		`llmgw_pool_waiting_requests{model="qwen-new"} 2`,
 		`llmgw_pool_available_backends{model="qwen-new"} 1`,
+		`llmgw_pool_pressure{model="qwen-new"} 0`,
+		`llmgw_pool_state{model="qwen-new",state="normal"} 0`,
 		`llmgw_requests_total{client="client-a",model="qwen-old",priority_class="high",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(text, current) {

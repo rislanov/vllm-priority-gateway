@@ -97,11 +97,12 @@ func New(dependencies Dependencies) *Service {
 }
 
 type APIError struct {
-	HTTPStatus int
-	Message    string
-	Type       string
-	Code       string
-	RetryAfter time.Duration
+	HTTPStatus     int
+	Message        string
+	Type           string
+	Code           string
+	RetryAfter     time.Duration
+	DecisionReason DecisionReason
 }
 
 type ForwardRequest struct {
@@ -206,6 +207,7 @@ func (s *Service) Forward(
 ) (result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
 	started := time.Now()
 	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
+	var admissionStarted time.Time
 	var reservationRollback func()
 	// Register before event finalization so panics from forwarding or deferred
 	// observer delivery both release an acquired lifecycle before propagating.
@@ -229,6 +231,11 @@ func (s *Service) Forward(
 		if apiErr != nil {
 			event.Status = apiErr.HTTPStatus
 			event.Reason = apiErr.Code
+			event.DecisionReason = apiErr.DecisionReason
+			if !admissionStarted.IsZero() && event.QueueOutcome == "" {
+				event.QueueWait = time.Since(admissionStarted)
+				event.QueueOutcome = QueueRejected
+			}
 		} else {
 			event.Status = result.Status
 		}
@@ -292,6 +299,7 @@ func (s *Service) Forward(
 	if err != nil {
 		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
 	}
+	admissionStarted = time.Now()
 	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
 	event.PoolState = poolRuntime.State
 	if poolErr != nil {
@@ -301,7 +309,7 @@ func (s *Service) Forward(
 	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
 	lease, ok := s.limiter.Acquire(client.ID, limit)
 	if !ok {
-		return proxy.Result{}, reservation, overloaded(s.retryAfter)
+		return proxy.Result{}, reservation, overloaded(s.retryAfter, DecisionPriorityConcurrencyLimit)
 	}
 	defer lease.Release()
 	inflight := InflightEvent{Client: client.Name, Model: publicModel, PriorityClass: client.PriorityClass}
@@ -348,6 +356,10 @@ func (s *Service) Forward(
 			backendInflight.Backend = candidate.Backend.Name
 			event.Backend = candidate.Backend.Name
 			event.BackendPressure = candidate.Pressure
+			if event.QueueOutcome == "" {
+				event.QueueWait = time.Since(admissionStarted)
+				event.QueueOutcome = QueueSelected
+			}
 			if s.observer != nil {
 				s.observer.BackendInflight(backendInflight, 1)
 			}
@@ -368,7 +380,7 @@ func (s *Service) Forward(
 
 	target, err := selectTarget(nil)
 	if err != nil {
-		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter)
+		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter, DecisionNoEligibleBackend)
 	}
 
 	headers := request.Headers.Clone()
@@ -397,30 +409,30 @@ func (s *Service) acquirePool(ctx context.Context, clientID int64, original doma
 		before := s.registry.Snapshot()
 		pool, valid := currentAdmissionPool(before, clientID, original)
 		if !valid {
-			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		runtime := s.runtime.PoolSnapshot(pool.ID, s.now().UTC())
 		if runtime.State == domain.PoolUnavailable {
-			return runtime, nil, backendUnavailable(s.retryAfter)
+			return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		if pool.MaxWaiting > 0 && runtime.TotalWaiting >= float64(pool.MaxWaiting) {
-			return runtime, nil, overloaded(s.retryAfter)
+			return runtime, nil, overloaded(s.retryAfter, DecisionPoolWaitingLimit)
 		}
 		release, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
 		if !ok {
-			return runtime, nil, overloaded(s.retryAfter)
+			return runtime, nil, overloaded(s.retryAfter, DecisionPoolInflightLimit)
 		}
 
 		after := s.registry.Snapshot()
 		validatedPool, stillValid := currentAdmissionPool(after, clientID, original)
 		if !stillValid {
 			release()
-			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		if validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
 			release()
 			if ctx.Err() != nil {
-				return runtime, nil, backendUnavailable(s.retryAfter)
+				return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 			}
 			continue
 		}
@@ -551,35 +563,36 @@ func forceStreamingUsage(body []byte, path string) ([]byte, error) {
 }
 
 func invalidAPIKey() *APIError {
-	return &APIError{HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+	return &APIError{HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key", DecisionReason: DecisionInvalidAPIKey}
 }
 
 func invalidRequest(message string) *APIError {
-	return &APIError{HTTPStatus: http.StatusBadRequest, Message: message, Type: "invalid_request_error", Code: "invalid_request_error"}
+	return &APIError{HTTPStatus: http.StatusBadRequest, Message: message, Type: "invalid_request_error", Code: "invalid_request_error", DecisionReason: DecisionInvalidRequest}
 }
 
 func modelNotAllowed() *APIError {
-	return &APIError{HTTPStatus: http.StatusForbidden, Message: "The requested model is not available to this client", Type: "invalid_request_error", Code: "model_not_allowed"}
+	return &APIError{HTTPStatus: http.StatusForbidden, Message: "The requested model is not available to this client", Type: "invalid_request_error", Code: "model_not_allowed", DecisionReason: DecisionModelNotAllowed}
 }
 
-func overloaded(retryAfter time.Duration) *APIError {
-	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: retryAfter}
+func overloaded(retryAfter time.Duration, reason DecisionReason) *APIError {
+	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: retryAfter, DecisionReason: reason}
 }
 
-func backendUnavailable(retryAfter time.Duration) *APIError {
-	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter}
+func backendUnavailable(retryAfter time.Duration, reason DecisionReason) *APIError {
+	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter, DecisionReason: reason}
 }
 
 func gatewayUnavailable(retryAfter time.Duration) *APIError {
 	return &APIError{
-		HTTPStatus: http.StatusServiceUnavailable,
-		Message:    "The gateway is temporarily unable to accept requests",
-		Type:       "server_error",
-		Code:       "gateway_unavailable",
-		RetryAfter: retryAfter,
+		HTTPStatus:     http.StatusServiceUnavailable,
+		Message:        "The gateway is temporarily unable to accept requests",
+		Type:           "server_error",
+		Code:           "gateway_unavailable",
+		RetryAfter:     retryAfter,
+		DecisionReason: DecisionGatewayBackpressure,
 	}
 }
 
 func upstreamError() *APIError {
-	return &APIError{HTTPStatus: http.StatusBadGateway, Message: "The inference backend could not complete the request", Type: "server_error", Code: "upstream_error"}
+	return &APIError{HTTPStatus: http.StatusBadGateway, Message: "The inference backend could not complete the request", Type: "server_error", Code: "upstream_error", DecisionReason: DecisionUpstreamFailure}
 }

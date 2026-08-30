@@ -34,13 +34,13 @@ func writeGatewayError(writer http.ResponseWriter, gatewayError *gateway.APIErro
 func unsupportedEndpoint() *gateway.APIError {
 	return &gateway.APIError{
 		HTTPStatus: http.StatusNotFound, Message: "This OpenAI-compatible endpoint is not supported by the gateway",
-		Type: "invalid_request_error", Code: "unsupported_endpoint",
+		Type: "invalid_request_error", Code: "unsupported_endpoint", DecisionReason: gateway.DecisionInvalidRequest,
 	}
 }
 
 func invalidRequest(message string) *gateway.APIError {
 	return &gateway.APIError{
 		HTTPStatus: http.StatusBadRequest, Message: message,
-		Type: "invalid_request_error", Code: "invalid_request_error",
+		Type: "invalid_request_error", Code: "invalid_request_error", DecisionReason: gateway.DecisionInvalidRequest,
 	}
 }

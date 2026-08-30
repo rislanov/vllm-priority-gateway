@@ -34,6 +34,9 @@ func TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion(t *testin
 	if second.apiErr == nil || second.apiErr.HTTPStatus != http.StatusTooManyRequests || second.apiErr.Code != "gateway_overloaded" || second.apiErr.RetryAfter <= 0 {
 		t.Fatalf("second request API error = %+v, want bounded 429 with Retry-After", second.apiErr)
 	}
+	if second.apiErr.DecisionReason != gateway.DecisionPoolInflightLimit {
+		t.Fatalf("second request reason = %q, want %q", second.apiErr.DecisionReason, gateway.DecisionPoolInflightLimit)
+	}
 	if got := runtime.PoolInflight(); got != 1 {
 		t.Fatalf("pool inflight while first request blocks = %d, want 1", got)
 	}
@@ -49,17 +52,28 @@ func TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion(t *testin
 }
 
 func TestServicePoolMaxWaitingRejectsBeforePoolAndClientAcquisition(t *testing.T) {
+	observer := &backendRecordingObserver{}
 	service, request, runtime := newPoolService(t, poolServiceOptions{
 		maximum: 2, maxWaiting: 5, totalWaiting: 5, priority: domain.PriorityCritical,
-		forwarder: &poolCompletionForwarder{},
+		forwarder: &poolCompletionForwarder{}, observer: observer,
 	})
 
 	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" || apiErr.RetryAfter <= 0 {
 		t.Fatalf("waiting rejection API error = %+v, want bounded 429 with Retry-After", apiErr)
 	}
+	if apiErr.DecisionReason != gateway.DecisionPoolWaitingLimit {
+		t.Fatalf("waiting rejection reason = %q, want %q", apiErr.DecisionReason, gateway.DecisionPoolWaitingLimit)
+	}
 	if got := runtime.PoolAcquisitions(); got != 0 {
 		t.Fatalf("pool acquisitions after waiting rejection = %d, want 0", got)
+	}
+	event := observer.Event()
+	if event.QueueOutcome != gateway.QueueRejected || event.QueueWait < 0 {
+		t.Fatalf("waiting rejection queue telemetry = outcome %q wait %s", event.QueueOutcome, event.QueueWait)
+	}
+	if event.DecisionReason != gateway.DecisionPoolWaitingLimit {
+		t.Fatalf("waiting rejection event reason = %q, want %q", event.DecisionReason, gateway.DecisionPoolWaitingLimit)
 	}
 }
 
@@ -296,6 +310,11 @@ func TestServiceReleasesPoolLeaseWhenClientLimiterRejects(t *testing.T) {
 		<-firstDone
 		t.Fatalf("client limiter API error = %+v", apiErr)
 	}
+	if apiErr.DecisionReason != gateway.DecisionPriorityConcurrencyLimit {
+		forwarder.releaseAll()
+		<-firstDone
+		t.Fatalf("client limiter reason = %q, want %q", apiErr.DecisionReason, gateway.DecisionPriorityConcurrencyLimit)
+	}
 	if got := runtime.PoolInflight(); got != 1 {
 		forwarder.releaseAll()
 		<-firstDone
@@ -443,6 +462,7 @@ type poolServiceOptions struct {
 	priority                  domain.PriorityClass
 	maxConcurrency            int
 	forwarder                 gateway.Forwarder
+	observer                  gateway.Observer
 	runtime                   *poolRuntimeStub
 	backends                  []domain.Backend
 	publishPoolOnSnapshot     *domain.ModelPool
@@ -510,7 +530,7 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 	service := gateway.New(gateway.Dependencies{
 		Registry: provider, HMACSecret: secret, Limiter: admission.NewLimiter(), Runtime: runtime,
 		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
-		Now: func() time.Time { return poolTestNow }, RetryAfter: 2 * time.Second,
+		Observer: options.observer, Now: func() time.Time { return poolTestNow }, RetryAfter: 2 * time.Second,
 	})
 	return service, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),

@@ -21,15 +21,20 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	metrics.BackendInflight(inflight, 1)
 	metrics.ClientInflight(inflight, -1)
 	metrics.BackendInflight(inflight, -1)
+	metrics.BackendInflight(inflight, 1)
+	metrics.BackendInflight(inflight, -1)
 	metrics.Complete(gateway.RequestEvent{
 		RequestID: "request-id-must-not-be-a-label", Client: "client-a", Model: "qwen",
 		Backend: "gpu-1", PriorityClass: domain.PriorityHigh, Status: 200,
 		Duration: 250 * time.Millisecond, TTFT: 50 * time.Millisecond, RetryCount: 1,
+		QueueWait: 4 * time.Millisecond, QueueOutcome: gateway.QueueSelected,
 		Usage: &domain.TokenUsage{InputTokens: 12, OutputTokens: 7, CacheReadTokens: &cacheReadTokens},
 	})
 	metrics.Complete(gateway.RequestEvent{
 		RequestID: "other-request-id", Client: "client-a", Model: "qwen",
 		PriorityClass: domain.PriorityHigh, Status: 429, Reason: "gateway_overloaded",
+		DecisionReason: gateway.DecisionPoolWaitingLimit,
+		QueueWait:      12 * time.Millisecond, QueueOutcome: gateway.QueueRejected,
 		Duration: time.Millisecond, UsageParseFailure: "json",
 	})
 	metrics.Complete(gateway.RequestEvent{
@@ -56,7 +61,10 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	})
 	metrics.SetBackend("qwen", "gpu-open", domain.BackendRuntime{CircuitState: domain.CircuitOpen})
 	metrics.SetBackend("qwen", "gpu-half-open", domain.BackendRuntime{CircuitState: domain.CircuitHalfOpen})
-	metrics.SetPool("qwen", domain.PoolRuntime{GatewayInflight: 3, TotalWaiting: 2.5, AvailableBackends: 2})
+	metrics.SetPool("qwen", domain.PoolRuntime{
+		State: domain.PoolSaturated, BestBackendPressure: 1.25,
+		GatewayInflight: 3, TotalWaiting: 2.5, AvailableBackends: 2,
+	})
 
 	server := httptest.NewServer(metrics.Handler())
 	defer server.Close()
@@ -74,7 +82,8 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		"llmgw_request_duration_seconds", "llmgw_ttft_seconds", "llmgw_stream_disconnects_total",
 		"llmgw_backend_failures_total", "llmgw_retries_total", "llmgw_backend_circuit_state",
 		"llmgw_backend_circuit_failures", "llmgw_pool_gateway_inflight",
-		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends",
+		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends", "llmgw_pool_pressure",
+		"llmgw_pool_state", "llmgw_backend_selected_total", "llmgw_queue_wait_seconds",
 	} {
 		if !strings.Contains(text, family) {
 			t.Fatalf("metrics missing %s:\n%s", family, text)
@@ -87,6 +96,13 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		`llmgw_usage_parse_failures_total{format="json"} 1`,
 		`llmgw_usage_parse_failures_total{format="sse"} 1`,
 		`llmgw_usage_persistence_failures_total 2`,
+		`llmgw_backend_selected_total{backend="gpu-1",model="qwen"} 2`,
+		`llmgw_pool_pressure{model="qwen"} 1.25`,
+		`llmgw_pool_state{model="qwen",state="saturated"} 1`,
+		`llmgw_pool_state{model="qwen",state="normal"} 0`,
+		`llmgw_requests_rejected_total{client="client-a",model="qwen",priority_class="high",reason="pool_waiting_limit"} 1`,
+		`llmgw_queue_wait_seconds_count{model="qwen",outcome="rejected",priority_class="high"} 1`,
+		`llmgw_queue_wait_seconds_count{model="qwen",outcome="selected",priority_class="high"} 1`,
 	} {
 		if !strings.Contains(text, sample+"\n") {
 			t.Fatalf("metrics missing exact sample %q:\n%s", sample, text)

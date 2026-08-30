@@ -7,6 +7,31 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
 
+// DecisionReason is a bounded, gateway-owned classification of the terminal
+// decision. It is deliberately separate from the public API error code.
+type DecisionReason string
+
+const (
+	DecisionPoolWaitingLimit         DecisionReason = "pool_waiting_limit"
+	DecisionPoolInflightLimit        DecisionReason = "pool_inflight_limit"
+	DecisionPriorityConcurrencyLimit DecisionReason = "priority_concurrency_limit"
+	DecisionPoolUnavailable          DecisionReason = "pool_unavailable"
+	DecisionNoEligibleBackend        DecisionReason = "no_eligible_backend"
+	DecisionGatewayBackpressure      DecisionReason = "gateway_backpressure"
+	DecisionModelNotAllowed          DecisionReason = "model_not_allowed"
+	DecisionInvalidRequest           DecisionReason = "invalid_request"
+	DecisionInvalidAPIKey            DecisionReason = "invalid_api_key"
+	DecisionUpstreamFailure          DecisionReason = "upstream_failure"
+)
+
+// QueueOutcome identifies how gateway admission ended for a request.
+type QueueOutcome string
+
+const (
+	QueueSelected QueueOutcome = "selected"
+	QueueRejected QueueOutcome = "rejected"
+)
+
 // InflightEvent contains the bounded dimensions used by inflight gauges.
 type InflightEvent struct {
 	Client        string
@@ -32,6 +57,9 @@ type RequestEvent struct {
 	BackendPressure   float64
 	Status            int
 	Reason            string
+	DecisionReason    DecisionReason
+	QueueWait         time.Duration
+	QueueOutcome      QueueOutcome
 	Duration          time.Duration
 	TTFT              time.Duration
 	Disconnect        bool

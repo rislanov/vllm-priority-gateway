@@ -246,6 +246,12 @@ func TestRequestEventUsageRecordsIdentityForKnownModelPolicyDenials(t *testing.T
 				t.Fatalf("ledger identity = client %d pool %d model %q, want client 1 pool %d model %q",
 					event.ClientID, event.ModelPoolID, event.Model, test.wantModelID, test.wantModelName)
 			}
+			if event.DecisionReason != gateway.DecisionModelNotAllowed {
+				t.Fatalf("policy denial reason = %q, want %q", event.DecisionReason, gateway.DecisionModelNotAllowed)
+			}
+			if event.QueueOutcome != "" {
+				t.Fatalf("policy denial queue outcome = %q, want empty before admission", event.QueueOutcome)
+			}
 			if forwarder.Request().Method != "" {
 				t.Fatalf("policy denial reached upstream forwarder: %+v", forwarder.Request())
 			}
