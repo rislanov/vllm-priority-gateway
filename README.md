@@ -1,12 +1,59 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# Lightweight vLLM Priority Gateway
+# vLLM Priority Gateway
+
+**Protect high-priority inference workloads on shared vLLM GPU clusters.**
+
+vLLM Priority Gateway is a lightweight policy and routing layer that sits **in front of your existing [vLLM](https://docs.vllm.ai/) servers**. Applications keep using the standard OpenAI API: change the API base URL, use a gateway-issued key, and leave model deployment and GPU scheduling where they already are.
+
+The gateway then:
+
+- assigns priority from server-side client policy;
+- enforces per-client concurrency and model access;
+- monitors every vLLM backend through health and Prometheus metrics;
+- routes requests to the least-pressured healthy backend;
+- keeps related agent or conversation traffic on the same backend when possible;
+- sheds lower-priority work when shared GPU capacity is overloaded.
+
+## Where it sits in your vLLM cluster
+
+```text
+                    Existing inference infrastructure
+
+ User-facing API ───────┐
+                        │  llmgw_prod_*     priority: high
+ Coding agents ─────────┼──────────────────────────────────┐
+                        │  llmgw_agents_*   priority: normal
+ Batch / eval jobs ─────┘  llmgw_batch_*    priority: background
+                                                            │
+                                                            ▼
+                                              ┌───────────────────────┐
+                                              │ vLLM Priority Gateway │
+                                              │                       │
+                                              │ auth / policy         │
+                                              │ admission control     │
+                                              │ pressure-aware route  │
+                                              │ session affinity      │
+                                              │ circuit breakers      │
+                                              └───────────┬───────────┘
+                                                          │
+                                      ┌───────────────────┼───────────────────┐
+                                      ▼                   ▼                   ▼
+                               vLLM GPU node A     vLLM GPU node B     vLLM GPU node C
+                               :8000               :8000               :8000
+```
+
+The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Slurm, or your existing vLLM lifecycle tooling. It controls **who gets shared inference capacity and which vLLM instance receives each request**.
+
+The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small, operator-managed backend pool; it does not require Redis, PostgreSQL, a message broker, a Kubernetes controller, or a frontend build chain.
 
 ## Contents
 
-- [What it is](#what-it-is)
+- [Where it sits in your vLLM cluster](#where-it-sits-in-your-vllm-cluster)
+- [Connect an existing vLLM cluster](#connect-an-existing-vllm-cluster)
+- [Why not just use Nginx or a Kubernetes Service?](#why-not-just-use-nginx-or-a-kubernetes-service)
 - [Key capabilities](#key-capabilities)
-- [Release quick start](#release-quick-start)
+- [Local demo with real vLLM](#local-demo-with-real-vllm)
 - [Admin UI](#admin-ui)
 - [Client API behavior](#client-api-behavior)
 - [Operations and deployment](#operations-and-deployment)
@@ -16,29 +63,178 @@
 - [Current scope and limitations](#current-scope-and-limitations)
 - [Documentation](#documentation)
 
-## What it is
+## Connect an existing vLLM cluster
 
-Lightweight vLLM Priority Gateway is a small control and routing layer for a static pool of [vLLM](https://docs.vllm.ai/) OpenAI-compatible servers. It lets application teams use ordinary OpenAI clients while operators centrally own priority, concurrency, model access, routing, and overload policy.
-
-Without the gateway, every client can reach vLLM directly and potentially choose its own priority. With the gateway, clients receive scoped API keys, request a public model name, and cannot raise their own priority. The gateway rewrites the model and priority, admits the request according to policy, selects a healthy backend using live GPU pressure, and streams the response back immediately.
+Suppose you already run three vLLM servers:
 
 ```text
-OpenAI client
-    │ Bearer llmgw_* key
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│ Lightweight vLLM Priority Gateway                       │
-│ auth → model access → admission → affinity/live routing │
-│ streaming proxy │ health/pressure │ Admin UI/API        │
-│ analytics       │ Prometheus      │ SQLite registry     │
-└───────────────────────────┬──────────────────────────────┘
-                            │ controlled X-Vllm-Priority
-                   ┌────────┴────────┐
-                   ▼                 ▼
-              vLLM backend A    vLLM backend B
+http://vllm-a.internal:8000
+http://vllm-b.internal:8000
+http://vllm-c.internal:8000
 ```
 
-The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small, operator-managed backend pool; it does not require Redis, PostgreSQL, a message broker, a Kubernetes controller, or a frontend build chain.
+The gateway must be able to reach `/health`, `/metrics`, and the OpenAI-compatible `/v1/*` routes on each server.
+
+### 1. Start the gateway
+
+Create `.env` with independently generated secrets:
+
+```dotenv
+LLMGW_ADMIN_USERNAME=operator
+LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
+LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+```
+
+Keep this file readable only by the operator account and out of version control; the repository already ignores `.env`. Pull the published image and start the gateway on a network that can reach your vLLM endpoints:
+
+```console
+docker pull ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+docker volume create llmgw-data
+docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+```
+
+If the vLLM servers live on a Docker network, add the corresponding `--network` option. In production, normally place your existing TLS reverse proxy or ingress in front of the gateway:
+
+```text
+clients
+   │
+   ▼
+https://llm.company.internal
+   │
+   ▼
+vLLM Priority Gateway
+   │
+   ├── vllm-a.internal:8000
+   ├── vllm-b.internal:8000
+   └── vllm-c.internal:8000
+```
+
+See the [production deployment guide](docs/deployment.md) for reverse-proxy, secret-management, backup, and systemd requirements.
+
+### 2. Register the existing vLLM servers
+
+Open `http://127.0.0.1:8080/admin` and create a model pool, for example:
+
+```text
+Public model:      qwen-coder
+Upstream model:    Qwen/Qwen3-Coder-Next
+```
+
+Then register every vLLM instance in that pool:
+
+```text
+vllm-a  → http://vllm-a.internal:8000
+vllm-b  → http://vllm-b.internal:8000
+vllm-c  → http://vllm-c.internal:8000
+```
+
+The gateway continuously polls each registered URL. It combines health, metrics freshness, running and waiting requests, KV-cache usage, circuit state, and gateway inflight counts when deciding which backend is eligible and least pressured.
+
+> **For pressure-aware routing, register individual vLLM instances or stable per-instance endpoints whenever possible.**
+>
+> Avoid placing an opaque round-robin load balancer between the gateway and multiple vLLM replicas. If metrics are read from one replica but the inference request is sent to another, the gateway cannot make a reliable backend-level routing decision.
+
+On Kubernetes, this usually means stable per-instance Services, StatefulSet DNS such as `vllm-0.vllm-headless`, or another topology in which the gateway can address each serving instance directly. Model deployment and GPU scheduling remain unchanged; backend registration is static in the current release.
+
+### 3. Create clients and priorities
+
+Create one gateway client for each workload class, grant only the required public models, and set its maximum concurrency. For example:
+
+```text
+production-api
+  priority class: high
+  max concurrency: 32
+  models: qwen-coder
+
+developer-agents
+  priority class: normal
+  max concurrency: 16
+  models: qwen-coder
+
+nightly-evals
+  priority class: background
+  max concurrency: 8
+  models: qwen-coder
+```
+
+Assign the corresponding integer vLLM priority and generate a gateway API key for each client. Clients cannot promote themselves: inbound priority values are removed and replaced with policy stored by the gateway.
+
+### 4. Point existing OpenAI clients at the gateway
+
+Before:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://vllm-a.internal:8000/v1",
+    api_key="token",
+)
+```
+
+After:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.company.internal/v1",
+    api_key="llmgw_...",
+)
+```
+
+Application code otherwise stays the same and requests the public model name:
+
+```python
+response = client.chat.completions.create(
+    model="qwen-coder",
+    messages=[{"role": "user", "content": "Review this function."}],
+)
+```
+
+For every request, the gateway performs this path:
+
+```text
+authenticate client
+        ↓
+check model access
+        ↓
+apply server-side priority and overload policy
+        ↓
+choose a healthy vLLM backend
+        ↓
+rewrite public → upstream model name
+        ↓
+stream the response back
+```
+
+## Why not just use Nginx or a Kubernetes Service?
+
+A normal HTTP load balancer can distribute requests. It usually does not know:
+
+- which client is allowed to consume shared GPU capacity;
+- which request is high-priority versus background work;
+- how many requests are running or waiting inside each vLLM scheduler;
+- how much KV cache each engine is using;
+- when lower-priority traffic should be rejected to protect interactive traffic;
+- which backend should receive the next request for prefix-cache locality.
+
+vLLM Priority Gateway makes these decisions using **application policy plus live inference-server state**:
+
+```text
+shared GPU cluster
+
+production requests  ── high ────────┐
+interactive agents   ── normal ──────┼──► same vLLM capacity
+nightly / eval jobs  ── background ──┘
+
+                         GPU pressure rises
+
+background traffic ──► throttled / 429
+production traffic ──► remains admitted
+```
+
+That is the problem the gateway is designed to solve.
 
 ## Key capabilities
 
@@ -54,11 +250,11 @@ The deployment footprint is one static Go binary and one SQLite state directory.
 - Embedded Basic-authenticated, CSRF-protected Admin UI and JSON Admin API.
 - Prometheus metrics and structured JSON completion logs.
 
-## Release quick start
+## Local demo with real vLLM
 
-This is the canonical first-run path for published releases. Choose exactly one gateway artifact: the multi-platform image from GHCR, or the checksum-verified Linux binary from the GitHub Release. Both paths use the same `compose.yaml` to launch two real `Qwen/Qwen3-0.6B` vLLM servers. The gateway is never built from the checkout in either release path; the checkout supplies only the pinned vLLM topology and the sample request.
+Don't have an existing cluster available? This self-contained demo uses two real `Qwen/Qwen3-0.6B` vLLM servers and one published gateway artifact: either the multi-platform image from GHCR or the checksum-verified Linux binary from the GitHub Release. The gateway is never built from the checkout in either path; the checkout supplies only the pinned vLLM topology and the sample request.
 
-The tested defaults deliberately run two small-capacity vLLM processes on one NVIDIA GPU with at least 12 GiB VRAM. They are suitable for validating routing and priority behavior, not production sizing. The Docker gateway path works with Linux Docker Engine and Docker Desktop. The native path requires Linux `amd64` or `arm64`; its local vLLM containers publish loopback ports only. See the [deployment guide](docs/deployment.md) before exposing the gateway outside the host.
+The tested defaults deliberately run two small-capacity vLLM processes on one NVIDIA GPU with at least 12 GiB VRAM. This environment validates routing, priority, overload behavior, metrics, release artifacts, and the Admin UI; it is not the recommended production topology or production sizing. The Docker gateway path works with Linux Docker Engine and Docker Desktop. The native path requires Linux `amd64` or `arm64`; its local vLLM containers publish loopback ports only. See the [deployment guide](docs/deployment.md) before exposing the gateway outside the host.
 
 ### Prerequisites
 
@@ -342,7 +538,7 @@ make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
-The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the release quick start.
+The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the local demo.
 
 The implementation and deterministic acceptance suite are code-complete. The local-build Docker topology and the real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on an RTX 4070 Ti with two `Qwen/Qwen3-0.6B` services on 2026-08-28. On 2026-08-30, both published v0.1.0 paths—the GHCR image and the checksum-verified Linux `amd64` archive—independently completed real streaming inference through the same two vLLM services and preserved their separate SQLite state across a gateway restart. Repeat compatibility, saturation, and threshold calibration with the selected production model and topology before sign-off.
 

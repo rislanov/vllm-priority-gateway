@@ -1,6 +1,6 @@
 # Production deployment
 
-This guide contains the detailed deployment and post-deployment procedures for Lightweight vLLM Priority Gateway. For the tested first run with two real vLLM servers, start with the canonical [release quick start](../README.md#release-quick-start).
+This guide contains the detailed deployment and post-deployment procedures for vLLM Priority Gateway. For the tested self-contained environment with two real vLLM servers, start with the [local demo](../README.md#local-demo-with-real-vllm).
 
 ## Supported topology
 
