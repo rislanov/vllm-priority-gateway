@@ -1,12 +1,59 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# Lightweight vLLM Priority Gateway
+# vLLM Priority Gateway
+
+**Защищайте высокоприоритетные inference-нагрузки в общих GPU-кластерах vLLM.**
+
+vLLM Priority Gateway — это компактный слой политик и маршрутизации, который устанавливается **перед вашими существующими серверами [vLLM](https://docs.vllm.ai/)**. Приложения продолжают использовать стандартный OpenAI API: достаточно изменить base URL, указать выданный gateway ключ и оставить развёртывание моделей и планирование GPU без изменений.
+
+Gateway:
+
+- назначает приоритет по серверной политике клиента;
+- ограничивает конкурентность и доступ к моделям для каждого клиента;
+- следит за каждым backend vLLM через health- и Prometheus-метрики;
+- направляет запросы на здоровый backend с минимальным pressure;
+- по возможности сохраняет запросы одного агента или диалога на одном backend;
+- ограничивает низкоприоритетную работу при перегрузке общей GPU capacity.
+
+## Где gateway находится в vLLM-кластере
+
+```text
+                    Существующая inference-инфраструктура
+
+ Пользовательский API ────┐
+                          │  llmgw_prod_*     priority: high
+ Coding agents ───────────┼──────────────────────────────────┐
+                          │  llmgw_agents_*   priority: normal
+ Batch / eval jobs ───────┘  llmgw_batch_*    priority: background
+                                                              │
+                                                              ▼
+                                                ┌───────────────────────┐
+                                                │ vLLM Priority Gateway │
+                                                │                       │
+                                                │ auth / policy         │
+                                                │ admission control     │
+                                                │ pressure-aware route  │
+                                                │ session affinity      │
+                                                │ circuit breakers      │
+                                                └───────────┬───────────┘
+                                                            │
+                                        ┌───────────────────┼───────────────────┐
+                                        ▼                   ▼                   ▼
+                                 vLLM GPU node A     vLLM GPU node B     vLLM GPU node C
+                                 :8000               :8000               :8000
+```
+
+Gateway **не** развёртывает модели, не планирует GPU и не заменяет Kubernetes, Slurm или существующие инструменты управления жизненным циклом vLLM. Он определяет, **кто получает общую inference capacity и какой экземпляр vLLM обслуживает каждый запрос**.
+
+Для развёртывания нужны один статический Go-бинарник и один каталог состояния SQLite. Текущая версия намеренно рассчитана на один экземпляр gateway и небольшой статический пул backend-серверов под управлением оператора. Redis, PostgreSQL, message broker, Kubernetes controller и отдельная сборка frontend не требуются.
 
 ## Содержание
 
-- [Что это за продукт](#что-это-за-продукт)
+- [Где gateway находится в vLLM-кластере](#где-gateway-находится-в-vllm-кластере)
+- [Подключение существующего vLLM-кластера](#подключение-существующего-vllm-кластера)
+- [Почему недостаточно Nginx или Kubernetes Service?](#почему-недостаточно-nginx-или-kubernetes-service)
 - [Основные возможности](#основные-возможности)
-- [Быстрый старт из релиза](#быстрый-старт-из-релиза)
+- [Локальный demo с реальным vLLM](#локальный-demo-с-реальным-vllm)
 - [Админка](#админка)
 - [Поведение клиентского API](#поведение-клиентского-api)
 - [Эксплуатация и развёртывание](#эксплуатация-и-развёртывание)
@@ -16,29 +63,178 @@
 - [Текущие ограничения](#текущие-ограничения)
 - [Документация](#документация)
 
-## Что это за продукт
+## Подключение существующего vLLM-кластера
 
-Lightweight vLLM Priority Gateway — это компактный слой управления и маршрутизации перед статическим пулом OpenAI-совместимых серверов [vLLM](https://docs.vllm.ai/). Приложения продолжают использовать обычные OpenAI-клиенты, а операторы централизованно задают приоритет, конкурентность, доступ к моделям, правила маршрутизации и поведение при перегрузке.
-
-Без gateway каждый клиент обращается к vLLM напрямую и потенциально может назначить себе приоритет. С gateway клиент получает API-ключ с ограниченными правами, запрашивает публичное имя модели и не может повысить собственный приоритет. Gateway заменяет модель и приоритет, применяет admission policy, выбирает здоровый backend по текущей нагрузке GPU и сразу начинает передавать потоковый ответ клиенту.
+Предположим, у вас уже работают три сервера vLLM:
 
 ```text
-OpenAI-клиент
-    │ Bearer-ключ llmgw_*
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│ Lightweight vLLM Priority Gateway                       │
-│ auth → доступ к модели → admission → affinity/routing   │
-│ streaming proxy │ health/pressure │ Admin UI/API        │
-│ analytics       │ Prometheus      │ SQLite registry     │
-└───────────────────────────┬──────────────────────────────┘
-                            │ управляемый X-Vllm-Priority
-                   ┌────────┴────────┐
-                   ▼                 ▼
-              vLLM backend A    vLLM backend B
+http://vllm-a.internal:8000
+http://vllm-b.internal:8000
+http://vllm-c.internal:8000
 ```
 
-Для развёртывания нужны один статический Go-бинарник и один каталог состояния SQLite. Текущая версия намеренно рассчитана на один экземпляр gateway и небольшой пул backend-серверов под управлением оператора. Redis, PostgreSQL, message broker, Kubernetes controller и отдельная сборка frontend не требуются.
+Gateway должен иметь доступ к `/health`, `/metrics` и OpenAI-совместимым маршрутам `/v1/*` на каждом сервере.
+
+### 1. Запустите gateway
+
+Создайте `.env` с независимо сгенерированными секретами:
+
+```dotenv
+LLMGW_ADMIN_USERNAME=operator
+LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
+LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+```
+
+Файл должен читаться только операторской учётной записью и не должен попадать в систему контроля версий; репозиторий уже игнорирует `.env`. Загрузите опубликованный образ и запустите gateway в сети, из которой доступны backend-серверы vLLM:
+
+```console
+docker pull ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+docker volume create llmgw-data
+docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+```
+
+Если vLLM работают в Docker-сети, добавьте соответствующий параметр `--network`. В production перед gateway обычно устанавливают существующий TLS reverse proxy или ingress:
+
+```text
+clients
+   │
+   ▼
+https://llm.company.internal
+   │
+   ▼
+vLLM Priority Gateway
+   │
+   ├── vllm-a.internal:8000
+   ├── vllm-b.internal:8000
+   └── vllm-c.internal:8000
+```
+
+Требования к reverse proxy, управлению секретами, backup и systemd описаны в [руководстве по production-развёртыванию](docs/deployment.md).
+
+### 2. Зарегистрируйте существующие серверы vLLM
+
+Откройте `http://127.0.0.1:8080/admin` и создайте пул модели, например:
+
+```text
+Public model:      qwen-coder
+Upstream model:    Qwen/Qwen3-Coder-Next
+```
+
+Затем зарегистрируйте в пуле каждый экземпляр vLLM:
+
+```text
+vllm-a  → http://vllm-a.internal:8000
+vllm-b  → http://vllm-b.internal:8000
+vllm-c  → http://vllm-c.internal:8000
+```
+
+Gateway постоянно опрашивает каждый зарегистрированный URL. При определении доступных backend и минимального pressure он учитывает health, свежесть метрик, количество running и waiting запросов, использование KV cache, состояние circuit breaker и число gateway inflight.
+
+> **Для pressure-aware routing по возможности регистрируйте отдельные экземпляры vLLM или стабильные per-instance endpoints.**
+>
+> Не устанавливайте между gateway и несколькими репликами vLLM непрозрачный round-robin load balancer. Если метрики прочитаны с одной реплики, а inference-запрос отправлен на другую, gateway не сможет принять корректное решение на уровне backend.
+
+В Kubernetes обычно используют отдельные Services, DNS StatefulSet вида `vllm-0.vllm-headless` или другую топологию, в которой gateway может обращаться к каждому serving instance напрямую. Развёртывание моделей и планирование GPU при этом не меняются; в текущей версии backend-серверы регистрируются статически.
+
+### 3. Создайте клиентов и приоритеты
+
+Создайте отдельного клиента gateway для каждого класса нагрузки, разрешите только нужные публичные модели и задайте максимальную конкурентность. Например:
+
+```text
+production-api
+  priority class: high
+  max concurrency: 32
+  models: qwen-coder
+
+developer-agents
+  priority class: normal
+  max concurrency: 16
+  models: qwen-coder
+
+nightly-evals
+  priority class: background
+  max concurrency: 8
+  models: qwen-coder
+```
+
+Назначьте соответствующий целочисленный приоритет vLLM и сгенерируйте API-ключ gateway для каждого клиента. Клиенты не могут повысить свой приоритет: входящие значения удаляются и заменяются политикой, сохранённой в gateway.
+
+### 4. Переключите существующие OpenAI-клиенты на gateway
+
+До:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://vllm-a.internal:8000/v1",
+    api_key="token",
+)
+```
+
+После:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.company.internal/v1",
+    api_key="llmgw_...",
+)
+```
+
+Остальной код приложения не меняется и использует публичное имя модели:
+
+```python
+response = client.chat.completions.create(
+    model="qwen-coder",
+    messages=[{"role": "user", "content": "Review this function."}],
+)
+```
+
+Для каждого запроса gateway выполняет следующую последовательность:
+
+```text
+аутентифицировать клиента
+        ↓
+проверить доступ к модели
+        ↓
+применить server-side priority и overload policy
+        ↓
+выбрать здоровый backend vLLM
+        ↓
+заменить public → upstream имя модели
+        ↓
+передать потоковый ответ клиенту
+```
+
+## Почему недостаточно Nginx или Kubernetes Service?
+
+Обычный HTTP load balancer умеет распределять запросы. Как правило, он не знает:
+
+- какой клиент имеет право использовать общую GPU capacity;
+- какой запрос относится к высокоприоритетной, а какой — к фоновой работе;
+- сколько запросов выполняется и ожидает внутри scheduler каждого vLLM;
+- сколько KV cache использует каждый engine;
+- когда низкоприоритетные запросы нужно отклонить для защиты интерактивной нагрузки;
+- на какой backend направить следующий запрос ради prefix-cache locality.
+
+vLLM Priority Gateway принимает эти решения на основе **политики приложения и текущего состояния inference-серверов**:
+
+```text
+общий GPU-кластер
+
+production requests  ── high ────────┐
+interactive agents   ── normal ──────┼──► общая vLLM capacity
+nightly / eval jobs  ── background ──┘
+
+                         GPU pressure растёт
+
+background traffic ──► ограничивается / 429
+production traffic ──► продолжает приниматься
+```
+
+Именно эту задачу решает gateway.
 
 ## Основные возможности
 
@@ -54,11 +250,11 @@ OpenAI-клиент
 - Встроенные Admin UI и JSON Admin API с Basic auth и CSRF-защитой.
 - Метрики Prometheus и структурированные JSON-логи завершённых запросов.
 
-## Быстрый старт из релиза
+## Локальный demo с реальным vLLM
 
-Это канонический первый запуск опубликованного релиза. Выберите ровно один артефакт gateway: multi-platform образ из GHCR или Linux-бинарник из GitHub Release с проверкой checksum. Оба пути используют один `compose.yaml` для запуска двух реальных vLLM с `Qwen/Qwen3-0.6B`. Ни один release-путь не собирает gateway из checkout: checkout предоставляет только зафиксированную топологию vLLM и пример запроса.
+Нет доступного vLLM-кластера? Этот автономный demo-сценарий использует два реальных vLLM с `Qwen/Qwen3-0.6B` и один опубликованный артефакт gateway: multi-platform образ из GHCR или Linux-бинарник из GitHub Release с проверкой checksum. Ни один путь не собирает gateway из checkout: checkout предоставляет только зафиксированную топологию vLLM и пример запроса.
 
-Проверенные значения намеренно запускают два маломощных процесса vLLM на одной NVIDIA GPU с минимум 12 ГиБ VRAM. Они подходят для проверки маршрутизации и приоритетов, но не являются production sizing. Docker-путь gateway работает в Linux Docker Engine и Docker Desktop. Native-путь требует Linux `amd64` или `arm64`; локальные контейнеры vLLM публикуют порты только на loopback. Перед публикацией gateway за пределы хоста изучите [руководство по развёртыванию](docs/deployment.md).
+Проверенные значения намеренно запускают два маломощных процесса vLLM на одной NVIDIA GPU с минимум 12 ГиБ VRAM. Эта среда проверяет маршрутизацию, приоритеты, поведение при перегрузке, метрики, релизные артефакты и Admin UI; она не является рекомендуемой production-топологией или production sizing. Docker-путь gateway работает в Linux Docker Engine и Docker Desktop. Native-путь требует Linux `amd64` или `arm64`; локальные контейнеры vLLM публикуют порты только на loopback. Перед публикацией gateway за пределы хоста изучите [руководство по развёртыванию](docs/deployment.md).
 
 ### Требования
 
@@ -348,7 +544,7 @@ make build-e2e-linux-amd64
 make container-smoke  # нужен запущенный Docker daemon
 ```
 
-В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть быстрого старта из релиза.
+В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть локального demo.
 
 Реализация и детерминированный acceptance suite завершены. Local-build Docker-топология и real-vLLM режимы smoke, priority/pool-safety и circuit-resilience прошли 28 августа 2026 года на RTX 4070 Ti с двумя сервисами `Qwen/Qwen3-0.6B`. 30 августа 2026 года оба опубликованных пути v0.1.0 — GHCR-образ и Linux `amd64` архив с проверенным checksum — независимо выполнили реальный streaming inference через те же два vLLM и сохранили раздельное SQLite-состояние после перезапуска gateway. Перед production sign-off повторите compatibility, saturation и threshold calibration на выбранной production-модели и топологии.
 
