@@ -759,9 +759,15 @@ func TestPublicObserverCoversNonForwardedOutcomes(t *testing.T) {
 		t.Fatalf("events = %+v", events)
 	}
 	wantStatuses := []int{http.StatusUnauthorized, http.StatusNotFound, http.StatusBadRequest, http.StatusOK}
+	wantReasons := []gateway.DecisionReason{
+		gateway.DecisionInvalidAPIKey, gateway.DecisionInvalidRequest, gateway.DecisionInvalidRequest, "",
+	}
 	for index, want := range wantStatuses {
 		if events[index].Status != want {
 			t.Fatalf("event %d = %+v, want status %d", index, events[index], want)
+		}
+		if events[index].DecisionReason != wantReasons[index] {
+			t.Fatalf("event %d decision reason = %q, want %q", index, events[index].DecisionReason, wantReasons[index])
 		}
 	}
 	if events[3].Client != "client" || events[3].PriorityClass != domain.PriorityHigh {
