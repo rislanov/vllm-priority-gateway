@@ -1082,6 +1082,7 @@ llmgw_requests_rejected_total
 llmgw_client_inflight
 
 llmgw_backend_requests_inflight
+llmgw_backend_selected_total
 llmgw_backend_pressure
 llmgw_backend_running_requests
 llmgw_backend_waiting_requests
@@ -1100,9 +1101,21 @@ llmgw_backend_circuit_failures
 llmgw_pool_gateway_inflight
 llmgw_pool_waiting_requests
 llmgw_pool_available_backends
+llmgw_pool_pressure
+llmgw_pool_state
+
+llmgw_queue_wait_seconds
 ```
 
 `llmgw_backend_circuit_state` uses the bounded numeric encoding `unmanaged/unknown=-1`, `closed=0`, `open=1`, and `half_open=2`. The negative value distinguishes a configured backend that has no managed runtime worker yet from an explicitly closed managed circuit.
+
+`llmgw_pool_state{model,state}` is one-hot over `normal`, `busy`, `saturated`, `emergency`, and `unavailable`. `llmgw_pool_pressure{model}` is the best eligible backend pressure used by pool admission. Both are current-topology gauges and their stale label sets are deleted on pool removal or rename. Backend/runtime/client in-flight gauges use the same topology cleanup; historical counters and histograms are retained.
+
+`llmgw_backend_selected_total{model,backend}` increments for every successful backend lease. The conservative alternate retry therefore increments the selected backend's counter without changing the request count.
+
+`llmgw_queue_wait_seconds{model,priority_class,outcome}` measures gateway pre-dispatch time, not vLLM's internal queue. It starts after stable client/model identity, access-policy validation, and request rewriting, immediately before pool admission. It ends at the first backend lease (`selected`) or terminal admission/selection rejection (`rejected`). Pre-admission failures emit no queue sample, and an alternate retry does not emit a second sample.
+
+`llmgw_requests_rejected_total` uses a gateway-owned bounded `reason`: `pool_waiting_limit`, `pool_inflight_limit`, `priority_concurrency_limit`, `pool_unavailable`, `no_eligible_backend`, `gateway_backpressure`, `model_not_allowed`, `invalid_request`, `invalid_api_key`, `upstream_failure`, or the pre-lifecycle fallback `internal_error`. This internal classification does not change the public OpenAI-compatible error code. In particular, the three overload reasons still return public `429 gateway_overloaded`; dashboards that previously selected `reason="gateway_overloaded"` must migrate to `reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"`.
 
 Labels:
 
@@ -1111,8 +1124,10 @@ client
 model
 backend
 priority_class
-status
+status_class
 reason
+state
+outcome
 ```
 
 Labels containing request IDs and other high-cardinality values should be avoided.
@@ -1137,6 +1152,9 @@ poolState
 backendPressure
 
 httpStatus
+decisionReason
+queueOutcome
+queueWaitMs
 
 duration
 ttft
@@ -1992,6 +2010,17 @@ structured logs
 ```
 
 The Grafana dashboard must show:
+
+The repository-provisioned **Gateway Decisions** dashboard leads with four aligned panels so an operator can read the overload sequence without changing filters:
+
+```promql
+max by (model) (llmgw_pool_pressure{model=~"$model"})
+sum by (reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background"}[$__rate_interval]))
+histogram_quantile(0.95, sum by (le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
+```
+
+This makes the intended claim inspectable: GPU pressure rose, Low was shed with an exact gateway decision, and High latency plus gateway queue wait remained controlled. The dashboard also exposes pool state, request/status mix, client/priority in-flight work, backend pressure/running/waiting, backend selection rate, and circuit state, with bounded model/backend/client/priority filters.
 
 ### Cluster
 

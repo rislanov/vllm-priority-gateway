@@ -35,6 +35,15 @@ export ADMIN_USER='operator'
 export ADMIN_PASSWORD='replace-with-your-password'
 ```
 
+For the canonical local Compose topology, enable live decision telemetry from the same checkout:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+curl -fsS http://127.0.0.1:9090/-/ready
+```
+
+Confirm the `vllm-priority-gateway` target at `http://127.0.0.1:9090/targets`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The first row must be captured over one aligned interval: GPU pool pressure, Low 429 decisions by exact reason, High p95 duration/TTFT, and High selected queue-wait p95. The Grafana `admin` / `admin` default is for loopback development only; override both Grafana credential variables anywhere else.
+
 Run the health, model, and metrics probes below from the gateway host. `VLLM_A` and `VLLM_B` may point to remote serving groups, provided the network policy allows only the intended gateway hosts to reach them.
 
 The native commands below are a two-GPU example. On a single GPU, prefer the canonical Docker Compose topology; if manually sharing the device between native processes, set and calibrate an explicit `--gpu-memory-utilization` for each process rather than referencing a nonexistent second device.
@@ -184,10 +193,10 @@ kill -0 "$LOAD_PID"
   -class-keys "critical=$CRITICAL_KEY,high=$HIGH_KEY,normal=$NORMAL_KEY,background=$BACKGROUND_KEY" \
   -mix critical=10,high=20,normal=30,background=40 -json | tee /tmp/mixed-priority.json
 
-curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds)'
+curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds|pool_pressure|pool_state|backend_selected_total|queue_wait_seconds)'
 ```
 
-Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
+Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; `priority_concurrency_limit` increases for Low while backend selections and both High histograms increase; accepted high-priority requests retain materially better TTFT than queued background traffic. Record the pre-load and loaded High first-byte values and ratio rather than applying an uncalibrated universal threshold.
 
 ## 6. Hysteresis, recovery, and health transitions
 
@@ -278,4 +287,4 @@ Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open 
 
 ## 8. Evidence to retain
 
-Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.
+Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Also retain the Prometheus target state and one Grafana time-window capture that shows pressure rising, Low `priority_concurrency_limit` 429s, and High duration/TTFT plus queue-wait on the same time axis. Record the baseline/loaded High first-byte measurements and ratio. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.

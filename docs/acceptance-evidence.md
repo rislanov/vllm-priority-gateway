@@ -24,7 +24,9 @@ This document maps the source specification's MVP acceptance criteria to repeata
 | A short spike is ignored, sustained overload advances without request polling, and recovery is hysteretic | `TestAdmissionPriorityAndHysteresisAcceptance`, `TestManagerAdvancesPoolHysteresisWithoutSnapshotReads`, all `TestPoolMachine*` tests |
 | A transport failure retries once before response bytes, never after streaming starts | `TestStreamingIsByteExactAndRetryStopsAfterFirstByte`, `TestForwardRetriesOneAlternateBeforeFirstByte`, `TestForwardDoesNotRetryAfterStreamStarts` |
 | Admin auth, CSRF, CRUD publication, backend edit/enable/disable/drain/resume, live key usage, and concurrent one-time key displays work | `TestAdminAuthenticationCSRFCRUDAndOneTimeSecret`, `TestBackendEditPageAndEnableToggle`, `TestOverlappingKeyCreationsKeepSeparateOneTimeSecrets`, `TestAdminSecurityRequiresBasicAuthAndMatchingCSRF`, `TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce` |
-| Metrics use bounded labels, including five circuit/pool runtime families and distinct unmanaged/unknown circuit encoding; completion logs contain policy/result fields without body or secret data | `TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels`, `TestMetricsUnmanagedCircuitEncodingFollowsTopologyLifecycle`, `TestStructuredLoggerWritesSafeCompletionRecord` |
+| Metrics use bounded labels, precise admission reasons, one queue sample, pool pressure/state, backend selections, and distinct unmanaged/unknown circuit encoding; pre-forward HTTP failures retain the same decision vocabulary; completion logs contain decision/queue/policy/result fields without body or secret data | `TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels`, `TestMetricsUnmanagedCircuitEncodingFollowsTopologyLifecycle`, `TestForwardRecordsAdmissionWaitOnceAcrossRetry`, `TestPublicObserverCoversNonForwardedOutcomes`, `TestLoggerIncludesDecisionTelemetry` |
+| The real HTTP admission path increases `priority_concurrency_limit` exactly for rejected lower classes and counts each selected backend lease | `TestAdmissionPriorityAndHysteresisAcceptance` |
+| The optional Prometheus/Grafana overlay pins consumer images, binds loopback ports, uses read-only provisioning, and provides the four-query causal dashboard with bounded filters | `TestObservabilityOverlayAndDashboardContract`, `TestMetricsResponseLookup` |
 | The real-vLLM fault proxy preserves health, metrics, exact headers/status/bytes and incremental streaming while healthy, injects inference-only `503 e2e_injected_failure`, and Admin cleanup attempts every captured pool/backend restore, joins all failures, and continues to later successful restores | `TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx`, `TestAdminMutationCleanupRestoresPoolAndBackends`, opt-in `TestCircuitBreakerRecoveryWithRealVLLM` |
 | Shutdown lets a short stream finish, force-closes a stream after grace expiry, and releases upstream work, monitors, and SQLite | `TestRunLetsActiveStreamFinishInsideGracePeriod`, `TestRunForceClosesActiveStreamAfterGracePeriod`, `TestRunServesHealthAndShutsDownGracefully`, integration harness cleanup checks |
 | Gateway-added fake-backend latency is measured against a warmed direct baseline and the optional engineering budget is enforced | `TestPerformanceSmoke` |
@@ -60,6 +62,19 @@ With a running Docker daemon, verify the non-root scratch image against a fresh 
 ```bash
 make container-smoke
 ```
+
+Validate and start the optional decision-telemetry stack:
+
+```bash
+go test ./tests/compose -run TestObservabilityOverlayAndDashboardContract -count=1
+docker run --rm --entrypoint /bin/promtool \
+  --mount "type=bind,source=$PWD/deploy/observability,target=/etc/llmgw-observability,readonly" \
+  prom/prometheus:v3.14.0 check config /etc/llmgw-observability/prometheus.yml
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml config --quiet
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+```
+
+Prometheus is expected at `http://127.0.0.1:9090`; the provisioned Grafana dashboard is `http://127.0.0.1:3000/d/llmgw-gateway-decisions`.
 
 This container smoke was not executed during the 2026-08-27 local evidence run because the Docker daemon was unavailable. No Docker image/runtime result is claimed by that run.
 

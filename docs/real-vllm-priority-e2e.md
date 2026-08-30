@@ -122,6 +122,14 @@ The Admin UI handles CSRF automatically. Direct JSON Admin API provisioning must
 
 Run from an operator workstation that can reach the public API, Admin API, and metrics endpoint:
 
+For the local Compose topology, start the optional live telemetry stack with the gateway:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+```
+
+Prometheus must show target `vllm-priority-gateway` as up at `http://127.0.0.1:9090/targets`. Open the provisioned dashboard at `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The local Grafana default is `admin` / `admin`; override it through `LLMGW_GRAFANA_ADMIN_USER` and `LLMGW_GRAFANA_ADMIN_PASSWORD` outside a loopback-only test host.
+
 ```bash
 export LLMGW_E2E_MODE=smoke
 export LLMGW_E2E_GATEWAY_URL='https://gateway.example.internal'
@@ -141,7 +149,7 @@ Expected result:
 PASS
 ```
 
-This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state. `/readyz` must remain HTTP 200 management readiness and `/inference-readyz` must be HTTP 200 with `status: "ready"`, at least one available pool, and the expected backend count.
+This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state. `/readyz` must remain HTTP 200 management readiness and `/inference-readyz` must be HTTP 200 with `status: "ready"`, at least one available pool, and the expected backend count. It also requires `llmgw_pool_pressure`, `llmgw_pool_state`, `llmgw_backend_selected_total`, and `llmgw_queue_wait_seconds` in addition to the existing request, backend, circuit, and pool families.
 
 ## 4. Run priority isolation and recovery
 
@@ -169,13 +177,16 @@ go test -count=1 -v -timeout 10m ./tests/e2e
 
 The priority test passes only when all of the following are observed:
 
-1. High streaming requests drive the selected pool into `saturated` or `emergency`, with `GatewayInflight > 0` and `TotalWaiting > 0` in Admin runtime.
-2. By default, `AllBackendsWaiting` is true.
-3. Ordinary Low, Low with a spoofed body/header priority, and Low with a session-affinity header all receive `429`, a positive `Retry-After`, and `gateway_overloaded`.
-4. Separate High and Critical probes receive `200` while the pool is saturated.
-5. A temporary positive `MaxGatewayInflight` at or below observed in-flight work causes a separate Critical request to receive the same bounded pool-safety `429`; after the exact original limit is restored, a complete Critical stream succeeds again.
-6. Immediately after load cancellation, Low remains rejected during hysteresis.
-7. The pool recovers through `busy` to `normal`, and Low is accepted again.
+1. A complete High stream establishes a pre-load first-byte baseline and a pre-load Prometheus snapshot.
+2. High streaming requests drive the selected pool into `saturated` or `emergency`, with `GatewayInflight > 0` and `TotalWaiting > 0` in Admin runtime.
+3. By default, `AllBackendsWaiting` is true.
+4. Ordinary Low, Low with a spoofed body/header priority, and Low with a session-affinity header all receive `429`, a positive `Retry-After`, and public code `gateway_overloaded`.
+5. `llmgw_requests_rejected_total{priority_class="background",reason="priority_concurrency_limit"}` increases by at least three, proving the gateway decision behind those public 429s.
+6. Separate High and Critical probes receive `200` while the pool is saturated. The High request-duration and selected queue-wait histogram counts increase, backend selections increase, and the current pool-pressure sample is positive.
+7. The test logs baseline and loaded High first-byte durations plus their ratio. It intentionally does not encode one universal latency threshold; retain the measured ratio and apply the target deployment's SLO during sign-off.
+8. A temporary positive `MaxGatewayInflight` at or below observed in-flight work causes a separate Critical request to receive the same bounded pool-safety `429`; after the exact original limit is restored, a complete Critical stream succeeds again.
+9. Immediately after load cancellation, Low remains rejected during hysteresis.
+10. The pool recovers through `busy` to `normal`, and Low is accepted again.
 
 The load uses streaming deliberately. A queued non-streaming generation does not deliver response headers until its complete response is ready and can exceed the gateway response-header timeout under deep queues.
 
