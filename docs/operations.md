@@ -113,14 +113,17 @@ Important capacity signals include:
 - `llmgw_pool_available_backends`
 - `llmgw_queue_wait_seconds`
 
-The four dashboard queries that make overload causality visible are:
+The five query expressions behind the four causal dashboard panels are:
 
 ```promql
 max by (model) (llmgw_pool_pressure{model=~"$model"})
-sum by (reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background"}[$__rate_interval]))
-histogram_quantile(0.95, sum by (le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
-histogram_quantile(0.95, sum by (le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
+sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background",reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"}[$__rate_interval]))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_ttft_seconds_bucket{model=~"$model",priority_class="high"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
 ```
+
+The rejection panel intentionally allowlists only gateway overload decisions that return HTTP 429. Every causal query retains `model`, so selecting `All` shows separate pool series instead of correlating pressure from one model with decisions or latency from another.
 
 For a local GPU stack, add `compose.observability.yaml`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. Prometheus listens on `127.0.0.1:9090`; both ports are configurable. The overlay defaults Grafana to `admin` / `admin`, which is acceptable only for a loopback development host and must be overridden elsewhere.
 

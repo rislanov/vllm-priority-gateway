@@ -21,7 +21,8 @@ type grafanaDashboard struct {
 			Datasource struct {
 				UID string `json:"uid"`
 			} `json:"datasource"`
-			Expr string `json:"expr"`
+			Expr         string `json:"expr"`
+			LegendFormat string `json:"legendFormat"`
 		} `json:"targets"`
 	} `json:"panels"`
 }
@@ -121,14 +122,24 @@ func TestObservabilityOverlayAndDashboardContract(t *testing.T) {
 
 	wantQueries := []string{
 		`max by (model) (llmgw_pool_pressure{model=~"$model"})`,
-		`sum by (reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background"}[$__rate_interval]))`,
-		`histogram_quantile(0.95, sum by (le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))`,
-		`histogram_quantile(0.95, sum by (le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))`,
+		`sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background",reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"}[$__rate_interval]))`,
+		`histogram_quantile(0.95, sum by (model, le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))`,
+		`histogram_quantile(0.95, sum by (model, le) (rate(llmgw_ttft_seconds_bucket{model=~"$model",priority_class="high"}[$__rate_interval])))`,
+		`histogram_quantile(0.95, sum by (model, le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))`,
+	}
+	wantLegends := map[string]string{
+		wantQueries[0]: `{{model}}`,
+		wantQueries[1]: `{{model}} · {{reason}}`,
+		wantQueries[2]: `{{model}} · request p95`,
+		wantQueries[3]: `{{model}} · TTFT p95`,
+		wantQueries[4]: `{{model}} · selected p95`,
 	}
 	var queries []string
+	legends := make(map[string]string)
 	for panelIndex, panel := range dashboard.Panels {
 		for _, target := range panel.Targets {
 			queries = append(queries, target.Expr)
+			legends[target.Expr] = target.LegendFormat
 			if target.Datasource.UID != "llmgw-prometheus" {
 				t.Errorf("panel %d target datasource UID = %q", panelIndex, target.Datasource.UID)
 			}
@@ -137,6 +148,8 @@ func TestObservabilityOverlayAndDashboardContract(t *testing.T) {
 	for _, required := range wantQueries {
 		if !slices.Contains(queries, required) {
 			t.Errorf("dashboard is missing causal query %q", required)
+		} else if legends[required] != wantLegends[required] {
+			t.Errorf("causal query %q legend = %q, want %q", required, legends[required], wantLegends[required])
 		}
 	}
 }

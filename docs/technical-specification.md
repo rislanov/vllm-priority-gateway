@@ -2015,12 +2015,13 @@ The repository-provisioned **Gateway Decisions** dashboard leads with four align
 
 ```promql
 max by (model) (llmgw_pool_pressure{model=~"$model"})
-sum by (reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background"}[$__rate_interval]))
-histogram_quantile(0.95, sum by (le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
-histogram_quantile(0.95, sum by (le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
+sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background",reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"}[$__rate_interval]))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_ttft_seconds_bucket{model=~"$model",priority_class="high"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
 ```
 
-This makes the intended claim inspectable: GPU pressure rose, Low was shed with an exact gateway decision, and High latency plus gateway queue wait remained controlled. The dashboard also exposes pool state, request/status mix, client/priority in-flight work, backend pressure/running/waiting, backend selection rate, and circuit state, with bounded model/backend/client/priority filters.
+The Low panel allowlists only the three gateway overload decisions that map to HTTP 429. Every causal query retains `model`, including with the `All` filter, so pools cannot be visually cross-correlated by aggregation. This makes the intended claim inspectable: GPU pressure rose, Low was shed with an exact gateway decision, and High latency plus gateway queue wait remained controlled. The dashboard also exposes pool state, request/status mix, client/priority in-flight work, backend pressure/running/waiting, backend selection rate, and circuit state, with bounded model/backend/client/priority filters.
 
 ### Cluster
 
