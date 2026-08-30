@@ -3,6 +3,7 @@ package observability_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -35,6 +36,27 @@ func TestStructuredLoggerWritesSafeCompletionRecord(t *testing.T) {
 		if strings.Contains(strings.ToLower(text), forbidden) {
 			t.Fatalf("unsafe field %q found in log: %s", forbidden, text)
 		}
+	}
+}
+
+func TestLoggerIncludesDecisionTelemetry(t *testing.T) {
+	var output bytes.Buffer
+	logger := observability.NewLogger(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.Complete(gateway.RequestEvent{
+		DecisionReason: gateway.DecisionPoolWaitingLimit,
+		QueueOutcome:   gateway.QueueRejected,
+		QueueWait:      12 * time.Millisecond,
+	})
+
+	var record map[string]any
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode log record: %v", err)
+	}
+	if record["decisionReason"] != "pool_waiting_limit" || record["queueOutcome"] != "rejected" {
+		t.Fatalf("decision log fields = %+v", record)
+	}
+	if record["queueWaitMs"] != float64(12) {
+		t.Fatalf("queueWaitMs = %#v, want 12", record["queueWaitMs"])
 	}
 }
 

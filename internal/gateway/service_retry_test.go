@@ -240,6 +240,37 @@ func TestForwardCompletesFailedBackendBeforeSelectingAlternateAndBalancesObserve
 	}
 }
 
+func TestForwardRecordsAdmissionWaitOnceAcrossRetry(t *testing.T) {
+	backends := []domain.Backend{
+		retryBackend(20, "gpu-20", "http://gpu-20.invalid"),
+		retryBackend(21, "gpu-21", "http://gpu-21.invalid"),
+	}
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		20: {BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true},
+		21: {BackendID: 21, Healthy: true, MetricsFresh: true, Pressure: .2, CircuitAvailable: true},
+	}}
+	observer := &backendRecordingObserver{}
+	service, request := retryService(backends, runtime, &retryProbeForwarder{beforeAlternate: func() {}}, observer, time.Now)
+
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr != nil {
+		t.Fatalf("Forward() API error = %+v", apiErr)
+	}
+	event := observer.Event()
+	if event.QueueOutcome != gateway.QueueSelected || event.QueueWait < 0 {
+		t.Fatalf("selected queue telemetry = outcome %q wait %s", event.QueueOutcome, event.QueueWait)
+	}
+	if event.DecisionReason != "" {
+		t.Fatalf("successful request decision reason = %q, want empty", event.DecisionReason)
+	}
+	if event.Backend != "gpu-21" {
+		t.Fatalf("retry event backend = %q, want gpu-21", event.Backend)
+	}
+	if got := strings.Join(runtime.Events(), ","); got != "acquire-20,complete-20:failure,acquire-21,complete-21:success" {
+		t.Fatalf("retry lifecycle = %q", got)
+	}
+}
+
 func TestForwardRecordsHTTP5xxFailureWithoutRetry(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{HTTPStatus: http.StatusServiceUnavailable, HTTPBody: `{"error":"busy"}`})
