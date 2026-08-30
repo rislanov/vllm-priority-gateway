@@ -212,33 +212,15 @@ func TestReleaseComposeUsesPublishedGatewayImageWithoutBuildingSource(t *testing
 	const environment = "LLMGW_ADMIN_USERNAME=operator\n" +
 		"LLMGW_ADMIN_PASSWORD=compose-contract-admin-password\n" +
 		"LLMGW_API_KEY_HMAC_SECRET=compose-contract-hmac-secret-at-least-32-bytes\n" +
-		"LLMGW_PORT=18080\n" +
-		"LLMGW_VERSION=0.1.0\n"
+		"LLMGW_PORT=18080\n"
 	if err := os.WriteFile(envPath, []byte(environment), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	command := exec.Command(
-		"docker", "compose",
-		"--project-name", "llmgw-release-contract",
-		"--project-directory", repositoryRoot,
-		"--env-file", envPath,
-		"-f", filepath.Join(repositoryRoot, "compose.yaml"),
-		"-f", filepath.Join(repositoryRoot, "compose.release.yaml"),
-		"config", "--format", "json",
-	)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("render release Compose stack: %v\n%s", err, output)
-	}
-
-	var config renderedCompose
-	if err := json.Unmarshal(output, &config); err != nil {
-		t.Fatalf("decode rendered release Compose configuration: %v\n%s", err, output)
-	}
+	config := renderReleaseCompose(t, repositoryRoot, envPath)
 	gateway := config.Services["gateway"]
-	if gateway.Image != "ghcr.io/rislanov/vllm-priority-gateway:0.1.0" {
-		t.Errorf("gateway image = %q, want published v0.1.0 image", gateway.Image)
+	if gateway.Image != "ghcr.io/rislanov/vllm-priority-gateway:0.2.0" {
+		t.Errorf("gateway image = %q, want published v0.2.0 image", gateway.Image)
 	}
 	if len(gateway.Build) != 0 && string(gateway.Build) != "null" {
 		t.Errorf("release gateway unexpectedly has a build configuration: %s", gateway.Build)
@@ -263,6 +245,57 @@ func TestReleaseComposeUsesPublishedGatewayImageWithoutBuildingSource(t *testing
 			t.Errorf("release %s publishes host ports: %#v", name, ports)
 		}
 	}
+}
+
+func TestReleaseExampleSelectsCurrentPublishedVersion(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not installed")
+	}
+	if err := exec.Command("docker", "compose", "version").Run(); err != nil {
+		t.Skip("docker compose is not available")
+	}
+
+	repositoryRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	example, err := os.ReadFile(filepath.Join(repositoryRoot, ".env.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	environment := strings.Replace(string(example), "LLMGW_ADMIN_PASSWORD=", "LLMGW_ADMIN_PASSWORD=compose-contract-admin-password", 1)
+	environment = strings.Replace(environment, "LLMGW_API_KEY_HMAC_SECRET=", "LLMGW_API_KEY_HMAC_SECRET=compose-contract-hmac-secret-at-least-32-bytes", 1)
+	envPath := filepath.Join(t.TempDir(), "compose.env")
+	if err := os.WriteFile(envPath, []byte(environment), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := renderReleaseCompose(t, repositoryRoot, envPath)
+	if image := config.Services["gateway"].Image; image != "ghcr.io/rislanov/vllm-priority-gateway:0.2.0" {
+		t.Errorf("gateway image from .env.example = %q, want published v0.2.0 image", image)
+	}
+}
+
+func renderReleaseCompose(t *testing.T, repositoryRoot, envPath string) renderedCompose {
+	t.Helper()
+	command := exec.Command(
+		"docker", "compose",
+		"--project-name", "llmgw-release-contract",
+		"--project-directory", repositoryRoot,
+		"--env-file", envPath,
+		"-f", filepath.Join(repositoryRoot, "compose.yaml"),
+		"-f", filepath.Join(repositoryRoot, "compose.release.yaml"),
+		"config", "--format", "json",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render release Compose stack: %v\n%s", err, output)
+	}
+
+	var config renderedCompose
+	if err := json.Unmarshal(output, &config); err != nil {
+		t.Fatalf("decode rendered release Compose configuration: %v\n%s", err, output)
+	}
+	return config
 }
 
 func TestNativeLinuxComposePublishesVLLMOnlyOnLoopback(t *testing.T) {
