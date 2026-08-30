@@ -6,7 +6,7 @@
 
 - [What it is](#what-it-is)
 - [Key capabilities](#key-capabilities)
-- [Docker quick start](#docker-quick-start)
+- [Release quick start](#release-quick-start)
 - [Admin UI](#admin-ui)
 - [Client API behavior](#client-api-behavior)
 - [Operations and deployment](#operations-and-deployment)
@@ -54,31 +54,33 @@ The deployment footprint is one static Go binary and one SQLite state directory.
 - Embedded Basic-authenticated, CSRF-protected Admin UI and JSON Admin API.
 - Prometheus metrics and structured JSON completion logs.
 
-## Docker quick start
+## Release quick start
 
-This is the canonical first-run path. The same `compose.yaml` launches the gateway and two real `Qwen/Qwen3-0.6B` vLLM servers on Linux Docker Engine and Docker Desktop. Compose creates the private network, service DNS, SQLite volume, and shared model cache; only the gateway is published, on `127.0.0.1:8080`.
+This is the canonical first-run path for published releases. Choose exactly one gateway artifact: the multi-platform image from GHCR, or the checksum-verified Linux binary from the GitHub Release. Both paths use the same `compose.yaml` to launch two real `Qwen/Qwen3-0.6B` vLLM servers. The gateway is never built from the checkout in either release path; the checkout supplies only the pinned vLLM topology and the sample request.
 
-The tested defaults deliberately run two small-capacity vLLM processes on one NVIDIA GPU with at least 12 GiB VRAM. They are suitable for validating routing and priority behavior, not production sizing. See the [deployment guide](docs/deployment.md) before exposing the gateway outside the Docker host.
+The tested defaults deliberately run two small-capacity vLLM processes on one NVIDIA GPU with at least 12 GiB VRAM. They are suitable for validating routing and priority behavior, not production sizing. The Docker gateway path works with Linux Docker Engine and Docker Desktop. The native path requires Linux `amd64` or `arm64`; its local vLLM containers publish loopback ports only. See the [deployment guide](docs/deployment.md) before exposing the gateway outside the host.
 
 ### Prerequisites
 
-- Docker Engine with Docker Compose v2, or Docker Desktop using Linux containers.
+- Docker Engine or Docker Desktop using Linux containers, with Docker Compose 2.24.4 or newer.
 - An NVIDIA GPU visible to Docker and a Docker daemon configured for [Compose GPU reservations](https://docs.docker.com/compose/how-tos/gpu-support/).
 - Approximately 25 GiB free disk space for the pinned vLLM image, model weights, and caches.
 - Access to Hugging Face for the public Qwen model. `HF_TOKEN` is optional but avoids anonymous download rate limits.
+- For the native Linux path: `curl`, `tar`, and GNU `sha256sum`.
 
 ### 1. Set local secrets and validate Docker
 
 Clone the repository and open its directory. Create `.env` next to `compose.yaml` from [`.env.example`](.env.example), then fill both blank secrets with independently generated random values:
 
 ```dotenv
+LLMGW_VERSION=0.1.0
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
 LLMGW_PORT=8080
 ```
 
-Keep `.env` readable only by the operator account and never commit it; the repository already ignores it. The remaining values in `.env.example` pin the tested vLLM image, Qwen model, memory fraction, and compatibility runner. Change capacity settings only after the first successful run.
+`LLMGW_VERSION` is the image/archive version without the leading `v`; the corresponding Git tag is `v0.1.0`. Keep `.env` readable only by the operator account and never commit it; the repository already ignores it. The remaining values in `.env.example` pin the tested vLLM image, Qwen model, memory fraction, and compatibility runner. Change capacity settings only after the first successful run.
 
 These commands are identical in Bash and PowerShell:
 
@@ -89,23 +91,71 @@ docker compose run --rm --no-deps --entrypoint nvidia-smi vllm-a
 
 The first command must finish silently. The second must show the intended NVIDIA GPU from inside the pinned vLLM container.
 
-### 2. Build and start the complete stack
+### 2. Choose one release artifact
+
+Do not run both gateway options at the same time: both listen on `127.0.0.1:8080`. Their SQLite state is independent: Docker uses its named volume, while the native path uses `data/release-linux`.
+
+#### Option A: Docker image from GHCR
 
 ```console
-docker compose up -d --build --wait --wait-timeout 900
-docker compose ps
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml config --quiet
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml pull gateway
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml up -d --no-build --wait --wait-timeout 900
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml ps
 ```
 
-`vllm-a` downloads and compiles the model first; `vllm-b` starts after A is healthy and reuses the named Hugging Face cache. The gateway starts only after both inference servers pass `/health`. On a cold machine the image pull and first model initialization can take several minutes.
+`compose.release.yaml` removes the local Docker build and selects `ghcr.io/rislanov/vllm-priority-gateway:${LLMGW_VERSION}`. `vllm-a` downloads and compiles the model first; `vllm-b` starts after A is healthy and reuses the named Hugging Face cache. The release gateway starts only after both inference servers pass `/health`. On a cold machine the image pull and first model initialization can take several minutes.
 
 The optional `probe` service provides a pinned curl client inside the private Compose network, so host curl, jq, shell variables, and platform-specific quoting are not required:
 
 ```console
-docker compose run --rm --no-deps probe -fsS http://gateway:8080/healthz
-docker compose run --rm --no-deps probe -fsS http://gateway:8080/readyz
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/healthz
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/readyz
 ```
 
 `/readyz` confirms management-plane readiness. It deliberately remains healthy before model pools are configured.
+
+#### Option B: native Linux binary from GitHub Release
+
+Start only the two local inference servers. `compose.native.yaml` publishes them on loopback so the host process can reach them without exposing vLLM to the LAN:
+
+```console
+docker compose --env-file .env -f compose.yaml -f compose.native.yaml config --quiet
+docker compose --env-file .env -f compose.yaml -f compose.native.yaml up -d --wait --wait-timeout 900 vllm-a vllm-b
+docker compose --env-file .env -f compose.yaml -f compose.native.yaml ps
+```
+
+Download the archive for the current Linux architecture and verify it against the release manifest before extraction:
+
+```bash
+VERSION=0.1.0
+case "$(uname -m)" in
+  x86_64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+ASSET="vllm-priority-gateway_${VERSION}_linux_${ARCH}.tar.gz"
+BASE_URL="https://github.com/rislanov/vllm-priority-gateway/releases/download/v${VERSION}"
+RELEASE_DIR="$PWD/dist/release-${VERSION}"
+mkdir -p "$RELEASE_DIR" &&
+curl --fail --location --remove-on-error --output "$RELEASE_DIR/$ASSET" "$BASE_URL/$ASSET" &&
+curl --fail --location --remove-on-error --output "$RELEASE_DIR/SHA256SUMS" "$BASE_URL/SHA256SUMS" &&
+(cd "$RELEASE_DIR" && sha256sum --check --ignore-missing SHA256SUMS) &&
+tar --extract --gzip --file "$RELEASE_DIR/$ASSET" --directory "$RELEASE_DIR"
+```
+
+The checksum command must print `./$ASSET: OK`. Start the binary in the foreground with a separate SQLite directory; keep this terminal open and use a second terminal for the remaining steps:
+
+```bash
+install -d -m 0750 "$PWD/data/release-linux"
+set -a
+. ./.env
+set +a
+export LLMGW_LISTEN_ADDRESS=127.0.0.1:8080
+export LLMGW_DATABASE_PATH="$PWD/data/release-linux/llmgw.db"
+"$RELEASE_DIR/gateway"
+```
 
 ### 3. Configure the gateway in Admin
 
@@ -120,8 +170,8 @@ Create resources in this order:
    - **Max waiting:** `8`
    - **Enabled:** checked
 2. Create two backends in the same pool:
-   - **Name:** `vllm-a`; **URL:** `http://vllm-a:8000`
-   - **Name:** `vllm-b`; **URL:** `http://vllm-b:8000`
+   - Docker gateway: **Name:** `vllm-a`; **URL:** `http://vllm-a:8000`, and **Name:** `vllm-b`; **URL:** `http://vllm-b:8000`
+   - Native Linux gateway: **Name:** `vllm-a`; **URL:** `http://127.0.0.1:8001`, and **Name:** `vllm-b`; **URL:** `http://127.0.0.1:8002`
    - For both: **Capacity hint:** `1`; **Running soft limit:** `1`; **Enabled:** checked
 3. Open **Clients → Create client**:
    - **Name:** `production-app`
@@ -132,39 +182,57 @@ Create resources in this order:
    - **Enabled:** checked
 4. Open **API Keys**, select `production-app`, optionally set an expiry date, and choose **Generate API key**. Copy the full `llmgw_*` value immediately; it is shown only once.
 
-The service names above are Compose DNS records, not host aliases. vLLM has no published host port and remains reachable only by other services in this stack.
+The Docker gateway uses private Compose DNS. The native gateway uses the loopback-only ports from `compose.native.yaml`; neither path exposes unauthenticated vLLM endpoints to the LAN.
 
 ### 4. Verify real inference
 
 After the monitor has polled both backends, inference readiness must return HTTP 200 and report two available backends:
 
 ```console
-docker compose run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
 ```
+
+For native Linux, run `curl -fsS http://127.0.0.1:8080/inference-readyz` instead. Wait until the response reports `"backendAvailability":2`; allow one more monitor interval before sending automated traffic.
 
 Replace the placeholder below with the one-time client key and list the public models:
 
 ```console
-docker compose run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
+```
+
+For native Linux:
+
+```bash
+export LLMGW_CLIENT_KEY='llmgw_replace-with-the-generated-key'
+curl -fsS http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $LLMGW_CLIENT_KEY"
 ```
 
 Send the checked-in streaming request body from [`examples/quickstart-chat.json`](examples/quickstart-chat.json):
 
 ```console
-docker compose run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
+```
+
+For native Linux:
+
+```bash
+curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary "@examples/quickstart-chat.json"
 ```
 
 The stream must end with `data: [DONE]`. The client uses public model `qwen`; the gateway authenticates it, applies the stored priority, rewrites the upstream model to `qwen-test`, and selects one of the two healthy vLLM services.
 
-Useful lifecycle commands are also host-independent:
+For the Docker gateway path:
 
 ```console
-docker compose logs -f gateway
-docker compose stop
-docker compose down
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml logs -f gateway
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml stop
+docker compose --env-file .env -f compose.yaml -f compose.release.yaml down
 ```
 
-`docker compose down` preserves the SQLite and cache volumes. Use `docker compose down --volumes` only when intentionally deleting all Quick Start state and cached model data.
+For native Linux, stop the foreground gateway with `Ctrl-C`, then stop the local backends with `docker compose --env-file .env -f compose.yaml -f compose.native.yaml down`. The SQLite file remains under `data/release-linux`; Docker's named Hugging Face cache also remains. Add `--volumes` only when intentionally deleting the Docker gateway state or cached model data.
 
 ## Admin UI
 
@@ -262,9 +330,9 @@ make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
 ```
 
-The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the Docker quick start.
+The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the release quick start.
 
-The implementation and deterministic acceptance suite are code-complete. The canonical Docker Quick Start and the real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on an RTX 4070 Ti with two `Qwen/Qwen3-0.6B` services on 2026-08-28. Repeat compatibility, saturation, and threshold calibration with the selected production model and topology before sign-off.
+The implementation and deterministic acceptance suite are code-complete. The local-build Docker topology and the real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on an RTX 4070 Ti with two `Qwen/Qwen3-0.6B` services on 2026-08-28. On 2026-08-30, both published v0.1.0 paths—the GHCR image and the checksum-verified Linux `amd64` archive—independently completed real streaming inference through the same two vLLM services and preserved their separate SQLite state across a gateway restart. Repeat compatibility, saturation, and threshold calibration with the selected production model and topology before sign-off.
 
 ## CI and releases
 
