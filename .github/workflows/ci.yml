@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    name: Unit tests and builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests
+        run: go test -count=1 ./cmd/... ./internal/...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build gateway binary
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o dist/gateway ./cmd/gateway
+
+      - name: Build Docker image
+        run: docker build --tag vllm-priority-gateway:ci .

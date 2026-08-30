@@ -12,6 +12,7 @@
 - [Operations and deployment](#operations-and-deployment)
 - [Admin API](#admin-api)
 - [Development and testing](#development-and-testing)
+- [CI and releases](#ci-and-releases)
 - [Current scope and limitations](#current-scope-and-limitations)
 - [Documentation](#documentation)
 
@@ -264,6 +265,23 @@ make container-smoke  # requires a running Docker daemon
 The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the Docker quick start.
 
 The implementation and deterministic acceptance suite are code-complete. The canonical Docker Quick Start and the real-vLLM smoke, priority/pool-safety, and circuit-resilience modes passed on an RTX 4070 Ti with two `Qwen/Qwen3-0.6B` services on 2026-08-28. Repeat compatibility, saturation, and threshold calibration with the selected production model and topology before sign-off.
+
+## CI and releases
+
+Pull requests and pushes to `main` automatically run the unit tests, `go vet`, a gateway binary build, and a Docker image build. They never publish artifacts or images.
+
+Releases are manual and use the newest existing stable SemVer tag reachable from `main`:
+
+```bash
+git tag -a v1.2.3 -m "v1.2.3"
+git push origin v1.2.3
+```
+
+In GitHub, open **Actions → Release → Run workflow**, enter the tag, and start the run. Releases are serialized, and an older tag is rejected so it cannot move `latest`, major, or minor image aliases backwards. The workflow publishes Linux `amd64` and `arm64` gateway archives plus `SHA256SUMS` to a GitHub Release. It also publishes the multi-platform image as `ghcr.io/rislanov/vllm-priority-gateway:1.2.3`, `:1.2`, `:1`, and `:latest`. Version numbers are derived exclusively from the selected tag.
+
+If a run is interrupted after creating its draft release, run the same tag again; the workflow validates and refreshes the matching draft before resuming. Configure a repository ruleset that prevents updates and deletion of stable `v*` tags. The workflow verifies the remote tag immediately before publishing the image and again before publishing the draft, but the ruleset is the durable protection against a tag changing during a release.
+
+GitHub Container Registry packages can be private after their first publication. If anonymous pulls are required, change the package visibility to public once in the package settings.
 
 ## Current scope and limitations
 
