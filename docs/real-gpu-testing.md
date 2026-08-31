@@ -20,7 +20,7 @@ Use a lower-priority saturation workload when the evidence target is the causal 
 
 ## Recorded v0.1.0 release-artifact evidence
 
-On 2026-08-30 the [local demo](../README.md#local-demo-with-real-vllm) was validated independently with both published gateway artifacts against two real `vllm/vllm-openai:v0.28.0` services serving `Qwen/Qwen3-0.6B` on the same RTX 4070 Ti. The Docker path pulled `ghcr.io/rislanov/vllm-priority-gateway:0.1.0` without a source build. The native path downloaded the GitHub Release Linux `amd64` archive inside a clean Ubuntu 24.04 container and verified it with the published `SHA256SUMS` before extraction. Each path used separate SQLite state, reached two healthy and metrics-fresh backends, completed a streaming chat request through the gateway with `data: [DONE]`, and retained its configuration and inference readiness after restarting only the gateway.
+On 2026-08-30 the [local demo](local-demo.md) was validated independently with both published gateway artifacts against two real `vllm/vllm-openai:v0.28.0` services serving `Qwen/Qwen3-0.6B` on the same RTX 4070 Ti. The Docker path pulled `ghcr.io/rislanov/vllm-priority-gateway:0.1.0` without a source build. The native path downloaded the GitHub Release Linux `amd64` archive inside a clean Ubuntu 24.04 container and verified it with the published `SHA256SUMS` before extraction. Each path used separate SQLite state, reached two healthy and metrics-fresh backends, completed a streaming chat request through the gateway with `data: [DONE]`, and retained its configuration and inference readiness after restarting only the gateway.
 
 ## 1. Prerequisites
 

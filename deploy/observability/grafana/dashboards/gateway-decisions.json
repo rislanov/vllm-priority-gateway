@@ -252,7 +252,7 @@
           "refId": "B"
         }
       ],
-      "title": "3 · High latency stays stable",
+      "title": "3 · High traffic remains admitted",
       "type": "timeseries"
     },
     {
