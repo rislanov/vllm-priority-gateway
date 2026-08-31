@@ -76,10 +76,7 @@ func (p *Proxy) Forward(ctx context.Context, downstream http.ResponseWriter, req
 	result := Result{BackendID: target.Backend.ID}
 	for attempt := 0; attempt < 2; attempt++ {
 		excluded[target.Backend.ID] = struct{}{}
-		attemptResult, retryable, outcome := p.forwardOnce(ctx, downstream, request, target, started)
-		if target.Complete != nil {
-			target.Complete(outcome)
-		}
+		attemptResult, retryable := p.forwardAttempt(ctx, downstream, request, target, started)
 		attemptResult.RetryCount = result.RetryCount
 		result = attemptResult
 		if !retryable || attempt == 1 || request.SelectAlternate == nil {
@@ -94,6 +91,40 @@ func (p *Proxy) Forward(ctx context.Context, downstream http.ResponseWriter, req
 		target = next
 	}
 	return result
+}
+
+func (p *Proxy) forwardAttempt(
+	ctx context.Context,
+	downstream http.ResponseWriter,
+	request Request,
+	target Target,
+	started time.Time,
+) (result Result, retryable bool) {
+	completed := false
+	defer func() {
+		panicValue := recover()
+		if panicValue == nil {
+			return
+		}
+		if !completed && target.Complete != nil {
+			completed = true
+			invokeCompletionAfterPanic(target.Complete)
+		}
+		panic(panicValue)
+	}()
+
+	var outcome domain.InferenceOutcome
+	result, retryable, outcome = p.forwardOnce(ctx, downstream, request, target, started)
+	if target.Complete != nil {
+		completed = true
+		target.Complete(outcome)
+	}
+	return result, retryable
+}
+
+func invokeCompletionAfterPanic(complete func(domain.InferenceOutcome)) {
+	defer func() { _ = recover() }()
+	complete(domain.InferenceNeutral)
 }
 
 func (p *Proxy) forwardOnce(

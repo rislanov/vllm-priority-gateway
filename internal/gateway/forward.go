@@ -32,6 +32,8 @@ type forwardLifecycle struct {
 	admissionStarted    time.Time
 	event               RequestEvent
 	reservationRollback func()
+	targetsMu           sync.Mutex
+	targetCompletions   []func(domain.InferenceOutcome)
 }
 
 func (l *forwardLifecycle) finish(result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
@@ -62,13 +64,31 @@ func (l *forwardLifecycle) finish(result proxy.Result, reservation ResponseCompl
 }
 
 func (l *forwardLifecycle) rollbackOnPanic() {
-	if l.reservationRollback == nil {
+	panicValue := recover()
+	if panicValue == nil {
 		return
 	}
-	if panicValue := recover(); panicValue != nil {
-		l.reservationRollback()
-		panic(panicValue)
+	l.targetsMu.Lock()
+	targetCompletions := append([]func(domain.InferenceOutcome){}, l.targetCompletions...)
+	l.targetsMu.Unlock()
+	for _, complete := range targetCompletions {
+		invokePanicCleanup(func() { complete(domain.InferenceNeutral) })
 	}
+	if l.reservationRollback != nil {
+		invokePanicCleanup(l.reservationRollback)
+	}
+	panic(panicValue)
+}
+
+func (l *forwardLifecycle) registerTarget(complete func(domain.InferenceOutcome)) {
+	l.targetsMu.Lock()
+	l.targetCompletions = append(l.targetCompletions, complete)
+	l.targetsMu.Unlock()
+}
+
+func invokePanicCleanup(cleanup func()) {
+	defer func() { _ = recover() }()
+	cleanup()
 }
 
 type resolvedForwardRequest struct {
@@ -174,14 +194,24 @@ func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, 
 		if err != nil {
 			return proxy.Target{}, err
 		}
+		backendInflight := s.inflight
+		backendInflight.Backend = candidate.Backend.Name
 		completeBackend, acquired := s.service.runtime.AcquireBackend(candidate.Backend, selectionTime)
 		if !acquired {
 			excluded[candidate.Backend.ID] = struct{}{}
 			continue
 		}
+		var once sync.Once
+		completeTarget := func(outcome domain.InferenceOutcome) {
+			once.Do(func() {
+				if s.service.observer != nil {
+					defer s.service.observer.BackendInflight(backendInflight, -1)
+				}
+				completeBackend(outcome)
+			})
+		}
+		s.lifecycle.registerTarget(completeTarget)
 		secret, _ := s.service.upstreamSecret(candidate.Backend)
-		backendInflight := s.inflight
-		backendInflight.Backend = candidate.Backend.Name
 		s.lifecycle.event.Backend = candidate.Backend.Name
 		s.lifecycle.event.BackendPressure = candidate.Pressure
 		if s.lifecycle.event.QueueOutcome == "" {
@@ -191,17 +221,9 @@ func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, 
 		if s.service.observer != nil {
 			s.service.observer.BackendInflight(backendInflight, 1)
 		}
-		var once sync.Once
 		return proxy.Target{
 			Backend: candidate.Backend, UpstreamAPIKey: secret,
-			Complete: func(outcome domain.InferenceOutcome) {
-				once.Do(func() {
-					completeBackend(outcome)
-					if s.service.observer != nil {
-						s.service.observer.BackendInflight(backendInflight, -1)
-					}
-				})
-			},
+			Complete: completeTarget,
 		}, nil
 	}
 }

@@ -578,6 +578,38 @@ func TestForwardCompletesEverySelectedTargetExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestForwardCompletesTargetWhenAttemptPanics(t *testing.T) {
+	panicValue := &struct{ message string }{message: "transport panic"}
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		panic(panicValue)
+	})}
+	var completions atomic.Int64
+	var outcome domain.InferenceOutcome
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		proxy.New(client).Forward(context.Background(), newObservingWriter(), proxy.Request{
+			Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+			Target: proxy.Target{
+				Backend: backend(1, "http://backend.invalid"),
+				Complete: func(value domain.InferenceOutcome) {
+					completions.Add(1)
+					outcome = value
+					panic("completion panic")
+				},
+			},
+		})
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	if completions.Load() != 1 || outcome != domain.InferenceNeutral {
+		t.Fatalf("panic completion = count %d outcome %q, want one neutral completion", completions.Load(), outcome)
+	}
+}
+
 func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 	failing := fakevllm.New()
 	failing.SetState(fakevllm.State{Tokens: []string{"one", "two"}, ResetMode: fakevllm.ResetAfterChunks, ResetAfterChunks: 1})
