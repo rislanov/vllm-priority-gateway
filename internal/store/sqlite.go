@@ -27,6 +27,20 @@ var migrations = []struct {
 	{version: 3, path: "migrations/003_usage_analytics.sql"},
 }
 
+const sqlitePragmas = "?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"
+
+func sqliteDSN(path string) (string, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve SQLite path: %w", err)
+	}
+	urlPath := filepath.ToSlash(absolutePath)
+	if filepath.VolumeName(absolutePath) != "" && !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	return (&url.URL{Scheme: "file", Path: urlPath}).String() + sqlitePragmas, nil
+}
+
 type SQLite struct {
 	db   *sql.DB
 	path string
@@ -51,12 +65,10 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 		return nil, fmt.Errorf("secure SQLite file permissions: %w", err)
 	}
 
-	absolutePath, err := filepath.Abs(path)
+	dsn, err := sqliteDSN(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve SQLite path: %w", err)
+		return nil, err
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolutePath)}).String() +
-		"?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite: %w", err)
