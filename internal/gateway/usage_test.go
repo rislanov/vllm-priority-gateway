@@ -364,6 +364,46 @@ func TestForwardPanicRollsBackCompletionReservation(t *testing.T) {
 	}
 }
 
+func TestForwardFinalizationPanicRollsBackCompletionReservation(t *testing.T) {
+	tests := []struct {
+		name             string
+		panicStage       bool
+		panicComplete    bool
+		wantCompleteCall int
+	}{
+		{name: "reservation staging", panicStage: true},
+		{name: "observer completion", panicComplete: true, wantCompleteCall: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			panicValue := &struct{ name string }{name: test.name}
+			observer := &finalizationPanicObserver{
+				panicValue: panicValue, panicStage: test.panicStage, panicComplete: test.panicComplete,
+			}
+			service, rawKey := newUsageTestService(t, &completionForwarder{}, observer, nil, nil)
+
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				_, _, _ = service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+					Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+					Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "finalization-panic",
+				})
+			}()
+
+			if recovered != panicValue {
+				t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+			}
+			reserves, stages, completes, rollbacks := observer.Counts()
+			if reserves != 1 || stages != 1 || completes != test.wantCompleteCall || rollbacks != 1 {
+				t.Fatalf("finalization calls = reserve %d stage %d complete %d rollback %d, want 1/1/%d/1",
+					reserves, stages, completes, rollbacks, test.wantCompleteCall)
+			}
+		})
+	}
+}
+
 func TestRequestEventUsageCompletePublicUsesCompletionClock(t *testing.T) {
 	completed := time.Date(2026, time.August, 27, 19, 25, 0, 0, time.FixedZone("CEST", 2*60*60))
 	observer := &usageRecordingObserver{}
@@ -397,6 +437,68 @@ type panickingUsageForwarder struct {
 
 func (f panickingUsageForwarder) Forward(context.Context, http.ResponseWriter, proxy.Request) proxy.Result {
 	panic(f.value)
+}
+
+type finalizationPanicObserver struct {
+	mu            sync.Mutex
+	panicValue    any
+	panicStage    bool
+	panicComplete bool
+	reserves      int
+	stages        int
+	completes     int
+	rollbacks     int
+}
+
+func (o *finalizationPanicObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	o.mu.Lock()
+	o.reserves++
+	o.mu.Unlock()
+	return finalizationPanicReservation{observer: o}, func() {
+		o.mu.Lock()
+		o.rollbacks++
+		o.mu.Unlock()
+	}, true
+}
+
+func (*finalizationPanicObserver) ResponseComplete(gateway.ResponseCompleteReservation) {}
+
+func (*finalizationPanicObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*finalizationPanicObserver) BackendInflight(gateway.InflightEvent, int) {}
+
+func (o *finalizationPanicObserver) Complete(gateway.RequestEvent) {
+	o.mu.Lock()
+	o.completes++
+	shouldPanic := o.panicComplete
+	panicValue := o.panicValue
+	o.mu.Unlock()
+	if shouldPanic {
+		panic(panicValue)
+	}
+}
+
+func (o *finalizationPanicObserver) Counts() (reserves, stages, completes, rollbacks int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.reserves, o.stages, o.completes, o.rollbacks
+}
+
+type finalizationPanicReservation struct {
+	observer *finalizationPanicObserver
+}
+
+func (r finalizationPanicReservation) StageResponseComplete(gateway.RequestEvent) {
+	r.observer.mu.Lock()
+	r.observer.stages++
+	shouldPanic := r.observer.panicStage
+	panicValue := r.observer.panicValue
+	r.observer.mu.Unlock()
+	if shouldPanic {
+		panic(panicValue)
+	}
 }
 
 type rollbackTrackingRecorder struct {

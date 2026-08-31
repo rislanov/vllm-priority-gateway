@@ -240,6 +240,31 @@ func TestForwardCompletesFailedBackendBeforeSelectingAlternateAndBalancesObserve
 	}
 }
 
+func TestForwardCompletesAcquiredTargetExactlyOnce(t *testing.T) {
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	runtime := &duplicateCompletionRuntime{value: domain.BackendRuntime{
+		BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true,
+	}}
+	observer := &backendRecordingObserver{}
+	service, request := retryService(
+		[]domain.Backend{backend}, runtime, duplicateCompletionForwarder{}, observer, time.Now,
+	)
+
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr != nil || result.Status != http.StatusOK {
+		t.Fatalf("Forward() result=%+v API error=%+v", result, apiErr)
+	}
+	if got := runtime.Completions(); len(got) != 1 || got[0] != domain.InferenceFailure {
+		t.Fatalf("runtime completions = %v, want one failure from first callback", got)
+	}
+	if got := runtime.Inflight(); got != 0 {
+		t.Fatalf("runtime inflight = %d, want 0", got)
+	}
+	if got := observer.Deltas(); strings.Join(got, ",") != "gpu-20:+1,gpu-20:-1" {
+		t.Fatalf("backend observer deltas = %v, want one balanced increment/decrement", got)
+	}
+}
+
 func TestForwardRecordsAdmissionWaitOnceAcrossRetry(t *testing.T) {
 	backends := []domain.Backend{
 		retryBackend(20, "gpu-20", "http://gpu-20.invalid"),
@@ -382,6 +407,55 @@ type recordingRuntime struct {
 	poolInflight       map[int64]int
 }
 
+type duplicateCompletionRuntime struct {
+	mu          sync.Mutex
+	value       domain.BackendRuntime
+	inflight    int
+	completions []domain.InferenceOutcome
+}
+
+func (r *duplicateCompletionRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
+	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal, AvailableBackends: 1}
+}
+
+func (*duplicateCompletionRuntime) AcquirePool(int64, int) (func(), bool) {
+	return func() {}, true
+}
+
+func (r *duplicateCompletionRuntime) Snapshot(int64, time.Time) domain.BackendRuntime {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.value
+}
+
+func (r *duplicateCompletionRuntime) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
+	r.mu.Lock()
+	if expected.ID != r.value.BackendID {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.inflight++
+	r.mu.Unlock()
+	return func(outcome domain.InferenceOutcome) {
+		r.mu.Lock()
+		r.completions = append(r.completions, outcome)
+		r.inflight--
+		r.mu.Unlock()
+	}, true
+}
+
+func (r *duplicateCompletionRuntime) Completions() []domain.InferenceOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]domain.InferenceOutcome(nil), r.completions...)
+}
+
+func (r *duplicateCompletionRuntime) Inflight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inflight
+}
+
 func (r *recordingRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
 	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal, AvailableBackends: len(r.values)}
 }
@@ -519,6 +593,15 @@ type completionForwarder struct {
 	calls     int
 }
 
+type duplicateCompletionForwarder struct{}
+
+func (duplicateCompletionForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
+	request.Target.Complete(domain.InferenceSuccess)
+	writer.WriteHeader(http.StatusOK)
+	return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
+}
+
 func (f *completionForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
 	f.mu.Lock()
 	f.backendID = request.Target.Backend.ID
@@ -580,7 +663,7 @@ func retryBackend(id int64, name, baseURL string) domain.Backend {
 	}
 }
 
-func retryService(backends []domain.Backend, runtime *recordingRuntime, forwarder gateway.Forwarder, observer gateway.Observer, now func() time.Time) (*gateway.Service, gateway.ForwardRequest) {
+func retryService(backends []domain.Backend, runtime gateway.Runtime, forwarder gateway.Forwarder, observer gateway.Observer, now func() time.Time) (*gateway.Service, gateway.ForwardRequest) {
 	secret := []byte(strings.Repeat("s", 32))
 	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
 	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}
