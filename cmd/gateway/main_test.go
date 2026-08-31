@@ -26,10 +26,12 @@ import (
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
+	"github.com/rislanov/vllm-priority-gateway/internal/config"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
+	"github.com/rislanov/vllm-priority-gateway/internal/monitor"
 	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
@@ -92,6 +94,72 @@ func TestCloseRecorderStoreDefersStoreCloseUntilRecorderDone(t *testing.T) {
 	case <-store.closed:
 	case <-time.After(time.Second):
 		t.Fatal("store did not close after recorder worker completed")
+	}
+}
+
+func TestGatewayApplicationCloseReturnsStoredOutcomeWithoutRepeatingCleanup(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "gateway.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRecorder := analytics.NewRecorder(database, 0, nil, nil)
+	_, release, reserved := requestRecorder.ReserveResponseComplete(ctx, "held-open")
+	if !reserved {
+		t.Fatal("reserve recorder lifecycle")
+	}
+	apiKeyUsage := newAPIKeyUsageRecorder(ctx, &keyUsageStoreStub{})
+	manager := monitor.NewManager(ctx, monitor.Options{})
+	application := &gatewayApplication{
+		database: database, requestRecorder: requestRecorder, apiKeyUsage: apiKeyUsage,
+		manager: manager, transport: &http.Transport{},
+	}
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-requestRecorder.Done():
+		case <-time.After(time.Second):
+			t.Fatal("request recorder did not stop")
+		}
+		_ = database.Close()
+		manager.Shutdown()
+		apiKeyUsage.Close()
+	})
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	first := application.Close(canceled)
+	if !errors.Is(first, context.Canceled) {
+		t.Fatalf("first Close() error = %v, want context cancellation", first)
+	}
+
+	secondCtx, secondCancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer secondCancel()
+	second := application.Close(secondCtx)
+	if second != first {
+		t.Fatalf("second Close() error = %v, want exact stored outcome %v", second, first)
+	}
+}
+
+func TestNewGatewayApplicationReturnsHandlerConstructionErrorAfterCleanup(t *testing.T) {
+	cfg, err := config.Load(mapLookup(map[string]string{
+		"LLMGW_DATABASE_PATH":       filepath.Join(t.TempDir(), "gateway.sqlite"),
+		"LLMGW_ADMIN_USERNAME":      "operator",
+		"LLMGW_ADMIN_PASSWORD":      "correct horse battery staple",
+		"LLMGW_API_KEY_HMAC_SECRET": strings.Repeat("s", 32),
+		"LLMGW_ANALYTICS_RETENTION": "0s",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.APIKeyHMACSecret = []byte("short")
+
+	application, err := newGatewayApplication(context.Background(), cfg, mapLookup(nil), io.Discard)
+	if application != nil {
+		t.Fatal("newGatewayApplication() returned an application after construction failed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "admin API-key HMAC secret must contain at least 32 bytes") {
+		t.Fatalf("newGatewayApplication() error = %v", err)
 	}
 }
 
