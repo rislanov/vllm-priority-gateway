@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
-	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 )
 
@@ -340,34 +339,14 @@ func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
 			data.Error = "Invalid form submission"
 		} else {
-			input, err := clientInput(request)
-			if err != nil {
-				data.Error = err.Error()
-			} else if request.Form.Get("action") == "update" {
-				id, parseErr := positiveID(request.Form.Get("id"))
-				if parseErr != nil {
-					data.Error = parseErr.Error()
-				} else {
-					_, data.Error = valueError(h.service.UpdateClient(request.Context(), id, input))
-				}
-			} else {
-				_, data.Error = valueError(h.service.CreateClient(request.Context(), input))
-			}
+			data.Error = h.mutateClient(request)
 		}
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
 	}
 	if rawID := request.URL.Query().Get("edit"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, client := range h.service.View().Clients {
-				if client.ID == id {
-					copy := client
-					data.EditClient = &copy
-					break
-				}
-			}
-		}
+		data.EditClient = editClient(h.service.View(), rawID)
 	}
 	status := http.StatusOK
 	if data.Error != "" {
@@ -382,31 +361,12 @@ func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
 			data.Error = "Invalid form submission"
 		} else {
-			id, err := positiveID(request.Form.Get(map[bool]string{true: "key_id", false: "client_id"}[request.Form.Get("action") == "revoke"]))
-			if err != nil {
-				data.Error = err.Error()
-			} else if request.Form.Get("action") == "revoke" {
-				data.Error = errorText(h.service.RevokeKey(request.Context(), id))
-			} else {
-				input := httpapi.KeyInput{}
-				if raw := request.Form.Get("expires_at"); raw != "" {
-					expires, parseErr := time.Parse("2006-01-02", raw)
-					if parseErr != nil {
-						data.Error = "Expiry must be a valid date"
-					} else {
-						input.ExpiresAt = &expires
-					}
-				}
-				if data.Error == "" {
-					created, createErr := h.service.CreateKey(request.Context(), id, input)
-					data.Error = errorText(createErr)
-					if createErr == nil {
-						nonce := h.putSecret(httpapi.AdminCSRFToken(request), created.ID, created.Secret)
-						http.Redirect(writer, request, "/admin/keys?flash="+nonce, http.StatusSeeOther)
-						return
-					}
-				}
+			redirect, errorText := h.mutateKey(request)
+			if redirect != "" {
+				http.Redirect(writer, request, redirect, http.StatusSeeOther)
+				return
 			}
+			data.Error = errorText
 		}
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
@@ -486,69 +446,16 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
 			data.Error = "Invalid form submission"
 		} else {
-			switch request.Form.Get("action") {
-			case "create_pool", "update_pool":
-				input, err := poolInput(request)
-				if err != nil {
-					data.Error = err.Error()
-				} else if request.Form.Get("action") == "update_pool" {
-					id, err := positiveID(request.Form.Get("id"))
-					if err != nil {
-						data.Error = err.Error()
-					} else {
-						_, data.Error = valueError(h.service.UpdatePool(request.Context(), id, input))
-					}
-				} else {
-					_, data.Error = valueError(h.service.CreatePool(request.Context(), input))
-				}
-			case "drain", "resume":
-				id, err := positiveID(request.Form.Get("id"))
-				if err != nil {
-					data.Error = err.Error()
-				} else {
-					_, data.Error = valueError(h.service.SetBackendDraining(request.Context(), id, request.Form.Get("action") == "drain"))
-				}
-			default:
-				input, err := backendInput(request)
-				if err != nil {
-					data.Error = err.Error()
-				} else if request.Form.Get("action") == "update_backend" {
-					id, parseErr := positiveID(request.Form.Get("id"))
-					if parseErr != nil {
-						data.Error = parseErr.Error()
-					} else {
-						_, data.Error = valueError(h.service.UpdateBackend(request.Context(), id, input))
-					}
-				} else {
-					_, data.Error = valueError(h.service.CreateBackend(request.Context(), input))
-				}
-			}
+			data.Error = h.mutateBackend(request)
 		}
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer)
 		return
 	}
-	if rawID := request.URL.Query().Get("edit_pool"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, pool := range h.service.View().Pools {
-				if pool.ID == id {
-					copy := pool
-					data.EditPool = &copy
-					break
-				}
-			}
-		}
-	}
-	if rawID := request.URL.Query().Get("edit"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, backend := range h.service.View().Backends {
-				if backend.ID == id {
-					copy := backend
-					data.EditBackend = &copy
-					break
-				}
-			}
-		}
+	if editPoolID, editBackendID := request.URL.Query().Get("edit_pool"), request.URL.Query().Get("edit"); editPoolID != "" || editBackendID != "" {
+		view := h.service.View()
+		data.EditPool = editPool(view, editPoolID)
+		data.EditBackend = editBackend(view, editBackendID)
 	}
 	status := http.StatusOK
 	if data.Error != "" {
@@ -567,88 +474,6 @@ func (h *Handler) render(writer http.ResponseWriter, request *http.Request, name
 	}
 }
 
-func clientInput(request *http.Request) (httpapi.ClientInput, error) {
-	priority, err := strconv.Atoi(request.Form.Get("vllm_priority"))
-	if err != nil {
-		return httpapi.ClientInput{}, fmt.Errorf("vLLM priority must be an integer")
-	}
-	maxConcurrency, err := strconv.Atoi(request.Form.Get("max_concurrency"))
-	if err != nil {
-		return httpapi.ClientInput{}, fmt.Errorf("max concurrency must be an integer")
-	}
-	input := httpapi.ClientInput{Name: request.Form.Get("name"), Enabled: request.Form.Get("enabled") == "on", PriorityClass: domain.PriorityClass(request.Form.Get("priority_class")), VLLMPriority: priority, MaxConcurrency: maxConcurrency}
-	for _, raw := range request.Form["model_pool_id"] {
-		id, parseErr := positiveID(raw)
-		if parseErr != nil {
-			return httpapi.ClientInput{}, parseErr
-		}
-		input.ModelPoolIDs = append(input.ModelPoolIDs, id)
-	}
-	return input, nil
-}
-
-func poolInput(request *http.Request) (httpapi.PoolInput, error) {
-	maxGatewayInflight, err := optionalFormInt(request.Form.Get("max_gateway_inflight"), "max gateway inflight")
-	if err != nil {
-		return httpapi.PoolInput{}, err
-	}
-	maxWaiting, err := optionalFormInt(request.Form.Get("max_waiting"), "max waiting")
-	if err != nil {
-		return httpapi.PoolInput{}, err
-	}
-	return httpapi.PoolInput{
-		PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"),
-		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, MaxWaiting: maxWaiting,
-	}, nil
-}
-
-func optionalFormInt(raw, label string) (int, error) {
-	if strings.TrimSpace(raw) == "" {
-		return 0, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer", label)
-	}
-	return value, nil
-}
-
-func backendInput(request *http.Request) (httpapi.BackendInput, error) {
-	poolID, err := positiveID(request.Form.Get("model_pool_id"))
-	if err != nil {
-		return httpapi.BackendInput{}, err
-	}
-	capacity, err := strconv.ParseFloat(request.Form.Get("capacity_hint"), 64)
-	if err != nil {
-		return httpapi.BackendInput{}, fmt.Errorf("capacity hint must be a number")
-	}
-	running, err := strconv.ParseFloat(request.Form.Get("running_soft_limit"), 64)
-	if err != nil {
-		return httpapi.BackendInput{}, fmt.Errorf("running soft limit must be a number")
-	}
-	return httpapi.BackendInput{ModelPoolID: poolID, Name: request.Form.Get("name"), BaseURL: request.Form.Get("base_url"), Enabled: request.Form.Get("enabled") == "on", Draining: request.Form.Get("draining") == "on", CapacityHint: capacity, RunningSoftLimit: running, UpstreamAPIKeyEnv: request.Form.Get("upstream_api_key_env")}, nil
-}
-
-func positiveID(raw string) (int64, error) {
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("resource ID must be a positive integer")
-	}
-	return id, nil
-}
-func errorText(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-func valueError[T any](_ T, err error) (T, string) {
-	var zero T
-	if err != nil {
-		return zero, err.Error()
-	}
-	return zero, ""
-}
 func timeValue(value *time.Time) string {
 	if value == nil {
 		return "Never"
