@@ -1,6 +1,6 @@
 # Production deployment
 
-This guide contains the detailed deployment and post-deployment procedures for vLLM Priority Gateway. For the tested self-contained environment with two real vLLM servers, start with the [local demo](../README.md#local-demo-with-real-vllm).
+This guide contains the detailed deployment and post-deployment procedures for vLLM Priority Gateway. For the tested self-contained environment with two real vLLM servers, start with the [local demo](local-demo.md).
 
 ## Supported topology
 

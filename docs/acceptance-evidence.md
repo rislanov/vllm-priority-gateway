@@ -103,7 +103,7 @@ Observed evidence on the aligned window:
 - High gateway queue-wait p95 was `4.75ms`, separating gateway decision time from the remaining upstream GPU wait;
 - recovery reached `busy` after `11.5818242s` and `normal` after `23.610879s`; `TestPriorityIsolationWithRealVLLM` passed in `30.83s` (`go test` package time `31.845s`) including cleanup.
 
-The rendered dashboard was checked in the in-app browser at the exact window. Its first row displayed, in order, `GPU pool pressure rises` (max `0.729`), `Low receives 429 decisions` (`priority_concurrency_limit`, total `4.00 req/s` over the short event window), `High latency stays stable` (request/TTFT p95 `975ms`), and `High gateway queue wait` (`4.75ms`). The same view also showed the pool state timeline, per-client inflight, request rates, and backend selection. This is a development-sized observability and isolation gate, not a production-model latency SLO.
+The rendered dashboard was checked in the in-app browser at the exact window. Its first row displayed, in order, `GPU pool pressure rises` (max `0.729`), `Low receives 429 decisions` (`priority_concurrency_limit`, total `4.00 req/s` over the short event window), `High traffic remains admitted` (request/TTFT p95 `975ms`), and `High gateway queue wait` (`4.75ms`). The same view also showed the pool state timeline, per-client inflight, request rates, and backend selection. The High probe remained admitted, but its first-byte latency increased from `186.9918ms` before load to `560.7569ms` under load. This is a development-sized observability and isolation gate, not a production-model latency SLO.
 
 ### Recorded RTX 4070 Ti Docker run — 2026-08-28
 
