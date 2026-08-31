@@ -333,54 +333,6 @@ func formatInteger(value int64) string {
 	return raw
 }
 
-func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "Clients", Active: "Clients"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			data.Error = h.mutateClient(request)
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	}
-	if rawID := request.URL.Query().Get("edit"); rawID != "" {
-		data.EditClient = editClient(h.service.View(), rawID)
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "clients", data, status)
-}
-
-func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "API Keys", Active: "API Keys"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			redirect, errorText := h.mutateKey(request)
-			if redirect != "" {
-				http.Redirect(writer, request, redirect, http.StatusSeeOther)
-				return
-			}
-			data.Error = errorText
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	} else {
-		data.Secret = h.takeSecret(httpapi.AdminCSRFToken(request), request.URL.Query().Get("flash"))
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "keys", data, status)
-}
-
 func (h *Handler) putSecret(session string, id int64, secret string) string {
 	digest := sha256.Sum256([]byte(strconv.FormatInt(id, 10) + "\x00" + secret))
 	nonce := base64.RawURLEncoding.EncodeToString(digest[:16])
@@ -438,30 +390,6 @@ func (h *Handler) expireSecret(key string, expiresAt time.Time) {
 		delete(h.secrets, key)
 	}
 	h.secretMu.Unlock()
-}
-
-func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "Backends", Active: "Backends"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			data.Error = h.mutateBackend(request)
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	}
-	if editPoolID, editBackendID := request.URL.Query().Get("edit_pool"), request.URL.Query().Get("edit"); editPoolID != "" || editBackendID != "" {
-		view := h.service.View()
-		data.EditPool = editPool(view, editPoolID)
-		data.EditBackend = editBackend(view, editBackendID)
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "backends", data, status)
 }
 
 func (h *Handler) render(writer http.ResponseWriter, request *http.Request, name string, data pageData, status int) {
