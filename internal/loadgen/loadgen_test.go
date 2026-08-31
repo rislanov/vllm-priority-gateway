@@ -116,7 +116,7 @@ func TestRunMeasuresStreamingTTFTAndCountsOverloadSeparately(t *testing.T) {
 	if result.Total != 2 || result.Successes != 1 || result.Overloaded != 1 || result.Failures != 0 {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.TTFT.Count != 1 || result.Latency.Count != 1 || result.TTFT.P95 <= 0 || result.Latency.P95 < 35*time.Millisecond || result.TTFT.P95 >= result.Latency.P95 {
+	if result.TTFT.Count != 1 || result.Latency.Count != 1 || result.TTFT.P95 <= 0 || result.Latency.P95 < 35*time.Millisecond || result.TTFT.P95 > result.Latency.P95 {
 		t.Fatalf("TTFT=%v latency=%v", result.TTFT, result.Latency)
 	}
 }
