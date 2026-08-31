@@ -5,6 +5,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,6 +111,63 @@ func TestWorkerMetricsPressureAndStaleness(t *testing.T) {
 	if stale.MetricsFresh || stale.State != domain.BackendUnhealthy {
 		t.Fatalf("stale snapshot = %+v", stale)
 	}
+}
+
+func TestWorkerRejectsOversizedMetricsWithoutChangingRuntime(t *testing.T) {
+	const payloadLimit = 4 << 20
+	var responseBody atomic.Value
+	responseBody.Store([]byte(validMetricsPayload(payloadLimit-1, 1)))
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write(responseBody.Load().([]byte))
+	}))
+	defer server.Close()
+	worker, err := monitor.NewWorker(testBackend(server.URL, 1, 1), monitorOptions(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accepted := []struct {
+		name    string
+		size    int
+		running float64
+		at      time.Time
+	}{
+		{name: "limit minus one", size: payloadLimit - 1, running: 1, at: time.Unix(100, 0)},
+		{name: "exact limit", size: payloadLimit, running: 2, at: time.Unix(101, 0)},
+	}
+	for _, test := range accepted {
+		t.Run(test.name, func(t *testing.T) {
+			responseBody.Store([]byte(validMetricsPayload(test.size, test.running)))
+			if err := worker.PollMetrics(context.Background(), test.at); err != nil {
+				t.Fatalf("PollMetrics() error = %v", err)
+			}
+			snapshot := worker.Snapshot(test.at)
+			if snapshot.Running != test.running || !snapshot.LastMetricsAt.Equal(test.at) {
+				t.Fatalf("accepted metrics snapshot = %+v, want running %v at %s", snapshot, test.running, test.at)
+			}
+		})
+	}
+
+	previous := worker.Snapshot(accepted[1].at)
+	responseBody.Store([]byte(validMetricsPayload(payloadLimit, 99) + "\n"))
+	err = worker.PollMetrics(context.Background(), time.Unix(102, 0))
+	if err == nil || !strings.Contains(err.Error(), "metrics payload exceeds 4194304 bytes") {
+		t.Fatalf("oversized PollMetrics() error = %v, want explicit 4 MiB limit error", err)
+	}
+	if current := worker.Snapshot(accepted[1].at); current != previous {
+		t.Fatalf("oversized metrics changed runtime:\nprevious=%+v\ncurrent=%+v", previous, current)
+	}
+}
+
+func validMetricsPayload(size int, running float64) string {
+	prefix := "vllm:num_requests_running " + strconv.FormatFloat(running, 'f', -1, 64) + "\n" +
+		"vllm:num_requests_waiting 0\n" +
+		"vllm:kv_cache_usage_perc 0.5\n"
+	padding := size - len(prefix)
+	if padding < 2 {
+		panic("metrics payload size is too small")
+	}
+	return prefix + "#" + strings.Repeat("x", padding-2) + "\n"
 }
 
 func TestWorkerDoesNotFollowHealthOrMetricsRedirects(t *testing.T) {

@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
+
+const maxMetricsPayloadBytes int64 = 4 << 20
 
 type Options struct {
 	HTTPClient         *http.Client
@@ -153,7 +156,14 @@ func (w *Worker) PollMetrics(ctx context.Context, at time.Time) error {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		return fmt.Errorf("scrape metrics: HTTP %d", response.StatusCode)
 	}
-	metrics, err := ParseMetrics(io.LimitReader(response.Body, 4<<20))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxMetricsPayloadBytes+1))
+	if err != nil {
+		return fmt.Errorf("read metrics payload: %w", err)
+	}
+	if int64(len(payload)) > maxMetricsPayloadBytes {
+		return fmt.Errorf("metrics payload exceeds %d bytes", maxMetricsPayloadBytes)
+	}
+	metrics, err := ParseMetrics(bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
