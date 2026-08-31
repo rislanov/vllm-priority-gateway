@@ -20,7 +20,7 @@
 Клонируйте репозиторий и создайте `.env` на основе [`.env.example`](../.env.example). Заполните два пустых секрета независимо сгенерированными случайными значениями:
 
 ```dotenv
-LLMGW_VERSION=0.2.0
+LLMGW_VERSION=0.3.0
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
@@ -75,7 +75,7 @@ docker compose --env-file .env -f compose.yaml -f compose.native.yaml ps
 Скачайте архив для текущей архитектуры и проверьте его до распаковки:
 
 ```bash
-VERSION=0.2.0
+VERSION=0.3.0
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;

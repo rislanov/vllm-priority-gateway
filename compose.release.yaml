@@ -1,5 +1,5 @@
 services:
   gateway:
     build: !reset null
-    image: "ghcr.io/rislanov/vllm-priority-gateway:${LLMGW_VERSION:-0.2.0}"
+    image: "ghcr.io/rislanov/vllm-priority-gateway:${LLMGW_VERSION:-0.3.0}"
     pull_policy: always

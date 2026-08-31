@@ -110,9 +110,9 @@ This path connects the published gateway to vLLM servers you already operate. Th
 2. Start the released image with persistent SQLite state:
 
    ```console
-   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.3.0
    docker volume create llmgw-data
-   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.2.0
+   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.3.0
    ```
 
 3. Open `http://127.0.0.1:8080/admin`, then create:
