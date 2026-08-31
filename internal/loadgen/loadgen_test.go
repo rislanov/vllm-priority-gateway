@@ -24,6 +24,70 @@ func TestTrafficMixRequiresAKeyForEveryNonZeroClass(t *testing.T) {
 	}
 }
 
+func TestConfigValidateRejectsAmbiguousGatewayURLs(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "leading whitespace", url: " https://gateway.example"},
+		{name: "trailing whitespace", url: "https://gateway.example "},
+		{name: "userinfo", url: "https://operator:secret@gateway.example"},
+		{name: "query", url: "https://gateway.example?tenant=payments"},
+		{name: "fragment", url: "https://gateway.example#completions"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := loadgen.Config{
+				URL: test.url, Key: "llmgw_test", Model: "qwen",
+				Requests: 1, Parallelism: 1,
+			}
+			if err := config.Validate(); err == nil {
+				t.Fatalf("Validate() accepted ambiguous gateway URL %q", test.url)
+			}
+		})
+	}
+}
+
+func TestConfigValidateAcceptsAbsoluteGatewayURLsWithPaths(t *testing.T) {
+	for _, gatewayURL := range []string{
+		"http://gateway.example",
+		"https://gateway.example/",
+		"https://gateway.example/prefix",
+		"https://gateway.example/prefix/",
+	} {
+		t.Run(gatewayURL, func(t *testing.T) {
+			config := loadgen.Config{
+				URL: gatewayURL, Key: "llmgw_test", Model: "qwen",
+				Requests: 1, Parallelism: 1,
+			}
+			if err := config.Validate(); err != nil {
+				t.Fatalf("Validate() rejected %q: %v", gatewayURL, err)
+			}
+		})
+	}
+}
+
+func TestRunAppendsCompletionsEndpointToGatewayPath(t *testing.T) {
+	requestPath := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestPath <- request.URL.RequestURI()
+		writer.WriteHeader(http.StatusOK)
+		fmt.Fprint(writer, `{}`)
+	}))
+	defer server.Close()
+
+	_, err := loadgen.Run(context.Background(), loadgen.Config{
+		URL: server.URL + "/gateway/", Key: "llmgw_test", Model: "qwen",
+		Requests: 1, Parallelism: 1, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := <-requestPath; got != "/gateway/v1/completions" {
+		t.Fatalf("request URI = %q, want /gateway/v1/completions", got)
+	}
+}
+
 func TestRunMeasuresStreamingTTFTAndCountsOverloadSeparately(t *testing.T) {
 	var requests int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

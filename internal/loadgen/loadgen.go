@@ -61,9 +61,15 @@ var priorityOrder = []domain.PriorityClass{
 }
 
 func (c Config) Validate() error {
-	parsed, err := url.Parse(strings.TrimSpace(c.URL))
+	if strings.TrimSpace(c.URL) != c.URL {
+		return errors.New("gateway URL must not contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(c.URL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return errors.New("gateway URL must be an absolute http(s) URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(c.URL, "#") {
+		return errors.New("gateway URL must not contain userinfo, query, or fragment")
 	}
 	if c.Requests <= 0 {
 		return errors.New("request count must be positive")
