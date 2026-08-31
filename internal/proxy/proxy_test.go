@@ -425,6 +425,37 @@ func TestForwardPreservesProvenBodyReadFailureWhenWriteCancelsContext(t *testing
 	}
 }
 
+func TestForwardPreservesLateReadFailureWhenSuccessfulWriteCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &chunkThenFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	var selections atomic.Int64
+	result := proxy.New(client).Forward(ctx, &cancelWriteWriter{header: make(http.Header), cancel: cancel}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, nil
+		},
+	})
+	if !errors.Is(result.Err, errUpstreamRead) || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != int64(len("partial")) || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceNeutral {
+		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
+	}
+}
+
 func TestForwardClassifiesCompleted4xxAsSuccess(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{HTTPStatus: http.StatusTooManyRequests, HTTPBody: `{"error":"rate limited"}`})
@@ -683,6 +714,20 @@ func (partialReadFailBody) Read(destination []byte) (int, error) {
 
 func (partialReadFailBody) Close() error { return nil }
 
+type chunkThenFailBody struct {
+	chunkRead bool
+}
+
+func (b *chunkThenFailBody) Read(destination []byte) (int, error) {
+	if !b.chunkRead {
+		b.chunkRead = true
+		return copy(destination, "partial"), nil
+	}
+	return 0, errUpstreamRead
+}
+
+func (*chunkThenFailBody) Close() error { return nil }
+
 type contextReadBody struct {
 	ctx context.Context
 }
@@ -738,6 +783,21 @@ func (w *cancelWriteFailWriter) WriteHeader(status int) { w.status = status }
 func (w *cancelWriteFailWriter) Write([]byte) (int, error) {
 	w.cancel()
 	return 0, errDownstreamWrite
+}
+
+type cancelWriteWriter struct {
+	header http.Header
+	status int
+	cancel context.CancelFunc
+}
+
+func (w *cancelWriteWriter) Header() http.Header { return w.header }
+
+func (w *cancelWriteWriter) WriteHeader(status int) { w.status = status }
+
+func (w *cancelWriteWriter) Write(data []byte) (int, error) {
+	w.cancel()
+	return len(data), nil
 }
 
 func newObservingWriter() *observingWriter {

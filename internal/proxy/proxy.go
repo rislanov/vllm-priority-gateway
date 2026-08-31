@@ -188,7 +188,9 @@ func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome
 			c.result.Err = readErr
 			c.result.Cancelled = c.ctx.Err() != nil
 			if c.result.Cancelled {
-				c.result.Err = c.ctx.Err()
+				if firstRead && count == 0 {
+					c.result.Err = c.ctx.Err()
+				}
 				return false, interruptedOutcome(c.response.StatusCode, provenReadFailure)
 			}
 			retryable := firstRead && count == 0 && !c.result.ResponseStarted &&
