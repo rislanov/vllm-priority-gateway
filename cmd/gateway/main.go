@@ -63,7 +63,7 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
 		defer cancel()
 		if err := application.Close(closeCtx); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("close gateway application: %w", err))
+			runErr = errors.Join(runErr, fmt.Errorf("drain usage recorder: %w", err))
 		}
 	}()
 	if listener == nil {
