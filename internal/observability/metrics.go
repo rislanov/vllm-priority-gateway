@@ -73,6 +73,13 @@ type clientMetricLabels struct {
 	priority string
 }
 
+type runtimeLabelSets struct {
+	pools    map[string]struct{}
+	backends map[backendMetricLabels]struct{}
+	requests map[requestMetricLabels]struct{}
+	clients  map[clientMetricLabels]struct{}
+}
+
 // PoolRuntimeMetric is one current-topology pool runtime sample.
 type PoolRuntimeMetric struct {
 	Model   string
@@ -297,15 +304,32 @@ func (m *Metrics) setPool(model string, runtime domain.PoolRuntime) {
 // publishes its latest samples atomically with respect to inflight updates.
 // Historical counters and histograms are intentionally left untouched.
 func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric, inflight []InflightRuntimeLabels) {
-	currentPools := make(map[string]struct{}, len(pools))
-	currentBackends := make(map[backendMetricLabels]struct{}, len(backends))
-	currentRequests := make(map[requestMetricLabels]struct{}, len(inflight))
-	currentClients := make(map[clientMetricLabels]struct{}, len(inflight))
+	current := makeRuntimeLabelSets(pools, backends, inflight)
+
+	m.runtimeMu.Lock()
+	defer m.runtimeMu.Unlock()
+
+	m.reconcileRuntimeLabels(current)
+	m.runtimeTopologyKnown = true
+	m.knownPoolLabels = current.pools
+	m.knownBackendLabels = current.backends
+	m.knownRequestLabels = current.requests
+	m.knownClientLabels = current.clients
+	m.publishRuntimeValues(pools, backends, current)
+}
+
+func makeRuntimeLabelSets(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric, inflight []InflightRuntimeLabels) runtimeLabelSets {
+	current := runtimeLabelSets{
+		pools:    make(map[string]struct{}, len(pools)),
+		backends: make(map[backendMetricLabels]struct{}, len(backends)),
+		requests: make(map[requestMetricLabels]struct{}, len(inflight)),
+		clients:  make(map[clientMetricLabels]struct{}, len(inflight)),
+	}
 	for _, pool := range pools {
-		currentPools[value(pool.Model)] = struct{}{}
+		current.pools[value(pool.Model)] = struct{}{}
 	}
 	for _, backend := range backends {
-		currentBackends[backendMetricLabels{
+		current.backends[backendMetricLabels{
 			model: value(backend.Model), backend: value(backend.Backend),
 		}] = struct{}{}
 	}
@@ -313,17 +337,17 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		requestLabels := requestMetricLabels{
 			model: value(labels.Model), priority: value(string(labels.PriorityClass)),
 		}
-		currentRequests[requestLabels] = struct{}{}
-		currentClients[clientMetricLabels{
+		current.requests[requestLabels] = struct{}{}
+		current.clients[clientMetricLabels{
 			client: value(labels.Client), model: requestLabels.model, priority: requestLabels.priority,
 		}] = struct{}{}
 	}
+	return current
+}
 
-	m.runtimeMu.Lock()
-	defer m.runtimeMu.Unlock()
-
+func (m *Metrics) reconcileRuntimeLabels(current runtimeLabelSets) {
 	for labels := range m.knownPoolLabels {
-		if _, current := currentPools[labels]; current {
+		if _, current := current.pools[labels]; current {
 			continue
 		}
 		m.poolGatewayInflight.DeleteLabelValues(labels)
@@ -335,13 +359,13 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		}
 	}
 	for labels := range m.knownBackendLabels {
-		if _, current := currentBackends[labels]; current {
+		if _, current := current.backends[labels]; current {
 			continue
 		}
 		m.deleteBackendRuntimeLabels(labels)
 	}
 	for labels := range m.observedBackendLabels {
-		if _, current := currentBackends[labels]; !current {
+		if _, current := current.backends[labels]; !current {
 			m.backendInflight.DeleteLabelValues(labels.model, labels.backend)
 			if m.backendInflightValues[labels] == 0 {
 				delete(m.observedBackendLabels, labels)
@@ -349,12 +373,12 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		}
 	}
 	for labels := range m.knownRequestLabels {
-		if _, current := currentRequests[labels]; !current {
+		if _, current := current.requests[labels]; !current {
 			m.requestsInflight.DeleteLabelValues(labels.model, labels.priority)
 		}
 	}
 	for labels := range m.observedRequestLabels {
-		if _, current := currentRequests[labels]; !current {
+		if _, current := current.requests[labels]; !current {
 			m.requestsInflight.DeleteLabelValues(labels.model, labels.priority)
 			if m.requestInflightValues[labels] == 0 {
 				delete(m.observedRequestLabels, labels)
@@ -362,12 +386,12 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		}
 	}
 	for labels := range m.knownClientLabels {
-		if _, current := currentClients[labels]; !current {
+		if _, current := current.clients[labels]; !current {
 			m.clientInflight.DeleteLabelValues(labels.client, labels.model, labels.priority)
 		}
 	}
 	for labels := range m.observedClientLabels {
-		if _, current := currentClients[labels]; !current {
+		if _, current := current.clients[labels]; !current {
 			m.clientInflight.DeleteLabelValues(labels.client, labels.model, labels.priority)
 			if m.clientInflightValues[labels] == 0 {
 				delete(m.observedClientLabels, labels)
@@ -375,11 +399,9 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		}
 	}
 
-	m.runtimeTopologyKnown = true
-	m.knownPoolLabels = currentPools
-	m.knownBackendLabels = currentBackends
-	m.knownRequestLabels = currentRequests
-	m.knownClientLabels = currentClients
+}
+
+func (m *Metrics) publishRuntimeValues(pools []PoolRuntimeMetric, backends []BackendRuntimeMetric, current runtimeLabelSets) {
 	for _, pool := range pools {
 		m.setPool(pool.Model, pool.Runtime)
 	}
@@ -388,10 +410,10 @@ func (m *Metrics) PublishRuntime(pools []PoolRuntimeMetric, backends []BackendRu
 		labels := backendMetricLabels{model: value(backend.Model), backend: value(backend.Backend)}
 		m.backendInflight.WithLabelValues(labels.model, labels.backend).Set(float64(m.backendInflightValues[labels]))
 	}
-	for labels := range currentRequests {
+	for labels := range current.requests {
 		m.requestsInflight.WithLabelValues(labels.model, labels.priority).Set(float64(m.requestInflightValues[labels]))
 	}
-	for labels := range currentClients {
+	for labels := range current.clients {
 		m.clientInflight.WithLabelValues(labels.client, labels.model, labels.priority).Set(float64(m.clientInflightValues[labels]))
 	}
 }
