@@ -11,6 +11,32 @@
 
 vLLM Priority Gateway — лёгкий слой policy, admission и routing перед **существующими серверами [vLLM](https://docs.vllm.ai/)**. Приложения продолжают использовать стандартный OpenAI API: достаточно изменить base URL, использовать выданный gateway ключ и оставить развёртывание моделей и GPU scheduling существующей инфраструктуре.
 
+**Проверено на реальном vLLM с GPU NVIDIA**, включая saturation, изоляцию приоритетов, отказ и восстановление backend-серверов, streaming и сохранность состояния после перезапуска. [Результаты проверки](docs/acceptance-evidence.md).
+
+## Какую проблему решает
+
+Обычный HTTP load balancer распределяет запросы, но обычно не знает:
+
+- какой клиент может потреблять общую GPU capacity;
+- какой запрос относится к production, а какой — к background;
+- сколько запросов выполняется и ожидает внутри scheduler каждого vLLM;
+- насколько занят KV cache;
+- когда нужно первым отклонить низкоприоритетный трафик;
+- какой backend лучше сохраняет prefix-cache locality.
+
+Gateway объединяет server-side policy клиента с live health и Prometheus-метриками vLLM:
+
+```text
+production requests  ── high ────────┐
+interactive agents   ── normal ──────┼──► общая vLLM capacity
+nightly / eval jobs  ── background ──┘
+
+                         GPU pressure растёт
+
+background traffic ──► throttled / 429
+production traffic ──► остаётся admitted
+```
+
 ## Место в кластере
 
 ```text
@@ -40,47 +66,6 @@ vLLM Priority Gateway — лёгкий слой policy, admission и routing п�
 Gateway **не** развёртывает модели, не планирует GPU и не заменяет Kubernetes, Slurm или существующие lifecycle-инструменты vLLM. Он решает, **кто получает общую inference capacity и на какой экземпляр vLLM направить запрос**.
 
 Для развёртывания нужны один статический Go-бинарник и каталог SQLite. Текущая версия намеренно рассчитана на один gateway и небольшой пул backend-серверов под управлением оператора.
-
-## Проверено на реальном vLLM
-
-Релизные артефакты и поведение при перегрузке проверены на реальной inference-среде:
-
-- NVIDIA RTX 4070 Ti с 12 ГБ VRAM;
-- два `vllm/vllm-openai:v0.28.0` с моделью `Qwen/Qwen3-0.6B`;
-- saturation при `GatewayInflight=16` и `TotalWaiting=14`;
-- низкоприоритетные probes отклонялись, а High/Critical продолжали admission;
-- проверены backend drain, pool safety limits, открытие и восстановление circuit breaker;
-- streaming, restart gateway и сохранность SQLite проверены на реальном vLLM;
-- propagation отмены downstream-клиента покрыта детерминированными integration tests;
-- отдельный Prometheus/Grafana-сценарий воспроизвёл цепочку pressure → shedding → admission.
-
-Под записанной нагрузкой защищённый High-запрос продолжал admission, однако latency первого байта выросла примерно с `187ms` до `561ms`. Evidence доказывает изоляцию admission, а не неизменность GPU latency при saturation.
-
-→ [Полный воспроизводимый acceptance evidence](docs/acceptance-evidence.md)
-
-## Какую проблему решает
-
-Обычный HTTP load balancer распределяет запросы, но обычно не знает:
-
-- какой клиент может потреблять общую GPU capacity;
-- какой запрос относится к production, а какой — к background;
-- сколько запросов выполняется и ожидает внутри scheduler каждого vLLM;
-- насколько занят KV cache;
-- когда нужно первым отклонить низкоприоритетный трафик;
-- какой backend лучше сохраняет prefix-cache locality.
-
-Gateway объединяет server-side policy клиента с live health и Prometheus-метриками vLLM:
-
-```text
-production requests  ── high ────────┐
-interactive agents   ── normal ──────┼──► общая vLLM capacity
-nightly / eval jobs  ── background ──┘
-
-                         GPU pressure растёт
-
-background traffic ──► throttled / 429
-production traffic ──► остаётся admitted
-```
 
 ## Инженерные особенности
 
@@ -189,7 +174,20 @@ docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up 
 
 Dashboard показывает pressure пула → точные причины Low 429 → остаётся ли High admitted → ожидание High внутри gateway. Он не называет latency перегруженной GPU стабильной.
 
-## Тестирование и evidence
+## Тестирование и проверка на реальном vLLM
+
+Релизные артефакты и поведение при перегрузке проверены на реальной inference-среде:
+
+- NVIDIA RTX 4070 Ti с 12 ГБ VRAM;
+- два `vllm/vllm-openai:v0.28.0` с моделью `Qwen/Qwen3-0.6B`;
+- saturation при `GatewayInflight=16` и `TotalWaiting=14`;
+- низкоприоритетные probes отклонялись, а High/Critical продолжали admission;
+- проверены backend drain, pool safety limits, открытие и восстановление circuit breaker;
+- streaming, restart gateway и сохранность SQLite проверены на реальном vLLM;
+- propagation отмены downstream-клиента покрыта детерминированными integration tests;
+- отдельный Prometheus/Grafana-сценарий воспроизвёл цепочку pressure → shedding → admission.
+
+Под записанной нагрузкой защищённый High-запрос продолжал admission, однако latency первого байта выросла примерно с `187ms` до `561ms`. Evidence доказывает изоляцию admission, а не неизменность GPU latency при saturation.
 
 - [Acceptance evidence](docs/acceptance-evidence.md) связывает claims с automated tests и записанными hardware runs.
 - [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md) содержит opt-in deployed tests.
