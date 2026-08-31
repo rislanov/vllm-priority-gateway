@@ -51,7 +51,8 @@ The release and overload behavior were exercised on real inference infrastructur
 - saturation at `GatewayInflight=16` and `TotalWaiting=14`;
 - lower-priority probes rejected while High and Critical traffic remained admitted;
 - backend drain, pool safety limits, circuit opening and recovery verified;
-- streaming, cancellation, gateway restart, and SQLite persistence verified;
+- streaming, gateway restart, and SQLite persistence verified on real vLLM;
+- downstream cancellation propagation covered by deterministic integration tests;
 - a separate Prometheus/Grafana decision-telemetry scenario reproduced the pressure → shed → admission chain.
 
 Under the recorded telemetry load, the protected High probe remained admitted while first-byte latency increased from about `187ms` to `561ms`. The evidence demonstrates admission isolation, not a claim that GPU latency stays unchanged under saturation.

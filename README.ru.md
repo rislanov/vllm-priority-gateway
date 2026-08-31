@@ -50,7 +50,8 @@ Gateway **не** развёртывает модели, не планирует 
 - saturation при `GatewayInflight=16` и `TotalWaiting=14`;
 - низкоприоритетные probes отклонялись, а High/Critical продолжали admission;
 - проверены backend drain, pool safety limits, открытие и восстановление circuit breaker;
-- проверены streaming, cancellation, restart gateway и сохранность SQLite;
+- streaming, restart gateway и сохранность SQLite проверены на реальном vLLM;
+- propagation отмены downstream-клиента покрыта детерминированными integration tests;
 - отдельный Prometheus/Grafana-сценарий воспроизвёл цепочку pressure → shedding → admission.
 
 Под записанной нагрузкой защищённый High-запрос продолжал admission, однако latency первого байта выросла примерно с `187ms` до `561ms`. Evidence доказывает изоляцию admission, а не неизменность GPU latency при saturation.

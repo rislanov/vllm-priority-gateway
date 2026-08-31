@@ -144,22 +144,30 @@ docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm 
 curl -fsS http://127.0.0.1:8080/inference-readyz
 ```
 
-Продолжайте, когда ответ содержит `"backendAvailability":2`. Подставьте одноразовый ключ клиента и запросите список моделей:
+Продолжайте, когда ответ содержит `"backendAvailability":2`.
+
+Для GHCR-пути подставьте одноразовый ключ клиента и запросите список моделей:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
 ```
 
-Отправьте сохранённый streaming-запрос:
+Для native Linux один раз экспортируйте ключ и выполните эквивалентный host probe:
+
+```bash
+export LLMGW_CLIENT_KEY='llmgw_replace-with-the-generated-key'
+curl -fsS http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $LLMGW_CLIENT_KEY"
+```
+
+Для GHCR-пути отправьте сохранённый streaming-запрос:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
 ```
 
-Для native Linux:
+Для native Linux повторно используйте экспортированный ключ:
 
 ```bash
-export LLMGW_CLIENT_KEY='llmgw_replace-with-the-generated-key'
 curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
   -H "Content-Type: application/json" \
@@ -168,9 +176,9 @@ curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
 
 Поток должен завершиться `data: [DONE]`. Gateway аутентифицирует публичную модель `qwen`, применяет сохранённый priority, переписывает имя на `qwen-test` и выбирает здоровый vLLM.
 
-## 5. Decision telemetry
+## 5. Decision telemetry (только GHCR-путь)
 
-Добавьте observability overlay для Prometheus и Grafana:
+Версионируемый observability overlay зависит от Compose service `gateway`, а Prometheus обращается к `gateway:8080`. Используйте его только с вариантом A:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml -f compose.observability.yaml up -d --no-build --wait --wait-timeout 900
@@ -178,23 +186,39 @@ docker compose --env-file .env -f compose.yaml -f compose.release.yaml -f compos
 
 Grafana доступна по адресу `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. Локальные credentials по умолчанию — `admin` / `admin`; измените их перед любым использованием вне loopback. Dashboard разделяет admission и latency: показывает, остаётся ли High traffic admitted, не утверждая, что latency перегруженной GPU неизменна.
 
+Если выбран native-бинарник, пропустите этот overlay. Настройте host или существующий Prometheus на scrape `http://127.0.0.1:8080/metrics`; metric contract описан в [operations.md](operations.md).
+
 ## 6. Restart и cleanup
 
-Перезапустите только gateway и убедитесь, что Admin configuration и inference readiness восстановились:
+### GHCR-путь
+
+Перезапустите только Compose gateway и убедитесь, что Admin configuration и inference readiness восстановились:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml restart gateway
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
 ```
 
-Для GHCR-пути:
-
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml logs -f gateway
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml down
 ```
 
-Для native Linux остановите foreground gateway с помощью `Ctrl-C`, затем выполните:
+### Native Linux-путь
+
+Остановите foreground gateway с помощью `Ctrl-C`. Перезапустите native gateway в том же настроенном терминале:
+
+```bash
+"$RELEASE_DIR/gateway"
+```
+
+Во втором терминале повторно проверьте inference readiness:
+
+```console
+curl -fsS http://127.0.0.1:8080/inference-readyz
+```
+
+Сохранённая Admin configuration должна вернуться с `"backendAvailability":2`. Снова остановите gateway с помощью `Ctrl-C`, затем остановите inference services:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.native.yaml down

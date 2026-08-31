@@ -144,22 +144,30 @@ For native Linux:
 curl -fsS http://127.0.0.1:8080/inference-readyz
 ```
 
-Continue when the response reports `"backendAvailability":2`. Replace the placeholder with the one-time client key and list models:
+Continue when the response reports `"backendAvailability":2`.
+
+For the GHCR path, replace the placeholder with the one-time client key and list models:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/v1/models -H "Authorization: Bearer llmgw_replace-with-the-generated-key"
 ```
 
-Send the checked-in streaming request:
+For native Linux, export the key once and run the equivalent host probe:
+
+```bash
+export LLMGW_CLIENT_KEY='llmgw_replace-with-the-generated-key'
+curl -fsS http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $LLMGW_CLIENT_KEY"
+```
+
+For the GHCR path, send the checked-in streaming request:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS -N http://gateway:8080/v1/chat/completions -H "Authorization: Bearer llmgw_replace-with-the-generated-key" -H "Content-Type: application/json" --data-binary "@/requests/chat.json"
 ```
 
-For native Linux:
+For native Linux, reuse the exported key:
 
 ```bash
-export LLMGW_CLIENT_KEY='llmgw_replace-with-the-generated-key'
 curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
   -H "Content-Type: application/json" \
@@ -168,9 +176,9 @@ curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
 
 The stream must end with `data: [DONE]`. The gateway authenticates the public model `qwen`, applies stored priority, rewrites it to `qwen-test`, and selects one healthy vLLM service.
 
-## 5. Optional decision telemetry
+## 5. Optional decision telemetry (GHCR path only)
 
-Add the observability overlay to provision Prometheus and Grafana:
+The checked-in observability overlay depends on the Compose `gateway` service and Prometheus scrapes `gateway:8080`. Use it only with Option A:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml -f compose.observability.yaml up -d --no-build --wait --wait-timeout 900
@@ -178,23 +186,39 @@ docker compose --env-file .env -f compose.yaml -f compose.release.yaml -f compos
 
 Open Grafana at `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. Local credentials default to `admin` / `admin`; override them before any non-loopback use. The dashboard distinguishes admission from latency: it shows whether High traffic remains admitted without claiming saturated GPU latency stays unchanged.
 
+If you selected the native binary, skip this overlay. Configure a host or existing Prometheus to scrape `http://127.0.0.1:8080/metrics`; see [operations.md](operations.md) for the metric contract.
+
 ## 6. Restart and cleanup
 
-Restart only the gateway and verify that Admin configuration and inference readiness return:
+### GHCR path
+
+Restart only the Compose gateway and verify that Admin configuration and inference readiness return:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml restart gateway
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml run --rm --no-deps probe -fsS http://gateway:8080/inference-readyz
 ```
 
-For the GHCR path:
-
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml logs -f gateway
 docker compose --env-file .env -f compose.yaml -f compose.release.yaml down
 ```
 
-For native Linux, stop the foreground gateway with `Ctrl-C`, then run:
+### Native Linux path
+
+Stop the foreground gateway with `Ctrl-C`. Restart the native gateway in the same configured terminal:
+
+```bash
+"$RELEASE_DIR/gateway"
+```
+
+From a second terminal, re-probe inference readiness:
+
+```console
+curl -fsS http://127.0.0.1:8080/inference-readyz
+```
+
+The persisted Admin configuration should return with `"backendAvailability":2`. Stop the gateway again with `Ctrl-C`, then stop the inference services:
 
 ```console
 docker compose --env-file .env -f compose.yaml -f compose.native.yaml down
