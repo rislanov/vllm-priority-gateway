@@ -49,6 +49,15 @@ type Proxy struct {
 	client *http.Client
 }
 
+type responseCopier struct {
+	ctx        context.Context
+	downstream http.ResponseWriter
+	response   *http.Response
+	inspector  *usageInspector
+	started    time.Time
+	result     *Result
+}
+
 func New(client *http.Client) *Proxy {
 	if client == nil {
 		client = http.DefaultClient
@@ -116,95 +125,77 @@ func (p *Proxy) forwardOnce(
 	defer response.Body.Close()
 	result.Status = response.StatusCode
 	inspector := newUsageInspector(response.Header.Get("Content-Type"))
-	commit := func() {
-		if !result.ResponseStarted {
-			CopyResponseHeaders(downstream.Header(), response.Header)
-			downstream.WriteHeader(response.StatusCode)
-			result.FirstByte = time.Since(started)
-			result.ResponseStarted = true
-		}
+	copier := responseCopier{
+		ctx:        ctx,
+		downstream: downstream,
+		response:   response,
+		inspector:  inspector,
+		started:    started,
+		result:     &result,
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		commit()
+		copier.commit()
 	}
+	retryable, outcome := copier.copy()
+	return result, retryable, outcome
+}
 
+func (c *responseCopier) commit() {
+	if c.result.ResponseStarted {
+		return
+	}
+	CopyResponseHeaders(c.downstream.Header(), c.response.Header)
+	c.downstream.WriteHeader(c.response.StatusCode)
+	c.result.FirstByte = time.Since(c.started)
+	c.result.ResponseStarted = true
+}
+
+func (c *responseCopier) write(data []byte, provenReadFailure bool) (domain.InferenceOutcome, bool) {
+	c.commit()
+	written, writeErr := c.downstream.Write(data)
+	c.result.BytesSent += int64(written)
+	flush(c.downstream)
+	c.inspector.Write(data[:written])
+	if writeErr == nil && written == len(data) {
+		return domain.InferenceNeutral, false
+	}
+	if writeErr == nil {
+		writeErr = io.ErrShortWrite
+	}
+	c.result.Err = writeErr
+	c.result.Cancelled = c.ctx.Err() != nil
+	return interruptedOutcome(c.response.StatusCode, provenReadFailure), true
+}
+
+func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome) {
 	buffer := make([]byte, 32<<10)
-	count, readErr := response.Body.Read(buffer)
-	provenReadFailure := readErr != nil && !errors.Is(readErr, io.EOF) && ctx.Err() == nil
-	if count == 0 && readErr != nil && !errors.Is(readErr, io.EOF) {
-		result.Err = readErr
-		if ctx.Err() != nil {
-			result.Err = ctx.Err()
-			result.Cancelled = true
-			return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
-		}
-		return result, response.StatusCode >= 200 && response.StatusCode < 300, domain.InferenceFailure
-	}
-
-	if count == 0 && errors.Is(readErr, io.EOF) {
-		commit()
-		completeUsageInspection(&result, inspector)
-		return result, false, completedOutcome(response.StatusCode)
-	}
-	if count > 0 {
-		commit()
-		written, writeErr := downstream.Write(buffer[:count])
-		result.BytesSent += int64(written)
-		flush(downstream)
-		inspector.Write(buffer[:written])
-		if writeErr != nil || written != count {
-			if writeErr == nil {
-				writeErr = io.ErrShortWrite
-			}
-			result.Err = writeErr
-			result.Cancelled = ctx.Err() != nil
-			return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
-		}
-	}
-	if readErr != nil {
-		if !errors.Is(readErr, io.EOF) {
-			result.Err = readErr
-			result.Cancelled = ctx.Err() != nil
-			if result.Cancelled {
-				return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
-			}
-			return result, false, domain.InferenceFailure
-		} else {
-			completeUsageInspection(&result, inspector)
-		}
-		return result, false, completedOutcome(response.StatusCode)
-	}
-
+	firstRead := true
 	for {
-		count, readErr = response.Body.Read(buffer)
-		provenReadFailure = readErr != nil && !errors.Is(readErr, io.EOF) && ctx.Err() == nil
+		count, readErr := c.response.Body.Read(buffer)
+		provenReadFailure := readErr != nil && !errors.Is(readErr, io.EOF) && c.ctx.Err() == nil
 		if count > 0 {
-			written, writeErr := downstream.Write(buffer[:count])
-			result.BytesSent += int64(written)
-			flush(downstream)
-			inspector.Write(buffer[:written])
-			if writeErr != nil || written != count {
-				if writeErr == nil {
-					writeErr = io.ErrShortWrite
-				}
-				result.Err = writeErr
-				result.Cancelled = ctx.Err() != nil
-				return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
+			if outcome, terminal := c.write(buffer[:count], provenReadFailure); terminal {
+				return false, outcome
 			}
 		}
 		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) {
-				result.Err = readErr
-				result.Cancelled = ctx.Err() != nil
-				if result.Cancelled {
-					return result, false, interruptedOutcome(response.StatusCode, provenReadFailure)
-				}
-				return result, false, domain.InferenceFailure
-			} else {
-				completeUsageInspection(&result, inspector)
+			if errors.Is(readErr, io.EOF) {
+				c.commit()
+				completeUsageInspection(c.result, c.inspector)
+				return false, completedOutcome(c.response.StatusCode)
 			}
-			return result, false, completedOutcome(response.StatusCode)
+
+			c.result.Err = readErr
+			c.result.Cancelled = c.ctx.Err() != nil
+			if c.result.Cancelled {
+				c.result.Err = c.ctx.Err()
+				return false, interruptedOutcome(c.response.StatusCode, provenReadFailure)
+			}
+			retryable := firstRead && count == 0 && !c.result.ResponseStarted &&
+				c.response.StatusCode >= http.StatusOK && c.response.StatusCode < http.StatusMultipleChoices
+			return retryable, domain.InferenceFailure
 		}
+		firstRead = false
 	}
 }
 

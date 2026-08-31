@@ -197,6 +197,39 @@ func TestForwardRetriesOneAlternateBeforeFirstByte(t *testing.T) {
 	}
 }
 
+func TestForwardDoesNotRetryAfterEmptyFirstRead(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &emptyThenFailBody{},
+		}, nil
+	})}
+	var selections atomic.Int64
+	var outcomes []domain.InferenceOutcome
+	result := proxy.New(client).Forward(context.Background(), newObservingWriter(), proxy.Request{
+		Method: http.MethodPost, Path: "/v1/responses", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://upstream.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, errors.New("unexpected alternate selection")
+		},
+	})
+
+	if !errors.Is(result.Err, errUpstreamRead) || result.RetryCount != 0 || result.ResponseStarted || result.BytesSent != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 {
+		t.Fatalf("alternate selections = %d, want 0", selections.Load())
+	}
+	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("outcomes = %v, want [failure]", outcomes)
+	}
+}
+
 func TestForwardCompletesTransportFailureBeforeSelectingAlternate(t *testing.T) {
 	failing := fakevllm.New()
 	failing.SetState(fakevllm.State{ResetMode: fakevllm.ResetBeforeHeaders})
@@ -627,6 +660,20 @@ type readFailBody struct{}
 func (readFailBody) Read([]byte) (int, error) { return 0, errUpstreamRead }
 
 func (readFailBody) Close() error { return nil }
+
+type emptyThenFailBody struct {
+	emptyReadDone bool
+}
+
+func (b *emptyThenFailBody) Read([]byte) (int, error) {
+	if !b.emptyReadDone {
+		b.emptyReadDone = true
+		return 0, nil
+	}
+	return 0, errUpstreamRead
+}
+
+func (*emptyThenFailBody) Close() error { return nil }
 
 type partialReadFailBody struct{}
 
