@@ -11,6 +11,34 @@
 
 vLLM Priority Gateway is a lightweight policy, admission, and routing layer for **existing [vLLM](https://docs.vllm.ai/) servers**. Applications keep the standard OpenAI API: change the base URL, use a gateway-issued key, and leave model deployment and GPU scheduling where they already are.
 
+**Validated against real vLLM:** two vLLM 0.28.0 instances on an NVIDIA RTX 4070 Ti, including saturation, priority isolation, backend drain, circuit recovery, streaming, and restart persistence.
+
+→ [Acceptance evidence](docs/acceptance-evidence.md)
+
+## What problem it solves
+
+A normal HTTP load balancer can distribute requests, but it usually does not know:
+
+- which client may consume shared GPU capacity;
+- which request is production traffic versus background work;
+- how many requests are running or waiting inside each vLLM scheduler;
+- how much KV cache each engine is using;
+- when lower-priority traffic should be shed;
+- which backend best preserves prefix-cache locality.
+
+The gateway combines server-side client policy with live vLLM health and Prometheus metrics:
+
+```text
+production requests  ── high ────────┐
+interactive agents   ── normal ──────┼──► shared vLLM capacity
+nightly / eval jobs  ── background ──┘
+
+                         GPU pressure rises
+
+background traffic ──► throttled / 429
+production traffic ──► remains admitted
+```
+
 ## Where it sits
 
 ```text
@@ -41,47 +69,6 @@ vLLM Priority Gateway is a lightweight policy, admission, and routing layer for 
 The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Slurm, or existing vLLM lifecycle tooling. It controls **who receives shared inference capacity and which vLLM instance receives each request**.
 
 The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small operator-managed backend pool.
-
-## Verified on real vLLM
-
-The release and overload behavior were exercised on real inference infrastructure:
-
-- NVIDIA RTX 4070 Ti with 12 GB VRAM;
-- two `vllm/vllm-openai:v0.28.0` instances serving `Qwen/Qwen3-0.6B`;
-- saturation at `GatewayInflight=16` and `TotalWaiting=14`;
-- lower-priority probes rejected while High and Critical traffic remained admitted;
-- backend drain, pool safety limits, circuit opening and recovery verified;
-- streaming, gateway restart, and SQLite persistence verified on real vLLM;
-- downstream cancellation propagation covered by deterministic integration tests;
-- a separate Prometheus/Grafana decision-telemetry scenario reproduced the pressure → shed → admission chain.
-
-Under the recorded telemetry load, the protected High probe remained admitted while first-byte latency increased from about `187ms` to `561ms`. The evidence demonstrates admission isolation, not a claim that GPU latency stays unchanged under saturation.
-
-→ [Full reproducible acceptance evidence](docs/acceptance-evidence.md)
-
-## What problem it solves
-
-A normal HTTP load balancer can distribute requests, but it usually does not know:
-
-- which client may consume shared GPU capacity;
-- which request is production traffic versus background work;
-- how many requests are running or waiting inside each vLLM scheduler;
-- how much KV cache each engine is using;
-- when lower-priority traffic should be shed;
-- which backend best preserves prefix-cache locality.
-
-The gateway combines server-side client policy with live vLLM health and Prometheus metrics:
-
-```text
-production requests  ── high ────────┐
-interactive agents   ── normal ──────┼──► shared vLLM capacity
-nightly / eval jobs  ── background ──┘
-
-                         GPU pressure rises
-
-background traffic ──► throttled / 429
-production traffic ──► remains admitted
-```
 
 ## Engineering highlights
 
@@ -190,7 +177,20 @@ docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up 
 
 The dashboard shows pool pressure → precise Low 429 reasons → whether High traffic remains admitted → High gateway queue wait. It does not present saturated GPU latency as stable.
 
-## Testing and evidence
+## Validation and real-vLLM evidence
+
+The release and overload behavior were exercised on real inference infrastructure:
+
+- NVIDIA RTX 4070 Ti with 12 GB VRAM;
+- two `vllm/vllm-openai:v0.28.0` instances serving `Qwen/Qwen3-0.6B`;
+- saturation at `GatewayInflight=16` and `TotalWaiting=14`;
+- lower-priority probes rejected while High and Critical traffic remained admitted;
+- backend drain, pool safety limits, circuit opening, and recovery verified;
+- streaming, gateway restart, and SQLite persistence verified on real vLLM;
+- downstream cancellation propagation covered by deterministic integration tests;
+- a separate Prometheus/Grafana decision-telemetry scenario reproduced the pressure → shed → admission chain.
+
+Under the recorded telemetry load, the protected High probe remained admitted while first-byte latency increased from about `187ms` to `561ms`. The evidence demonstrates admission isolation, not a claim that GPU latency stays unchanged under saturation.
 
 - [Acceptance evidence](docs/acceptance-evidence.md) maps product claims to automated tests and recorded hardware runs.
 - [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md) contains opt-in deployed tests.
