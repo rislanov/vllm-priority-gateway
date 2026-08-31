@@ -121,6 +121,63 @@ func TestMultiRollsBackEarlierReservationWhenLaterPeerRefuses(t *testing.T) {
 	}
 }
 
+func TestMultiReservationPanicUnwindsAcceptedPeersAndPreservesPanicIdentity(t *testing.T) {
+	var calls []string
+	panicValue := &struct{ message string }{message: "reserve panic"}
+	first := &panicReservationObserver{name: "first", calls: &calls}
+	second := &panicReservationObserver{name: "second", calls: &calls, rollbackPanic: "rollback panic"}
+	third := &panicReservationObserver{name: "third", calls: &calls, reservePanic: panicValue}
+	reserver := observability.Multi(first, second, third).(gateway.ResponseCompleteReserver)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _, _ = reserver.ReserveResponseComplete(context.Background(), "request-1")
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	want := "reserve:first,reserve:second,reserve:third,rollback:second,rollback:first"
+	if got := strings.Join(calls, ","); got != want {
+		t.Fatalf("panic reservation lifecycle = %q, want %q", got, want)
+	}
+}
+
+func TestMultiCompletionPanicRollsBackCurrentAndRemainingPeers(t *testing.T) {
+	var calls []string
+	panicValue := &struct{ message string }{message: "completion panic"}
+	first := &panicReservationObserver{name: "first", calls: &calls}
+	second := &panicReservationObserver{name: "second", calls: &calls, completePanic: panicValue}
+	third := &panicReservationObserver{name: "third", calls: &calls, rollbackPanic: "rollback panic"}
+	reserver := observability.Multi(first, second, third).(gateway.ResponseCompleteReserver)
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("Multi did not return the aggregate reservation")
+	}
+	reservation.StageResponseComplete(gateway.RequestEvent{RequestID: "request-1"})
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		reserver.ResponseComplete(reservation)
+	}()
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	reserver.ResponseComplete(reservation)
+	rollback()
+
+	want := strings.Join([]string{
+		"reserve:first", "reserve:second", "reserve:third",
+		"stage:first", "stage:second", "stage:third",
+		"complete:first", "complete:second", "rollback:third", "rollback:second",
+	}, ",")
+	if got := strings.Join(calls, ","); got != want {
+		t.Fatalf("panic completion lifecycle = %q, want %q", got, want)
+	}
+}
+
 func TestMultiDoesNotReservePeerWithoutTerminalCapability(t *testing.T) {
 	peer := &reservationOnlyObserver{}
 	combined := observability.Multi(peer)
@@ -154,6 +211,53 @@ type reservationObserver struct {
 type reservationOnlyObserver struct {
 	reservations int
 	completions  int
+}
+
+type panicReservationObserver struct {
+	name          string
+	calls         *[]string
+	reservePanic  any
+	completePanic any
+	rollbackPanic any
+}
+
+func (*panicReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*panicReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*panicReservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *panicReservationObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	*o.calls = append(*o.calls, "reserve:"+o.name)
+	if o.reservePanic != nil {
+		panic(o.reservePanic)
+	}
+	return &panicReservationProbe{owner: o}, func() {
+		*o.calls = append(*o.calls, "rollback:"+o.name)
+		if o.rollbackPanic != nil {
+			panic(o.rollbackPanic)
+		}
+	}, true
+}
+
+func (o *panicReservationObserver) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*panicReservationProbe)
+	if !ok || reservation.owner != o {
+		return
+	}
+	*o.calls = append(*o.calls, "complete:"+o.name)
+	if o.completePanic != nil {
+		panic(o.completePanic)
+	}
+}
+
+type panicReservationProbe struct {
+	owner *panicReservationObserver
+}
+
+func (r *panicReservationProbe) StageResponseComplete(gateway.RequestEvent) {
+	*r.owner.calls = append(*r.owner.calls, "stage:"+r.owner.name)
 }
 
 func (*reservationOnlyObserver) ClientInflight(gateway.InflightEvent, int)  {}
