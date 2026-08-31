@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -19,13 +20,29 @@ func serveGateway(
 	ctx context.Context,
 	listener net.Listener,
 	handler http.Handler,
-	grace time.Duration,
+	shutdown *shutdownBudget,
 	stdout io.Writer,
 ) error {
 	server := &http.Server{
 		Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
+	return serveGatewayWithServer(ctx, listener, server, shutdown, stdout)
+}
+
+type gatewayHTTPServer interface {
+	Serve(net.Listener) error
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func serveGatewayWithServer(
+	ctx context.Context,
+	listener net.Listener,
+	server gatewayHTTPServer,
+	shutdown *shutdownBudget,
+	stdout io.Writer,
+) error {
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.Serve(listener) }()
 	fmt.Fprintf(stdout, "vLLM Priority Gateway listening on %s\n", listener.Addr())
@@ -38,10 +55,8 @@ func serveGateway(
 		return nil
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
 	var shutdownErr error
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(shutdown.Context()); err != nil {
 		_ = server.Close()
 		shutdownErr = fmt.Errorf("graceful HTTP shutdown: %w", err)
 	}
@@ -51,6 +66,36 @@ func serveGateway(
 		serveErr = fmt.Errorf("serve gateway: %w", err)
 	}
 	return errors.Join(shutdownErr, serveErr)
+}
+
+type shutdownBudget struct {
+	grace      time.Duration
+	once       sync.Once
+	newContext func(time.Duration) (context.Context, context.CancelFunc)
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func newShutdownBudget(grace time.Duration) *shutdownBudget {
+	return &shutdownBudget{grace: grace}
+}
+
+func (b *shutdownBudget) Context() context.Context {
+	b.once.Do(func() {
+		newContext := b.newContext
+		if newContext == nil {
+			newContext = func(grace time.Duration) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), grace)
+			}
+		}
+		b.ctx, b.cancel = newContext(b.grace)
+	})
+	return b.ctx
+}
+
+func (b *shutdownBudget) Cancel() {
+	_ = b.Context()
+	b.cancel()
 }
 
 type runtimeMetrics interface {

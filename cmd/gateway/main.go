@@ -59,20 +59,30 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	if err != nil {
 		return err
 	}
+	shutdown := newShutdownBudget(cfg.ShutdownGracePeriod)
+	return runGatewayLifecycle(shutdown, application.Close, func(shutdown *shutdownBudget) error {
+		if listener == nil {
+			listener, err = net.Listen("tcp", cfg.ListenAddress)
+			if err != nil {
+				return fmt.Errorf("listen on %s: %w", cfg.ListenAddress, err)
+			}
+		}
+		return serveGateway(ctx, listener, application.Handler(), shutdown, stdout)
+	})
+}
+
+func runGatewayLifecycle(
+	shutdown *shutdownBudget,
+	closeApplication func(context.Context) error,
+	serve func(*shutdownBudget) error,
+) (runErr error) {
+	defer shutdown.Cancel()
 	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
-		defer cancel()
-		if err := application.Close(closeCtx); err != nil {
+		if err := closeApplication(shutdown.Context()); err != nil {
 			runErr = errors.Join(runErr, fmt.Errorf("drain usage recorder: %w", err))
 		}
 	}()
-	if listener == nil {
-		listener, err = net.Listen("tcp", cfg.ListenAddress)
-		if err != nil {
-			return fmt.Errorf("listen on %s: %w", cfg.ListenAddress, err)
-		}
-	}
-	return serveGateway(ctx, listener, application.Handler(), cfg.ShutdownGracePeriod, stdout)
+	return serve(shutdown)
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {

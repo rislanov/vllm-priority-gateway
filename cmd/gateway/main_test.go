@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +139,114 @@ func TestGatewayApplicationCloseReturnsStoredOutcomeWithoutRepeatingCleanup(t *t
 	second := application.Close(secondCtx)
 	if second != first {
 		t.Fatalf("second Close() error = %v, want exact stored outcome %v", second, first)
+	}
+}
+
+func TestGatewayShutdownSharesDeadlineAcrossHTTPAndApplicationCleanup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	grace := time.Minute
+	fixedDeadline := time.Now().Add(time.Hour)
+	var factoryCalls, cancelCalls int
+	var expire context.CancelFunc
+	budget := &shutdownBudget{
+		grace: grace,
+		newContext: func(gotGrace time.Duration) (context.Context, context.CancelFunc) {
+			factoryCalls++
+			if gotGrace != grace {
+				t.Fatalf("shutdown grace = %v, want %v", gotGrace, grace)
+			}
+			ctx, cancel := context.WithDeadline(context.Background(), fixedDeadline)
+			expire = cancel
+			return ctx, func() {
+				cancelCalls++
+				cancel()
+			}
+		},
+	}
+	server := &shutdownServerStub{stopped: make(chan struct{})}
+	var httpShutdownCtx, applicationCloseCtx context.Context
+	server.shutdown = func(ctx context.Context) error {
+		httpShutdownCtx = ctx
+		expire()
+		return ctx.Err()
+	}
+	runCtx, stopRun := context.WithCancel(context.Background())
+	stopRun()
+
+	err = runGatewayLifecycle(
+		budget,
+		func(ctx context.Context) error {
+			applicationCloseCtx = ctx
+			return nil
+		},
+		func(shared *shutdownBudget) error {
+			return serveGatewayWithServer(runCtx, listener, server, shared, io.Discard)
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "graceful HTTP shutdown") {
+		t.Fatalf("runGatewayLifecycle() error = %v, want graceful HTTP shutdown", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("shutdown context factory calls = %d, want 1", factoryCalls)
+	}
+	if httpShutdownCtx != applicationCloseCtx {
+		t.Fatal("application cleanup received a different shutdown context")
+	}
+	deadline, ok := applicationCloseCtx.Deadline()
+	if !ok || !deadline.Equal(fixedDeadline) {
+		t.Fatalf("application cleanup deadline = %v, %v, want %v", deadline, ok, fixedDeadline)
+	}
+	if !errors.Is(applicationCloseCtx.Err(), context.Canceled) {
+		t.Fatalf("application cleanup context error = %v, want consumed shutdown budget", applicationCloseCtx.Err())
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("shutdown context cancel calls = %d, want 1", cancelCalls)
+	}
+}
+
+func TestGatewayShutdownStartsCleanupBudgetAfterEarlyServeError(t *testing.T) {
+	serveErr := errors.New("serve failed before shutdown")
+	var factoryCalls, cancelCalls int
+	budget := &shutdownBudget{
+		grace: time.Minute,
+		newContext: func(time.Duration) (context.Context, context.CancelFunc) {
+			factoryCalls++
+			ctx, cancel := context.WithCancel(context.Background())
+			return ctx, func() {
+				cancelCalls++
+				cancel()
+			}
+		},
+	}
+
+	err := runGatewayLifecycle(
+		budget,
+		func(ctx context.Context) error {
+			if factoryCalls != 1 {
+				t.Fatalf("shutdown context factory calls before cleanup = %d, want 1", factoryCalls)
+			}
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("fresh cleanup context error = %v", err)
+			}
+			return nil
+		},
+		func(*shutdownBudget) error {
+			if factoryCalls != 0 {
+				t.Fatalf("shutdown budget started before early serve error: %d calls", factoryCalls)
+			}
+			return serveErr
+		},
+	)
+	if !errors.Is(err, serveErr) {
+		t.Fatalf("runGatewayLifecycle() error = %v, want %v", err, serveErr)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("shutdown context cancel calls = %d, want 1", cancelCalls)
 	}
 }
 
@@ -1310,6 +1419,26 @@ type closeTrackingStore struct{ closed chan struct{} }
 
 func (s *closeTrackingStore) Close() error {
 	close(s.closed)
+	return nil
+}
+
+type shutdownServerStub struct {
+	stopped  chan struct{}
+	stopOnce sync.Once
+	shutdown func(context.Context) error
+}
+
+func (s *shutdownServerStub) Serve(net.Listener) error {
+	<-s.stopped
+	return http.ErrServerClosed
+}
+
+func (s *shutdownServerStub) Shutdown(ctx context.Context) error {
+	return s.shutdown(ctx)
+}
+
+func (s *shutdownServerStub) Close() error {
+	s.stopOnce.Do(func() { close(s.stopped) })
 	return nil
 }
 
