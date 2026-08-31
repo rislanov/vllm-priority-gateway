@@ -103,6 +103,38 @@ func TestAnalyticsPageUsesCombinedDashboardSnapshotOperation(t *testing.T) {
 	}
 }
 
+func TestAdminPagesAdvertiseOnlyTheirSupportedMethods(t *testing.T) {
+	handler := newWebFixture(t)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		allow  string
+	}{
+		{name: "dashboard", method: http.MethodPost, path: "/admin", allow: http.MethodGet},
+		{name: "dashboard slash", method: http.MethodPost, path: "/admin/", allow: http.MethodGet},
+		{name: "analytics", method: http.MethodPost, path: "/admin/analytics", allow: http.MethodGet},
+		{name: "clients", method: http.MethodPut, path: "/admin/clients", allow: "GET, POST"},
+		{name: "keys", method: http.MethodPut, path: "/admin/keys", allow: "GET, POST"},
+		{name: "backends", method: http.MethodPut, path: "/admin/backends", allow: "GET, POST"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(test.method, test.path, nil))
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("%s %s = %d, want 405 body=%s", test.method, test.path, response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Allow"); got != test.allow {
+				t.Fatalf("%s %s Allow = %q, want %q", test.method, test.path, got, test.allow)
+			}
+			if got := response.Body.String(); got != "Method not allowed\n" {
+				t.Fatalf("%s %s body = %q, want unchanged method error", test.method, test.path, got)
+			}
+		})
+	}
+}
+
 func TestAnalyticsPageRendersMissingUsageAndHonestEmptyState(t *testing.T) {
 	handler := newAnalyticsWebFixture(t)
 	response := httptest.NewRecorder()

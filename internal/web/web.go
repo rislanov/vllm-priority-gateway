@@ -142,7 +142,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch request.URL.Path {
 	case "/admin", "/admin/":
 		if request.Method != http.MethodGet {
-			methodNotAllowed(writer)
+			methodNotAllowed(writer, http.MethodGet)
 			return
 		}
 		h.render(writer, request, "dashboard", pageData{Title: "Gateway overview", Active: "Dashboard"}, http.StatusOK)
@@ -161,7 +161,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) analytics(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
+		methodNotAllowed(writer, http.MethodGet)
 		return
 	}
 	values, normalized, err := normalizeAnalyticsWebValues(request.URL.Query())
@@ -408,8 +408,8 @@ func timeValue(value *time.Time) string {
 	}
 	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
-func methodNotAllowed(writer http.ResponseWriter) {
-	writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+func methodNotAllowed(writer http.ResponseWriter, methods ...string) {
+	writer.Header().Set("Allow", strings.Join(methods, ", "))
 	http.Error(writer, "Method not allowed", http.StatusMethodNotAllowed)
 }
 func withPath(request *http.Request, path string) *http.Request {

@@ -20,7 +20,7 @@ func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {
 			data.Error = h.mutateClient(request)
 		}
 	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
+		methodNotAllowed(writer, http.MethodGet, http.MethodPost)
 		return
 	}
 	if rawID := request.URL.Query().Get("edit"); rawID != "" {
@@ -47,7 +47,7 @@ func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
 			data.Error = errorText
 		}
 	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
+		methodNotAllowed(writer, http.MethodGet, http.MethodPost)
 		return
 	} else {
 		data.Secret = h.takeSecret(httpapi.AdminCSRFToken(request), request.URL.Query().Get("flash"))
@@ -68,7 +68,7 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 			data.Error = h.mutateBackend(request)
 		}
 	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
+		methodNotAllowed(writer, http.MethodGet, http.MethodPost)
 		return
 	}
 	if editPoolID, editBackendID := request.URL.Query().Get("edit_pool"), request.URL.Query().Get("edit"); editPoolID != "" || editBackendID != "" {
