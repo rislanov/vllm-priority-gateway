@@ -67,11 +67,13 @@ const (
 )
 
 type responseCompleteReservation struct {
-	owner    *observers
-	mu       sync.Mutex
-	peers    []reservedPeer
-	staged   bool
-	finished bool
+	owner        *observers
+	mu           sync.Mutex
+	peers        []reservedPeer
+	stageStarted bool
+	stageDone    chan struct{}
+	staged       bool
+	finished     bool
 }
 
 // Multi combines observers in declaration order and skips nil entries.
@@ -153,26 +155,32 @@ func (o *observers) ReserveResponseComplete(
 
 func (r *responseCompleteReservation) StageResponseComplete(event gateway.RequestEvent) {
 	r.mu.Lock()
-	if r.staged || r.finished {
+	if r.stageStarted || r.finished {
 		r.mu.Unlock()
 		return
 	}
-	r.staged = true
+	r.stageStarted = true
+	r.stageDone = make(chan struct{})
 	peers := append([]reservedPeer(nil), r.peers...)
 	r.mu.Unlock()
+
+	staged := false
+	defer func() {
+		r.mu.Lock()
+		r.staged = staged
+		close(r.stageDone)
+		r.mu.Unlock()
+	}()
 	for _, peer := range peers {
 		peer.reservation.StageResponseComplete(event)
 	}
+	staged = true
 }
 
 func (r *responseCompleteReservation) complete() {
-	r.mu.Lock()
-	if r.finished {
-		r.mu.Unlock()
+	if !r.beginCompletion() {
 		return
 	}
-	r.finished = true
-	r.mu.Unlock()
 
 	for index := range r.peers {
 		r.mu.Lock()
@@ -196,6 +204,28 @@ func (r *responseCompleteReservation) complete() {
 		}
 		r.mu.Unlock()
 	}
+}
+
+func (r *responseCompleteReservation) beginCompletion() bool {
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return false
+	}
+	if r.stageStarted {
+		stageDone := r.stageDone
+		r.mu.Unlock()
+		<-stageDone
+
+		r.mu.Lock()
+		if r.finished || !r.staged {
+			r.mu.Unlock()
+			return false
+		}
+	}
+	r.finished = true
+	r.mu.Unlock()
+	return true
 }
 
 func (r *responseCompleteReservation) rollback() {
