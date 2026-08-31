@@ -11,9 +11,7 @@
 
 vLLM Priority Gateway — лёгкий слой policy, admission и routing перед **существующими серверами [vLLM](https://docs.vllm.ai/)**. Приложения продолжают использовать стандартный OpenAI API: достаточно изменить base URL, использовать выданный gateway ключ и оставить развёртывание моделей и GPU scheduling существующей инфраструктуре.
 
-**Проверено на реальном vLLM:** два экземпляра vLLM 0.28.0 на NVIDIA RTX 4070 Ti; проверены saturation, изоляция приоритетов, drain backend-серверов, восстановление circuit breaker, streaming и сохранность состояния после перезапуска.
-
-→ [Acceptance evidence](docs/acceptance-evidence.md)
+**Проверено на реальном vLLM с GPU NVIDIA**, включая saturation, изоляцию приоритетов, отказ и восстановление backend-серверов, streaming и сохранность состояния после перезапуска. [Результаты проверки](docs/acceptance-evidence.md).
 
 ## Какую проблему решает
 
