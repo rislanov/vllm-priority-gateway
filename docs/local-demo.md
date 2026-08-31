@@ -20,7 +20,7 @@ The tested defaults run both small vLLM processes on one NVIDIA GPU with at leas
 Clone the repository and create `.env` from [`.env.example`](../.env.example). Fill both blank secrets with independently generated random values:
 
 ```dotenv
-LLMGW_VERSION=0.2.0
+LLMGW_VERSION=0.3.0
 LLMGW_ADMIN_USERNAME=operator
 LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
 LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
@@ -75,7 +75,7 @@ docker compose --env-file .env -f compose.yaml -f compose.native.yaml ps
 Download the archive for the current architecture and verify it before extraction:
 
 ```bash
-VERSION=0.2.0
+VERSION=0.3.0
 case "$(uname -m)" in
   x86_64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;

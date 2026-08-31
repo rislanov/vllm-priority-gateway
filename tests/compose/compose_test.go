@@ -219,8 +219,8 @@ func TestReleaseComposeUsesPublishedGatewayImageWithoutBuildingSource(t *testing
 
 	config := renderReleaseCompose(t, repositoryRoot, envPath)
 	gateway := config.Services["gateway"]
-	if gateway.Image != "ghcr.io/rislanov/vllm-priority-gateway:0.2.0" {
-		t.Errorf("gateway image = %q, want published v0.2.0 image", gateway.Image)
+	if gateway.Image != "ghcr.io/rislanov/vllm-priority-gateway:0.3.0" {
+		t.Errorf("gateway image = %q, want published v0.3.0 image", gateway.Image)
 	}
 	if len(gateway.Build) != 0 && string(gateway.Build) != "null" {
 		t.Errorf("release gateway unexpectedly has a build configuration: %s", gateway.Build)
@@ -270,8 +270,8 @@ func TestReleaseExampleSelectsCurrentPublishedVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := renderReleaseCompose(t, repositoryRoot, envPath)
-	if image := config.Services["gateway"].Image; image != "ghcr.io/rislanov/vllm-priority-gateway:0.2.0" {
-		t.Errorf("gateway image from .env.example = %q, want published v0.2.0 image", image)
+	if image := config.Services["gateway"].Image; image != "ghcr.io/rislanov/vllm-priority-gateway:0.3.0" {
+		t.Errorf("gateway image from .env.example = %q, want published v0.3.0 image", image)
 	}
 }
 
