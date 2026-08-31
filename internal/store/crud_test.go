@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -127,5 +129,39 @@ func TestSetClientModelAccessReplacesAndDeduplicates(t *testing.T) {
 	}
 	if len(snapshot.Access) != 1 || snapshot.Access[0].ModelPoolID != second.ID {
 		t.Fatalf("model access = %+v", snapshot.Access)
+	}
+}
+
+func TestSetClientModelAccessRejectsMissingClientWithoutRevisionChange(t *testing.T) {
+	tests := []struct {
+		name    string
+		poolIDs []int64
+	}{
+		{name: "nil access", poolIDs: nil},
+		{name: "empty access", poolIDs: []int64{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			before, err := db.LoadSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("LoadSnapshot() before update error = %v", err)
+			}
+
+			err = db.SetClientModelAccess(ctx, 999, tt.poolIDs)
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("SetClientModelAccess() error = %v, want sql.ErrNoRows", err)
+			}
+
+			after, err := db.LoadSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("LoadSnapshot() after update error = %v", err)
+			}
+			if after.Revision != before.Revision {
+				t.Fatalf("revision changed from %d to %d after rejected update", before.Revision, after.Revision)
+			}
+		})
 	}
 }

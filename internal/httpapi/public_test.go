@@ -263,21 +263,47 @@ func TestConcurrencyLeaseSpansWholeForwardLifecycle(t *testing.T) {
 	handler, _ := newFixture(t, fixtureOptions{client: client, key: key, forwarder: forwarder})
 	server := httptest.NewServer(handler)
 	defer server.Close()
-	firstDone := make(chan *http.Response, 1)
-	go func() {
-		firstDone <- post(t, server.URL, raw)
+	defer func() {
+		select {
+		case <-forwarder.release:
+		default:
+			close(forwarder.release)
+		}
 	}()
-	<-forwarder.started
-	second := post(t, server.URL, raw)
+	type postResult struct {
+		response *http.Response
+		err      error
+	}
+	firstDone := make(chan postResult, 1)
+	go func() {
+		response, err := post(server.URL, raw)
+		firstDone <- postResult{response: response, err: err}
+	}()
+	awaitSignal(t, forwarder.started, "first request to enter the forwarder")
+	second, err := post(server.URL, raw)
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
 	secondBody, _ := io.ReadAll(second.Body)
 	second.Body.Close()
 	if second.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d body=%s", second.StatusCode, secondBody)
 	}
 	close(forwarder.release)
-	first := <-firstDone
-	first.Body.Close()
-	third := post(t, server.URL, raw)
+	var first postResult
+	select {
+	case first = <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first request to finish")
+	}
+	if first.err != nil {
+		t.Fatalf("first request: %v", first.err)
+	}
+	first.response.Body.Close()
+	third, err := post(server.URL, raw)
+	if err != nil {
+		t.Fatalf("third request: %v", err)
+	}
 	third.Body.Close()
 	if third.StatusCode != http.StatusOK {
 		t.Fatalf("third status = %d", third.StatusCode)
@@ -1333,15 +1359,13 @@ func withRevoked(key domain.APIKey) domain.APIKey {
 }
 func withExpiry(key domain.APIKey, value time.Time) domain.APIKey { key.ExpiresAt = &value; return key }
 
-func post(t *testing.T, url, rawKey string) *http.Response {
-	t.Helper()
-	request, _ := http.NewRequest(http.MethodPost, url+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
-	request.Header.Set("Authorization", "Bearer "+rawKey)
-	response, err := http.DefaultClient.Do(request)
+func post(url, rawKey string) (*http.Response, error) {
+	request, err := http.NewRequest(http.MethodPost, url+"/v1/completions", strings.NewReader(`{"model":"public-model"}`))
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	return response
+	request.Header.Set("Authorization", "Bearer "+rawKey)
+	return http.DefaultClient.Do(request)
 }
 
 func assertErrorCode(t *testing.T, body []byte, want string) {

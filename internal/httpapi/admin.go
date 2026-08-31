@@ -426,7 +426,8 @@ func NewAdminAPI(service *AdminService) http.Handler {
 		router.Get("/analytics/requests", analyticsRequestsHandler(service))
 		router.Get("/analytics/export.csv", analyticsCSVHandler(service))
 		router.Get("/clients", func(writer http.ResponseWriter, _ *http.Request) {
-			writeAdminJSON(writer, http.StatusOK, map[string]any{"revision": service.View().Revision, "clients": service.View().Clients})
+			view := service.View()
+			writeAdminJSON(writer, http.StatusOK, map[string]any{"revision": view.Revision, "clients": view.Clients})
 		})
 		router.Post("/clients", createClientHandler(service))
 		router.Put("/clients/{id}", updateClientHandler(service))

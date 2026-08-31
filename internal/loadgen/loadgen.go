@@ -61,9 +61,15 @@ var priorityOrder = []domain.PriorityClass{
 }
 
 func (c Config) Validate() error {
-	parsed, err := url.Parse(strings.TrimSpace(c.URL))
+	if strings.TrimSpace(c.URL) != c.URL {
+		return errors.New("gateway URL must not contain surrounding whitespace")
+	}
+	parsed, err := url.Parse(c.URL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return errors.New("gateway URL must be an absolute http(s) URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(c.URL, "#") {
+		return errors.New("gateway URL must not contain userinfo, query, or fragment")
 	}
 	if c.Requests <= 0 {
 		return errors.New("request count must be positive")
@@ -123,18 +129,28 @@ func Run(ctx context.Context, config Config) (Result, error) {
 		return Result{}, err
 	}
 	identities := identitySequence(config)
+	accumulator := resultAccumulator{
+		summary:      Result{ByClass: make(map[domain.PriorityClass]ClassResult)},
+		classTTFT:    make(map[domain.PriorityClass][]time.Duration),
+		classLatency: make(map[domain.PriorityClass][]time.Duration),
+	}
+	for observation := range observe(ctx, config, identities) {
+		accumulator.add(observation)
+	}
+	return accumulator.finish(ctx)
+}
+
+func observe(ctx context.Context, config Config, identities []identity) <-chan observation {
 	jobs := make(chan identity)
 	observations := make(chan observation, config.Requests)
 	workers := min(config.Parallelism, config.Requests)
 	var group sync.WaitGroup
-	group.Add(workers)
 	for range workers {
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			for identity := range jobs {
 				observations <- execute(ctx, config, identity)
 			}
-		}()
+		})
 	}
 	go func() {
 		defer close(jobs)
@@ -150,72 +166,80 @@ func Run(ctx context.Context, config Config) (Result, error) {
 		group.Wait()
 		close(observations)
 	}()
+	return observations
+}
 
-	result := Result{ByClass: make(map[domain.PriorityClass]ClassResult)}
-	var ttft, latency []time.Duration
-	classTTFT := make(map[domain.PriorityClass][]time.Duration)
-	classLatency := make(map[domain.PriorityClass][]time.Duration)
-	for observation := range observations {
-		result.Total++
-		classResult := result.ByClass[observation.class]
+type resultAccumulator struct {
+	summary      Result
+	ttft         []time.Duration
+	latency      []time.Duration
+	classTTFT    map[domain.PriorityClass][]time.Duration
+	classLatency map[domain.PriorityClass][]time.Duration
+}
+
+func (accumulator *resultAccumulator) add(observation observation) {
+	accumulator.summary.Total++
+	classResult := accumulator.summary.ByClass[observation.class]
+	if observation.class.Valid() {
+		classResult.Total++
+	}
+	if observation.err != nil {
+		accumulator.summary.TransportFailures++
 		if observation.class.Valid() {
-			classResult.Total++
+			classResult.TransportFailures++
+			accumulator.summary.ByClass[observation.class] = classResult
 		}
-		if observation.err != nil {
-			result.TransportFailures++
-			if observation.class.Valid() {
-				classResult.TransportFailures++
-				result.ByClass[observation.class] = classResult
-			}
-			continue
-		}
-		switch {
-		case observation.status >= 200 && observation.status < 300:
-			result.Successes++
-			if observation.class.Valid() {
-				classResult.Successes++
-			}
-			if observation.ttft > 0 {
-				ttft = append(ttft, observation.ttft)
-				if observation.class.Valid() {
-					classTTFT[observation.class] = append(classTTFT[observation.class], observation.ttft)
-				}
-			}
-			latency = append(latency, observation.latency)
-			if observation.class.Valid() {
-				classLatency[observation.class] = append(classLatency[observation.class], observation.latency)
-			}
-		case observation.status == http.StatusTooManyRequests:
-			result.Overloaded++
-			classResult.Overloaded++
-		case observation.status >= 500:
-			result.ServerErrors++
-			classResult.ServerErrors++
-		default:
-			result.Failures++
-			classResult.Failures++
-		}
+		return
+	}
+	switch {
+	case observation.status >= 200 && observation.status < 300:
+		accumulator.summary.Successes++
 		if observation.class.Valid() {
-			result.ByClass[observation.class] = classResult
+			classResult.Successes++
 		}
+		if observation.ttft > 0 {
+			accumulator.ttft = append(accumulator.ttft, observation.ttft)
+			if observation.class.Valid() {
+				accumulator.classTTFT[observation.class] = append(accumulator.classTTFT[observation.class], observation.ttft)
+			}
+		}
+		accumulator.latency = append(accumulator.latency, observation.latency)
+		if observation.class.Valid() {
+			accumulator.classLatency[observation.class] = append(accumulator.classLatency[observation.class], observation.latency)
+		}
+	case observation.status == http.StatusTooManyRequests:
+		accumulator.summary.Overloaded++
+		classResult.Overloaded++
+	case observation.status >= 500:
+		accumulator.summary.ServerErrors++
+		classResult.ServerErrors++
+	default:
+		accumulator.summary.Failures++
+		classResult.Failures++
 	}
-	result.TTFT = Summarize(ttft)
-	result.Latency = Summarize(latency)
-	for class, classResult := range result.ByClass {
-		classResult.TTFT = Summarize(classTTFT[class])
-		classResult.Latency = Summarize(classLatency[class])
-		result.ByClass[class] = classResult
+	if observation.class.Valid() {
+		accumulator.summary.ByClass[observation.class] = classResult
 	}
-	if len(result.ByClass) == 0 {
-		result.ByClass = nil
+}
+
+func (accumulator *resultAccumulator) finish(ctx context.Context) (Result, error) {
+	accumulator.summary.TTFT = Summarize(accumulator.ttft)
+	accumulator.summary.Latency = Summarize(accumulator.latency)
+	for class, classResult := range accumulator.summary.ByClass {
+		classResult.TTFT = Summarize(accumulator.classTTFT[class])
+		classResult.Latency = Summarize(accumulator.classLatency[class])
+		accumulator.summary.ByClass[class] = classResult
 	}
-	if result.TransportFailures > 0 {
-		return result, fmt.Errorf("%d request(s) failed at the transport layer", result.TransportFailures)
+	if len(accumulator.summary.ByClass) == 0 {
+		accumulator.summary.ByClass = nil
+	}
+	if accumulator.summary.TransportFailures > 0 {
+		return accumulator.summary, fmt.Errorf("%d request(s) failed at the transport layer", accumulator.summary.TransportFailures)
 	}
 	if ctx.Err() != nil {
-		return result, ctx.Err()
+		return accumulator.summary, ctx.Err()
 	}
-	return result, nil
+	return accumulator.summary, nil
 }
 
 func identitySequence(config Config) []identity {

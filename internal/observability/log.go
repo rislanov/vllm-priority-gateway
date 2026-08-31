@@ -54,14 +54,26 @@ type reservedPeer struct {
 	observer    gateway.ResponseCompleteObserver
 	reservation gateway.ResponseCompleteReservation
 	rollback    func()
+	state       reservedPeerState
 }
 
+type reservedPeerState uint8
+
+const (
+	peerPending reservedPeerState = iota
+	peerCompleting
+	peerCompleted
+	peerRolledBack
+)
+
 type responseCompleteReservation struct {
-	owner    *observers
-	mu       sync.Mutex
-	peers    []reservedPeer
-	staged   bool
-	finished bool
+	owner        *observers
+	mu           sync.Mutex
+	peers        []reservedPeer
+	stageStarted bool
+	stageDone    chan struct{}
+	staged       bool
+	finished     bool
 }
 
 // Multi combines observers in declaration order and skips nil entries.
@@ -106,6 +118,14 @@ func (o *observers) ReserveResponseComplete(
 	requestID string,
 ) (gateway.ResponseCompleteReservation, func(), bool) {
 	reservation := &responseCompleteReservation{owner: o, peers: make([]reservedPeer, 0, len(o.values))}
+	defer func() {
+		panicValue := recover()
+		if panicValue == nil {
+			return
+		}
+		reservation.rollbackAfterPanic()
+		panic(panicValue)
+	}()
 	for _, observer := range o.values {
 		reserver, ok := observer.(gateway.ResponseCompleteReserver)
 		if !ok {
@@ -113,10 +133,14 @@ func (o *observers) ReserveResponseComplete(
 		}
 		peerReservation, rollback, reserved := reserver.ReserveResponseComplete(ctx, requestID)
 		if !reserved || peerReservation == nil {
+			rollbacks := make([]func(), 0, len(reservation.peers)+1)
 			if rollback != nil {
-				rollback()
+				rollbacks = append(rollbacks, rollback)
 			}
-			reservation.rollback()
+			rollbacks = append(rollbacks, reservation.takeRollbackActions()...)
+			if panicValue := invokeRollbackActions(rollbacks); panicValue != nil {
+				panic(panicValue)
+			}
 			return nil, nil, false
 		}
 		if rollback == nil {
@@ -131,36 +155,134 @@ func (o *observers) ReserveResponseComplete(
 
 func (r *responseCompleteReservation) StageResponseComplete(event gateway.RequestEvent) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.staged || r.finished {
+	if r.stageStarted || r.finished {
+		r.mu.Unlock()
 		return
 	}
-	r.staged = true
-	for _, peer := range r.peers {
+	r.stageStarted = true
+	r.stageDone = make(chan struct{})
+	peers := append([]reservedPeer(nil), r.peers...)
+	r.mu.Unlock()
+
+	staged := false
+	defer func() {
+		r.mu.Lock()
+		r.staged = staged
+		close(r.stageDone)
+		r.mu.Unlock()
+	}()
+	for _, peer := range peers {
 		peer.reservation.StageResponseComplete(event)
 	}
+	staged = true
 }
 
 func (r *responseCompleteReservation) complete() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.finished {
+	if !r.beginCompletion() {
 		return
 	}
-	r.finished = true
-	for _, peer := range r.peers {
-		peer.observer.ResponseComplete(peer.reservation)
+
+	for index := range r.peers {
+		r.mu.Lock()
+		if r.peers[index].state != peerPending {
+			r.mu.Unlock()
+			continue
+		}
+		r.peers[index].state = peerCompleting
+		peer := r.peers[index]
+		r.mu.Unlock()
+
+		panicValue := invokeResponseComplete(peer)
+		if panicValue != nil {
+			_ = invokeRollbackActions(r.takeRollbackActionsFrom(index))
+			panic(panicValue)
+		}
+
+		r.mu.Lock()
+		if r.peers[index].state == peerCompleting {
+			r.peers[index].state = peerCompleted
+		}
+		r.mu.Unlock()
 	}
 }
 
+func (r *responseCompleteReservation) beginCompletion() bool {
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return false
+	}
+	if r.stageStarted {
+		stageDone := r.stageDone
+		r.mu.Unlock()
+		<-stageDone
+
+		r.mu.Lock()
+		if r.finished || !r.staged {
+			r.mu.Unlock()
+			return false
+		}
+	}
+	r.finished = true
+	r.mu.Unlock()
+	return true
+}
+
 func (r *responseCompleteReservation) rollback() {
+	if panicValue := invokeRollbackActions(r.takeRollbackActions()); panicValue != nil {
+		panic(panicValue)
+	}
+}
+
+func (r *responseCompleteReservation) rollbackAfterPanic() {
+	_ = invokeRollbackActions(r.takeRollbackActions())
+}
+
+func (r *responseCompleteReservation) takeRollbackActions() []func() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.finished {
-		return
+		return nil
 	}
 	r.finished = true
-	for index := len(r.peers) - 1; index >= 0; index-- {
-		r.peers[index].rollback()
+	return r.takeRollbackActionsLocked(0)
+}
+
+func (r *responseCompleteReservation) takeRollbackActionsFrom(start int) []func() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.takeRollbackActionsLocked(start)
+}
+
+func (r *responseCompleteReservation) takeRollbackActionsLocked(start int) []func() {
+	rollbacks := make([]func(), 0, len(r.peers)-start)
+	for index := len(r.peers) - 1; index >= start; index-- {
+		if r.peers[index].state != peerPending && r.peers[index].state != peerCompleting {
+			continue
+		}
+		r.peers[index].state = peerRolledBack
+		rollbacks = append(rollbacks, r.peers[index].rollback)
 	}
+	return rollbacks
+}
+
+func invokeResponseComplete(peer reservedPeer) (panicValue any) {
+	defer func() { panicValue = recover() }()
+	peer.observer.ResponseComplete(peer.reservation)
+	return nil
+}
+
+func invokeRollbackActions(rollbacks []func()) (firstPanic any) {
+	for _, rollback := range rollbacks {
+		if panicValue := invokeRollback(rollback); panicValue != nil && firstPanic == nil {
+			firstPanic = panicValue
+		}
+	}
+	return firstPanic
+}
+
+func invokeRollback(rollback func()) (panicValue any) {
+	defer func() { panicValue = recover() }()
+	rollback()
+	return nil
 }

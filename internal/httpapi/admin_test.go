@@ -97,6 +97,53 @@ func TestAdminSecurityRequiresBasicAuthAndMatchingCSRF(t *testing.T) {
 	}
 }
 
+func TestAdminClientListUsesSingleRegistrySnapshot(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	registryValue := &alternatingAdminRegistry{snapshots: []*registry.Snapshot{
+		{
+			Revision: 41,
+			Clients: map[int64]domain.Client{
+				1: {ID: 1, Name: "snapshot-41", Enabled: true, PriorityClass: domain.PriorityNormal},
+			},
+		},
+		{
+			Revision: 42,
+			Clients: map[int64]domain.Client{
+				2: {ID: 2, Name: "snapshot-42", Enabled: true, PriorityClass: domain.PriorityHigh},
+			},
+		},
+	}}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Analytics: database, Registry: registryValue,
+		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
+		HMACSecret: []byte(strings.Repeat("h", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/clients", nil)
+	response := httptest.NewRecorder()
+	httpapi.NewAdminAPI(service).ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /admin/api/clients = %d body=%s", response.Code, response.Body.String())
+	}
+	var got struct {
+		Revision int64                 `json:"revision"`
+		Clients  []httpapi.AdminClient `json:"clients"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Revision != 41 || len(got.Clients) != 1 || got.Clients[0].ID != 1 || got.Clients[0].Name != "snapshot-41" {
+		t.Fatalf("client list combined registry snapshots: %+v", got)
+	}
+}
+
 func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	handler, registryValue, runtime := newAdminFixture(t)
 	csrf := fetchCSRF(t, handler)
@@ -434,6 +481,19 @@ type cancellingStore struct {
 type reloadFailureRegistry struct {
 	*registry.Registry
 	fail bool
+}
+
+type alternatingAdminRegistry struct {
+	snapshots []*registry.Snapshot
+	next      int
+}
+
+func (r *alternatingAdminRegistry) Reload(context.Context) error { return nil }
+
+func (r *alternatingAdminRegistry) Snapshot() *registry.Snapshot {
+	snapshot := r.snapshots[r.next%len(r.snapshots)]
+	r.next++
+	return snapshot
 }
 
 func (r *reloadFailureRegistry) Reload(ctx context.Context) error {

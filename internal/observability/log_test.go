@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,6 +123,169 @@ func TestMultiRollsBackEarlierReservationWhenLaterPeerRefuses(t *testing.T) {
 	}
 }
 
+func TestMultiReservationPanicUnwindsAcceptedPeersAndPreservesPanicIdentity(t *testing.T) {
+	var calls []string
+	panicValue := &struct{ message string }{message: "reserve panic"}
+	first := &panicReservationObserver{name: "first", calls: &calls}
+	second := &panicReservationObserver{name: "second", calls: &calls, rollbackPanic: "rollback panic"}
+	third := &panicReservationObserver{name: "third", calls: &calls, reservePanic: panicValue}
+	reserver := observability.Multi(first, second, third).(gateway.ResponseCompleteReserver)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _, _ = reserver.ReserveResponseComplete(context.Background(), "request-1")
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	want := "reserve:first,reserve:second,reserve:third,rollback:second,rollback:first"
+	if got := strings.Join(calls, ","); got != want {
+		t.Fatalf("panic reservation lifecycle = %q, want %q", got, want)
+	}
+}
+
+func TestMultiCompletionPanicRollsBackCurrentAndRemainingPeers(t *testing.T) {
+	var calls []string
+	panicValue := &struct{ message string }{message: "completion panic"}
+	first := &panicReservationObserver{name: "first", calls: &calls}
+	second := &panicReservationObserver{name: "second", calls: &calls, completePanic: panicValue}
+	third := &panicReservationObserver{name: "third", calls: &calls, rollbackPanic: "rollback panic"}
+	reserver := observability.Multi(first, second, third).(gateway.ResponseCompleteReserver)
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("Multi did not return the aggregate reservation")
+	}
+	reservation.StageResponseComplete(gateway.RequestEvent{RequestID: "request-1"})
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		reserver.ResponseComplete(reservation)
+	}()
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	reserver.ResponseComplete(reservation)
+	rollback()
+
+	want := strings.Join([]string{
+		"reserve:first", "reserve:second", "reserve:third",
+		"stage:first", "stage:second", "stage:third",
+		"complete:first", "complete:second", "rollback:third", "rollback:second",
+	}, ",")
+	if got := strings.Join(calls, ","); got != want {
+		t.Fatalf("panic completion lifecycle = %q, want %q", got, want)
+	}
+}
+
+func TestMultiCompletionWaitsForInProgressStaging(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	calls := &concurrentCallLog{}
+	stageStarted := make(chan struct{})
+	releaseStage := make(chan struct{})
+	first := &concurrentReservationObserver{
+		name: "first", calls: calls, stageStarted: stageStarted, releaseStage: releaseStage,
+	}
+	second := &concurrentReservationObserver{name: "second", calls: calls}
+	reserver := observability.Multi(first, second).(gateway.ResponseCompleteReserver)
+	reservation, _, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil {
+		t.Fatal("Multi did not return the aggregate reservation")
+	}
+
+	stageDone := make(chan struct{})
+	go func() {
+		defer close(stageDone)
+		reservation.StageResponseComplete(gateway.RequestEvent{RequestID: "request-1"})
+	}()
+	waitObserverSignal(t, stageStarted, "first peer staging")
+
+	completeStarted := make(chan struct{})
+	completeDone := make(chan struct{})
+	go func() {
+		close(completeStarted)
+		reserver.ResponseComplete(reservation)
+		close(completeDone)
+	}()
+	waitObserverSignal(t, completeStarted, "completion attempt")
+	runtime.Gosched()
+	select {
+	case <-completeDone:
+		close(releaseStage)
+		waitObserverSignal(t, stageDone, "staging after early completion")
+		t.Fatal("ResponseComplete returned before in-progress staging finished")
+	default:
+	}
+
+	close(releaseStage)
+	waitObserverSignal(t, stageDone, "staging completion")
+	waitObserverSignal(t, completeDone, "response completion")
+	if got := strings.Join(calls.Values(), ","); got != "stage:first,stage:second,complete:first,complete:second" {
+		t.Fatalf("concurrent lifecycle order = %q", got)
+	}
+}
+
+func TestMultiStagePanicWakesWaitingCompletionWithoutCompletingPeers(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	calls := &concurrentCallLog{}
+	stageStarted := make(chan struct{})
+	releaseStage := make(chan struct{})
+	panicValue := &struct{ message string }{message: "stage panic"}
+	first := &concurrentReservationObserver{
+		name: "first", calls: calls, stageStarted: stageStarted, releaseStage: releaseStage, stagePanic: panicValue,
+	}
+	second := &concurrentReservationObserver{name: "second", calls: calls}
+	reserver := observability.Multi(first, second).(gateway.ResponseCompleteReserver)
+	reservation, rollback, reserved := reserver.ReserveResponseComplete(context.Background(), "request-1")
+	if !reserved || reservation == nil || rollback == nil {
+		t.Fatal("Multi did not return the aggregate reservation")
+	}
+
+	stagePanic := make(chan any, 1)
+	go func() {
+		defer func() { stagePanic <- recover() }()
+		reservation.StageResponseComplete(gateway.RequestEvent{RequestID: "request-1"})
+	}()
+	waitObserverSignal(t, stageStarted, "panicking peer staging")
+
+	completeStarted := make(chan struct{})
+	completeDone := make(chan struct{})
+	go func() {
+		close(completeStarted)
+		reserver.ResponseComplete(reservation)
+		close(completeDone)
+	}()
+	waitObserverSignal(t, completeStarted, "completion attempt")
+	runtime.Gosched()
+	select {
+	case <-completeDone:
+		close(releaseStage)
+		t.Fatalf("ResponseComplete returned before panicking staging finished; calls=%v", calls.Values())
+	default:
+	}
+
+	close(releaseStage)
+	select {
+	case recovered := <-stagePanic:
+		if recovered != panicValue {
+			t.Fatalf("recovered stage panic = %#v, want original identity %#v", recovered, panicValue)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stage panic")
+	}
+	waitObserverSignal(t, completeDone, "completion after stage panic")
+	rollback()
+	if got := strings.Join(calls.Values(), ","); got != "stage:first,rollback:second,rollback:first" {
+		t.Fatalf("stage panic lifecycle = %q", got)
+	}
+}
+
 func TestMultiDoesNotReservePeerWithoutTerminalCapability(t *testing.T) {
 	peer := &reservationOnlyObserver{}
 	combined := observability.Multi(peer)
@@ -154,6 +319,124 @@ type reservationObserver struct {
 type reservationOnlyObserver struct {
 	reservations int
 	completions  int
+}
+
+type panicReservationObserver struct {
+	name          string
+	calls         *[]string
+	reservePanic  any
+	completePanic any
+	rollbackPanic any
+}
+
+type concurrentCallLog struct {
+	mu     sync.Mutex
+	values []string
+}
+
+func (l *concurrentCallLog) Add(value string) {
+	l.mu.Lock()
+	l.values = append(l.values, value)
+	l.mu.Unlock()
+}
+
+func (l *concurrentCallLog) Values() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.values...)
+}
+
+type concurrentReservationObserver struct {
+	name         string
+	calls        *concurrentCallLog
+	stageStarted chan struct{}
+	releaseStage <-chan struct{}
+	stagePanic   any
+	stageOnce    sync.Once
+}
+
+func (*concurrentReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*concurrentReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*concurrentReservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *concurrentReservationObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	return &concurrentReservationProbe{owner: o}, func() { o.calls.Add("rollback:" + o.name) }, true
+}
+
+func (o *concurrentReservationObserver) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*concurrentReservationProbe)
+	if !ok || reservation.owner != o {
+		return
+	}
+	o.calls.Add("complete:" + o.name)
+}
+
+type concurrentReservationProbe struct {
+	owner *concurrentReservationObserver
+}
+
+func (r *concurrentReservationProbe) StageResponseComplete(gateway.RequestEvent) {
+	r.owner.calls.Add("stage:" + r.owner.name)
+	if r.owner.stageStarted != nil {
+		r.owner.stageOnce.Do(func() { close(r.owner.stageStarted) })
+	}
+	if r.owner.releaseStage != nil {
+		<-r.owner.releaseStage
+	}
+	if r.owner.stagePanic != nil {
+		panic(r.owner.stagePanic)
+	}
+}
+
+func waitObserverSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func (*panicReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*panicReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*panicReservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *panicReservationObserver) ReserveResponseComplete(
+	context.Context,
+	string,
+) (gateway.ResponseCompleteReservation, func(), bool) {
+	*o.calls = append(*o.calls, "reserve:"+o.name)
+	if o.reservePanic != nil {
+		panic(o.reservePanic)
+	}
+	return &panicReservationProbe{owner: o}, func() {
+		*o.calls = append(*o.calls, "rollback:"+o.name)
+		if o.rollbackPanic != nil {
+			panic(o.rollbackPanic)
+		}
+	}, true
+}
+
+func (o *panicReservationObserver) ResponseComplete(handle gateway.ResponseCompleteReservation) {
+	reservation, ok := handle.(*panicReservationProbe)
+	if !ok || reservation.owner != o {
+		return
+	}
+	*o.calls = append(*o.calls, "complete:"+o.name)
+	if o.completePanic != nil {
+		panic(o.completePanic)
+	}
+}
+
+type panicReservationProbe struct {
+	owner *panicReservationObserver
+}
+
+func (r *panicReservationProbe) StageResponseComplete(gateway.RequestEvent) {
+	*r.owner.calls = append(*r.owner.calls, "stage:"+r.owner.name)
 }
 
 func (*reservationOnlyObserver) ClientInflight(gateway.InflightEvent, int)  {}

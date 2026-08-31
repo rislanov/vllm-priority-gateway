@@ -52,7 +52,38 @@ type Config struct {
 }
 
 func Load(lookup LookupFunc) (Config, error) {
-	cfg := Config{
+	cfg := defaultConfig()
+
+	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
+	cfg.DatabasePath = stringValue(lookup, "LLMGW_DATABASE_PATH", cfg.DatabasePath)
+	cfg.AdminUsername = stringValue(lookup, "LLMGW_ADMIN_USERNAME", "")
+	cfg.AdminPassword = stringValue(lookup, "LLMGW_ADMIN_PASSWORD", "")
+	cfg.APIKeyHMACSecret = []byte(stringValue(lookup, "LLMGW_API_KEY_HMAC_SECRET", ""))
+
+	if err := cfg.loadHealth(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadCircuit(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadPressure(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadRequestPolicy(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadTransport(lookup); err != nil {
+		return Config{}, err
+	}
+
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func defaultConfig() Config {
+	return Config{
 		ListenAddress:              ":8080",
 		DatabasePath:               "./data/llmgw.db",
 		HealthInterval:             2 * time.Second,
@@ -88,115 +119,127 @@ func Load(lookup LookupFunc) (Config, error) {
 		ShutdownGracePeriod:        30 * time.Second,
 		AnalyticsRetention:         2160 * time.Hour,
 	}
+}
 
-	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
-	cfg.DatabasePath = stringValue(lookup, "LLMGW_DATABASE_PATH", cfg.DatabasePath)
-	cfg.AdminUsername = stringValue(lookup, "LLMGW_ADMIN_USERNAME", "")
-	cfg.AdminPassword = stringValue(lookup, "LLMGW_ADMIN_PASSWORD", "")
-	cfg.APIKeyHMACSecret = []byte(stringValue(lookup, "LLMGW_API_KEY_HMAC_SECRET", ""))
-
+func (c *Config) loadHealth(lookup LookupFunc) error {
 	var err error
-	if cfg.HealthInterval, err = durationValue(lookup, "LLMGW_HEALTH_INTERVAL", cfg.HealthInterval); err != nil {
-		return Config{}, err
+	if c.HealthInterval, err = durationValue(lookup, "LLMGW_HEALTH_INTERVAL", c.HealthInterval); err != nil {
+		return err
 	}
-	if cfg.HealthTimeout, err = durationValue(lookup, "LLMGW_HEALTH_TIMEOUT", cfg.HealthTimeout); err != nil {
-		return Config{}, err
+	if c.HealthTimeout, err = durationValue(lookup, "LLMGW_HEALTH_TIMEOUT", c.HealthTimeout); err != nil {
+		return err
 	}
-	if cfg.MetricsInterval, err = durationValue(lookup, "LLMGW_METRICS_INTERVAL", cfg.MetricsInterval); err != nil {
-		return Config{}, err
+	if c.MetricsInterval, err = durationValue(lookup, "LLMGW_METRICS_INTERVAL", c.MetricsInterval); err != nil {
+		return err
 	}
-	if cfg.MetricsTimeout, err = durationValue(lookup, "LLMGW_METRICS_TIMEOUT", cfg.MetricsTimeout); err != nil {
-		return Config{}, err
+	if c.MetricsTimeout, err = durationValue(lookup, "LLMGW_METRICS_TIMEOUT", c.MetricsTimeout); err != nil {
+		return err
 	}
-	if cfg.MetricsStaleAfter, err = durationValue(lookup, "LLMGW_METRICS_STALE_AFTER", cfg.MetricsStaleAfter); err != nil {
-		return Config{}, err
+	if c.MetricsStaleAfter, err = durationValue(lookup, "LLMGW_METRICS_STALE_AFTER", c.MetricsStaleAfter); err != nil {
+		return err
 	}
-	if cfg.UnhealthyAfter, err = intValue(lookup, "LLMGW_UNHEALTHY_AFTER", cfg.UnhealthyAfter); err != nil {
-		return Config{}, err
+	if c.UnhealthyAfter, err = intValue(lookup, "LLMGW_UNHEALTHY_AFTER", c.UnhealthyAfter); err != nil {
+		return err
 	}
-	if cfg.RecoveryAfter, err = intValue(lookup, "LLMGW_RECOVERY_AFTER", cfg.RecoveryAfter); err != nil {
-		return Config{}, err
+	if c.RecoveryAfter, err = intValue(lookup, "LLMGW_RECOVERY_AFTER", c.RecoveryAfter); err != nil {
+		return err
 	}
-	if cfg.CircuitFailureThreshold, err = intValue(lookup, "LLMGW_CIRCUIT_FAILURE_THRESHOLD", cfg.CircuitFailureThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitFailureWindow, err = durationValue(lookup, "LLMGW_CIRCUIT_FAILURE_WINDOW", cfg.CircuitFailureWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitOpenCooldown, err = durationValue(lookup, "LLMGW_CIRCUIT_OPEN_COOLDOWN", cfg.CircuitOpenCooldown); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitHalfOpenMaxProbes, err = intValue(lookup, "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", cfg.CircuitHalfOpenMaxProbes); err != nil {
-		return Config{}, err
-	}
-	if cfg.QueueSoftLimit, err = floatValue(lookup, "LLMGW_QUEUE_SOFT_LIMIT", cfg.QueueSoftLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.KVSoftLimit, err = floatValue(lookup, "LLMGW_KV_SOFT_LIMIT", cfg.KVSoftLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.KVHardLimit, err = floatValue(lookup, "LLMGW_KV_HARD_LIMIT", cfg.KVHardLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.EWMAWindow, err = durationValue(lookup, "LLMGW_EWMA_WINDOW", cfg.EWMAWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.BusyThreshold, err = floatValue(lookup, "LLMGW_BUSY_THRESHOLD", cfg.BusyThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.SaturatedThreshold, err = floatValue(lookup, "LLMGW_SATURATED_THRESHOLD", cfg.SaturatedThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_THRESHOLD", cfg.EmergencyThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.BusyRecoveryThreshold, err = floatValue(lookup, "LLMGW_BUSY_RECOVERY_THRESHOLD", cfg.BusyRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.SaturatedRecoveryThreshold, err = floatValue(lookup, "LLMGW_SATURATED_RECOVERY_THRESHOLD", cfg.SaturatedRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyRecoveryThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_RECOVERY_THRESHOLD", cfg.EmergencyRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.OverloadEnterWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_ENTER_WINDOW", cfg.OverloadEnterWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.OverloadRecoveryWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_RECOVERY_WINDOW", cfg.OverloadRecoveryWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.RequestBodyLimit, err = int64Value(lookup, "LLMGW_REQUEST_BODY_LIMIT", cfg.RequestBodyLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.RetryAfter, err = durationValue(lookup, "LLMGW_RETRY_AFTER", cfg.RetryAfter); err != nil {
-		return Config{}, err
-	}
-	if cfg.RoutingPressureEpsilon, err = floatValue(lookup, "LLMGW_ROUTING_PRESSURE_EPSILON", cfg.RoutingPressureEpsilon); err != nil {
-		return Config{}, err
-	}
-	if cfg.SessionAffinityMaxPressure, err = floatValue(lookup, "LLMGW_SESSION_AFFINITY_MAX_PRESSURE", cfg.SessionAffinityMaxPressure); err != nil {
-		return Config{}, err
-	}
-	if cfg.DialTimeout, err = durationValue(lookup, "LLMGW_DIAL_TIMEOUT", cfg.DialTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.TLSHandshakeTimeout, err = durationValue(lookup, "LLMGW_TLS_HANDSHAKE_TIMEOUT", cfg.TLSHandshakeTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.ResponseHeaderTimeout, err = durationValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT", cfg.ResponseHeaderTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", cfg.ShutdownGracePeriod); err != nil {
-		return Config{}, err
-	}
-	if cfg.AnalyticsRetention, err = durationValue(lookup, "LLMGW_ANALYTICS_RETENTION", cfg.AnalyticsRetention); err != nil {
-		return Config{}, err
-	}
+	return nil
+}
 
-	if err := cfg.validate(); err != nil {
-		return Config{}, err
+func (c *Config) loadCircuit(lookup LookupFunc) error {
+	var err error
+	if c.CircuitFailureThreshold, err = intValue(lookup, "LLMGW_CIRCUIT_FAILURE_THRESHOLD", c.CircuitFailureThreshold); err != nil {
+		return err
 	}
-	return cfg, nil
+	if c.CircuitFailureWindow, err = durationValue(lookup, "LLMGW_CIRCUIT_FAILURE_WINDOW", c.CircuitFailureWindow); err != nil {
+		return err
+	}
+	if c.CircuitOpenCooldown, err = durationValue(lookup, "LLMGW_CIRCUIT_OPEN_COOLDOWN", c.CircuitOpenCooldown); err != nil {
+		return err
+	}
+	if c.CircuitHalfOpenMaxProbes, err = intValue(lookup, "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", c.CircuitHalfOpenMaxProbes); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadPressure(lookup LookupFunc) error {
+	var err error
+	if c.QueueSoftLimit, err = floatValue(lookup, "LLMGW_QUEUE_SOFT_LIMIT", c.QueueSoftLimit); err != nil {
+		return err
+	}
+	if c.KVSoftLimit, err = floatValue(lookup, "LLMGW_KV_SOFT_LIMIT", c.KVSoftLimit); err != nil {
+		return err
+	}
+	if c.KVHardLimit, err = floatValue(lookup, "LLMGW_KV_HARD_LIMIT", c.KVHardLimit); err != nil {
+		return err
+	}
+	if c.EWMAWindow, err = durationValue(lookup, "LLMGW_EWMA_WINDOW", c.EWMAWindow); err != nil {
+		return err
+	}
+	if c.BusyThreshold, err = floatValue(lookup, "LLMGW_BUSY_THRESHOLD", c.BusyThreshold); err != nil {
+		return err
+	}
+	if c.SaturatedThreshold, err = floatValue(lookup, "LLMGW_SATURATED_THRESHOLD", c.SaturatedThreshold); err != nil {
+		return err
+	}
+	if c.EmergencyThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_THRESHOLD", c.EmergencyThreshold); err != nil {
+		return err
+	}
+	if c.BusyRecoveryThreshold, err = floatValue(lookup, "LLMGW_BUSY_RECOVERY_THRESHOLD", c.BusyRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.SaturatedRecoveryThreshold, err = floatValue(lookup, "LLMGW_SATURATED_RECOVERY_THRESHOLD", c.SaturatedRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.EmergencyRecoveryThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_RECOVERY_THRESHOLD", c.EmergencyRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.OverloadEnterWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_ENTER_WINDOW", c.OverloadEnterWindow); err != nil {
+		return err
+	}
+	if c.OverloadRecoveryWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_RECOVERY_WINDOW", c.OverloadRecoveryWindow); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadRequestPolicy(lookup LookupFunc) error {
+	var err error
+	if c.RequestBodyLimit, err = int64Value(lookup, "LLMGW_REQUEST_BODY_LIMIT", c.RequestBodyLimit); err != nil {
+		return err
+	}
+	if c.RetryAfter, err = durationValue(lookup, "LLMGW_RETRY_AFTER", c.RetryAfter); err != nil {
+		return err
+	}
+	if c.RoutingPressureEpsilon, err = floatValue(lookup, "LLMGW_ROUTING_PRESSURE_EPSILON", c.RoutingPressureEpsilon); err != nil {
+		return err
+	}
+	if c.SessionAffinityMaxPressure, err = floatValue(lookup, "LLMGW_SESSION_AFFINITY_MAX_PRESSURE", c.SessionAffinityMaxPressure); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadTransport(lookup LookupFunc) error {
+	var err error
+	if c.DialTimeout, err = durationValue(lookup, "LLMGW_DIAL_TIMEOUT", c.DialTimeout); err != nil {
+		return err
+	}
+	if c.TLSHandshakeTimeout, err = durationValue(lookup, "LLMGW_TLS_HANDSHAKE_TIMEOUT", c.TLSHandshakeTimeout); err != nil {
+		return err
+	}
+	if c.ResponseHeaderTimeout, err = durationValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT", c.ResponseHeaderTimeout); err != nil {
+		return err
+	}
+	if c.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", c.ShutdownGracePeriod); err != nil {
+		return err
+	}
+	if c.AnalyticsRetention, err = durationValue(lookup, "LLMGW_ANALYTICS_RETENTION", c.AnalyticsRetention); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c Config) validate() error {
@@ -242,6 +285,18 @@ func (c Config) validate() error {
 		math.IsNaN(c.KVHardLimit) || math.IsInf(c.KVHardLimit, 0) ||
 		c.KVSoftLimit < 0 || c.KVHardLimit > 1 || c.KVSoftLimit >= c.KVHardLimit {
 		return errors.New("KV limits must satisfy 0 <= soft < hard <= 1")
+	}
+	for _, threshold := range []float64{
+		c.BusyRecoveryThreshold,
+		c.BusyThreshold,
+		c.SaturatedRecoveryThreshold,
+		c.SaturatedThreshold,
+		c.EmergencyRecoveryThreshold,
+		c.EmergencyThreshold,
+	} {
+		if !finitePositive(threshold) {
+			return errors.New("pool thresholds and recovery thresholds must be finite and positive")
+		}
 	}
 	if !(c.BusyRecoveryThreshold < c.BusyThreshold && c.BusyThreshold < c.SaturatedRecoveryThreshold && c.SaturatedRecoveryThreshold < c.SaturatedThreshold && c.SaturatedThreshold < c.EmergencyRecoveryThreshold && c.EmergencyRecoveryThreshold < c.EmergencyThreshold) {
 		return errors.New("pool thresholds and recovery thresholds are out of order")

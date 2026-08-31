@@ -124,6 +124,10 @@ func (s *SQLite) SetClientModelAccess(ctx context.Context, clientID int64, model
 		return err
 	}
 	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM clients WHERE id = ?`, clientID).Scan(&exists); err != nil {
+		return fmt.Errorf("find client %d: %w", clientID, err)
+	}
 	if err := replaceClientAccess(ctx, tx, clientID, modelPoolIDs); err != nil {
 		return err
 	}

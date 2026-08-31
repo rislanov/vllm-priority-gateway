@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -340,7 +341,7 @@ func TestAnalyticsCSVBoundsTemporaryFilesThroughBlockedDelivery(t *testing.T) {
 	// delivery: a third export would be admitted while two full temporary files
 	// are still retained by blocked clients.
 	tempDirectory := t.TempDir()
-	t.Setenv("TMPDIR", tempDirectory)
+	setTestTempDir(t, tempDirectory)
 
 	thirdSpoolStarted := make(chan struct{})
 	releaseThirdSpool := make(chan struct{})
@@ -447,7 +448,7 @@ func TestAnalyticsCSVTemporaryFileIsSecureAndRemovedOnEveryPath(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			tempDirectory := t.TempDir()
-			t.Setenv("TMPDIR", tempDirectory)
+			setTestTempDir(t, tempDirectory)
 			observedSecureFile := false
 			queryStore := &analyticsQueryStoreStub{}
 			queryStore.stream = func(_ context.Context, _ analytics.Filter, yield func(analytics.RequestRecord) error) error {
@@ -456,7 +457,7 @@ func TestAnalyticsCSVTemporaryFileIsSecureAndRemovedOnEveryPath(t *testing.T) {
 					return errors.New("secure analytics spool was not present during store scan")
 				}
 				info, err := os.Stat(matches[0])
-				if err != nil || info.Mode().Perm() != 0o600 {
+				if runtime.GOOS != "windows" && (err != nil || info.Mode().Perm() != 0o600) {
 					return errors.New("analytics spool permissions were not 0600")
 				}
 				observedSecureFile = true
@@ -487,6 +488,15 @@ func TestAnalyticsCSVTemporaryFileIsSecureAndRemovedOnEveryPath(t *testing.T) {
 				t.Fatalf("temporary analytics spools remain after handler return: %v", entries)
 			}
 		})
+	}
+}
+
+func setTestTempDir(t *testing.T, path string) {
+	t.Helper()
+	t.Setenv("TMPDIR", path)
+	if runtime.GOOS == "windows" {
+		t.Setenv("TMP", path)
+		t.Setenv("TEMP", path)
 	}
 }
 

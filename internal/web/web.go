@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
-	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 )
 
@@ -143,7 +142,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	switch request.URL.Path {
 	case "/admin", "/admin/":
 		if request.Method != http.MethodGet {
-			methodNotAllowed(writer)
+			methodNotAllowed(writer, http.MethodGet)
 			return
 		}
 		h.render(writer, request, "dashboard", pageData{Title: "Gateway overview", Active: "Dashboard"}, http.StatusOK)
@@ -162,7 +161,7 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) analytics(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
+		methodNotAllowed(writer, http.MethodGet)
 		return
 	}
 	values, normalized, err := normalizeAnalyticsWebValues(request.URL.Query())
@@ -334,93 +333,6 @@ func formatInteger(value int64) string {
 	return raw
 }
 
-func (h *Handler) clients(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "Clients", Active: "Clients"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			input, err := clientInput(request)
-			if err != nil {
-				data.Error = err.Error()
-			} else if request.Form.Get("action") == "update" {
-				id, parseErr := positiveID(request.Form.Get("id"))
-				if parseErr != nil {
-					data.Error = parseErr.Error()
-				} else {
-					_, data.Error = valueError(h.service.UpdateClient(request.Context(), id, input))
-				}
-			} else {
-				_, data.Error = valueError(h.service.CreateClient(request.Context(), input))
-			}
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	}
-	if rawID := request.URL.Query().Get("edit"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, client := range h.service.View().Clients {
-				if client.ID == id {
-					copy := client
-					data.EditClient = &copy
-					break
-				}
-			}
-		}
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "clients", data, status)
-}
-
-func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "API Keys", Active: "API Keys"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			id, err := positiveID(request.Form.Get(map[bool]string{true: "key_id", false: "client_id"}[request.Form.Get("action") == "revoke"]))
-			if err != nil {
-				data.Error = err.Error()
-			} else if request.Form.Get("action") == "revoke" {
-				data.Error = errorText(h.service.RevokeKey(request.Context(), id))
-			} else {
-				input := httpapi.KeyInput{}
-				if raw := request.Form.Get("expires_at"); raw != "" {
-					expires, parseErr := time.Parse("2006-01-02", raw)
-					if parseErr != nil {
-						data.Error = "Expiry must be a valid date"
-					} else {
-						input.ExpiresAt = &expires
-					}
-				}
-				if data.Error == "" {
-					created, createErr := h.service.CreateKey(request.Context(), id, input)
-					data.Error = errorText(createErr)
-					if createErr == nil {
-						nonce := h.putSecret(httpapi.AdminCSRFToken(request), created.ID, created.Secret)
-						http.Redirect(writer, request, "/admin/keys?flash="+nonce, http.StatusSeeOther)
-						return
-					}
-				}
-			}
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	} else {
-		data.Secret = h.takeSecret(httpapi.AdminCSRFToken(request), request.URL.Query().Get("flash"))
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "keys", data, status)
-}
-
 func (h *Handler) putSecret(session string, id int64, secret string) string {
 	digest := sha256.Sum256([]byte(strconv.FormatInt(id, 10) + "\x00" + secret))
 	nonce := base64.RawURLEncoding.EncodeToString(digest[:16])
@@ -480,83 +392,6 @@ func (h *Handler) expireSecret(key string, expiresAt time.Time) {
 	h.secretMu.Unlock()
 }
 
-func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
-	data := pageData{Title: "Backends", Active: "Backends"}
-	if request.Method == http.MethodPost {
-		if err := request.ParseForm(); err != nil {
-			data.Error = "Invalid form submission"
-		} else {
-			switch request.Form.Get("action") {
-			case "create_pool", "update_pool":
-				input, err := poolInput(request)
-				if err != nil {
-					data.Error = err.Error()
-				} else if request.Form.Get("action") == "update_pool" {
-					id, err := positiveID(request.Form.Get("id"))
-					if err != nil {
-						data.Error = err.Error()
-					} else {
-						_, data.Error = valueError(h.service.UpdatePool(request.Context(), id, input))
-					}
-				} else {
-					_, data.Error = valueError(h.service.CreatePool(request.Context(), input))
-				}
-			case "drain", "resume":
-				id, err := positiveID(request.Form.Get("id"))
-				if err != nil {
-					data.Error = err.Error()
-				} else {
-					_, data.Error = valueError(h.service.SetBackendDraining(request.Context(), id, request.Form.Get("action") == "drain"))
-				}
-			default:
-				input, err := backendInput(request)
-				if err != nil {
-					data.Error = err.Error()
-				} else if request.Form.Get("action") == "update_backend" {
-					id, parseErr := positiveID(request.Form.Get("id"))
-					if parseErr != nil {
-						data.Error = parseErr.Error()
-					} else {
-						_, data.Error = valueError(h.service.UpdateBackend(request.Context(), id, input))
-					}
-				} else {
-					_, data.Error = valueError(h.service.CreateBackend(request.Context(), input))
-				}
-			}
-		}
-	} else if request.Method != http.MethodGet {
-		methodNotAllowed(writer)
-		return
-	}
-	if rawID := request.URL.Query().Get("edit_pool"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, pool := range h.service.View().Pools {
-				if pool.ID == id {
-					copy := pool
-					data.EditPool = &copy
-					break
-				}
-			}
-		}
-	}
-	if rawID := request.URL.Query().Get("edit"); rawID != "" {
-		if id, err := positiveID(rawID); err == nil {
-			for _, backend := range h.service.View().Backends {
-				if backend.ID == id {
-					copy := backend
-					data.EditBackend = &copy
-					break
-				}
-			}
-		}
-	}
-	status := http.StatusOK
-	if data.Error != "" {
-		status = http.StatusBadRequest
-	}
-	h.render(writer, request, "backends", data, status)
-}
-
 func (h *Handler) render(writer http.ResponseWriter, request *http.Request, name string, data pageData, status int) {
 	data.CSRF = httpapi.AdminCSRFToken(request)
 	data.View = h.service.View()
@@ -567,96 +402,14 @@ func (h *Handler) render(writer http.ResponseWriter, request *http.Request, name
 	}
 }
 
-func clientInput(request *http.Request) (httpapi.ClientInput, error) {
-	priority, err := strconv.Atoi(request.Form.Get("vllm_priority"))
-	if err != nil {
-		return httpapi.ClientInput{}, fmt.Errorf("vLLM priority must be an integer")
-	}
-	maxConcurrency, err := strconv.Atoi(request.Form.Get("max_concurrency"))
-	if err != nil {
-		return httpapi.ClientInput{}, fmt.Errorf("max concurrency must be an integer")
-	}
-	input := httpapi.ClientInput{Name: request.Form.Get("name"), Enabled: request.Form.Get("enabled") == "on", PriorityClass: domain.PriorityClass(request.Form.Get("priority_class")), VLLMPriority: priority, MaxConcurrency: maxConcurrency}
-	for _, raw := range request.Form["model_pool_id"] {
-		id, parseErr := positiveID(raw)
-		if parseErr != nil {
-			return httpapi.ClientInput{}, parseErr
-		}
-		input.ModelPoolIDs = append(input.ModelPoolIDs, id)
-	}
-	return input, nil
-}
-
-func poolInput(request *http.Request) (httpapi.PoolInput, error) {
-	maxGatewayInflight, err := optionalFormInt(request.Form.Get("max_gateway_inflight"), "max gateway inflight")
-	if err != nil {
-		return httpapi.PoolInput{}, err
-	}
-	maxWaiting, err := optionalFormInt(request.Form.Get("max_waiting"), "max waiting")
-	if err != nil {
-		return httpapi.PoolInput{}, err
-	}
-	return httpapi.PoolInput{
-		PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"),
-		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, MaxWaiting: maxWaiting,
-	}, nil
-}
-
-func optionalFormInt(raw, label string) (int, error) {
-	if strings.TrimSpace(raw) == "" {
-		return 0, nil
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be an integer", label)
-	}
-	return value, nil
-}
-
-func backendInput(request *http.Request) (httpapi.BackendInput, error) {
-	poolID, err := positiveID(request.Form.Get("model_pool_id"))
-	if err != nil {
-		return httpapi.BackendInput{}, err
-	}
-	capacity, err := strconv.ParseFloat(request.Form.Get("capacity_hint"), 64)
-	if err != nil {
-		return httpapi.BackendInput{}, fmt.Errorf("capacity hint must be a number")
-	}
-	running, err := strconv.ParseFloat(request.Form.Get("running_soft_limit"), 64)
-	if err != nil {
-		return httpapi.BackendInput{}, fmt.Errorf("running soft limit must be a number")
-	}
-	return httpapi.BackendInput{ModelPoolID: poolID, Name: request.Form.Get("name"), BaseURL: request.Form.Get("base_url"), Enabled: request.Form.Get("enabled") == "on", Draining: request.Form.Get("draining") == "on", CapacityHint: capacity, RunningSoftLimit: running, UpstreamAPIKeyEnv: request.Form.Get("upstream_api_key_env")}, nil
-}
-
-func positiveID(raw string) (int64, error) {
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("resource ID must be a positive integer")
-	}
-	return id, nil
-}
-func errorText(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-func valueError[T any](_ T, err error) (T, string) {
-	var zero T
-	if err != nil {
-		return zero, err.Error()
-	}
-	return zero, ""
-}
 func timeValue(value *time.Time) string {
 	if value == nil {
 		return "Never"
 	}
 	return value.UTC().Format("2006-01-02 15:04 UTC")
 }
-func methodNotAllowed(writer http.ResponseWriter) {
-	writer.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+func methodNotAllowed(writer http.ResponseWriter, methods ...string) {
+	writer.Header().Set("Allow", strings.Join(methods, ", "))
 	http.Error(writer, "Method not allowed", http.StatusMethodNotAllowed)
 }
 func withPath(request *http.Request, path string) *http.Request {
