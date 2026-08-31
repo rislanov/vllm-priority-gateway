@@ -286,6 +286,18 @@ func (c Config) validate() error {
 		c.KVSoftLimit < 0 || c.KVHardLimit > 1 || c.KVSoftLimit >= c.KVHardLimit {
 		return errors.New("KV limits must satisfy 0 <= soft < hard <= 1")
 	}
+	for _, threshold := range []float64{
+		c.BusyRecoveryThreshold,
+		c.BusyThreshold,
+		c.SaturatedRecoveryThreshold,
+		c.SaturatedThreshold,
+		c.EmergencyRecoveryThreshold,
+		c.EmergencyThreshold,
+	} {
+		if !finitePositive(threshold) {
+			return errors.New("pool thresholds and recovery thresholds must be finite and positive")
+		}
+	}
 	if !(c.BusyRecoveryThreshold < c.BusyThreshold && c.BusyThreshold < c.SaturatedRecoveryThreshold && c.SaturatedRecoveryThreshold < c.SaturatedThreshold && c.SaturatedThreshold < c.EmergencyRecoveryThreshold && c.EmergencyRecoveryThreshold < c.EmergencyThreshold) {
 		return errors.New("pool thresholds and recovery thresholds are out of order")
 	}

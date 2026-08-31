@@ -134,6 +134,61 @@ func TestLoadRejectsNonFiniteKVThresholds(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNonPositiveOrNonFinitePoolThresholds(t *testing.T) {
+	validThresholds := map[string]string{
+		"LLMGW_BUSY_RECOVERY_THRESHOLD":      "0.1",
+		"LLMGW_BUSY_THRESHOLD":               "0.2",
+		"LLMGW_SATURATED_RECOVERY_THRESHOLD": "0.3",
+		"LLMGW_SATURATED_THRESHOLD":          "0.4",
+		"LLMGW_EMERGENCY_RECOVERY_THRESHOLD": "0.5",
+		"LLMGW_EMERGENCY_THRESHOLD":          "0.6",
+	}
+
+	t.Run("valid ordered thresholds", func(t *testing.T) {
+		env := validEnvironment()
+		for variable, value := range validThresholds {
+			env[variable] = value
+		}
+		if _, err := config.Load(lookup(env)); err != nil {
+			t.Fatalf("Load() rejected valid ordered pool thresholds: %v", err)
+		}
+	})
+
+	for variable := range validThresholds {
+		for _, value := range []string{"0", "-0.1", "NaN", "+Inf", "-Inf"} {
+			t.Run(variable+"="+value, func(t *testing.T) {
+				env := validEnvironment()
+				for validVariable, validValue := range validThresholds {
+					env[validVariable] = validValue
+				}
+				env[variable] = value
+
+				_, err := config.Load(lookup(env))
+				if err == nil {
+					t.Fatalf("Load() accepted %s=%q", variable, value)
+				}
+				if got, want := err.Error(), "pool thresholds and recovery thresholds must be finite and positive"; got != want {
+					t.Fatalf("Load() error = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadPreservesPoolThresholdOrderingError(t *testing.T) {
+	env := validEnvironment()
+	env["LLMGW_BUSY_RECOVERY_THRESHOLD"] = "0.2"
+	env["LLMGW_BUSY_THRESHOLD"] = "0.1"
+
+	_, err := config.Load(lookup(env))
+	if err == nil {
+		t.Fatal("Load() accepted out-of-order pool thresholds")
+	}
+	if got, want := err.Error(), "pool thresholds and recovery thresholds are out of order"; got != want {
+		t.Fatalf("Load() error = %q, want %q", got, want)
+	}
+}
+
 func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	env := validEnvironment()
 	env["LLMGW_LISTEN_ADDRESS"] = "127.0.0.1:9090"
