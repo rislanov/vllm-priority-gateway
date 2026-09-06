@@ -42,6 +42,7 @@ type Result struct {
 	Cancelled         bool
 	Usage             *domain.TokenUsage
 	UsageParseFailure string
+	UpstreamFailure   string
 	Err               error
 }
 
@@ -218,6 +219,9 @@ func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome
 
 			c.result.Err = readErr
 			c.result.Cancelled = c.ctx.Err() != nil
+			if !c.result.Cancelled {
+				c.result.UpstreamFailure = "upstream_body_read_error"
+			}
 			if c.result.Cancelled {
 				if firstRead && count == 0 {
 					c.result.Err = c.ctx.Err()

@@ -72,6 +72,95 @@ func TestRetrySelectionUsesCurrentRegistryAndTime(t *testing.T) {
 	}
 }
 
+func TestForwardRevalidatesKeyAfterResponseReservationWait(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	backend.ModelPoolID = pool.ID
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		backend.ID: {BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true},
+	}}
+	forwarder := &completionForwarder{}
+	observer := newBlockingReservationObserver()
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+		Observer: observer,
+	})
+	type forwardResult struct {
+		reservation gateway.ResponseCompleteReservation
+		err         *gateway.APIError
+	}
+	returned := make(chan forwardResult, 1)
+	go func() {
+		_, reservation, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+			Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "waiting-request",
+		})
+		returned <- forwardResult{reservation: reservation, err: apiErr}
+	}()
+	<-observer.entered
+	revokedAt := time.Now().UTC()
+	key.RevokedAt = &revokedAt
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	close(observer.release)
+	result := <-returned
+	service.ResponseComplete(result.reservation)
+	if result.err == nil || result.err.HTTPStatus != http.StatusUnauthorized || result.err.Code != "invalid_api_key" {
+		t.Fatalf("Forward() error after revocation = %+v", result.err)
+	}
+	if forwarder.Calls() != 0 || runtime.Inflight(backend.ID) != 0 {
+		t.Fatalf("revoked waiting request reached upstream: calls=%d inflight=%d", forwarder.Calls(), runtime.Inflight(backend.ID))
+	}
+	if observer.terminals != 1 {
+		t.Fatalf("reservation terminal callbacks = %d, want 1", observer.terminals)
+	}
+}
+
+func TestRetrySelectionRejectsKeyRevokedAfterFirstAttempt(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	first := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	second := retryBackend(21, "gpu-21", "http://gpu-21.invalid")
+	first.ModelPoolID, second.ModelPoolID = pool.ID, pool.ID
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{first, second}))
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		first.ID:  {BackendID: first.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true, Pressure: .1},
+		second.ID: {BackendID: second.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true, Pressure: .2},
+	}}
+	forwarder := &revokingRetryForwarder{beforeAlternate: func() {
+		revokedAt := time.Now().UTC()
+		key.RevokedAt = &revokedAt
+		provider.Set(testSnapshot(client, key, pool, []domain.Backend{first, second}))
+	}}
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+	})
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusUnauthorized || apiErr.Code != "invalid_api_key" {
+		t.Fatalf("retry after revocation error = %+v", apiErr)
+	}
+	if forwarder.alternateSelected {
+		t.Fatal("retry selected an alternate backend after key revocation")
+	}
+	if runtime.Inflight(first.ID) != 0 || runtime.Inflight(second.ID) != 0 {
+		t.Fatalf("inflight after rejected retry: first=%d second=%d", runtime.Inflight(first.ID), runtime.Inflight(second.ID))
+	}
+}
+
 func TestRetrySelectionRejectsPoolModelReconfiguration(t *testing.T) {
 	started := time.Unix(1_700_000_000, 0).UTC()
 	clock := &mutableClock{current: started}
@@ -403,6 +492,38 @@ type mutableSnapshotProvider struct {
 	snapshot *registry.Snapshot
 }
 
+type noOpReservation struct{}
+
+func (noOpReservation) StageResponseComplete(gateway.RequestEvent) {}
+
+type blockingReservationObserver struct {
+	entered   chan struct{}
+	release   chan struct{}
+	terminals int
+}
+
+func newBlockingReservationObserver() *blockingReservationObserver {
+	return &blockingReservationObserver{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (*blockingReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*blockingReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*blockingReservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *blockingReservationObserver) ReserveResponseComplete(ctx context.Context, _ string) (gateway.ResponseCompleteReservation, func(), bool) {
+	close(o.entered)
+	select {
+	case <-o.release:
+		return noOpReservation{}, func() {}, true
+	case <-ctx.Done():
+		return nil, nil, false
+	}
+}
+
+func (o *blockingReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {
+	o.terminals++
+}
+
 func (p *mutableSnapshotProvider) Snapshot() *registry.Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -664,6 +785,23 @@ type retryProbeForwarder struct {
 	alternateBackend int64
 	alternateErr     error
 	result           proxy.Result
+}
+
+type revokingRetryForwarder struct {
+	beforeAlternate   func()
+	alternateSelected bool
+}
+
+func (f *revokingRetryForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
+	f.beforeAlternate()
+	alternate, err := request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
+	if err == nil {
+		f.alternateSelected = true
+		alternate.Complete(domain.InferenceNeutral)
+		return proxy.Result{BackendID: alternate.Backend.ID, Status: http.StatusOK}
+	}
+	return proxy.Result{BackendID: request.Target.Backend.ID, Err: fmt.Errorf("select retry backend: %w", err)}
 }
 
 func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {

@@ -36,6 +36,8 @@ type forwardLifecycle struct {
 	targetCompletions   []func(domain.InferenceOutcome)
 }
 
+var errAPIKeyBecameInvalid = errors.New("API key became invalid while request was waiting")
+
 func (l *forwardLifecycle) finish(result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
 	l.event.OccurredAt = l.service.now().UTC()
 	l.event.Duration = time.Since(l.started)
@@ -44,6 +46,7 @@ func (l *forwardLifecycle) finish(result proxy.Result, reservation ResponseCompl
 	l.event.RetryCount = result.RetryCount
 	l.event.Usage = result.Usage
 	l.event.UsageParseFailure = result.UsageParseFailure
+	l.event.UpstreamFailure = result.UpstreamFailure
 	if apiErr != nil {
 		l.event.Status = apiErr.HTTPStatus
 		l.event.Reason = apiErr.Code
@@ -164,6 +167,7 @@ type targetSelector struct {
 	affinity  string
 	inflight  InflightEvent
 	lifecycle *forwardLifecycle
+	rawAPIKey string
 }
 
 func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, error) {
@@ -173,8 +177,12 @@ func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, 
 	}
 	for {
 		currentSnapshot := s.service.registry.Snapshot()
+		currentClient, _, authErr := s.service.validateAPIKeySnapshot(s.rawAPIKey, currentSnapshot)
+		if authErr != nil || currentClient.ID != s.client.ID {
+			return proxy.Target{}, errAPIKeyBecameInvalid
+		}
 		currentPool, poolExists := currentSnapshot.PoolsByID[s.pool.ID]
-		currentClient, clientExists := currentSnapshot.Clients[s.client.ID]
+		_, clientExists := currentSnapshot.Clients[s.client.ID]
 		if !poolExists || !currentPool.Enabled || currentPool.PublicModelName != s.pool.PublicModelName ||
 			currentPool.UpstreamModelName != s.pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
 			!currentSnapshot.Access[s.client.ID][s.pool.ID] {
@@ -261,6 +269,26 @@ func (s *Service) Forward(
 		reservation = reservedLifecycle
 		lifecycle.reservationRollback = rollback
 	}
+	// Reservation can block under recorder backpressure. Re-resolve identity and
+	// policy from one current snapshot so a key revoked or expired while waiting
+	// never reaches admission or an upstream backend.
+	currentSnapshot := s.registry.Snapshot()
+	currentClient, _, authErr := s.validateAPIKeySnapshot(request.APIKey, currentSnapshot)
+	if authErr != nil {
+		return proxy.Result{}, reservation, authErr
+	}
+	currentPool, exists := currentSnapshot.PoolsByName[resolved.publicModel]
+	if !exists {
+		return proxy.Result{}, reservation, modelNotAllowed()
+	}
+	resolved.client = currentClient
+	resolved.pool = currentPool
+	resolved.snapshot = currentSnapshot
+	lifecycle.event.ClientID = currentClient.ID
+	lifecycle.event.Client = currentClient.Name
+	lifecycle.event.PriorityClass = currentClient.PriorityClass
+	lifecycle.event.VLLMPriority = currentClient.VLLMPriority
+	lifecycle.event.ModelPoolID = currentPool.ID
 	resolved, apiErr = s.prepareForwardPayload(request, resolved)
 	if apiErr != nil {
 		return proxy.Result{}, reservation, apiErr
@@ -289,10 +317,13 @@ func (s *Service) Forward(
 
 	selector := targetSelector{
 		service: s, client: resolved.client, pool: resolved.pool, affinity: resolved.affinityKey,
-		inflight: inflight, lifecycle: &lifecycle,
+		inflight: inflight, lifecycle: &lifecycle, rawAPIKey: request.APIKey,
 	}
 	target, err := selector.selectTarget(nil)
 	if err != nil {
+		if errors.Is(err, errAPIKeyBecameInvalid) {
+			return proxy.Result{}, reservation, invalidAPIKey()
+		}
 		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter, DecisionNoEligibleBackend)
 	}
 
@@ -307,6 +338,9 @@ func (s *Service) Forward(
 	proxyRequest.SelectAlternate = selector.selectTarget
 	result = s.forwarder.Forward(ctx, writer, proxyRequest)
 	if result.Err != nil && !result.ResponseStarted {
+		if errors.Is(result.Err, errAPIKeyBecameInvalid) {
+			return result, reservation, invalidAPIKey()
+		}
 		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
 			return result, reservation, nil
 		}

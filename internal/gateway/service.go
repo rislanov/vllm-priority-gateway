@@ -245,10 +245,13 @@ func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIEr
 }
 
 func (s *Service) validateAPIKey(raw string) (domain.Client, domain.APIKey, *APIError) {
+	return s.validateAPIKeySnapshot(raw, s.registry.Snapshot())
+}
+
+func (s *Service) validateAPIKeySnapshot(raw string, snapshot *registry.Snapshot) (domain.Client, domain.APIKey, *APIError) {
 	if len(raw) < 12 || !strings.HasPrefix(raw, "llmgw_") {
 		return domain.Client{}, domain.APIKey{}, invalidAPIKey()
 	}
-	snapshot := s.registry.Snapshot()
 	candidates := snapshot.KeyCandidates[raw[:12]]
 	var matched domain.APIKey
 	found := false

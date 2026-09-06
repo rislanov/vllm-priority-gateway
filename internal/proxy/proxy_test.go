@@ -494,7 +494,7 @@ func TestForwardClassifiesUpstreamBodyReadFailureAsFailure(t *testing.T) {
 			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
 		},
 	})
-	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted {
+	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted || result.UpstreamFailure != "upstream_body_read_error" {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
@@ -625,7 +625,7 @@ func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 			return proxy.Target{}, errors.New("must not be called")
 		},
 	})
-	if result.Err == nil || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
+	if result.Err == nil || result.UpstreamFailure != "upstream_body_read_error" || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
 		t.Fatalf("result=%+v selections=%d body=%q", result, selections.Load(), writer.String())
 	}
 }

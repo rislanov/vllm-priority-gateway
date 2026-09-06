@@ -135,12 +135,15 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 		h.completePublic(started, event)
 		return
 	}
-	_, reservation, gatewayError = h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
+	result, reservation, gatewayError := h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
 		Method: request.Method, Path: request.URL.Path, Headers: request.Header.Clone(), Body: body,
 		APIKey: rawKey, RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id")),
 	})
 	if gatewayError != nil {
 		writeGatewayError(writer, gatewayError)
+	}
+	if result.Err != nil && result.ResponseStarted && !result.Cancelled {
+		panic(http.ErrAbortHandler)
 	}
 }
 

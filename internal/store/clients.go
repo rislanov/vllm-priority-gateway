@@ -63,26 +63,20 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 		return domain.Client{}, err
 	}
 	defer tx.Rollback()
+	client.UpdatedAt = s.now().UTC()
 	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM clients WHERE id = ?`, id).Scan(&created); err != nil {
-		return domain.Client{}, fmt.Errorf("find client %d: %w", id, err)
+	err = tx.QueryRowContext(ctx, `
+		UPDATE clients SET name = ?, enabled = ?, priority_class = ?, vllm_priority = ?,
+		max_concurrency = ?, updated_at = ? WHERE id = ? RETURNING created_at`,
+		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
+		client.MaxConcurrency, timestamp(client.UpdatedAt), id,
+	).Scan(&created)
+	if err != nil {
+		return domain.Client{}, fmt.Errorf("update client: %w", err)
 	}
 	client.CreatedAt, err = parseTimestamp(created)
 	if err != nil {
 		return domain.Client{}, err
-	}
-	client.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE clients SET name = ?, enabled = ?, priority_class = ?, vllm_priority = ?,
-		max_concurrency = ?, updated_at = ? WHERE id = ?`,
-		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
-		client.MaxConcurrency, timestamp(client.UpdatedAt), id,
-	)
-	if err != nil {
-		return domain.Client{}, fmt.Errorf("update client: %w", err)
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.Client{}, sql.ErrNoRows
 	}
 	if err := replaceClientAccess(ctx, tx, id, params.ModelPoolIDs); err != nil {
 		return domain.Client{}, err
@@ -125,7 +119,7 @@ func (s *SQLite) SetClientModelAccess(ctx context.Context, clientID int64, model
 	}
 	defer tx.Rollback()
 	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM clients WHERE id = ?`, clientID).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING 1`, clientID).Scan(&exists); err != nil {
 		return fmt.Errorf("find client %d: %w", clientID, err)
 	}
 	if err := replaceClientAccess(ctx, tx, clientID, modelPoolIDs); err != nil {

@@ -4,12 +4,70 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
+
+func TestConfigurationUpdatesDoNotLoseSQLiteWriteUpgradeRace(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := db.CreateClient(ctx, store.CreateClientParams{
+		Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal, MaxConcurrency: 2,
+		ModelPoolIDs: []int64{pool.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const iterations = 250
+	start := make(chan struct{})
+	errorsFound := make(chan error, iterations*2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			_, updateErr := db.UpdateClient(ctx, client.ID, store.UpdateClientParams{
+				Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal,
+				MaxConcurrency: 2, ModelPoolIDs: []int64{pool.ID},
+			})
+			if updateErr != nil {
+				errorsFound <- fmt.Errorf("update %d: %w", index, updateErr)
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			insertErr := db.InsertUsageBatch(ctx, []analytics.RequestRecord{{
+				OccurredAt: time.Now().UTC(), RequestID: fmt.Sprintf("request-%d", index),
+				ClientID: client.ID, ClientName: client.Name, ModelPoolID: pool.ID,
+				ModelName: pool.PublicModelName, HTTPStatus: 200,
+			}})
+			if insertErr != nil {
+				errorsFound <- fmt.Errorf("analytics %d: %w", index, insertErr)
+			}
+		}
+	}()
+	close(start)
+	workers.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Error(err)
+	}
+}
 
 func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	ctx := context.Background()

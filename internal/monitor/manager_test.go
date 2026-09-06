@@ -366,10 +366,10 @@ func TestManagerAcquireBackendRequiresExactIdentityAndKeepsOldCompletionBalanced
 		oldComplete(domain.InferenceNeutral)
 		t.Fatal("AcquireBackend() rejected the exact reconciled identity")
 	}
-	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
+	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 2 {
 		oldComplete(domain.InferenceNeutral)
 		newComplete(domain.InferenceNeutral)
-		t.Fatalf("new worker inflight = %d, want 1", got)
+		t.Fatalf("backend inflight across worker generations = %d, want 2", got)
 	}
 	oldComplete(domain.InferenceSuccess)
 	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
@@ -379,6 +379,54 @@ func TestManagerAcquireBackendRequiresExactIdentityAndKeepsOldCompletionBalanced
 	newComplete(domain.InferenceSuccess)
 	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 0 {
 		t.Fatalf("new worker inflight after completion = %d, want 0", got)
+	}
+}
+
+func TestManagerDrainAndResumePreserveActiveBackendLeaseCount(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	complete, ok := manager.AcquireBackend(backend, time.Now())
+	if !ok {
+		t.Fatal("AcquireBackend() rejected known backend")
+	}
+	draining := backend
+	draining.Draining = true
+	draining.UpdatedAt = time.Now().UTC()
+	if err := manager.Reconcile([]domain.Backend{draining}); err != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal(err)
+	}
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 1 {
+		complete(domain.InferenceNeutral)
+		t.Fatalf("inflight after drain = %d, want 1", got)
+	}
+	if retry, acquired := manager.AcquireBackend(backend, time.Now()); acquired || retry != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal("draining backend accepted a new lease with stale identity")
+	}
+	resumed := draining
+	resumed.Draining = false
+	resumed.UpdatedAt = time.Now().UTC()
+	if err := manager.Reconcile([]domain.Backend{resumed}); err != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal(err)
+	}
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 1 {
+		complete(domain.InferenceNeutral)
+		t.Fatalf("inflight after resume = %d, want 1", got)
+	}
+	complete(domain.InferenceSuccess)
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("inflight after old lease completion = %d, want 0", got)
 	}
 }
 

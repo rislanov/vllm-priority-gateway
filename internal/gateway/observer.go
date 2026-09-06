@@ -66,6 +66,7 @@ type RequestEvent struct {
 	RetryCount        int
 	Usage             *domain.TokenUsage
 	UsageParseFailure string
+	UpstreamFailure   string
 }
 
 // Observer receives synchronous request-lifecycle events. Implementations

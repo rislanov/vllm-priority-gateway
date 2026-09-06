@@ -55,27 +55,21 @@ func (s *SQLite) UpdateBackend(ctx context.Context, id int64, params UpdateBacke
 		return domain.Backend{}, err
 	}
 	defer tx.Rollback()
+	backend.UpdatedAt = s.now().UTC()
 	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM backends WHERE id = ?`, id).Scan(&created); err != nil {
-		return domain.Backend{}, fmt.Errorf("find backend %d: %w", id, err)
+	err = tx.QueryRowContext(ctx, `
+		UPDATE backends SET model_pool_id = ?, name = ?, base_url = ?, enabled = ?, draining = ?,
+		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, updated_at = ? WHERE id = ? RETURNING created_at`,
+		backend.ModelPoolID, backend.Name, backend.BaseURL, boolInt(backend.Enabled),
+		boolInt(backend.Draining), backend.CapacityHint, backend.RunningSoftLimit,
+		backend.UpstreamAPIKeyEnv, timestamp(backend.UpdatedAt), id,
+	).Scan(&created)
+	if err != nil {
+		return domain.Backend{}, fmt.Errorf("update backend: %w", err)
 	}
 	backend.CreatedAt, err = parseTimestamp(created)
 	if err != nil {
 		return domain.Backend{}, err
-	}
-	backend.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE backends SET model_pool_id = ?, name = ?, base_url = ?, enabled = ?, draining = ?,
-		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, updated_at = ? WHERE id = ?`,
-		backend.ModelPoolID, backend.Name, backend.BaseURL, boolInt(backend.Enabled),
-		boolInt(backend.Draining), backend.CapacityHint, backend.RunningSoftLimit,
-		backend.UpstreamAPIKeyEnv, timestamp(backend.UpdatedAt), id,
-	)
-	if err != nil {
-		return domain.Backend{}, fmt.Errorf("update backend: %w", err)
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.Backend{}, sql.ErrNoRows
 	}
 	if err := bumpRevision(ctx, tx); err != nil {
 		return domain.Backend{}, err

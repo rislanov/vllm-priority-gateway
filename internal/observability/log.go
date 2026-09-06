@@ -36,6 +36,7 @@ func (l *Logger) Complete(event gateway.RequestEvent) {
 		slog.Float64("backendPressure", event.BackendPressure),
 		slog.Int("status", event.Status),
 		slog.String("reason", event.Reason),
+		slog.String("upstreamFailure", event.UpstreamFailure),
 		slog.String("decisionReason", string(event.DecisionReason)),
 		slog.String("queueOutcome", string(event.QueueOutcome)),
 		slog.Float64("queueWaitMs", float64(event.QueueWait.Microseconds())/1000),
