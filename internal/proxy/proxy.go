@@ -205,6 +205,9 @@ func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome
 	for {
 		count, readErr := c.response.Body.Read(buffer)
 		provenReadFailure := readErr != nil && !errors.Is(readErr, io.EOF) && c.ctx.Err() == nil
+		if provenReadFailure {
+			c.result.UpstreamFailure = "upstream_body_read_error"
+		}
 		if count > 0 {
 			if outcome, terminal := c.write(buffer[:count], provenReadFailure); terminal {
 				return false, outcome
