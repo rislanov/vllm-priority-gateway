@@ -42,6 +42,7 @@ type Result struct {
 	Cancelled         bool
 	Usage             *domain.TokenUsage
 	UsageParseFailure string
+	UpstreamFailure   string
 	Err               error
 }
 
@@ -204,6 +205,9 @@ func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome
 	for {
 		count, readErr := c.response.Body.Read(buffer)
 		provenReadFailure := readErr != nil && !errors.Is(readErr, io.EOF) && c.ctx.Err() == nil
+		if provenReadFailure {
+			c.result.UpstreamFailure = "upstream_body_read_error"
+		}
 		if count > 0 {
 			if outcome, terminal := c.write(buffer[:count], provenReadFailure); terminal {
 				return false, outcome
@@ -218,6 +222,9 @@ func (c *responseCopier) copy() (retryable bool, outcome domain.InferenceOutcome
 
 			c.result.Err = readErr
 			c.result.Cancelled = c.ctx.Err() != nil
+			if !c.result.Cancelled {
+				c.result.UpstreamFailure = "upstream_body_read_error"
+			}
 			if c.result.Cancelled {
 				if firstRead && count == 0 {
 					c.result.Err = c.ctx.Err()

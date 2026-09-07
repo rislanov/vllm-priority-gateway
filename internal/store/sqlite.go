@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed migrations/*.sql
@@ -45,6 +46,21 @@ type SQLite struct {
 	db   *sql.DB
 	path string
 	now  func() time.Time
+}
+
+// IsTemporary reports SQLite contention that callers may safely surface as a
+// transient server failure instead of blaming otherwise valid input.
+func IsTemporary(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	default:
+		return false
+	}
 }
 
 func Open(ctx context.Context, path string) (*SQLite, error) {

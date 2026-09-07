@@ -26,13 +26,14 @@ type Manager struct {
 	observerDone chan struct{}
 	options      Options
 
-	mu           sync.Mutex
-	workers      map[int64]*managedWorker
-	poolMachine  map[int64]*pressure.PoolMachine
-	poolRuntime  map[int64]domain.PoolRuntime
-	poolInflight map[int64]int
-	nextGen      uint64
-	shutdown     bool
+	mu              sync.Mutex
+	workers         map[int64]*managedWorker
+	poolMachine     map[int64]*pressure.PoolMachine
+	poolRuntime     map[int64]domain.PoolRuntime
+	poolInflight    map[int64]int
+	backendInflight map[int64]int
+	nextGen         uint64
+	shutdown        bool
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
@@ -47,6 +48,7 @@ func NewManager(ctx context.Context, options Options) *Manager {
 		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
 		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
 		poolRuntime: make(map[int64]domain.PoolRuntime), poolInflight: make(map[int64]int),
+		backendInflight: make(map[int64]int),
 	}
 	go manager.runPoolObserver()
 	return manager
@@ -114,11 +116,14 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime {
 	m.mu.Lock()
 	managed := m.workers[backendID]
+	inflight := m.backendInflight[backendID]
 	m.mu.Unlock()
 	if managed == nil {
-		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy}
+		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy, GatewayInflight: inflight}
 	}
-	return snapshotManaged(managed, at)
+	snapshot := snapshotManaged(managed, at)
+	snapshot.GatewayInflight = inflight
+	return snapshot
 }
 
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
@@ -264,13 +269,21 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 		m.mu.Unlock()
 		return nil, false
 	}
-	managed.worker.incrementInflight(1)
+	m.backendInflight[expected.ID]++
 	m.mu.Unlock()
 	var once sync.Once
 	return func(outcome domain.InferenceOutcome) {
 		once.Do(func() {
+			defer func() {
+				m.mu.Lock()
+				if current := m.backendInflight[expected.ID]; current > 1 {
+					m.backendInflight[expected.ID] = current - 1
+				} else {
+					delete(m.backendInflight, expected.ID)
+				}
+				m.mu.Unlock()
+			}()
 			completeCircuit(outcome, time.Now())
-			managed.worker.incrementInflight(-1)
 		})
 	}, true
 }

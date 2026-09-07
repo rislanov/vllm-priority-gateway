@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ func TestAdminSecurityRequiresBasicAuthAndMatchingCSRF(t *testing.T) {
 	}
 	next := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+		writer.Header().Set("X-Rendered-CSRF", httpapi.AdminCSRFToken(request))
 		writer.WriteHeader(http.StatusOK)
 	})
 	handler := security.Wrap(next)
@@ -57,6 +59,9 @@ func TestAdminSecurityRequiresBasicAuthAndMatchingCSRF(t *testing.T) {
 		t.Fatalf("authorized response = %d cookies=%v", response.Code, response.Result().Cookies())
 	}
 	csrf := response.Result().Cookies()[0]
+	if rendered := response.Header().Get("X-Rendered-CSRF"); rendered == "" || rendered != csrf.Value {
+		t.Fatalf("first rendered CSRF token = %q, cookie = %q", rendered, csrf.Value)
+	}
 	if !csrf.HttpOnly || csrf.SameSite != http.SameSiteStrictMode || csrf.Path != "/admin" {
 		t.Fatalf("csrf cookie = %+v", csrf)
 	}
@@ -206,6 +211,75 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	}
 	if !strings.Contains(listed.String(), `"revision":8`) || runtime.ReconcileCount() != 8 {
 		t.Fatalf("aggregate status/reconcile count: body=%s reconciles=%d", listed.String(), runtime.ReconcileCount())
+	}
+}
+
+func TestAdminPublishSerializesSnapshotAndRuntimeReconcile(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	pool, err := database.CreatePool(ctx, store.CreatePoolParams{
+		PublicModelName: "public", UpstreamModelName: "upstream", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRegistry := registry.New(database)
+	if err := baseRegistry.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blockingRegistry := &snapshotBlockingRegistry{
+		Registry: baseRegistry, blocked: make(chan struct{}), release: make(chan struct{}),
+	}
+	runtime := &reconcileHistoryRuntime{}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Analytics: database, Registry: blockingRegistry, Runtime: runtime,
+		HMACSecret: []byte(strings.Repeat("s", 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(name string) error {
+		_, err := service.CreateBackend(ctx, httpapi.BackendInput{
+			ModelPoolID: pool.ID, Name: name, BaseURL: "http://" + name + ".invalid",
+			Enabled: true, CapacityHint: 1, RunningSoftLimit: 8,
+		})
+		return err
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- create("gpu-a") }()
+	<-blockingRegistry.blocked
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- create("gpu-b") }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		data, loadErr := database.LoadSnapshot(ctx)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if data.Revision >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second configuration transaction did not commit while first publication was paused")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(blockingRegistry.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.LatestIDs(); len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("latest reconciled backend IDs = %v, want both current backends", got)
+	}
+	if revision := baseRegistry.Snapshot().Revision; revision != 3 {
+		t.Fatalf("published revision = %d, want 3", revision)
 	}
 }
 
@@ -486,6 +560,73 @@ type reloadFailureRegistry struct {
 type alternatingAdminRegistry struct {
 	snapshots []*registry.Snapshot
 	next      int
+}
+
+type snapshotBlockingRegistry struct {
+	*registry.Registry
+	mu      sync.Mutex
+	armed   bool
+	used    bool
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (r *snapshotBlockingRegistry) Reload(ctx context.Context) error {
+	if err := r.Registry.Reload(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if !r.used {
+		r.armed = true
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *snapshotBlockingRegistry) Snapshot() *registry.Snapshot {
+	r.mu.Lock()
+	if r.armed {
+		r.armed = false
+		r.used = true
+		snapshot := r.Registry.Snapshot()
+		close(r.blocked)
+		r.mu.Unlock()
+		<-r.release
+		return snapshot
+	}
+	r.mu.Unlock()
+	return r.Registry.Snapshot()
+}
+
+type reconcileHistoryRuntime struct {
+	mu     sync.Mutex
+	latest []int64
+}
+
+func (r *reconcileHistoryRuntime) Reconcile(backends []domain.Backend) error {
+	ids := make([]int64, 0, len(backends))
+	for _, backend := range backends {
+		ids = append(ids, backend.ID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	r.mu.Lock()
+	r.latest = ids
+	r.mu.Unlock()
+	return nil
+}
+
+func (*reconcileHistoryRuntime) Snapshot(id int64, _ time.Time) domain.BackendRuntime {
+	return domain.BackendRuntime{BackendID: id}
+}
+
+func (*reconcileHistoryRuntime) PoolSnapshot(id int64, _ time.Time) domain.PoolRuntime {
+	return domain.PoolRuntime{PoolID: id}
+}
+
+func (r *reconcileHistoryRuntime) LatestIDs() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.latest...)
 }
 
 func (r *alternatingAdminRegistry) Reload(context.Context) error { return nil }

@@ -235,8 +235,11 @@ func (m *Metrics) Complete(event gateway.RequestEvent) {
 	if event.Disconnect {
 		m.disconnects.WithLabelValues(model, backend, priority).Inc()
 	}
-	if event.Status >= http.StatusInternalServerError && event.Backend != "" {
+	if (event.Status >= http.StatusInternalServerError || event.UpstreamFailure != "") && event.Backend != "" {
 		reason := event.Reason
+		if event.UpstreamFailure != "" {
+			reason = event.UpstreamFailure
+		}
 		if reason == "" {
 			reason = "upstream_status"
 		}

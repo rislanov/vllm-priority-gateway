@@ -69,9 +69,10 @@ type AdminService struct {
 	random     io.Reader
 	now        func() time.Time
 
-	randomMu sync.Mutex
-	stateMu  sync.RWMutex
-	degraded string
+	randomMu  sync.Mutex
+	publishMu sync.Mutex
+	stateMu   sync.RWMutex
+	degraded  string
 }
 
 func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
@@ -363,6 +364,9 @@ func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, drainin
 }
 
 func (s *AdminService) publish(ctx context.Context) error {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
 	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := s.registry.Reload(publishCtx); err != nil {
@@ -610,6 +614,8 @@ func writeAdminError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		status, code = http.StatusNotFound, "not_found"
+	case store.IsTemporary(err):
+		status, code = http.StatusServiceUnavailable, "storage_unavailable"
 	case strings.Contains(message, "UNIQUE constraint failed"), strings.Contains(message, "FOREIGN KEY constraint failed"):
 		status, code = http.StatusConflict, "conflict"
 	case strings.Contains(message, "publish configuration"), strings.Contains(message, "reconcile backend monitors"):

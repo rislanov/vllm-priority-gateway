@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -57,23 +56,17 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 		return domain.ModelPool{}, err
 	}
 	defer tx.Rollback()
+	pool.UpdatedAt = s.now().UTC()
 	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM model_pools WHERE id = ?`, id).Scan(&created); err != nil {
-		return domain.ModelPool{}, fmt.Errorf("find model pool %d: %w", id, err)
+	err = tx.QueryRowContext(ctx, `
+		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, updated_at = ?
+		WHERE id = ? RETURNING created_at`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(pool.UpdatedAt), id).Scan(&created)
+	if err != nil {
+		return domain.ModelPool{}, fmt.Errorf("update model pool: %w", err)
 	}
 	pool.CreatedAt, err = parseTimestamp(created)
 	if err != nil {
 		return domain.ModelPool{}, err
-	}
-	pool.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, updated_at = ?
-		WHERE id = ?`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(pool.UpdatedAt), id)
-	if err != nil {
-		return domain.ModelPool{}, fmt.Errorf("update model pool: %w", err)
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.ModelPool{}, sql.ErrNoRows
 	}
 	if err := bumpRevision(ctx, tx); err != nil {
 		return domain.ModelPool{}, err

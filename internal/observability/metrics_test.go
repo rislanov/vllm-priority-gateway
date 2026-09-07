@@ -53,6 +53,11 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		PriorityClass: domain.PriorityHigh, Status: 200, Duration: time.Millisecond,
 		UsageParseFailure: "request-body-must-not-be-a-label",
 	})
+	metrics.Complete(gateway.RequestEvent{
+		RequestID: "truncated-stream", Client: "client-a", Model: "qwen",
+		Backend: "gpu-stream", PriorityClass: domain.PriorityHigh, Status: 200,
+		UpstreamFailure: "upstream_body_read_error", Duration: time.Millisecond,
+	})
 	metrics.UsagePersistenceFailure()
 	metrics.UsagePersistenceFailure()
 	metrics.SetBackend("qwen", "gpu-1", domain.BackendRuntime{
@@ -97,6 +102,7 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		`llmgw_usage_parse_failures_total{format="sse"} 1`,
 		`llmgw_usage_persistence_failures_total 2`,
 		`llmgw_backend_selected_total{backend="gpu-1",model="qwen"} 2`,
+		`llmgw_backend_failures_total{backend="gpu-stream",model="qwen",reason="upstream_body_read_error"} 1`,
 		`llmgw_pool_pressure{model="qwen"} 1.25`,
 		`llmgw_pool_state{model="qwen",state="saturated"} 1`,
 		`llmgw_pool_state{model="qwen",state="normal"} 0`,

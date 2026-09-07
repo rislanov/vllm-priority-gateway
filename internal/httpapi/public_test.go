@@ -824,12 +824,19 @@ func TestServicePreservesCommittedUpstreamStatusOnBodyFailure(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
 	request.Header.Set("Authorization", "Bearer "+raw)
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("panic = %v, want http.ErrAbortHandler", recovered)
+			}
+		}()
+		handler.ServeHTTP(response, request)
+	}()
 	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "upstream_error") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	events := observer.Events()
-	if len(events) != 1 || events[0].Status != http.StatusServiceUnavailable {
+	if len(events) != 1 || events[0].Status != http.StatusServiceUnavailable || events[0].UpstreamFailure != "upstream_body_read_error" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -989,7 +996,7 @@ func (committedErrorForwarder) Forward(_ context.Context, writer http.ResponseWr
 	writer.WriteHeader(http.StatusServiceUnavailable)
 	return proxy.Result{
 		BackendID: request.Target.Backend.ID, Status: http.StatusServiceUnavailable,
-		ResponseStarted: true, Err: io.ErrUnexpectedEOF,
+		ResponseStarted: true, UpstreamFailure: "upstream_body_read_error", Err: io.ErrUnexpectedEOF,
 	}
 }
 

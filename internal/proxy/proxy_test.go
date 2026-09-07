@@ -386,7 +386,7 @@ func TestForwardClassifiesBodyReadFailureBeforeDownstreamWriteFailureAsFailure(t
 			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
 		},
 	})
-	if !errors.Is(result.Err, errDownstreamWrite) || !result.ResponseStarted || result.RetryCount != 0 {
+	if !errors.Is(result.Err, errDownstreamWrite) || result.UpstreamFailure != "upstream_body_read_error" || !result.ResponseStarted || result.RetryCount != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
@@ -417,11 +417,38 @@ func TestForwardPreservesProvenBodyReadFailureWhenWriteCancelsContext(t *testing
 			return proxy.Target{}, nil
 		},
 	})
-	if !errors.Is(result.Err, errDownstreamWrite) || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != 0 || result.RetryCount != 0 {
+	if !errors.Is(result.Err, errDownstreamWrite) || result.UpstreamFailure != "upstream_body_read_error" || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != 0 || result.RetryCount != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
 		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
+	}
+}
+
+func TestForwardPreservesProvenBodyReadFailureWhenSuccessfulWriteCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       partialReadFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	result := proxy.New(client).Forward(ctx, &cancelWriteWriter{header: make(http.Header), cancel: cancel}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+	})
+	if !errors.Is(result.Err, errUpstreamRead) || result.UpstreamFailure != "upstream_body_read_error" || !result.Cancelled ||
+		result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != int64(len("partial")) || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("outcomes = %v, want [failure]", outcomes)
 	}
 }
 
@@ -494,7 +521,7 @@ func TestForwardClassifiesUpstreamBodyReadFailureAsFailure(t *testing.T) {
 			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
 		},
 	})
-	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted {
+	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted || result.UpstreamFailure != "upstream_body_read_error" {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
@@ -625,7 +652,7 @@ func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 			return proxy.Target{}, errors.New("must not be called")
 		},
 	})
-	if result.Err == nil || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
+	if result.Err == nil || result.UpstreamFailure != "upstream_body_read_error" || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
 		t.Fatalf("result=%+v selections=%d body=%q", result, selections.Load(), writer.String())
 	}
 }
