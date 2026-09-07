@@ -146,18 +146,47 @@ func TestForwardRewritesModelAndClientControlledPriority(t *testing.T) {
 }
 
 func TestSessionAffinityPrefersRendezvousBackendAndStripsHeader(t *testing.T) {
+	for _, header := range []string{gateway.SessionAffinityHeader, "X-Opencode-Session", "X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-Affinity", "X-Session-Id"} {
+		t.Run(header, func(t *testing.T) {
+			raw, key := testKey(t)
+			forwarder := &capturingForwarder{}
+			handler, _ := newFixture(t, fixtureOptions{
+				client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+			request.Header.Set("Authorization", "Bearer "+raw)
+			request.Header.Set(header, "alpha")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+			captured := forwarder.Request()
+			if captured.Target.Backend.ID != 22 {
+				t.Fatalf("backend = %d, want rendezvous backend 22", captured.Target.Backend.ID)
+			}
+			if got := captured.Headers.Get(header); got != "" {
+				t.Fatalf("session affinity header reached upstream: %q", got)
+			}
+
+		})
+	}
+}
+
+func TestPiClientRequestIDProvidesSessionAffinity(t *testing.T) {
 	raw, key := testKey(t)
 	forwarder := &capturingForwarder{}
 	handler, _ := newFixture(t, fixtureOptions{
 		client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
 	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","input":"hello"}`))
 	request.Header.Set("Authorization", "Bearer "+raw)
-	request.Header.Set(gateway.SessionAffinityHeader, "alpha")
+	request.Header.Set("User-Agent", "pi (linux 6.0; x64)")
+	request.Header.Set("X-Client-Request-Id", "alpha")
 	response := httptest.NewRecorder()
-
 	handler.ServeHTTP(response, request)
-
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
@@ -165,8 +194,60 @@ func TestSessionAffinityPrefersRendezvousBackendAndStripsHeader(t *testing.T) {
 	if captured.Target.Backend.ID != 22 {
 		t.Fatalf("backend = %d, want rendezvous backend 22", captured.Target.Backend.ID)
 	}
-	if got := captured.Headers.Get(gateway.SessionAffinityHeader); got != "" {
-		t.Fatalf("session affinity header reached upstream: %q", got)
+	if got := captured.Headers.Get("X-Client-Request-Id"); got != "" {
+		t.Fatalf("Pi session fallback reached upstream: %q", got)
+	}
+}
+
+func TestGenericClientRequestIDIsPreservedWithoutAffinity(t *testing.T) {
+	raw, key := testKey(t)
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","input":"hello"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	request.Header.Set("User-Agent", "other-client/1.0")
+	request.Header.Set("X-Client-Request-Id", "request-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	captured := forwarder.Request()
+	if captured.Target.Backend.ID != 20 {
+		t.Fatalf("backend = %d, want least-pressure backend 20", captured.Target.Backend.ID)
+	}
+	if got := captured.Headers.Get("X-Client-Request-Id"); got != "request-1" {
+		t.Fatalf("generic request ID = %q", got)
+	}
+}
+
+func TestClaudeSessionAffinityPreservesClientRequestID(t *testing.T) {
+	raw, key := testKey(t)
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","input":"hello"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	request.Header.Set("User-Agent", "claude-cli/2.1.86")
+	request.Header.Set("X-Claude-Code-Session-Id", "alpha")
+	request.Header.Set("X-Client-Request-Id", "request-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	captured := forwarder.Request()
+	if captured.Target.Backend.ID != 22 {
+		t.Fatalf("backend = %d, want rendezvous backend 22", captured.Target.Backend.ID)
+	}
+	if got := captured.Headers.Get("X-Claude-Code-Session-Id"); got != "" {
+		t.Fatalf("Claude session ID reached upstream: %q", got)
+	}
+	if got := captured.Headers.Get("X-Client-Request-Id"); got != "request-1" {
+		t.Fatalf("Claude request ID = %q", got)
 	}
 }
 
@@ -194,6 +275,42 @@ func TestRequestWithoutSessionAffinityUsesLeastPressure(t *testing.T) {
 				t.Fatalf("backend = %d, want least-pressure backend 20", got)
 			}
 		})
+	}
+}
+
+func TestSessionAffinityOverrideStripsAliasesAndPreservesGenericRequestID(t *testing.T) {
+	raw, key := testKey(t)
+	forwarder := &capturingForwarder{}
+	handler, _ := newFixture(t, fixtureOptions{
+		client: enabledClient(), key: key, forwarder: forwarder, sessionAffinityBackends: true,
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"public-model","input":"hello"}`))
+	request.Header.Set("Authorization", "Bearer "+raw)
+	aliases := []string{"X-Opencode-Session", "X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-Affinity", "X-Session-Id"}
+	for _, name := range aliases {
+		request.Header.Set(name, "different-session")
+	}
+	request.Header.Set(gateway.SessionAffinityHeader, "alpha")
+	request.Header.Set("X-Client-Request-Id", "request-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	captured := forwarder.Request()
+	if captured.Target.Backend.ID != 22 {
+		t.Fatalf("override selected backend %d, want 22", captured.Target.Backend.ID)
+	}
+	for _, name := range append(aliases, gateway.SessionAffinityHeader) {
+		if len(captured.Headers.Values(name)) != 0 {
+			t.Fatalf("%s reached upstream", name)
+		}
+		if request.Header.Get(name) == "" {
+			t.Fatalf("incoming %s was mutated", name)
+		}
+	}
+	if got := captured.Headers.Get("X-Client-Request-Id"); got != "request-1" {
+		t.Fatalf("generic request ID = %q", got)
 	}
 }
 
@@ -236,22 +353,46 @@ func TestSessionAffinityKeyIncludesClientAndPoolIdentity(t *testing.T) {
 }
 
 func TestSessionAffinityRejectsOversizedIdentifier(t *testing.T) {
+	for _, header := range []string{gateway.SessionAffinityHeader, "X-Opencode-Session", "X-Claude-Code-Session-Id", "Session-Id", "Session_id", "X-Session-Affinity", "X-Session-Id"} {
+		t.Run(header, func(t *testing.T) {
+			raw, key := testKey(t)
+			forwarder := &capturingForwarder{}
+			handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, forwarder: forwarder})
+			request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
+			request.Header.Set("Authorization", "Bearer "+raw)
+			request.Header.Set(header, strings.Repeat("s", gateway.MaxSessionAffinityIDBytes+1))
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+			assertErrorCode(t, response.Body.Bytes(), "invalid_request_error")
+			if forwarder.Calls() != 0 {
+				t.Fatalf("oversized session identifier was forwarded %d time(s)", forwarder.Calls())
+			}
+
+		})
+	}
+}
+
+func TestSessionAffinityRejectsConflictingWireValues(t *testing.T) {
 	raw, key := testKey(t)
 	forwarder := &capturingForwarder{}
 	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, forwarder: forwarder})
 	request := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{"model":"public-model"}`))
 	request.Header.Set("Authorization", "Bearer "+raw)
-	request.Header.Set(gateway.SessionAffinityHeader, strings.Repeat("s", gateway.MaxSessionAffinityIDBytes+1))
+	request.Header.Add("X-Opencode-Session", "alpha")
+	request.Header.Add("X-Opencode-Session", "beta")
 	response := httptest.NewRecorder()
-
 	handler.ServeHTTP(response, request)
-
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
 	assertErrorCode(t, response.Body.Bytes(), "invalid_request_error")
 	if forwarder.Calls() != 0 {
-		t.Fatalf("oversized session identifier was forwarded %d time(s)", forwarder.Calls())
+		t.Fatalf("conflicting session identifiers were forwarded %d time(s)", forwarder.Calls())
 	}
 }
 

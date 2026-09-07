@@ -22,6 +22,25 @@ Send a stable opaque `X-LLM-Session-Id` for consecutive requests from one agent 
 
 This is locality-aware routing, not a distributed KV-block index. A session can move when its preferred backend becomes unavailable or overloaded.
 
+The first nonempty header in this order supplies the session ID (header names are case-insensitive):
+
+| Priority | Header | Client / purpose |
+|---|---|---|
+| 1 | `X-LLM-Session-Id` | Explicit gateway override |
+| 2 | `X-OpenCode-Session` | OpenCode |
+| 3 | `X-Claude-Code-Session-Id` | Claude Code |
+| 4 | `Session-Id` | Codex and Pi Codex transport |
+| 5 | `Session_id` | Older Codex and Pi OpenAI transport |
+| 6 | `X-Session-Affinity` | Pi completions transport |
+| 7 | `X-Session-Id` | Pi OpenRouter transport |
+| 8 | `X-Client-Request-Id` | Pi-only fallback when `User-Agent` starts with `pi (` |
+
+PiCode here refers to the Pi coding agent. Header emission depends on the client version, provider and cache settings. Because `X-Client-Request-Id` identifies a single request in many other clients, the gateway treats it as a session ID and removes it only when Pi's `User-Agent` is present. Other clients keep that header and can supply `X-LLM-Session-Id` as an explicit stable conversation ID. If the client sends none of these headers, routing remains least-pressure. These aliases apply to the gateway's existing OpenAI-compatible endpoints; recognizing Claude's header does not add the Anthropic Messages API.
+
+Values are trimmed and scoped to the authenticated client and model pool. Every applicable alias is checked against the 256-byte limit, including lower-priority aliases. Repeated values for one header must agree after trimming; conflicting duplicates return HTTP `400` with `invalid_request_error`. Different header names may have different values; precedence resolves them. Applicable session headers are removed before forwarding, including unused aliases, and their values are never recorded in gateway logs or metric labels.
+
+Client references: [OpenCode request headers](https://github.com/anomalyco/opencode/blob/e207624c48159b03dbe17dbc8e51bbcf23e72df5/packages/opencode/src/session/llm/request.ts), [Claude Code changelog](https://github.com/anthropics/claude-code/blob/ab9b2cf7bb9e4f98ff264c07a22e46d83c29c558/CHANGELOG.md), [Codex session headers](https://github.com/openai/codex/blob/455318c2020d75ae7d66d6ccf19defda97edec34/codex-rs/codex-api/src/requests/headers.rs), [Pi responses](https://github.com/earendil-works/pi/blob/9767ba275f3e9a5ee0f5c5342249b629ab1b2282/packages/ai/src/api/openai-responses.ts), [Pi completions](https://github.com/earendil-works/pi/blob/9767ba275f3e9a5ee0f5c5342249b629ab1b2282/packages/ai/src/api/openai-completions.ts).
+
 ## Circuit breaker and pool safety
 
 Each managed backend has a process-local inference circuit. With the default configuration, five qualifying failures in 30 seconds open the circuit for 15 seconds; one half-open probe is then allowed. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against the circuit. Downstream cancellation and write failure are neutral.
