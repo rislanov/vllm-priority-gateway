@@ -152,6 +152,8 @@ POST /v1/responses
 
 For prefix-cache locality, send the same opaque `X-LLM-Session-Id` on consecutive requests from one agent or conversation. The value is bounded, never logged or used as a metric label, and stripped before forwarding. Health, drain state, metrics freshness, circuit state, and pressure always take precedence over affinity.
 
+Session headers from OpenCode, Pi (PiCode), Codex, and Claude Code are also recognized automatically. `X-LLM-Session-Id` takes precedence over client aliases. See [supported headers and precedence](docs/operations.md#backend-monitoring-and-routing).
+
 ## Production and operations
 
 - [Production deployment](docs/deployment.md): Docker and systemd installation, TLS reverse proxy, secrets, backup, and restore.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -114,9 +113,9 @@ func (s *Service) resolveForwardRequest(request ForwardRequest, lifecycle *forwa
 	lifecycle.event.PriorityClass = client.PriorityClass
 	lifecycle.event.VLLMPriority = client.VLLMPriority
 
-	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
-	if len(sessionID) > MaxSessionAffinityIDBytes {
-		return resolvedForwardRequest{}, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
+	sessionID, sessionErr := sessionAffinityID(request.Headers)
+	if sessionErr != nil {
+		return resolvedForwardRequest{}, sessionErr
 	}
 	payload, publicModel, parseErr := rewritePayload(request.Body)
 	if parseErr != nil {
@@ -329,7 +328,7 @@ func (s *Service) Forward(
 
 	headers := request.Headers.Clone()
 	headers.Del("X-Vllm-Priority")
-	headers.Del(SessionAffinityHeader)
+	stripSessionAffinityHeaders(headers)
 	headers.Del("Authorization")
 	proxyRequest := proxy.Request{
 		Method: request.Method, Path: request.Path, Headers: headers, Body: resolved.payload,
