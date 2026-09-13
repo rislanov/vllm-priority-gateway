@@ -2,7 +2,7 @@
 
 This procedure validates behavior that the deterministic fake backend cannot prove: current OpenAI API compatibility, upstream cancellation on a real engine, queue metrics under GPU contention, vLLM priority scheduling, gateway hysteretic recovery, and circuit recovery against a live inference endpoint.
 
-The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
+The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). The suite also verifies the authenticated `/v1/load` signal against Admin runtime and Prometheus during idle, sustained load, hysteretic recovery, circuit unavailability, and recovery. Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
 
 ## Recorded RTX 4070 Ti local-build evidence
 

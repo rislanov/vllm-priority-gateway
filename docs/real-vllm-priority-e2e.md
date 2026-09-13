@@ -2,9 +2,9 @@
 
 This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has exactly three modes:
 
-- `smoke` is safe for a production verification window. It checks management and inference readiness separately, Admin pool/backend counts, healthy and metrics-fresh backends, model visibility, one complete short stream, and required Prometheus families including all five circuit/pool gauges.
-- `priority` intentionally saturates inference capacity. It observes non-zero gateway in-flight and upstream waiting work, proves background shedding and High/Critical priority continuity, then temporarily sets a pool-wide in-flight limit and proves that even Critical receives the bounded `429 gateway_overloaded`. It restores the limit and proves Critical streaming continuity again.
-- `resilience` is destructive and isolated. It places a loopback fault proxy in front of one real backend, drains its siblings, proves inference-only `503` failures open the circuit while health/metrics remain fresh, then observes half-open streaming recovery and closure. Run it only against a gateway on the same host and with no production traffic.
+- `smoke` is safe for a production verification window. It checks management and inference readiness separately, Admin pool/backend counts, healthy and metrics-fresh backends, model visibility, the authenticated `/v1/load` contract, one complete short stream, and required Prometheus families including all five circuit/pool gauges.
+- `priority` intentionally saturates inference capacity. It observes non-zero gateway in-flight and upstream waiting work, requires `/v1/load` to report `loaded` consistently with the pool-state and capacity gauges, proves background shedding and High/Critical priority continuity, then temporarily sets a pool-wide in-flight limit and proves that even Critical receives the bounded `429 gateway_overloaded`. It restores the limit, proves Critical streaming continuity again, and checks `medium` and `free` during hysteretic recovery.
+- `resilience` is destructive and isolated. It places a loopback fault proxy in front of one real backend, drains its siblings, proves inference-only `503` failures open the circuit while health/metrics remain fresh, requires `/v1/load` and Prometheus to report unavailable capacity, then observes half-open streaming recovery and closure. Run it only against a gateway on the same host and with no production traffic.
 
 The test is opt-in. Ordinary `go test ./...` compiles it and reports it as skipped unless `LLMGW_E2E_MODE` is set.
 
@@ -149,7 +149,7 @@ Expected result:
 PASS
 ```
 
-This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state. `/readyz` must remain HTTP 200 management readiness and `/inference-readyz` must be HTTP 200 with `status: "ready"`, at least one available pool, and the expected backend count. It also requires `llmgw_pool_pressure`, `llmgw_pool_state`, `llmgw_backend_selected_total`, and `llmgw_queue_wait_seconds` in addition to the existing request, backend, circuit, and pool families.
+This mode sends one four-token streaming completion. It does not saturate capacity or mutate Admin state. `/readyz` must remain HTTP 200 management readiness and `/inference-readyz` must be HTTP 200 with `status: "ready"`, at least one available pool, and the expected backend count. Authenticated `/v1/load` must match the Admin pool state and available-backend count, return its non-cacheable/request-ID headers, and align with the published pool state, pressure, and availability gauges. The mode also requires `llmgw_backend_selected_total` and `llmgw_queue_wait_seconds` in addition to the existing request, backend, circuit, and pool families.
 
 ## 4. Run priority isolation and recovery
 
@@ -179,14 +179,14 @@ The priority test passes only when all of the following are observed:
 
 1. A complete High stream establishes a pre-load first-byte baseline and a pre-load Prometheus snapshot.
 2. High streaming requests drive the selected pool into `saturated` or `emergency`, with `GatewayInflight > 0` and `TotalWaiting > 0` in Admin runtime.
-3. By default, `AllBackendsWaiting` is true.
+3. `/v1/load` reports `level: loaded`, the exact internal `poolState`, positive pressure, and current backend availability consistently with Prometheus. By default, `AllBackendsWaiting` is true.
 4. Ordinary Low, Low with a spoofed body/header priority, and Low with a session-affinity header all receive `429`, a positive `Retry-After`, and public code `gateway_overloaded`.
 5. `llmgw_requests_rejected_total{priority_class="background",reason="priority_concurrency_limit"}` increases by at least three, proving the gateway decision behind those public 429s.
 6. Separate High and Critical probes receive `200` while the pool is saturated. The High request-duration and selected queue-wait histogram counts increase, backend selections increase, and the current pool-pressure sample is positive.
 7. The test logs baseline and loaded High first-byte durations plus their ratio. It intentionally does not encode one universal latency threshold; retain the measured ratio and apply the target deployment's SLO during sign-off.
 8. A temporary positive `MaxGatewayInflight` at or below observed in-flight work causes a separate Critical request to receive the same bounded pool-safety `429`; after the exact original limit is restored, a complete Critical stream succeeds again.
 9. Immediately after load cancellation, Low remains rejected during hysteresis.
-10. The pool recovers through `busy` to `normal`, and Low is accepted again.
+10. The pool recovers through `busy` to `normal`, `/v1/load` changes through `medium` to `free`, and Low is accepted again.
 
 The load uses streaming deliberately. A queued non-streaming generation does not deliver response headers until its complete response is ready and can exceed the gateway response-header timeout under deep queues.
 
@@ -227,7 +227,7 @@ go test -count=1 -v -timeout 10m ./tests/e2e -run TestCircuitBreakerRecoveryWith
 
 The scenario captures originals before mutation, starts a loopback reverse proxy to the selected real-vLLM URL, sets both pool safety limits to unlimited for fault isolation, updates the target URL, and waits for a clean baseline: `CircuitState=closed`, circuit available, zero circuit failures, healthy, and metrics-fresh. The test process and gateway must share a host because this proxy listens on loopback; the original vLLM target may be remote as long as that host can reach it. The test then drains every sibling. The proxy passes `/health`, `/metrics`, and all non-faulting inference headers, statuses, bytes, and streaming through to real vLLM. While faulting, only `/v1/chat/completions`, `/v1/completions`, and `/v1/responses` return deterministic OpenAI-shaped HTTP 503 with error code `e2e_injected_failure`; health and metrics continue to come from real vLLM.
 
-Each configured failure has a distinct `X-Request-Id`, and every response must have HTTP 503 plus the exact OpenAI error code `e2e_injected_failure`. Pass criteria are: target Admin runtime remains healthy/fresh and reaches `CircuitState=open`; `/inference-readyz` becomes HTTP 503 `unavailable`; after fault disable and the configured cooldown, Admin exposes half-open probe capacity and pool availability; one complete stream closes the circuit; `/inference-readyz` returns HTTP 200 `ready`. Cleanup attempts the original target URL, every sibling drain state, all other backend fields, and both original pool limits before stopping the proxy. It reports all failed updates and continues later restores; any resource whose restore update fails may remain mutated and requires manual recovery. No API-key or Basic-auth value is included in test errors or logs.
+Each configured failure has a distinct `X-Request-Id`, and every response must have HTTP 503 plus the exact OpenAI error code `e2e_injected_failure`. Pass criteria are: target Admin runtime remains healthy/fresh and reaches `CircuitState=open`; `/inference-readyz` becomes HTTP 503 `unavailable`; authenticated `/v1/load` reports `level` and `poolState` as `unavailable` with zero available backends and the matching one-hot metric; after fault disable and the configured cooldown, Admin exposes half-open probe capacity and pool availability; one complete stream closes the circuit; `/inference-readyz` returns HTTP 200 `ready` and `/v1/load` becomes available again. Cleanup attempts the original target URL, every sibling drain state, all other backend fields, and both original pool limits before stopping the proxy. It reports all failed updates and continues later restores; any resource whose restore update fails may remain mutated and requires manual recovery. No API-key or Basic-auth value is included in test errors or logs.
 
 ## Configuration knobs
 

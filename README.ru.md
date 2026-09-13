@@ -143,11 +143,14 @@ UI встроен в gateway; отдельное frontend-развёртыван
 ## Клиентский API
 
 ```text
+GET  /v1/load?model=<public-model>
 GET  /v1/models
 POST /v1/chat/completions
 POST /v1/completions
 POST /v1/responses
 ```
+
+Авторизованный клиент может опрашивать `/v1/load` перед отправкой работы. Ручка возвращает для пула модели уровень `free`, `medium`, `loaded` или `unavailable`; контракт ответа и рекомендации по polling описаны в [руководстве по эксплуатации](docs/operations.md#client-side-load-polling).
 
 Для prefix-cache locality передавайте один непрозрачный `X-LLM-Session-Id` в последовательных запросах агента или диалога. Значение ограничено, не попадает в логи и metric labels и удаляется перед forwarding. Health, drain, свежесть метрик, circuit state и pressure всегда важнее affinity.
 
@@ -165,6 +168,7 @@ POST /v1/responses
 | `/healthz` | Liveness процесса |
 | `/readyz` | Готовность SQLite и registry |
 | `/inference-readyz` | Доступная inference capacity; HTTP `503`, если её нет |
+| `/v1/load?model=...` | Авторизованный сигнал нагрузки для конкретной модели |
 | `/metrics` | Prometheus telemetry |
 | `/admin` | Интерфейс оператора |
 

@@ -455,6 +455,68 @@ func TestServiceInferenceReadinessMatrix(t *testing.T) {
 	}
 }
 
+func TestServiceLoadStatusMapsPoolStatesToStablePublicLevels(t *testing.T) {
+	tests := []struct {
+		state domain.PoolState
+		level gateway.LoadLevel
+	}{
+		{state: domain.PoolNormal, level: gateway.LoadFree},
+		{state: domain.PoolBusy, level: gateway.LoadMedium},
+		{state: domain.PoolSaturated, level: gateway.LoadLoaded},
+		{state: domain.PoolEmergency, level: gateway.LoadLoaded},
+		{state: domain.PoolUnavailable, level: gateway.LoadUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.state), func(t *testing.T) {
+			runtime := newPoolRuntime(domain.PoolRuntime{
+				PoolID: 10, State: tt.state, BestBackendPressure: .82,
+				AvailableBackends: 1, TotalWaiting: 3,
+			}, []domain.BackendRuntime{{
+				BackendID: 20, Healthy: true, MetricsFresh: true, CircuitAvailable: true,
+			}})
+			runtime.poolInflight = 11
+			service, request, _ := newPoolService(t, poolServiceOptions{runtime: runtime})
+
+			status, apiErr := service.LoadStatus(request.APIKey, "public-model")
+
+			if apiErr != nil {
+				t.Fatalf("LoadStatus() API error = %+v", apiErr)
+			}
+			if status.Model != "public-model" || status.Level != tt.level || status.PoolState != tt.state {
+				t.Fatalf("LoadStatus() identity/state = %+v, want model=public-model level=%q state=%q", status, tt.level, tt.state)
+			}
+			if status.BestBackendPressure != .82 || status.AvailableBackends != 1 ||
+				status.WaitingRequests != 3 || status.GatewayInflight != 11 {
+				t.Fatalf("LoadStatus() runtime = %+v", status)
+			}
+			if status.ConfigRevision != 1 || !status.EvaluatedAt.Equal(poolTestNow) {
+				t.Fatalf("LoadStatus() metadata = %+v, want revision=1 evaluatedAt=%s", status, poolTestNow)
+			}
+		})
+	}
+}
+
+func TestServiceLoadStatusReportsUnavailableWhenNoBackendCanServeRequests(t *testing.T) {
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	backend.UpstreamAPIKeyEnv = "MISSING_UPSTREAM_KEY"
+	runtime := newPoolRuntime(domain.PoolRuntime{
+		PoolID: 10, State: domain.PoolNormal, BestBackendPressure: .2, AvailableBackends: 1,
+	}, []domain.BackendRuntime{{
+		BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true,
+	}})
+	service, request, _ := newPoolService(t, poolServiceOptions{runtime: runtime, backends: []domain.Backend{backend}})
+
+	status, apiErr := service.LoadStatus(request.APIKey, "public-model")
+
+	if apiErr != nil {
+		t.Fatalf("LoadStatus() API error = %+v", apiErr)
+	}
+	if status.Level != gateway.LoadUnavailable || status.PoolState != domain.PoolUnavailable || status.AvailableBackends != 0 {
+		t.Fatalf("LoadStatus() = %+v, want unavailable with zero serving backends", status)
+	}
+}
+
 type poolServiceOptions struct {
 	maximum                   int
 	maxWaiting                int

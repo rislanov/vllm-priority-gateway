@@ -144,11 +144,14 @@ The UI is embedded in the gateway; there is no separate frontend deployment.
 ## Client API
 
 ```text
+GET  /v1/load?model=<public-model>
 GET  /v1/models
 POST /v1/chat/completions
 POST /v1/completions
 POST /v1/responses
 ```
+
+Authenticated clients can poll `/v1/load` before submitting work. It returns the model pool as `free`, `medium`, `loaded`, or `unavailable`; see the [operations guide](docs/operations.md#client-side-load-polling) for the response contract and polling guidance.
 
 For prefix-cache locality, send the same opaque `X-LLM-Session-Id` on consecutive requests from one agent or conversation. The value is bounded, never logged or used as a metric label, and stripped before forwarding. Health, drain state, metrics freshness, circuit state, and pressure always take precedence over affinity.
 
@@ -166,6 +169,7 @@ Session headers from OpenCode, Pi (PiCode), Codex, and Claude Code are also reco
 | `/healthz` | Process liveness |
 | `/readyz` | SQLite and registry readiness |
 | `/inference-readyz` | Usable inference capacity; HTTP `503` when unavailable |
+| `/v1/load?model=...` | Authenticated, model-specific client load signal |
 | `/metrics` | Prometheus telemetry |
 | `/admin` | Operator UI |
 

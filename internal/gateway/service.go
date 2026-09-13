@@ -110,6 +110,27 @@ type InferenceReadiness struct {
 	BackendAvailability int    `json:"backendAvailability"`
 }
 
+type LoadLevel string
+
+const (
+	LoadFree        LoadLevel = "free"
+	LoadMedium      LoadLevel = "medium"
+	LoadLoaded      LoadLevel = "loaded"
+	LoadUnavailable LoadLevel = "unavailable"
+)
+
+type LoadStatus struct {
+	Model               string           `json:"model"`
+	Level               LoadLevel        `json:"level"`
+	PoolState           domain.PoolState `json:"poolState"`
+	BestBackendPressure float64          `json:"bestBackendPressure"`
+	AvailableBackends   int              `json:"availableBackends"`
+	WaitingRequests     float64          `json:"waitingRequests"`
+	GatewayInflight     int              `json:"gatewayInflight"`
+	ConfigRevision      int64            `json:"configRevision"`
+	EvaluatedAt         time.Time        `json:"evaluatedAt"`
+}
+
 func (s *Service) InferenceReadiness() InferenceReadiness {
 	snapshot := s.registry.Snapshot()
 	readiness := InferenceReadiness{Status: "unavailable", Revision: snapshot.Revision}
@@ -118,20 +139,9 @@ func (s *Service) InferenceReadiness() InferenceReadiness {
 		if !pool.Enabled {
 			continue
 		}
-		poolAvailable := false
-		for _, backend := range snapshot.BackendsByPool[pool.ID] {
-			if !backend.Enabled || backend.Draining {
-				continue
-			}
-			runtime := s.runtime.Snapshot(backend.ID, at)
-			_, secretAvailable := s.upstreamSecret(backend)
-			if !runtime.Healthy || !runtime.MetricsFresh || !runtime.CircuitAvailable || !secretAvailable {
-				continue
-			}
-			readiness.BackendAvailability++
-			poolAvailable = true
-		}
-		if poolAvailable {
+		available := s.availableBackends(snapshot, pool.ID, at)
+		readiness.BackendAvailability += available
+		if available > 0 {
 			readiness.PoolAvailability++
 		}
 	}
@@ -139,6 +149,64 @@ func (s *Service) InferenceReadiness() InferenceReadiness {
 		readiness.Status = "ready"
 	}
 	return readiness
+}
+
+func (s *Service) LoadStatus(rawKey, model string) (LoadStatus, *APIError) {
+	snapshot := s.registry.Snapshot()
+	client, _, apiErr := s.validateAPIKeySnapshot(rawKey, snapshot)
+	if apiErr != nil {
+		return LoadStatus{}, apiErr
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return LoadStatus{}, invalidRequest("Model is required")
+	}
+	pool, exists := snapshot.PoolsByName[model]
+	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
+		return LoadStatus{}, modelNotAllowed()
+	}
+
+	at := s.now().UTC()
+	runtime := s.runtime.PoolSnapshot(pool.ID, at)
+	available := s.availableBackends(snapshot, pool.ID, at)
+	state := runtime.State
+	if available == 0 {
+		state = domain.PoolUnavailable
+	}
+	return LoadStatus{
+		Model: model, Level: loadLevel(state), PoolState: state,
+		BestBackendPressure: runtime.BestBackendPressure, AvailableBackends: available,
+		WaitingRequests: runtime.TotalWaiting, GatewayInflight: runtime.GatewayInflight,
+		ConfigRevision: snapshot.Revision, EvaluatedAt: at,
+	}, nil
+}
+
+func loadLevel(state domain.PoolState) LoadLevel {
+	switch state {
+	case domain.PoolNormal:
+		return LoadFree
+	case domain.PoolBusy:
+		return LoadMedium
+	case domain.PoolSaturated, domain.PoolEmergency:
+		return LoadLoaded
+	default:
+		return LoadUnavailable
+	}
+}
+
+func (s *Service) availableBackends(snapshot *registry.Snapshot, poolID int64, at time.Time) int {
+	available := 0
+	for _, backend := range snapshot.BackendsByPool[poolID] {
+		if !backend.Enabled || backend.Draining {
+			continue
+		}
+		runtime := s.runtime.Snapshot(backend.ID, at)
+		_, secretAvailable := s.upstreamSecret(backend)
+		if runtime.Healthy && runtime.MetricsFresh && runtime.CircuitAvailable && secretAvailable {
+			available++
+		}
+	}
+	return available
 }
 
 func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, domain.Client, *APIError) {

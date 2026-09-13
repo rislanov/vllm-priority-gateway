@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -394,6 +395,18 @@ type inferenceReadyResponse struct {
 	BackendAvailability int    `json:"backendAvailability"`
 }
 
+type loadStatusResponse struct {
+	Model               string    `json:"model"`
+	Level               string    `json:"level"`
+	PoolState           string    `json:"poolState"`
+	BestBackendPressure float64   `json:"bestBackendPressure"`
+	AvailableBackends   int       `json:"availableBackends"`
+	WaitingRequests     float64   `json:"waitingRequests"`
+	GatewayInflight     int       `json:"gatewayInflight"`
+	ConfigRevision      int64     `json:"configRevision"`
+	EvaluatedAt         time.Time `json:"evaluatedAt"`
+}
+
 type adminStatus struct {
 	Revision int64          `json:"revision"`
 	Pools    []adminPool    `json:"pools"`
@@ -582,6 +595,75 @@ func (metrics metricsResponse) metricFamilies() (map[string]*dto.MetricFamily, b
 	return families, err == nil
 }
 
+func requireLoadMatchesPool(t *testing.T, load loadStatusResponse, pool adminPool) {
+	t.Helper()
+	wantLevel := map[string]string{
+		"normal": "free", "busy": "medium", "saturated": "loaded", "emergency": "loaded", "unavailable": "unavailable",
+	}[pool.Runtime.State]
+	if wantLevel == "" {
+		t.Fatalf("pool has unsupported runtime state %q", pool.Runtime.State)
+	}
+	if load.Model != pool.PublicModelName || load.PoolState != pool.Runtime.State || load.Level != wantLevel {
+		t.Fatalf("load status = model %q level %q pool state %q, want model %q level %q pool state %q",
+			load.Model, load.Level, load.PoolState, pool.PublicModelName, wantLevel, pool.Runtime.State)
+	}
+	if load.AvailableBackends != pool.Runtime.AvailableBackends {
+		t.Fatalf("load available backends = %d, admin pool = %d", load.AvailableBackends, pool.Runtime.AvailableBackends)
+	}
+	if load.ConfigRevision <= 0 || load.EvaluatedAt.IsZero() {
+		t.Fatalf("load status has invalid revision or timestamp: %+v", load)
+	}
+}
+
+func (h *remoteHarness) waitForLoadMetrics(key, level string, timeout time.Duration) (loadStatusResponse, metricsResponse) {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var lastLoad loadStatusResponse
+	var lastMetrics metricsResponse
+	var lastErr error
+	for {
+		lastLoad, lastErr = h.fetchLoadStatus(ctx, key)
+		if lastErr == nil {
+			lastMetrics, lastErr = h.fetchMetrics(ctx)
+		}
+		if lastErr == nil && (level == "" || lastLoad.Level == level) && loadMetricsAligned(lastLoad, lastMetrics) {
+			return lastLoad, lastMetrics
+		}
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("load status and metrics did not align before %s: level=%q load=%+v err=%v", timeout, level, lastLoad, lastErr)
+			return loadStatusResponse{}, ""
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func loadMetricsAligned(load loadStatusResponse, metrics metricsResponse) bool {
+	state, stateOK := metrics.value("llmgw_pool_state", map[string]string{"model": load.Model, "state": load.PoolState})
+	pressure, pressureOK := metrics.value("llmgw_pool_pressure", map[string]string{"model": load.Model})
+	available, availableOK := metrics.value("llmgw_pool_available_backends", map[string]string{"model": load.Model})
+	if !stateOK || state != 1 || !pressureOK || math.IsNaN(pressure) || math.IsInf(pressure, 0) || !availableOK || available != float64(load.AvailableBackends) {
+		return false
+	}
+	if load.Level == "loaded" && (load.BestBackendPressure <= 0 || pressure <= 0) {
+		return false
+	}
+	if load.WaitingRequests > 0 {
+		waiting, ok := metrics.value("llmgw_pool_waiting_requests", map[string]string{"model": load.Model})
+		if !ok || waiting <= 0 {
+			return false
+		}
+	}
+	if load.GatewayInflight > 0 {
+		inflight, ok := metrics.value("llmgw_pool_gateway_inflight", map[string]string{"model": load.Model})
+		if !ok || inflight <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func metricMatches(metric *dto.Metric, want map[string]string) bool {
 	matched := 0
 	for _, pair := range metric.Label {
@@ -672,6 +754,48 @@ func (h *remoteHarness) inferenceReadiness() (inferenceReadyResponse, int) {
 		h.t.Fatal(err)
 	}
 	return readiness, status
+}
+
+func (h *remoteHarness) loadStatus(key string) loadStatusResponse {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), h.cfg.probeTimeout)
+	defer cancel()
+	status, err := h.fetchLoadStatus(ctx, key)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return status
+}
+
+func (h *remoteHarness) fetchLoadStatus(ctx context.Context, key string) (loadStatusResponse, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.endpoint("/v1/load")+"?model="+url.QueryEscape(h.cfg.model), nil)
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("create GET /v1/load: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	response, err := h.client.Do(request)
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("read /v1/load: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load = %d: %s", response.StatusCode, bodyExcerpt(body))
+	}
+	if response.Header.Get("Cache-Control") != "no-store" {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load Cache-Control = %q, want no-store", response.Header.Get("Cache-Control"))
+	}
+	if response.Header.Get("X-Request-Id") == "" {
+		return loadStatusResponse{}, errors.New("GET /v1/load did not return X-Request-Id")
+	}
+	var status loadStatusResponse
+	if err := json.Unmarshal(body, &status); err != nil {
+		return loadStatusResponse{}, fmt.Errorf("decode /v1/load: %w", err)
+	}
+	return status, nil
 }
 
 func (h *remoteHarness) fetchInferenceReadiness(ctx context.Context) (inferenceReadyResponse, int, error) {

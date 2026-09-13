@@ -14,6 +14,39 @@ The gateway exposes three intentionally different health signals:
 
 Use `/inference-readyz` as the load-balancer signal for client traffic. Removing a gateway from service cannot create GPU capacity, so transient pool congestion does not make this endpoint fail.
 
+## Client-side load polling
+
+An authenticated client that can delay or pace its own work may poll `GET /v1/load?model=<public-model>` with its normal gateway Bearer key. This is a model-pool signal, not a gateway-wide average. A successful evaluation always returns HTTP `200`; the `level` field carries the decision signal:
+
+| `level` | Internal pool state | Suggested client behavior |
+|---|---|---|
+| `free` | `normal` | Submit work normally. |
+| `medium` | `busy` | Reduce concurrency or admit only higher-value work. |
+| `loaded` | `saturated` or `emergency` | Delay optional work and retry the status check later. |
+| `unavailable` | No backend can currently serve the model | Do not submit work; retry the status check with backoff. |
+
+Example response:
+
+```json
+{
+  "model": "qwen",
+  "level": "medium",
+  "poolState": "busy",
+  "bestBackendPressure": 0.72,
+  "availableBackends": 2,
+  "waitingRequests": 3,
+  "gatewayInflight": 8,
+  "configRevision": 42,
+  "evaluatedAt": "2026-09-13T14:00:00Z"
+}
+```
+
+`availableBackends` counts enabled, non-draining backends with healthy and fresh monitoring data, circuit capacity, and a resolvable upstream secret. `bestBackendPressure`, `waitingRequests`, and `gatewayInflight` are diagnostic snapshots; clients should branch on the stable `level` vocabulary rather than duplicate the gateway's thresholds.
+
+Poll on a timer appropriate for the workload, add random jitter, and increase the delay while the result stays `loaded` or `unavailable` to avoid a synchronized polling herd. Treat `401`, `400`, and `403` as configuration or access errors rather than load signals. Responses use `Cache-Control: no-store` and include `X-Request-Id` for diagnostics.
+
+The result is advisory and does not reserve capacity: load may change between the check and the inference request, and normal `429`/`503` handling remains required. Polls are excluded from inference request analytics and do not consume an admission or backend lease.
+
 ## Backend monitoring and routing
 
 Each enabled backend has independent health and Prometheus scrapes. The gateway derives EWMA pressure from running requests, waiting requests, and KV-cache utilization, applies hysteresis to pool state, and routes to the least-pressured eligible backend.
