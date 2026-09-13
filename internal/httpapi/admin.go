@@ -26,7 +26,7 @@ import (
 type AdminStore interface {
 	CreateClient(context.Context, store.CreateClientParams) (domain.Client, error)
 	UpdateClient(context.Context, int64, store.UpdateClientParams) (domain.Client, error)
-	DeleteClient(context.Context, int64) error
+	DeleteClient(context.Context, int64) ([]int64, error)
 	CreateAPIKey(context.Context, store.CreateAPIKeyParams) (domain.APIKey, error)
 	RevokeAPIKey(context.Context, int64) error
 	CreatePool(context.Context, store.CreatePoolParams) (domain.ModelPool, error)
@@ -41,10 +41,8 @@ type AdminStore interface {
 type AdminRegistry interface {
 	Reload(context.Context) error
 	Snapshot() *registry.Snapshot
-}
-
-type keyRevocationOverlay interface {
 	MarkKeyRevoked(id int64, at time.Time) bool
+	MarkBackendDeleted(id int64) bool
 }
 
 type AdminRuntime interface {
@@ -280,22 +278,23 @@ func (s *AdminService) UpdateClient(ctx context.Context, id int64, input ClientI
 }
 
 func (s *AdminService) DeleteClient(ctx context.Context, id int64) error {
-	var keyIDs []int64
-	for _, key := range s.View().Keys {
-		if key.ClientID == id {
-			keyIDs = append(keyIDs, key.ID)
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
+	keyIDs, err := s.store.DeleteClient(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if publishErr := s.publishLocked(ctx); publishErr != nil {
+				return publishErr
+			}
 		}
-	}
-	if err := s.store.DeleteClient(ctx, id); err != nil {
 		return err
 	}
-	if overlay, ok := s.registry.(keyRevocationOverlay); ok {
-		revokedAt := s.now().UTC()
-		for _, keyID := range keyIDs {
-			overlay.MarkKeyRevoked(keyID, revokedAt)
-		}
+	revokedAt := s.now().UTC()
+	for _, keyID := range keyIDs {
+		s.registry.MarkKeyRevoked(keyID, revokedAt)
 	}
-	return s.publish(ctx)
+	return s.publishLocked(ctx)
 }
 
 func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyInput) (CreatedKey, error) {
@@ -305,13 +304,15 @@ func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyI
 	if err != nil {
 		return CreatedKey{}, err
 	}
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
 	key, err := s.store.CreateAPIKey(ctx, store.CreateAPIKeyParams{
 		ClientID: clientID, Prefix: plain.Prefix, SecretHash: apikey.Digest(s.hmacSecret, plain.Value), ExpiresAt: input.ExpiresAt,
 	})
 	if err != nil {
 		return CreatedKey{}, err
 	}
-	if err := s.publish(ctx); err != nil {
+	if err := s.publishLocked(ctx); err != nil {
 		return CreatedKey{}, err
 	}
 	client := s.registry.Snapshot().Clients[clientID]
@@ -325,10 +326,10 @@ func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
 	if err := s.store.RevokeAPIKey(ctx, id); err != nil {
 		return err
 	}
-	if overlay, ok := s.registry.(keyRevocationOverlay); ok {
-		overlay.MarkKeyRevoked(id, s.now().UTC())
-	}
-	return s.publish(ctx)
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	s.registry.MarkKeyRevoked(id, s.now().UTC())
+	return s.publishLocked(ctx)
 }
 
 func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPool, error) {
@@ -383,10 +384,22 @@ func (s *AdminService) UpdateBackend(ctx context.Context, id int64, input Backen
 }
 
 func (s *AdminService) DeleteBackend(ctx context.Context, id int64) error {
-	if err := s.store.DeleteBackend(ctx, id); err != nil {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
+	deleteErr := s.store.DeleteBackend(ctx, id)
+	if deleteErr != nil && !errors.Is(deleteErr, sql.ErrNoRows) {
+		return deleteErr
+	}
+	s.registry.MarkBackendDeleted(id)
+	if err := s.reconcileCurrentBackends(); err != nil {
+		s.setDegraded(err)
+		return fmt.Errorf("reconcile backend monitors: %w", err)
+	}
+	if err := s.publishLocked(ctx); err != nil {
 		return err
 	}
-	return s.publish(ctx)
+	return deleteErr
 }
 
 func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, draining bool) (AdminBackend, error) {
@@ -402,24 +415,31 @@ func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, drainin
 func (s *AdminService) publish(ctx context.Context) error {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
+	return s.publishLocked(ctx)
+}
 
+func (s *AdminService) publishLocked(ctx context.Context) error {
 	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := s.registry.Reload(publishCtx); err != nil {
 		s.setDegraded(err)
 		return fmt.Errorf("publish configuration: %w", err)
 	}
-	snapshot := s.registry.Snapshot()
-	backends := make([]domain.Backend, 0, len(snapshot.BackendsByID))
-	for _, backend := range snapshot.BackendsByID {
-		backends = append(backends, backend)
-	}
-	if err := s.runtime.Reconcile(backends); err != nil {
+	if err := s.reconcileCurrentBackends(); err != nil {
 		s.setDegraded(err)
 		return fmt.Errorf("reconcile backend monitors: %w", err)
 	}
 	s.setDegraded(nil)
 	return nil
+}
+
+func (s *AdminService) reconcileCurrentBackends() error {
+	snapshot := s.registry.Snapshot()
+	backends := make([]domain.Backend, 0, len(snapshot.BackendsByID))
+	for _, backend := range snapshot.BackendsByID {
+		backends = append(backends, backend)
+	}
+	return s.runtime.Reconcile(backends)
 }
 
 func (s *AdminService) setDegraded(err error) {

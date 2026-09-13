@@ -3,12 +3,14 @@ package httpapi_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
+	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
@@ -262,8 +265,8 @@ func TestAdminDeleteConfigurationPublishesAndEnforcesReferences(t *testing.T) {
 	if len(view.Clients) != 0 || len(view.KeyCandidates) != 0 || len(view.PoolsByID) != 0 || len(view.BackendsByID) != 0 || len(view.Access) != 0 {
 		t.Fatalf("snapshot after deletes = %+v", view)
 	}
-	if runtime.ReconcileCount() != int(revision) {
-		t.Fatalf("runtime reconciles = %d, want %d", runtime.ReconcileCount(), revision)
+	if runtime.ReconcileCount() != int(revision)+1 {
+		t.Fatalf("runtime reconciles = %d, want %d including fail-closed backend removal", runtime.ReconcileCount(), revision+1)
 	}
 }
 
@@ -521,6 +524,139 @@ func TestClientDeletionRemainsFailClosedWhenReloadFails(t *testing.T) {
 	}
 }
 
+func TestClientDeletionSerializesWithKeyPublicationAndRemainsFailClosed(t *testing.T) {
+	previousMaxProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousMaxProcs)
+
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	loader := newBlockingFailureLoader(database)
+	registryValue := registry.New(loader)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	observedStore := &observedDeleteStore{SQLite: database, deleteCalled: make(chan struct{}, 1)}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: observedStore, Analytics: database, Registry: registryValue,
+		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
+		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := service.CreateClient(context.Background(), httpapi.ClientInput{
+		Name: "racing-client", Enabled: true, PriorityClass: domain.PriorityHigh, VLLMPriority: -10, MaxConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loader.ArmBlockThenFail()
+	created := make(chan httpapi.CreatedKey, 1)
+	createErrors := make(chan error, 1)
+	go func() {
+		key, createErr := service.CreateKey(context.Background(), client.ID, httpapi.KeyInput{})
+		created <- key
+		createErrors <- createErr
+	}()
+	<-loader.blocked
+
+	deleteErrors := make(chan error, 1)
+	deleteStarted := make(chan struct{})
+	go func() {
+		close(deleteStarted)
+		deleteErrors <- service.DeleteClient(context.Background(), client.ID)
+	}()
+	<-deleteStarted
+	runtime.Gosched()
+	select {
+	case <-observedStore.deleteCalled:
+		close(loader.release)
+		<-createErrors
+		<-deleteErrors
+		t.Fatal("client deletion reached SQLite while an older key snapshot was still being published")
+	default:
+	}
+	close(loader.release)
+	key := <-created
+	if err := <-createErrors; err != nil {
+		t.Fatalf("CreateKey() = %v", err)
+	}
+	if err := <-deleteErrors; err == nil || !strings.Contains(err.Error(), "forced reload failure") {
+		t.Fatalf("DeleteClient() error = %v, want forced reload failure", err)
+	}
+
+	gatewayService := gateway.New(gateway.Dependencies{Registry: registryValue, HMACSecret: []byte(strings.Repeat("h", 32))})
+	if _, apiErr := gatewayService.ValidateAPIKey(key.Secret); apiErr == nil {
+		t.Fatal("deleted client's concurrently published API key still authenticates")
+	}
+	if err := service.DeleteClient(context.Background(), client.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("retry DeleteClient() error = %v, want sql.ErrNoRows after convergence", err)
+	}
+	if _, exists := registryValue.Snapshot().Clients[client.ID]; exists {
+		t.Fatal("retry did not remove the deleted client from the registry")
+	}
+}
+
+func TestBackendDeletionRemainsFailClosedAndRetryConvergesAfterReloadFailure(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	failingRegistry := &reloadFailureRegistry{Registry: registryValue}
+	runtime := &reconcileHistoryRuntime{}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Analytics: database, Registry: failingRegistry, Runtime: runtime,
+		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := service.CreatePool(context.Background(), httpapi.PoolInput{
+		PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := service.CreateBackend(context.Background(), httpapi.BackendInput{
+		ModelPoolID: pool.ID, Name: "backend", BaseURL: "http://127.0.0.1:8000", Enabled: true, CapacityHint: 1, RunningSoftLimit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failingRegistry.fail = true
+	if err := service.DeleteBackend(context.Background(), backend.ID); err == nil {
+		t.Fatal("expected degraded reload error")
+	}
+	if _, exists := registryValue.Snapshot().BackendsByID[backend.ID]; exists {
+		t.Fatal("deleted backend remained selectable after reload failure")
+	}
+	if ids := runtime.LatestIDs(); len(ids) != 0 {
+		t.Fatalf("runtime still monitors deleted backend IDs %v", ids)
+	}
+
+	failingRegistry.fail = false
+	if err := service.DeleteBackend(context.Background(), backend.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("retry DeleteBackend() error = %v, want sql.ErrNoRows after convergence", err)
+	}
+	data, err := database.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registryValue.Snapshot().Revision != data.Revision {
+		t.Fatalf("retry did not converge registry revision: got %d want %d", registryValue.Snapshot().Revision, data.Revision)
+	}
+}
+
 const (
 	adminUser     = "operator"
 	adminPassword = "correct horse battery staple"
@@ -649,6 +785,71 @@ type reloadFailureRegistry struct {
 	fail bool
 }
 
+type observedDeleteStore struct {
+	*store.SQLite
+	deleteCalled chan struct{}
+}
+
+type blockingFailureLoader struct {
+	loader  registry.Loader
+	mu      sync.Mutex
+	armed   bool
+	fail    bool
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func newBlockingFailureLoader(loader registry.Loader) *blockingFailureLoader {
+	return &blockingFailureLoader{loader: loader}
+}
+
+func (l *blockingFailureLoader) ArmBlockThenFail() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.armed = true
+	l.blocked = make(chan struct{})
+	l.release = make(chan struct{})
+}
+
+func (l *blockingFailureLoader) LoadSnapshot(ctx context.Context) (registry.Data, error) {
+	l.mu.Lock()
+	if l.fail {
+		l.fail = false
+		l.mu.Unlock()
+		return registry.Data{}, errors.New("forced reload failure")
+	}
+	armed := l.armed
+	if armed {
+		l.armed = false
+	}
+	blocked := l.blocked
+	result := l.release
+	l.mu.Unlock()
+
+	data, err := l.loader.LoadSnapshot(ctx)
+	if err != nil || !armed {
+		return data, err
+	}
+	close(blocked)
+	select {
+	case <-result:
+	case <-ctx.Done():
+		return registry.Data{}, ctx.Err()
+	}
+	l.mu.Lock()
+	l.fail = true
+	l.mu.Unlock()
+	return data, nil
+}
+
+func (s *observedDeleteStore) DeleteClient(ctx context.Context, id int64) ([]int64, error) {
+	select {
+	case s.deleteCalled <- struct{}{}:
+	default:
+	}
+	return s.SQLite.DeleteClient(ctx, id)
+}
+
 type alternatingAdminRegistry struct {
 	snapshots []*registry.Snapshot
 	next      int
@@ -722,6 +923,10 @@ func (r *reconcileHistoryRuntime) LatestIDs() []int64 {
 }
 
 func (r *alternatingAdminRegistry) Reload(context.Context) error { return nil }
+
+func (r *alternatingAdminRegistry) MarkKeyRevoked(int64, time.Time) bool { return false }
+
+func (r *alternatingAdminRegistry) MarkBackendDeleted(int64) bool { return false }
 
 func (r *alternatingAdminRegistry) Snapshot() *registry.Snapshot {
 	snapshot := r.snapshots[r.next%len(r.snapshots)]

@@ -953,6 +953,7 @@ Actions:
 Create
 Edit
 Disable
+Delete
 ```
 
 ---
@@ -1033,6 +1034,8 @@ POST   /admin/api/backends/{id}/resume
 
 GET    /admin/api/status
 ```
+
+Deletion is destructive and requires an explicit confirmation in the Admin UI. Deleting a client also removes its model access and API keys; captured keys are immediately denied even if the subsequent registry reload fails. A model pool cannot be deleted while any backend still references it, so its backends must be deleted first. Deleting a backend removes it from routing and runtime monitoring immediately after the database commit, including when the full registry reload fails; retrying the delete reconciles any stale published configuration.
 
 ---
 

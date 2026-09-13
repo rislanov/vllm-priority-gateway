@@ -185,9 +185,10 @@ func TestSQLiteDeletesConfigurationAndCascadesDependents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.CreateAPIKey(ctx, store.CreateAPIKeyParams{
+	key, err := db.CreateAPIKey(ctx, store.CreateAPIKeyParams{
 		ClientID: client.ID, Prefix: "llmgw_123456", SecretHash: [32]byte{1},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	backend, err := db.CreateBackend(ctx, store.CreateBackendParams{
@@ -204,8 +205,12 @@ func TestSQLiteDeletesConfigurationAndCascadesDependents(t *testing.T) {
 	if err := db.DeletePool(ctx, pool.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DeleteClient(ctx, client.ID); err != nil {
+	deletedKeyIDs, err := db.DeleteClient(ctx, client.ID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(deletedKeyIDs) != 1 || deletedKeyIDs[0] != key.ID {
+		t.Fatalf("DeleteClient() key IDs = %v, want [%d]", deletedKeyIDs, key.ID)
 	}
 
 	snapshot, err := db.LoadSnapshot(ctx)
@@ -238,8 +243,12 @@ func TestSQLiteDeleteRejectsReferencedPoolAndMissingTargetsWithoutRevisionChange
 	if err := db.DeletePool(ctx, pool.ID); !errors.Is(err, store.ErrPoolHasBackends) {
 		t.Fatalf("DeletePool() error = %v, want ErrPoolHasBackends", err)
 	}
+	deleteMissingClient := func(ctx context.Context, id int64) error {
+		_, err := db.DeleteClient(ctx, id)
+		return err
+	}
 	for name, deleteValue := range map[string]func(context.Context, int64) error{
-		"client":  db.DeleteClient,
+		"client":  deleteMissingClient,
 		"pool":    db.DeletePool,
 		"backend": db.DeleteBackend,
 	} {

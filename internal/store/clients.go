@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -90,23 +91,52 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	return client, nil
 }
 
-func (s *SQLite) DeleteClient(ctx context.Context, id int64) error {
+func (s *SQLite) DeleteClient(ctx context.Context, id int64) ([]int64, error) {
 	tx, err := s.begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING 1`, id).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, sql.ErrNoRows
+		}
+		return nil, fmt.Errorf("reserve client deletion: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM api_keys WHERE client_id = ? ORDER BY id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("list client API keys before deletion: %w", err)
+	}
+	var keyIDs []int64
+	for rows.Next() {
+		var keyID int64
+		if err := rows.Scan(&keyID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan client API key before deletion: %w", err)
+		}
+		keyIDs = append(keyIDs, keyID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close client API key rows: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate client API keys before deletion: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM clients WHERE id = ?`, id)
 	if err != nil {
-		return fmt.Errorf("delete client: %w", err)
+		return nil, fmt.Errorf("delete client: %w", err)
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
-		return sql.ErrNoRows
+		return nil, sql.ErrNoRows
 	}
 	if err := bumpRevision(ctx, tx); err != nil {
-		return err
+		return nil, err
 	}
-	return commit(tx)
+	if err := commit(tx); err != nil {
+		return nil, err
+	}
+	return keyIDs, nil
 }
 
 func (s *SQLite) ListClients(ctx context.Context) ([]domain.Client, error) {
