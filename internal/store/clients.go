@@ -90,6 +90,25 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	return client, nil
 }
 
+func (s *SQLite) DeleteClient(ctx context.Context, id int64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM clients WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete client: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	return commit(tx)
+}
+
 func (s *SQLite) ListClients(ctx context.Context) ([]domain.Client, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at

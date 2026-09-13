@@ -80,6 +80,25 @@ func (s *SQLite) UpdateBackend(ctx context.Context, id int64, params UpdateBacke
 	return backend, nil
 }
 
+func (s *SQLite) DeleteBackend(ctx context.Context, id int64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM backends WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete backend: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	return commit(tx)
+}
+
 func (s *SQLite) SetBackendDraining(ctx context.Context, id int64, draining bool) error {
 	tx, err := s.begin(ctx)
 	if err != nil {

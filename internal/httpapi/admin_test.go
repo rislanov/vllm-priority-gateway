@@ -214,6 +214,59 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	}
 }
 
+func TestAdminDeleteConfigurationPublishesAndEnforcesReferences(t *testing.T) {
+	handler, registryValue, runtime := newAdminFixture(t)
+	csrf := fetchCSRF(t, handler)
+	revision := int64(0)
+
+	pool := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "qwen-72b", "upstreamModelName": "Qwen/Qwen2.5-72B-Instruct", "enabled": true,
+	}, http.StatusCreated)
+	poolID := jsonInt64(t, pool, "id")
+	assertRevision(t, registryValue, &revision)
+
+	backend := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/backends", map[string]any{
+		"modelPoolId": poolID, "name": "gpu-a", "baseUrl": "http://127.0.0.1:9001", "enabled": true,
+		"capacityHint": 1, "runningSoftLimit": 16,
+	}, http.StatusCreated)
+	backendID := jsonInt64(t, backend, "id")
+	assertRevision(t, registryValue, &revision)
+
+	client := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients", map[string]any{
+		"name": "payments", "enabled": true, "priorityClass": "critical", "vllmPriority": -100,
+		"maxConcurrency": 24, "modelPoolIds": []int64{poolID},
+	}, http.StatusCreated)
+	clientID := jsonInt64(t, client, "id")
+	assertRevision(t, registryValue, &revision)
+
+	adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients/"+strconv.FormatInt(clientID, 10)+"/keys", map[string]any{}, http.StatusCreated)
+	assertRevision(t, registryValue, &revision)
+
+	conflict := adminJSON(t, handler, csrf, http.MethodDelete, "/admin/api/pools/"+strconv.FormatInt(poolID, 10), nil, http.StatusConflict)
+	errorValue, ok := conflict["error"].(map[string]any)
+	if !ok || errorValue["code"] != "conflict" || errorValue["message"] != "model pool cannot be deleted while backends reference it" {
+		t.Fatalf("delete referenced pool response = %#v", conflict)
+	}
+	if got := registryValue.Snapshot().Revision; got != revision {
+		t.Fatalf("revision after rejected pool delete = %d, want %d", got, revision)
+	}
+
+	adminJSON(t, handler, csrf, http.MethodDelete, "/admin/api/backends/"+strconv.FormatInt(backendID, 10), nil, http.StatusNoContent)
+	assertRevision(t, registryValue, &revision)
+	adminJSON(t, handler, csrf, http.MethodDelete, "/admin/api/pools/"+strconv.FormatInt(poolID, 10), nil, http.StatusNoContent)
+	assertRevision(t, registryValue, &revision)
+	adminJSON(t, handler, csrf, http.MethodDelete, "/admin/api/clients/"+strconv.FormatInt(clientID, 10), nil, http.StatusNoContent)
+	assertRevision(t, registryValue, &revision)
+
+	view := registryValue.Snapshot()
+	if len(view.Clients) != 0 || len(view.KeyCandidates) != 0 || len(view.PoolsByID) != 0 || len(view.BackendsByID) != 0 || len(view.Access) != 0 {
+		t.Fatalf("snapshot after deletes = %+v", view)
+	}
+	if runtime.ReconcileCount() != int(revision) {
+		t.Fatalf("runtime reconciles = %d, want %d", runtime.ReconcileCount(), revision)
+	}
+}
+
 func TestAdminPublishSerializesSnapshotAndRuntimeReconcile(t *testing.T) {
 	ctx := context.Background()
 	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "gateway.db"))
@@ -426,6 +479,45 @@ func TestRevocationRemainsFailClosedWhenReloadFails(t *testing.T) {
 	candidates := registryValue.Snapshot().KeyCandidates[key.Prefix]
 	if len(candidates) != 1 || candidates[0].RevokedAt == nil {
 		t.Fatalf("revoked key remained active after reload failure: %+v", candidates)
+	}
+}
+
+func TestClientDeletionRemainsFailClosedWhenReloadFails(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	failingRegistry := &reloadFailureRegistry{Registry: registryValue}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Analytics: database, Registry: failingRegistry,
+		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
+		HMACSecret: []byte(strings.Repeat("h", 32)), Random: bytes.NewReader(bytes.Repeat([]byte{9}, 256)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := service.CreateClient(context.Background(), httpapi.ClientInput{
+		Name: "deleted-client", Enabled: true, PriorityClass: domain.PriorityHigh, VLLMPriority: -10, MaxConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := service.CreateKey(context.Background(), client.ID, httpapi.KeyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingRegistry.fail = true
+	if err := service.DeleteClient(context.Background(), client.ID); err == nil {
+		t.Fatal("expected degraded reload error")
+	}
+	candidates := registryValue.Snapshot().KeyCandidates[key.Prefix]
+	if len(candidates) != 1 || candidates[0].RevokedAt == nil {
+		t.Fatalf("deleted client's key remained active after reload failure: %+v", candidates)
 	}
 }
 

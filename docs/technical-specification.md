@@ -1000,6 +1000,7 @@ Edit
 Enable
 Disable
 Drain
+Delete
 ```
 
 ---
@@ -1012,6 +1013,7 @@ At minimum:
 GET    /admin/api/clients
 POST   /admin/api/clients
 PUT    /admin/api/clients/{id}
+DELETE /admin/api/clients/{id}
 
 POST   /admin/api/clients/{id}/keys
 DELETE /admin/api/keys/{id}
@@ -1019,10 +1021,12 @@ DELETE /admin/api/keys/{id}
 GET    /admin/api/pools
 POST   /admin/api/pools
 PUT    /admin/api/pools/{id}
+DELETE /admin/api/pools/{id}
 
 GET    /admin/api/backends
 POST   /admin/api/backends
 PUT    /admin/api/backends/{id}
+DELETE /admin/api/backends/{id}
 
 POST   /admin/api/backends/{id}/drain
 POST   /admin/api/backends/{id}/resume

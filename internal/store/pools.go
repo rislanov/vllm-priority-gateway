@@ -2,10 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
+
+var ErrPoolHasBackends = errors.New("model pool cannot be deleted while backends reference it")
 
 func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domain.ModelPool, error) {
 	pool := domain.ModelPool{
@@ -75,6 +79,32 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 		return domain.ModelPool{}, err
 	}
 	return pool, nil
+}
+
+func (s *SQLite) DeletePool(ctx context.Context, id int64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var backendCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backends WHERE model_pool_id = ?`, id).Scan(&backendCount); err != nil {
+		return fmt.Errorf("count model pool backends: %w", err)
+	}
+	if backendCount != 0 {
+		return ErrPoolHasBackends
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM model_pools WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete model pool: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	return commit(tx)
 }
 
 func (s *SQLite) ListPools(ctx context.Context) ([]domain.ModelPool, error) {

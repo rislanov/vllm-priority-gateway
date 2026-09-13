@@ -518,6 +518,81 @@ func TestBackendEditPageAndEnableToggle(t *testing.T) {
 	}
 }
 
+func TestAdminResourceDeletionFormsAndMutations(t *testing.T) {
+	handler := newWebFixture(t)
+
+	for _, test := range []struct {
+		path     string
+		expected []string
+	}{
+		{
+			path: "/admin/clients",
+			expected: []string{
+				`name="action" value="delete"`,
+				`data-confirm="Delete this client and all of its API keys?"`,
+			},
+		},
+		{
+			path: "/admin/backends",
+			expected: []string{
+				`name="action" value="delete_pool"`,
+				`data-confirm="Delete this model pool?"`,
+				`name="action" value="delete_backend"`,
+				`data-confirm="Delete this backend?"`,
+			},
+		},
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d body=%s", test.path, response.Code, response.Body.String())
+		}
+		for _, expected := range test.expected {
+			if !strings.Contains(response.Body.String(), expected) {
+				t.Fatalf("GET %s missing %q: %s", test.path, expected, response.Body.String())
+			}
+		}
+	}
+
+	postForm := func(path, form string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	response := postForm("/admin/keys", "client_id=1&action=create")
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("create key response = %d body=%s", response.Code, response.Body.String())
+	}
+
+	response = postForm("/admin/backends", "action=delete_pool&id=1")
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "model pool cannot be deleted while backends reference it") {
+		t.Fatalf("delete referenced pool response = %d body=%s", response.Code, response.Body.String())
+	}
+
+	response = postForm("/admin/backends", "action=delete_backend&id=1")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "No backends configured.") {
+		t.Fatalf("delete backend response = %d body=%s", response.Code, response.Body.String())
+	}
+	response = postForm("/admin/backends", "action=delete_pool&id=1")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "No model pools configured.") {
+		t.Fatalf("delete pool response = %d body=%s", response.Code, response.Body.String())
+	}
+	response = postForm("/admin/clients", "action=delete&id=1")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "No clients configured.") {
+		t.Fatalf("delete client response = %d body=%s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "No API keys generated.") {
+		t.Fatalf("keys after client delete = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestPoolSafetyFormsRenderAndPrefillExistingLimits(t *testing.T) {
 	handler := newWebFixture(t)
 	response := httptest.NewRecorder()
