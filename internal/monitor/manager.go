@@ -186,8 +186,8 @@ func (m *Manager) runPoolObserver() {
 	defer ticker.Stop()
 	for {
 		select {
-		case at := <-ticker.C:
-			m.observePools(at)
+		case <-ticker.C:
+			m.observePools(time.Now())
 		case <-m.ctx.Done():
 			return
 		}
