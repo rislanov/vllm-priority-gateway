@@ -953,6 +953,7 @@ Actions:
 Create
 Edit
 Disable
+Delete
 ```
 
 ---
@@ -1000,6 +1001,7 @@ Edit
 Enable
 Disable
 Drain
+Delete
 ```
 
 ---
@@ -1012,6 +1014,7 @@ At minimum:
 GET    /admin/api/clients
 POST   /admin/api/clients
 PUT    /admin/api/clients/{id}
+DELETE /admin/api/clients/{id}
 
 POST   /admin/api/clients/{id}/keys
 DELETE /admin/api/keys/{id}
@@ -1019,16 +1022,20 @@ DELETE /admin/api/keys/{id}
 GET    /admin/api/pools
 POST   /admin/api/pools
 PUT    /admin/api/pools/{id}
+DELETE /admin/api/pools/{id}
 
 GET    /admin/api/backends
 POST   /admin/api/backends
 PUT    /admin/api/backends/{id}
+DELETE /admin/api/backends/{id}
 
 POST   /admin/api/backends/{id}/drain
 POST   /admin/api/backends/{id}/resume
 
 GET    /admin/api/status
 ```
+
+Deletion is destructive and requires an explicit confirmation in the Admin UI. Deleting a client also removes its model access and API keys; captured keys are immediately denied even if the subsequent registry reload fails. A model pool cannot be deleted while any backend still references it, so its backends must be deleted first. Deleting a backend removes it from routing and runtime monitoring immediately after the database commit, including when the full registry reload fails; retrying the delete reconciles any stale published configuration.
 
 ---
 

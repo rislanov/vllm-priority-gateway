@@ -92,6 +92,30 @@ func TestMarkKeyRevokedPublishesFailClosedOverlay(t *testing.T) {
 	}
 }
 
+func TestMarkBackendDeletedPublishesFailClosedOverlay(t *testing.T) {
+	backend := domain.Backend{ID: 9, ModelPoolID: 4, Name: "backend", BaseURL: "http://127.0.0.1:8000", Enabled: true}
+	loader := &sequenceLoader{results: []loadResult{{data: registry.Data{
+		Revision: 3,
+		Pools:    []domain.ModelPool{{ID: 4, PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true}},
+		Backends: []domain.Backend{backend},
+	}}}}
+	reg := registry.New(loader)
+	if err := reg.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := reg.Snapshot()
+	if !reg.MarkBackendDeleted(backend.ID) {
+		t.Fatal("backend was not found")
+	}
+	after := reg.Snapshot()
+	if after.Revision != before.Revision || len(after.BackendsByID) != 0 || len(after.BackendsByPool) != 0 {
+		t.Fatalf("overlay snapshot = %+v", after)
+	}
+	if _, exists := before.BackendsByID[backend.ID]; !exists || len(before.BackendsByPool[backend.ModelPoolID]) != 1 {
+		t.Fatalf("previously published snapshot mutated: %+v", before)
+	}
+}
+
 func TestConcurrentReloadPreservesFailClosedRevocationOverlay(t *testing.T) {
 	loader := &staleKeyReloadLoader{
 		key:           domain.APIKey{ID: 7, ClientID: 1, Prefix: "llmgw_abcd"},

@@ -104,6 +104,40 @@ func (r *Registry) MarkKeyRevoked(id int64, at time.Time) bool {
 	})
 }
 
+// MarkBackendDeleted immediately publishes a fail-closed view after durable
+// deletion, before a complete database snapshot is reloaded.
+func (r *Registry) MarkBackendDeleted(id int64) bool {
+	for {
+		current := r.current.Load()
+		backend, found := current.BackendsByID[id]
+		if !found {
+			return false
+		}
+		updated := *current
+		updated.BackendsByID = make(map[int64]domain.Backend, len(current.BackendsByID)-1)
+		for backendID, candidate := range current.BackendsByID {
+			if backendID != id {
+				updated.BackendsByID[backendID] = candidate
+			}
+		}
+		updated.BackendsByPool = make(map[int64][]domain.Backend, len(current.BackendsByPool))
+		for poolID, candidates := range current.BackendsByPool {
+			copied := make([]domain.Backend, 0, len(candidates))
+			for _, candidate := range candidates {
+				if candidate.ID != id {
+					copied = append(copied, candidate)
+				}
+			}
+			if len(copied) > 0 || poolID != backend.ModelPoolID {
+				updated.BackendsByPool[poolID] = copied
+			}
+		}
+		if r.current.CompareAndSwap(current, &updated) {
+			return true
+		}
+	}
+}
+
 // MarkKeyUsed updates the non-policy usage projection without changing the
 // durable configuration revision.
 func (r *Registry) MarkKeyUsed(id int64, at time.Time) bool {

@@ -84,6 +84,13 @@ func (h *Handler) backends(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (h *Handler) mutateClient(request *http.Request) string {
+	if request.Form.Get("action") == "delete" {
+		id, err := positiveID(request.Form.Get("id"))
+		if err != nil {
+			return err.Error()
+		}
+		return errorText(h.service.DeleteClient(request.Context(), id))
+	}
 	input, err := clientInput(request)
 	if err != nil {
 		return err.Error()
@@ -129,6 +136,18 @@ func (h *Handler) mutateKey(request *http.Request) (redirect string, errorText s
 
 func (h *Handler) mutateBackend(request *http.Request) string {
 	switch request.Form.Get("action") {
+	case "delete_pool":
+		id, err := positiveID(request.Form.Get("id"))
+		if err != nil {
+			return err.Error()
+		}
+		return errorText(h.service.DeletePool(request.Context(), id))
+	case "delete_backend":
+		id, err := positiveID(request.Form.Get("id"))
+		if err != nil {
+			return err.Error()
+		}
+		return errorText(h.service.DeleteBackend(request.Context(), id))
 	case "create_pool", "update_pool":
 		input, err := poolInput(request)
 		if err != nil {

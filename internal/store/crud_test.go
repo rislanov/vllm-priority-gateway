@@ -171,6 +171,102 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	}
 }
 
+func TestSQLiteDeletesConfigurationAndCascadesDependents(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := db.CreateClient(ctx, store.CreateClientParams{
+		Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal, MaxConcurrency: 2,
+		ModelPoolIDs: []int64{pool.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := db.CreateAPIKey(ctx, store.CreateAPIKeyParams{
+		ClientID: client.ID, Prefix: "llmgw_123456", SecretHash: [32]byte{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := db.CreateBackend(ctx, store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "backend", BaseURL: "http://127.0.0.1:8000",
+		Enabled: true, CapacityHint: 1, RunningSoftLimit: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteBackend(ctx, backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeletePool(ctx, pool.ID); err != nil {
+		t.Fatal(err)
+	}
+	deletedKeyIDs, err := db.DeleteClient(ctx, client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletedKeyIDs) != 1 || deletedKeyIDs[0] != key.ID {
+		t.Fatalf("DeleteClient() key IDs = %v, want [%d]", deletedKeyIDs, key.ID)
+	}
+
+	snapshot, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Revision != 7 || len(snapshot.Clients) != 0 || len(snapshot.Keys) != 0 || len(snapshot.Pools) != 0 || len(snapshot.Backends) != 0 || len(snapshot.Access) != 0 {
+		t.Fatalf("snapshot after deletes = %+v", snapshot)
+	}
+}
+
+func TestSQLiteDeleteRejectsReferencedPoolAndMissingTargetsWithoutRevisionChange(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackend(ctx, store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "backend", BaseURL: "http://127.0.0.1:8000",
+		Enabled: true, CapacityHint: 1, RunningSoftLimit: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeletePool(ctx, pool.ID); !errors.Is(err, store.ErrPoolHasBackends) {
+		t.Fatalf("DeletePool() error = %v, want ErrPoolHasBackends", err)
+	}
+	deleteMissingClient := func(ctx context.Context, id int64) error {
+		_, err := db.DeleteClient(ctx, id)
+		return err
+	}
+	for name, deleteValue := range map[string]func(context.Context, int64) error{
+		"client":  deleteMissingClient,
+		"pool":    db.DeletePool,
+		"backend": db.DeleteBackend,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := deleteValue(ctx, 999); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("delete missing %s error = %v, want sql.ErrNoRows", name, err)
+			}
+		})
+	}
+	after, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != before.Revision {
+		t.Fatalf("revision changed from %d to %d after rejected deletes", before.Revision, after.Revision)
+	}
+}
+
 func TestSetClientModelAccessReplacesAndDeduplicates(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
