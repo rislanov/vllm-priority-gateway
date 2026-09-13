@@ -1857,6 +1857,10 @@ This protection is implemented for one gateway process. Pool fields are exposed 
 
 Inference capacity has its own unauthenticated `GET /inference-readyz`: HTTP `200`/`status: ready` when at least one enabled pool has a healthy, metrics-fresh, secret-ready, non-draining backend whose circuit has capacity; otherwise HTTP `503`/`status: unavailable`. The body includes configuration `revision`, `poolAvailability`, and `backendAvailability`. Pool congestion does not make inference readiness flap. `GET /readyz` remains separate management-plane readiness and stays HTTP `200` during an inference outage.
 
+Authenticated workload producers have a separate model-scoped `GET /v1/load?model=<public-model>` endpoint. It uses the same Bearer-key and model-access policy as inference requests, returns HTTP `200` for every successfully evaluated state, and exposes a stable `level` vocabulary: `normal` maps to `free`, `busy` to `medium`, `saturated` and `emergency` to `loaded`, and zero eligible backends to `unavailable`. The response also carries the internal pool state, best eligible pressure, eligible backend count, upstream waiting requests, gateway in-flight count, configuration revision, and evaluation timestamp.
+
+The load endpoint is an advisory observation only. It does not acquire admission capacity or a backend lease, and it is excluded from inference analytics. Responses are non-cacheable and carry a request ID. Clients must add jitter/backoff to polling and must still handle admission races and ordinary inference `429`/`503` responses.
+
 ---
 
 # 47. Anti-Starvation
