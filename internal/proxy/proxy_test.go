@@ -32,7 +32,7 @@ func TestForwardFlushesStreamingBytesWithoutFullBuffering(t *testing.T) {
 		})
 	}()
 	select {
-	case <-writer.firstWrite:
+	case <-writer.firstFlush:
 		if !strings.Contains(writer.String(), "one") {
 			t.Fatalf("first bytes = %q", writer.String())
 		}
@@ -82,7 +82,7 @@ func TestForwardInspectsUsageWithoutChangingStreamingBehavior(t *testing.T) {
 	}()
 
 	select {
-	case <-downstream.firstWrite:
+	case <-downstream.firstFlush:
 	case <-time.After(time.Second):
 		t.Fatal("first response chunk was not forwarded")
 	}
@@ -731,8 +731,8 @@ type observingWriter struct {
 	status     int
 	body       bytes.Buffer
 	flushes    int
-	firstWrite chan struct{}
-	once       sync.Once
+	firstFlush chan struct{}
+	flushOnce  sync.Once
 }
 
 var errDownstreamWrite = errors.New("downstream write failed")
@@ -860,7 +860,7 @@ func (w *cancelWriteWriter) Write(data []byte) (int, error) {
 }
 
 func newObservingWriter() *observingWriter {
-	return &observingWriter{header: make(http.Header), firstWrite: make(chan struct{})}
+	return &observingWriter{header: make(http.Header), firstFlush: make(chan struct{})}
 }
 
 func (w *observingWriter) Header() http.Header { return w.header }
@@ -879,14 +879,14 @@ func (w *observingWriter) Write(data []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	w.once.Do(func() { close(w.firstWrite) })
 	return w.body.Write(data)
 }
 
 func (w *observingWriter) Flush() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.flushes++
-	w.mu.Unlock()
+	w.flushOnce.Do(func() { close(w.firstFlush) })
 }
 
 func (w *observingWriter) String() string {
