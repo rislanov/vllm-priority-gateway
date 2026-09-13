@@ -108,6 +108,102 @@ func TestModelsListsOnlyExplicitEnabledAccess(t *testing.T) {
 	}
 }
 
+func TestLoadEndpointReturnsCurrentPoolLevelForPolling(t *testing.T) {
+	raw, key := testKey(t)
+	handler, runtime := newFixture(t, fixtureOptions{client: enabledClient(), key: key, poolState: domain.PoolBusy})
+	runtime.pool.BestBackendPressure = .82
+	runtime.pool.GatewayInflight = 11
+	runtime.pool.TotalWaiting = 3
+	request := httptest.NewRequest(http.MethodGet, "/v1/load?model=public-model", nil)
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := response.Header().Get("X-Request-Id"); got != "fixed-gateway-id" {
+		t.Fatalf("X-Request-Id = %q, want fixed-gateway-id", got)
+	}
+	var body struct {
+		Model               string            `json:"model"`
+		Level               gateway.LoadLevel `json:"level"`
+		PoolState           domain.PoolState  `json:"poolState"`
+		BestBackendPressure float64           `json:"bestBackendPressure"`
+		AvailableBackends   int               `json:"availableBackends"`
+		WaitingRequests     float64           `json:"waitingRequests"`
+		GatewayInflight     int               `json:"gatewayInflight"`
+		ConfigRevision      int64             `json:"configRevision"`
+		EvaluatedAt         time.Time         `json:"evaluatedAt"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Model != "public-model" || body.Level != gateway.LoadMedium || body.PoolState != domain.PoolBusy ||
+		body.BestBackendPressure != .82 || body.AvailableBackends != 1 || body.WaitingRequests != 3 ||
+		body.GatewayInflight != 11 || body.ConfigRevision != 1 || !body.EvaluatedAt.Equal(testNow) {
+		t.Fatalf("load response = %+v", body)
+	}
+}
+
+func TestLoadEndpointUsesExistingAuthenticationAndModelAccessErrors(t *testing.T) {
+	raw, key := testKey(t)
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, extraPools: true})
+	tests := []struct {
+		name      string
+		target    string
+		token     string
+		status    int
+		errorCode string
+	}{
+		{name: "missing bearer", target: "/v1/load?model=public-model", status: http.StatusUnauthorized, errorCode: "invalid_api_key"},
+		{name: "missing model", target: "/v1/load", token: raw, status: http.StatusBadRequest, errorCode: "invalid_request_error"},
+		{name: "model not allowed", target: "/v1/load?model=not-allowed", token: raw, status: http.StatusForbidden, errorCode: "model_not_allowed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			if tt.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tt.token)
+			}
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != tt.status {
+				t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), tt.status)
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", got)
+			}
+			assertErrorCode(t, response.Body.Bytes(), tt.errorCode)
+		})
+	}
+}
+
+func TestLoadEndpointDoesNotRecordInferenceAnalytics(t *testing.T) {
+	raw, key := testKey(t)
+	observer := &recordingObserver{}
+	handler, _ := newFixture(t, fixtureOptions{client: enabledClient(), key: key, observer: observer})
+	request := httptest.NewRequest(http.MethodGet, "/v1/load?model=public-model", nil)
+	request.Header.Set("Authorization", "Bearer "+raw)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if events := observer.Events(); len(events) != 0 {
+		t.Fatalf("load polling recorded inference events: %+v", events)
+	}
+}
+
 func TestForwardRewritesModelAndClientControlledPriority(t *testing.T) {
 	raw, key := testKey(t)
 	forwarder := &capturingForwarder{}

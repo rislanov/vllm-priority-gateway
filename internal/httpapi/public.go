@@ -40,6 +40,7 @@ func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGe
 	}
 	handler := &PublicHandler{service: service, bodyLimit: bodyLimit, generateID: generateID}
 	router := chi.NewRouter()
+	router.Get("/v1/load", handler.load)
 	router.Get("/v1/models", handler.models)
 	router.Post("/v1/chat/completions", handler.forward)
 	router.Post("/v1/completions", handler.forward)
@@ -48,6 +49,28 @@ func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGe
 	router.MethodNotAllowed(handler.unsupported)
 	handler.router = router
 	return handler
+}
+
+func (h *PublicHandler) load(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
+	if _, ok := h.begin(writer); !ok {
+		return
+	}
+	rawKey, err := bearerToken(request.Header.Get("Authorization"))
+	if err != nil {
+		writeGatewayError(writer, &gateway.APIError{
+			HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key",
+			Type: "authentication_error", Code: "invalid_api_key", DecisionReason: gateway.DecisionInvalidAPIKey,
+		})
+		return
+	}
+	status, gatewayError := h.service.LoadStatus(rawKey, request.URL.Query().Get("model"))
+	if gatewayError != nil {
+		writeGatewayError(writer, gatewayError)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(status)
 }
 
 func (h *PublicHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
