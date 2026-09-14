@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-14
 
-**Status:** Approved design
+**Status:** Revised design — review requested
 
 **Source requirements:** `docs/technical-specification.md`, especially sections 38-40, 45-47, 55-57, 60, and Stage 6
 
@@ -110,7 +110,9 @@ type AdmissionCoordinator interface {
 }
 ```
 
-`AdmissionRequest` contains the request and replica identifiers, immutable configuration revision, authenticated API-key ID, client and pool IDs, the priority-adjusted effective client concurrency limit, pool gateway-inflight limit, client RPM/TPM policy, lease TTL, and the decision timestamp. The local coordinator uses the supplied timestamp for deterministic tests; the PostgreSQL coordinator uses database server time and never trusts the caller timestamp for expiry or refill decisions. `AdmissionDecision` contains either a lease identity or one bounded rejection reason with an optional retry time.
+Before its first coordinator call, the gateway generates one random lease UUID and records one operation-start timestamp. `AdmissionRequest` contains both stable values, the request and replica identifiers, immutable configuration revision, authenticated API-key ID, client and pool IDs, the priority-adjusted effective client concurrency limit, pool gateway-inflight limit, client RPM/TPM policy, and lease TTL. An automatic retry after an ambiguous database result reuses the UUID, timestamp, and identical inputs. Re-evaluating an authoritative rejection is a new logical admission operation and uses a new UUID.
+
+The local coordinator uses the supplied operation timestamp for deterministic tests. The PostgreSQL coordinator uses it only to reject replay outside the documented idempotency window; PostgreSQL server time remains authoritative for expiry, cooldown, rolling-window, and refill decisions. `AdmissionDecision` contains either a lease identity or one bounded rejection reason with an optional retry time.
 
 The circuit contract is:
 
@@ -126,7 +128,7 @@ type CircuitCoordinator interface {
 }
 ```
 
-The public contracts use typed reasons rather than backend error strings. The required reasons are `concurrency_exhausted`, `rpm_exhausted`, `tpm_exhausted`, `stale_configuration`, `stale_backend`, `circuit_open`, `probe_capacity_exhausted`, `coordination_unavailable`, and `lease_lost`.
+The public contracts use typed reasons rather than backend error strings. The required reasons are `concurrency_exhausted`, `rpm_exhausted`, `tpm_exhausted`, `stale_configuration`, `stale_backend`, `circuit_open`, `probe_capacity_exhausted`, `coordination_unavailable`, `lease_lost`, `stale_operation`, and `idempotency_conflict`.
 
 ### 5.3 Runtime ownership
 
@@ -160,7 +162,11 @@ MaxRequestsPerMinute       = 10_000_000
 MaxTokensPerMinute         = 10_000_000_000_000
 ```
 
-The same bounds are enforced by SQLite constraints, PostgreSQL constraints, Admin JSON, Admin forms, and coordinator input validation. Concurrency values remain Go `int` values and the selected bounds fit a signed 32-bit integer. Rate values use Go `int64` and fit PostgreSQL `BIGINT`. Validation runs before scope creation, migration backfill, or any loop whose work is proportional to a configured value.
+Concurrency values remain Go `int` values and the selected bounds fit a signed 32-bit integer. Rate values use Go `int64` and fit PostgreSQL `BIGINT`. Strict validation applies to every newly created policy and every changed limit before persistence, scope creation, migration backfill, or any loop whose work is proportional to a configured value. New PostgreSQL tables enforce all four upper bounds with hard `CHECK` constraints. The new SQLite rate columns also use hard upper-bound constraints because no legacy rows contain those fields.
+
+Existing SQLite databases receive a compatibility exception for only the two already-shipped concurrency fields. A stored `MaxConcurrency > 10_000` or `MaxGatewayInflight > 100_000` remains loadable and keeps its existing local-runtime behavior. Create rejects such a value. Update may preserve the exact grandfathered value while changing unrelated fields, or lower it to a supported value; it may not increase it or change it to a different above-maximum value. Once lowered into range, it cannot be raised above the maximum again. Shared domain mutation validation therefore accepts an optional previous persisted value; snapshot decoding does not apply new-write maxima to grandfathered rows.
+
+The SQLite migration neither clamps nor rejects grandfathered data and does not rebuild these tables with an incompatible hard upper-bound `CHECK`. Instead it adds database triggers that reject above-maximum inserts and reject an update when the new concurrency value is above the maximum and differs from the old value. Admin JSON applies the same change-aware rule. The Admin form renders an explicit legacy-value warning and permits an unchanged submission; its ordinary HTML `max` constraint applies once the value is within the supported range.
 
 ## 7. PostgreSQL Driver and Pools
 
@@ -202,7 +208,7 @@ The PostgreSQL driver advisory lock prevents concurrent gateway replicas from ap
 
 Migration files are immutable after merge. The default CI validates unique ordered versions, matched up/down files, and embedded manifest completeness. PostgreSQL itself stores migration version and dirty state; this design does not add a second custom migration-version table.
 
-SQLite retains the current embedded migration runner and `PRAGMA user_version`. A SQLite migration adds rate-policy fields and row revisions while preserving existing data and defaults. Existing SQLite databases do not adopt the PostgreSQL migration mechanism.
+SQLite retains the current embedded migration runner and `PRAGMA user_version`. A SQLite migration adds rate-policy fields, row revisions, and the compatibility triggers described in section 6 while preserving existing data and defaults. Before commit it verifies that the trigger definitions were installed; it does not treat grandfathered concurrency values as corruption. Existing SQLite databases do not adopt the PostgreSQL migration mechanism.
 
 ## 9. PostgreSQL Configuration Store
 
@@ -263,8 +269,25 @@ pool_admission_scopes
   pool_id        BIGINT PRIMARY KEY
   updated_at     TIMESTAMPTZ
 
+admission_operations
+  lease_id               UUID PRIMARY KEY
+  operation_started_at   TIMESTAMPTZ NOT NULL
+  input_fingerprint      BYTEA NOT NULL
+  request_id             TEXT NOT NULL
+  replica_id             UUID NOT NULL
+  client_id              BIGINT NOT NULL
+  pool_id                BIGINT NOT NULL
+  decision               pending | admitted | rejected
+  rejection_reason       TEXT NULL
+  retry_at               TIMESTAMPTZ NULL
+  decided_at             TIMESTAMPTZ NULL
+  lease_expired_at       TIMESTAMPTZ NULL
+  completed_at           TIMESTAMPTZ NULL
+  completion_result      released | lease_lost | NULL
+  retain_until           TIMESTAMPTZ NULL
+
 request_leases
-  lease_id       UUID PRIMARY KEY
+  lease_id       UUID PRIMARY KEY REFERENCES admission_operations(lease_id)
   request_id     TEXT NOT NULL
   replica_id     UUID NOT NULL
   client_id      BIGINT NOT NULL
@@ -273,28 +296,47 @@ request_leases
   expires_at     TIMESTAMPTZ NOT NULL
 ```
 
-`request_leases` has non-unique indexes on `client_id` and `pool_id`; `expires_at` is deliberately not indexed so renewal remains eligible for HOT updates. Lease UUID is the acquire/completion idempotency key. Client-supplied or repeated request IDs are diagnostic values and are not uniqueness keys.
+`request_leases` has non-unique indexes on `client_id` and `pool_id`; `expires_at` is deliberately not indexed so renewal remains eligible for HOT updates. Client-supplied or repeated request IDs are diagnostic values and are not uniqueness keys.
 
-Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit.
+`admission_operations` is the durable idempotency receipt; the active ledger is not used as an operation history. Its fingerprint covers every immutable admission input, including request/replica identity, configuration revision, API-key/client/pool identity, resolved limits and rate policy, operation timestamp, and TTL. It contains no API-key secret or request body. Reuse of a lease UUID with a different fingerprint returns `idempotency_conflict` and performs no rate or lease mutation.
+
+Acquire receipts and completion idempotency share this row. `pending` is an internal, uncommitted claim state; the function must change it to `admitted` or `rejected` before commit. Active receipts are never age-deleted. Rejected receipts and admitted receipts that have completed or expired are retained for 24 hours after their terminal timestamp. An unseen operation whose stable start timestamp is more than 24 hours old or more than five minutes ahead of PostgreSQL server time returns `stale_operation`; therefore removal of an old receipt cannot turn its UUID into a fresh admission. These windows are part of the coordination contract and replica fingerprint.
+
+Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit. Deleting configuration tombstones the corresponding scope instead of cascading through active leases or retained receipts; physical scope deletion waits until no coordination row references that identity. IDs are never reused.
 
 Every request lease always records both client and pool identity. Pool limit zero disables only the rejection check; it does not disable lease creation, renewal, distributed pool-inflight accounting, or later transition to a positive limit.
 
-`try_acquire_admission` executes atomically in one PostgreSQL transaction. It captures one PostgreSQL server timestamp for every expiry and refill comparison, then:
+`try_acquire_admission` executes atomically in one PostgreSQL transaction. Before any capacity check or RPM debit, it resolves idempotency as follows:
+
+1. look up `admission_operations` by the stable lease UUID;
+2. if no row exists, insert a `pending` row with `ON CONFLICT DO NOTHING`; a concurrent loser waits for the winner and restarts receipt lookup;
+3. verify that an existing row's input fingerprint matches;
+4. return a recorded rejection unchanged;
+5. return `lease_lost` for a completed or expired admission without re-running it;
+6. for an admitted receipt that may still be active, lock its scopes, matching lease row when present, and receipt in the global order; then capture `clock_timestamp()` and return the same lease identity only if that row is still unexpired; otherwise mark the receipt expired and return `lease_lost`;
+7. only the transaction that created the `pending` receipt continues to a new admission decision.
+
+The new-operation path then:
 
 1. locks the requested pool scope row and then the requested client scope row;
 2. re-reads and checks the global configuration revision, API key, client, pool, enabled policy, and configured limits while those locks are held;
-3. counts all unexpired leases for the pool, regardless of the previous or current pool limit;
-4. counts all unexpired leases for the client, including leases admitted under a larger administrative or priority-adjusted limit;
-5. rejects when a positive pool limit is not greater than total pool inflight;
-6. rejects when the effective client limit is not greater than total client inflight;
-7. refreshes and checks the soft TPM balance;
-8. refreshes and debits one RPM token;
-9. inserts exactly one request lease containing both client and pool identity;
-10. returns the lease identity and decision metadata.
+3. locks the applicable client TPM and RPM state rows in fixed rate-kind order, creating missing rows while the client scope is held;
+4. after every correctness-relevant row lock has been acquired, assigns `v_now := clock_timestamp()` exactly once;
+5. validates the operation-start replay window against `v_now`;
+6. counts leases with `expires_at > v_now` for the pool, regardless of its previous or current limit;
+7. counts leases with `expires_at > v_now` for the client, including leases admitted under a larger administrative or priority-adjusted limit;
+8. rejects when a positive pool limit is not greater than total pool inflight;
+9. rejects when the effective client limit is not greater than total client inflight;
+10. normalizes and checks the soft TPM balance at `v_now`;
+11. normalizes and debits one RPM token at `v_now`;
+12. inserts exactly one request lease containing both client and pool identity, changes the receipt to `admitted`, and returns that lease;
+13. for an authoritative rejection, records `rejected`, the bounded reason, and optional retry time in the receipt and commits without an RPM debit or request lease.
 
 The supplied effective client limit must be between zero and the current configured client maximum read in step 2. A global revision mismatch returns `stale_configuration`; the gateway reloads and recomputes the effective limit from fresh policy and pool state rather than scaling a stale value inside SQL.
 
-All acquisition, renewal, policy-change, and completion paths lock scopes in the global order `all pool IDs ascending, then all client IDs ascending`. A single-request acquisition therefore locks its pool before its client. Scope locking serializes every membership-changing operation that could affect the two counts. Failure at any step rolls back lease and rate-state changes.
+All acquisition, renewal, policy-change, completion, and expiry-cleanup paths lock scopes in the global order `all pool IDs ascending, then all client IDs ascending`. A single-request acquisition therefore locks its pool before its client. After scopes, existing request-lease rows are locked by lease UUID, existing admission-operation rows by lease UUID, and rate rows by fixed rate-kind order. A newly inserted, still-uncommitted `pending` receipt is the only exception: no other transaction can yet resolve it to a lease or scope, so holding it before scope acquisition cannot create the reverse edge of a deadlock. Scope locking serializes every membership-changing operation that could affect the two counts. A database error rolls back the pending receipt and every lease/rate mutation; a policy rejection commits only its durable receipt and any explicitly normalized rate timestamp, never an RPM debit or request lease.
+
+Every PostgreSQL coordination operation that evaluates TTL, cooldown, rolling-window age, or token refill follows one time rule: acquire all rows on which the decision may block, then capture one `clock_timestamp()`, then make every time-dependent comparison and update from that value without acquiring another correctness-relevant lock. `now()`, `CURRENT_TIMESTAMP`, `statement_timestamp()`, and `transaction_timestamp()` are prohibited for these decisions because they can precede lock wait time.
 
 The atomic invariant is:
 
@@ -305,7 +347,7 @@ admit only if active_pool_leases < positive_pool_limit (when enabled)
 
 Counts include leases created under an older, larger limit. The implementation must not infer inflight from slot ordinals or configured capacity.
 
-Lease identity includes the lease UUID, client ID, pool ID, request ID, replica ID, and expiry. Renewal never resurrects an expired lease: it locks the same pool/client scopes and updates only a matching lease whose existing expiry is still in the future according to the transaction's PostgreSQL server timestamp.
+Lease identity includes the lease UUID, client ID, pool ID, request ID, replica ID, and expiry. Batch renewal locks all referenced pool scopes ascending, then client scopes ascending, then matching lease rows and operation receipts by UUID. Only after the final lock does it capture `v_now := clock_timestamp()`. It extends only a matching lease with `expires_at > v_now`; otherwise it marks the operation receipt expired and returns `lease_lost`. It never reuses the transaction-start timestamp and never resurrects an expired lease.
 
 Lease TTL and renewal settings are:
 
@@ -316,7 +358,7 @@ LLMGW_LEASE_RENEW_INTERVAL=30s
 
 The renewal interval must be positive and no greater than one third of the TTL. PostgreSQL server time is authoritative for expiry. A crashed gateway stops renewing and its lease stops contributing to active counts after TTL.
 
-`request_leases` uses a reduced fillfactor and aggressive per-table autovacuum settings because expiry is updated frequently. A bounded cleanup worker deletes expired ledger rows in batches; correctness never depends on physical deletion because counts and renewals always test expiry. Distributed pool/client inflight snapshots use a batched `GROUP BY` over unexpired ledger rows and are cached no longer than the metrics interval.
+`request_leases` uses a reduced fillfactor and aggressive per-table autovacuum settings because expiry is updated frequently. A bounded cleanup worker locks the affected scopes, lease rows, and operation receipts in the same order, captures a fresh post-lock `clock_timestamp()`, marks corresponding receipts expired, and deletes expired ledger rows in batches. Correctness never depends on physical deletion because counts and renewals always test expiry. A separate bounded cleanup deletes terminal receipts only after `retain_until`. Distributed pool/client inflight snapshots use a batched `GROUP BY` over unexpired ledger rows and are cached no longer than the metrics interval.
 
 ## 12. Lease Manager and Completion
 
@@ -324,13 +366,18 @@ Each gateway process runs one central `LeaseManager`. It owns active distributed
 
 Completion contains optional actual usage. A PostgreSQL completion function:
 
-1. locks the pool and client scope rows named by the immutable lease identity in the global order;
-2. checks whether a completion idempotency record already exists for the lease UUID;
-3. when the completion is new, inserts that record and debits the client's soft token balance by `input_tokens + output_tokens`;
-4. deletes the request lease only when its lease UUID, client ID, and pool ID match;
-5. returns `released`, `already_completed`, or `lease_lost`.
+1. reads the admission receipt to resolve the trusted pool and client identity, then locks those scope rows in the global order;
+2. locks the matching request-lease row when present, then locks and re-checks the receipt, then re-reads the current client policy and locks its TPM state row when TPM is enabled;
+3. after the final row lock, assigns `v_now := clock_timestamp()` exactly once;
+4. if `completed_at` is already set, returns the stored completion result without another refill, debit, or delete;
+5. normalizes the TPM row to the current client policy generation, applies refill capped at current capacity through `v_now`, then debits `input_tokens + output_tokens` and writes `last_refill_at = v_now`;
+6. deletes the request lease only when its lease UUID, client ID, and pool ID match;
+7. records `completed_at`, `completion_result`, and `retain_until` in the admission receipt;
+8. returns `released` when the matching lease was unexpired at `v_now`, `lease_lost` when it was expired or absent, or `already_completed` with the previously stored result for a duplicate completion.
 
-Actual usage is debited once even when the request lease already expired or bounded cleanup removed it: the upstream work still consumed tokens. The immutable lease handle supplies the trusted client and pool identity, while the conditional delete prevents a stale completion from removing any other request. All steps commit or roll back together.
+Actual usage is debited once even when the request lease already expired or bounded cleanup removed it: the upstream work still consumed tokens. The durable receipt, rather than caller-supplied scope fields, supplies the trusted client and pool identity. The conditional delete prevents a stale completion from removing any other request. Receipt update, rate normalization/debit, and lease deletion commit or roll back together.
+
+A completion with no retained receipt returns `stale_operation`; a receipt for an admission that was rejected returns `lease_lost`. Neither case mutates a rate row. A late completion for an expired admitted receipt remains valid during the 24-hour retention window and performs the one actual-usage debit described above. If the current client no longer exists or its TPM limit is zero, completion skips the TPM row while still recording completion and releasing any matching lease.
 
 `cache_read_tokens` is a subset of input tokens and is not added again. Missing or invalid usage releases the lease without a token debit and increments a bounded-cardinality unmetered-completion metric.
 
@@ -340,7 +387,7 @@ Completion delivery is asynchronous and idempotent. The manager retries transien
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
 ```
 
-When the backlog is full, the response remains successful, lease cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Completion idempotency records are retained for 24 hours, longer than the manager's retry horizon, and deleted in bounded batches.
+When the backlog is full, the response remains successful, lease cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Terminal admission receipts are retained for 24 hours, longer than the manager's retry horizon, and deleted in bounded batches.
 
 An active stream is never cancelled solely because renewal failed. The manager continues retrying. If the lease expires and another request uses the newly available capacity, a later renewal returns `lease_lost`; the original stream continues and telemetry records temporary overcommit risk.
 
@@ -353,11 +400,19 @@ RequestsPerMinute
 TokensPerMinute
 ```
 
-Both use rows in `coordination_rate_state` keyed by client and rate kind. State stores client policy revision, current balance, and the PostgreSQL update timestamp. A policy-revision change starts a new bucket generation with the new full capacity.
+Both use rows in `coordination_rate_state` keyed by client and rate kind. State stores client policy revision, current balance, and `last_refill_at`. A policy-revision change starts a new bucket generation with the new full capacity at the operation's post-lock `v_now`.
 
-RPM is a distributed token bucket. Capacity equals `RequestsPerMinute`, refill is `limit / 60 seconds`, and every successful admission costs one token. The acquisition function serializes changes to one client's RPM row and returns a calculated `retry_at` when exhausted. A rejected concurrency or pool acquisition does not consume an RPM token because the entire statement rolls back.
+RPM is a distributed token bucket. Capacity equals `RequestsPerMinute`, refill is `limit / 60 seconds`, and every successful admission costs one token. The acquisition function serializes changes to one client's RPM row and returns a calculated `retry_at` when exhausted. A rejected concurrency, pool, TPM, or RPM decision may commit its idempotency receipt, but it never debits an RPM token.
 
-TPM is intentionally soft. Admission refreshes the balance and requires at least one available token but does not reserve an estimated request cost. Successful completion debits actual `input_tokens + output_tokens`; balance may become negative. Further requests are rejected until refill makes the balance positive. Requests already in flight may overshoot the configured TPM, and the maximum overshoot depends on their concurrency and actual response sizes.
+TPM is intentionally soft. Admission normalizes the current policy generation, refills to at most capacity through its post-lock `v_now`, and requires at least one available token, but does not reserve an estimated request cost. Successful completion performs the same generation normalization and capped refill before debiting actual `input_tokens + output_tokens`; balance may become negative. Formally, for an unchanged generation:
+
+```text
+refilled = min(capacity, balance + max(0, v_now - last_refill_at) * capacity / 60s)
+balance = refilled - actual_usage
+last_refill_at = v_now
+```
+
+For example, a full bucket of 1,000 tokens at `t=0` completed with usage 2,000 at `t=60s` first refills/caps to 1,000 and then becomes `-1,000`; later admission cannot recover an extra full bucket by applying the same elapsed interval again. Further requests are rejected until a later refill makes the balance positive. Requests already in flight may overshoot the configured TPM, and the maximum overshoot depends on their concurrency and actual response sizes.
 
 The gateway does not tokenize request bodies, derive billing usage, or reserve `max_tokens`. Usage missing from a completed upstream response is observable but not charged.
 
@@ -401,6 +456,8 @@ backend_circuit_probes
 A closed-state fast path reads the committed state without taking a write lock. A request racing with a newly opened circuit is treated as already admitted, matching ordinary circuit-breaker semantics. Open-to-half-open transition and half-open probe acquisition lock the backend state row and re-check every condition atomically.
 
 Half-open capacity is global across replicas. Probe permits have a TTL, are scheduled for renewal by the same process-level lease scheduler through `CircuitCoordinator.RenewProbes`, and are counted only for the matching backend revision and circuit generation. Admission-lease completion and circuit-probe completion remain separate idempotent operations because one client request may make more than one backend attempt.
+
+Every time-dependent circuit mutation locks the backend circuit-state row and all affected permit rows in deterministic permit-ID order before capturing `v_now := clock_timestamp()`. Probe expiry, renewal eligibility, cooldown, failure-window pruning, and completion timestamps use that post-lock value. Circuit SQL never substitutes a transaction-start timestamp.
 
 ### 14.2 Completion
 
@@ -512,13 +569,13 @@ Existing circuit and pool dashboard fields switch to distributed values in Postg
 The default suite requires no PostgreSQL process and includes:
 
 - every existing SQLite unit, integration, race, vet, and build check;
-- SQLite migration tests for rate-policy and revision additions;
-- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, expiry without resurrection, and completion idempotency;
+- SQLite migration tests for rate-policy and revision additions, including pre-existing `MaxConcurrency=10_001` and `MaxGatewayInflight=100_001` rows that remain loadable and unchanged while new/increased above-maximum values are rejected and lowering succeeds;
+- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, completion idempotency, and refill-before-debit TPM completion;
 - deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, and stale-generation no-ops;
 - gateway tests using deterministic fake coordinators;
 - emergency-mode and recovery state-machine tests;
 - `LeaseManager` renewal, completion, backlog, cancellation, and shutdown race tests;
-- domain and transport boundary tests for every concurrency and rate maximum;
+- domain and transport boundary tests for every concurrency and rate maximum, including change-aware SQLite grandfathering;
 - circuit-cache notification/poll/reconnect tests with fake transports;
 - migration manifest tests for unique versions, matched up/down files, and embedded coverage;
 - compile-time interface assertions for local and PostgreSQL implementations.
@@ -547,9 +604,11 @@ The opt-in suite covers:
 - unlimited-pool accounting and `0 -> positive` pool-limit transitions with existing inflight;
 - administrative client/pool limit reductions with existing inflight;
 - conservative no-over-admission under scope-lock contention;
+- renewal waiting across lease expiry while a same-client request in another pool acquires the freed capacity;
+- acquire response loss after commit followed by the same UUID before expiry, after expiry, and after completion, proving no second RPM debit or lease;
 - long-stream renewal, crash expiry, idempotent completion, and lost-lease detection;
 - distributed RPM refill and rejection;
-- soft TPM completion debit, natural overshoot, missing usage, and policy reset;
+- soft TPM completion normalization/refill/debit ordering, natural overshoot, missing usage, and policy reset;
 - distributed circuit rolling window, open, cooldown, half-open capacity, completion ordering, neutral outcomes, and stale generations;
 - `success + crashed probe` expiry reopening and `success + expired probe + late failure` stale completion;
 - PostgreSQL outage, emergency admission, failure replay, and recovery;
