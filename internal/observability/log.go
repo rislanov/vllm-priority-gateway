@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 )
 
@@ -130,6 +131,14 @@ func (o *observers) BackendInflight(event gateway.InflightEvent, delta int) {
 func (o *observers) Complete(event gateway.RequestEvent) {
 	for _, observer := range o.values {
 		observer.Complete(event)
+	}
+}
+
+func (o *observers) CoordinationEmergency(class domain.PriorityClass, admitted bool) {
+	for _, observer := range o.values {
+		if emergencyObserver, ok := observer.(gateway.CoordinationEmergencyObserver); ok {
+			emergencyObserver.CoordinationEmergency(class, admitted)
+		}
 	}
 }
 

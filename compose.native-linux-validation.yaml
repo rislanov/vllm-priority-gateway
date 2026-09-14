@@ -1,0 +1,8 @@
+services:
+  vllm-a:
+    ports:
+      - "${LLMGW_NATIVE_BIND_ADDRESS:-127.0.0.1}:8001:8000"
+
+  vllm-b:
+    ports:
+      - "${LLMGW_NATIVE_BIND_ADDRESS:-127.0.0.1}:8002:8000"

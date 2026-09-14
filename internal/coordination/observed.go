@@ -10,40 +10,62 @@ type OperationObserver interface {
 	CoordinationOperation(backend, operation, outcome string, duration time.Duration, reason Reason)
 }
 
+type CoordinationFailureObserver interface {
+	CoordinationFailure(error)
+}
+
 type observedAdmission struct {
 	next     AdmissionCoordinator
 	observer OperationObserver
+	failure  CoordinationFailureObserver
 }
 
-func ObserveAdmission(next AdmissionCoordinator, observer OperationObserver) AdmissionCoordinator {
-	if observer == nil {
+func ObserveAdmission(next AdmissionCoordinator, observer OperationObserver, failures ...CoordinationFailureObserver) AdmissionCoordinator {
+	var failure CoordinationFailureObserver
+	if len(failures) > 0 {
+		failure = failures[0]
+	}
+	if observer == nil && failure == nil {
 		return next
 	}
-	return &observedAdmission{next: next, observer: observer}
+	return &observedAdmission{next: next, observer: observer, failure: failure}
 }
 
 func (o *observedAdmission) Acquire(ctx context.Context, request AdmissionRequest) (AdmissionDecision, error) {
 	started := time.Now()
 	decision, err := o.next.Acquire(ctx, request)
-	o.observer.CoordinationOperation(o.Status().Backend, "acquire", operationOutcome(decision.Reason, err), time.Since(started), decision.Reason)
+	o.observe("acquire", decision.Reason, err, started)
 	return decision, err
 }
 
 func (o *observedAdmission) Renew(ctx context.Context, leases []LeaseIdentity) ([]RenewResult, error) {
 	started := time.Now()
 	results, err := o.next.Renew(ctx, leases)
-	o.observer.CoordinationOperation(o.Status().Backend, "renew", operationOutcome("", err), time.Since(started), "")
+	o.observe("renew", "", err, started)
 	return results, err
 }
 
 func (o *observedAdmission) Complete(ctx context.Context, completions []LeaseCompletion) ([]CompleteResult, error) {
 	started := time.Now()
 	results, err := o.next.Complete(ctx, completions)
-	o.observer.CoordinationOperation(o.Status().Backend, "complete", operationOutcome("", err), time.Since(started), "")
+	o.observe("complete", "", err, started)
 	return results, err
 }
 
+func (o *observedAdmission) observe(operation string, reason Reason, err error, started time.Time) {
+	observeCoordinationFailure(o.failure, err)
+	if o.observer != nil {
+		o.observer.CoordinationOperation(o.Status().Backend, operation, operationOutcome(reason, err), time.Since(started), reason)
+	}
+}
+
 func (o *observedAdmission) Status() Status { return o.next.Status() }
+
+func (o *observedAdmission) ObserveClientRatePolicy(policy ClientRatePolicy) {
+	if observer, ok := o.next.(AdmissionPolicyObserver); ok {
+		observer.ObserveClientRatePolicy(policy)
+	}
+}
 
 func (o *observedAdmission) PoolInflight(poolID int64) int {
 	if runtime, ok := o.next.(AdmissionRuntime); ok {
@@ -54,7 +76,9 @@ func (o *observedAdmission) PoolInflight(poolID int64) int {
 
 func (o *observedAdmission) RefreshInflight(ctx context.Context) error {
 	if runtime, ok := o.next.(AdmissionRuntime); ok {
-		return runtime.RefreshInflight(ctx)
+		err := runtime.RefreshInflight(ctx)
+		observeCoordinationFailure(o.failure, err)
+		return err
 	}
 	return nil
 }
@@ -63,7 +87,9 @@ func (o *observedAdmission) Cleanup(ctx context.Context, batch int) error {
 	if cleaner, ok := o.next.(interface {
 		Cleanup(context.Context, int) error
 	}); ok {
-		return cleaner.Cleanup(ctx, batch)
+		err := cleaner.Cleanup(ctx, batch)
+		observeCoordinationFailure(o.failure, err)
+		return err
 	}
 	return nil
 }
@@ -71,19 +97,24 @@ func (o *observedAdmission) Cleanup(ctx context.Context, batch int) error {
 type observedCircuit struct {
 	next     CircuitCoordinator
 	observer OperationObserver
+	failure  CoordinationFailureObserver
 }
 
-func ObserveCircuit(next CircuitCoordinator, observer OperationObserver) CircuitCoordinator {
-	if observer == nil {
+func ObserveCircuit(next CircuitCoordinator, observer OperationObserver, failures ...CoordinationFailureObserver) CircuitCoordinator {
+	var failure CoordinationFailureObserver
+	if len(failures) > 0 {
+		failure = failures[0]
+	}
+	if observer == nil && failure == nil {
 		return next
 	}
-	return &observedCircuit{next: next, observer: observer}
+	return &observedCircuit{next: next, observer: observer, failure: failure}
 }
 
 func (o *observedCircuit) Reconcile(ctx context.Context, backends []BackendIdentity) error {
 	started := time.Now()
 	err := o.next.Reconcile(ctx, backends)
-	o.observer.CoordinationOperation(o.Status().Backend, "reconcile", operationOutcome("", err), time.Since(started), "")
+	o.observe("reconcile", "", err, started)
 	return err
 }
 
@@ -94,7 +125,7 @@ func (o *observedCircuit) Snapshot(backendID int64, at time.Time) CircuitSnapsho
 func (o *observedCircuit) Acquire(ctx context.Context, request CircuitAcquireRequest) (CircuitDecision, error) {
 	started := time.Now()
 	decision, err := o.next.Acquire(ctx, request)
-	o.observer.CoordinationOperation(o.Status().Backend, "acquire", operationOutcome(decision.Reason, err), time.Since(started), decision.Reason)
+	o.observe("acquire", decision.Reason, err, started)
 	return decision, err
 }
 
@@ -102,22 +133,29 @@ func (o *observedCircuit) Complete(ctx context.Context, completion CircuitComple
 	started := time.Now()
 	snapshot, err := o.next.Complete(ctx, completion)
 	reason := operationReason(err)
-	o.observer.CoordinationOperation(o.Status().Backend, "complete", operationOutcome(reason, err), time.Since(started), reason)
+	o.observe("complete", reason, err, started)
 	return snapshot, err
 }
 
 func (o *observedCircuit) RenewProbes(ctx context.Context, probes []ProbeIdentity) ([]RenewResult, error) {
 	started := time.Now()
 	results, err := o.next.RenewProbes(ctx, probes)
-	o.observer.CoordinationOperation(o.Status().Backend, "renew", operationOutcome("", err), time.Since(started), "")
+	o.observe("renew", "", err, started)
 	return results, err
 }
 
 func (o *observedCircuit) Refresh(ctx context.Context) error {
 	started := time.Now()
 	err := o.next.Refresh(ctx)
-	o.observer.CoordinationOperation(o.Status().Backend, "refresh", operationOutcome("", err), time.Since(started), "")
+	o.observe("refresh", "", err, started)
 	return err
+}
+
+func (o *observedCircuit) observe(operation string, reason Reason, err error, started time.Time) {
+	observeCoordinationFailure(o.failure, err)
+	if o.observer != nil {
+		o.observer.CoordinationOperation(o.Status().Backend, operation, operationOutcome(reason, err), time.Since(started), reason)
+	}
 }
 
 func (o *observedCircuit) Status() Status { return o.next.Status() }
@@ -126,9 +164,22 @@ func (o *observedCircuit) Cleanup(ctx context.Context, batch int) error {
 	if cleaner, ok := o.next.(interface {
 		Cleanup(context.Context, int) error
 	}); ok {
-		return cleaner.Cleanup(ctx, batch)
+		err := cleaner.Cleanup(ctx, batch)
+		observeCoordinationFailure(o.failure, err)
+		return err
 	}
 	return nil
+}
+
+func observeCoordinationFailure(observer CoordinationFailureObserver, err error) {
+	if observer == nil || err == nil {
+		return
+	}
+	var reason ReasonError
+	if errors.As(err, &reason) {
+		return
+	}
+	observer.CoordinationFailure(err)
 }
 
 func operationOutcome(reason Reason, err error) string {

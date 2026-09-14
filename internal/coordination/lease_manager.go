@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,9 @@ type LeaseManagerObserver interface {
 	CoordinationRenewFailure()
 	CoordinationLeaseLost()
 }
+type LeaseManagerDropObserver interface {
+	CoordinationCompletionDropped()
+}
 type LeaseManager struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -33,6 +37,7 @@ type LeaseManager struct {
 	dropped         atomic.Uint64
 	done            chan struct{}
 	close           sync.Once
+	closeErr        error
 	shutdownTimeout time.Duration
 	observer        LeaseManagerObserver
 }
@@ -85,7 +90,7 @@ func (h *LeaseHandle) Complete(usage *TokenUsage) bool {
 		return true
 	default:
 		h.manager.remove(h.lease)
-		h.manager.dropped.Add(1)
+		h.manager.observeDropped(1)
 		return false
 	}
 }
@@ -105,8 +110,13 @@ func (m *LeaseManager) PendingCompletions() int {
 	return count
 }
 func (m *LeaseManager) Close() error {
-	m.close.Do(func() { m.cancel(); m.stopTicker(); <-m.done; m.drainShutdown() })
-	return nil
+	m.close.Do(func() {
+		m.cancel()
+		m.stopTicker()
+		<-m.done
+		m.closeErr = m.drainShutdown()
+	})
+	return m.closeErr
 }
 
 // Reconcile renews every locally tracked lease as one batch. It is the lease
@@ -115,7 +125,7 @@ func (m *LeaseManager) Reconcile(ctx context.Context) error {
 	return m.renewContext(ctx)
 }
 
-func (m *LeaseManager) drainShutdown() {
+func (m *LeaseManager) drainShutdown() error {
 	items := make([]LeaseCompletion, 0, len(m.completions))
 	for {
 		select {
@@ -133,14 +143,32 @@ pending:
 	m.pending = nil
 	m.mu.Unlock()
 	if len(items) == 0 {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
 	defer cancel()
-	if results, err := m.coordinator.Complete(ctx, items); err == nil {
-		m.observeLost(results)
-		for _, item := range items {
-			m.remove(item.Lease)
+	backoff := 10 * time.Millisecond
+	var lastErr error
+	for {
+		results, err := m.coordinator.Complete(ctx, items)
+		items = m.remainingCompletions(items, results, err)
+		if len(items) == 0 {
+			return nil
+		}
+		lastErr = err
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			for _, item := range items {
+				m.remove(item.Lease)
+			}
+			m.observeDropped(len(items))
+			return fmt.Errorf("drain lease completions: %w", lastErr)
+		case <-timer.C:
+		}
+		if backoff < 200*time.Millisecond {
+			backoff *= 2
 		}
 	}
 }
@@ -208,31 +236,11 @@ func (m *LeaseManager) complete(first LeaseCompletion) {
 	}
 deliver:
 	results, err := m.coordinator.Complete(m.ctx, batch)
-	if err == nil {
-		m.observeLost(results)
-		for _, item := range batch {
-			m.remove(item.Lease)
-		}
+	remaining := m.remainingCompletions(batch, results, err)
+	if len(remaining) == 0 {
 		return
 	}
-	if m.ctx.Err() != nil {
-		return
-	}
-	m.mu.Lock()
-	queued := 0
-	for _, pending := range m.pending {
-		queued += len(pending.items)
-	}
-	if queued+len(batch) <= m.backlogCap {
-		m.pending = append(m.pending, pendingCompletion{items: batch, next: time.Now().Add(10 * time.Millisecond), backoff: 10 * time.Millisecond})
-		m.mu.Unlock()
-		return
-	}
-	m.mu.Unlock()
-	for _, item := range batch {
-		m.remove(item.Lease)
-	}
-	m.dropped.Add(uint64(len(batch)))
+	m.queueRetry(pendingCompletion{items: remaining, next: time.Now().Add(10 * time.Millisecond), backoff: 10 * time.Millisecond})
 }
 
 func (m *LeaseManager) retryPending(now time.Time) {
@@ -250,24 +258,69 @@ func (m *LeaseManager) retryPending(now time.Time) {
 	m.mu.Unlock()
 	for _, pending := range due {
 		results, err := m.coordinator.Complete(m.ctx, pending.items)
-		if err == nil {
-			m.observeLost(results)
-			for _, item := range pending.items {
-				m.remove(item.Lease)
-			}
+		pending.items = m.remainingCompletions(pending.items, results, err)
+		if len(pending.items) == 0 {
 			continue
-		}
-		if m.ctx.Err() != nil {
-			return
 		}
 		pending.backoff *= 2
 		if pending.backoff > 5*time.Second {
 			pending.backoff = 5 * time.Second
 		}
 		pending.next = now.Add(pending.backoff)
-		m.mu.Lock()
+		m.queueRetry(pending)
+	}
+}
+
+func (m *LeaseManager) remainingCompletions(items []LeaseCompletion, results []CompleteResult, err error) []LeaseCompletion {
+	completed := len(items)
+	completedResults := results
+	if err != nil {
+		completed = len(results)
+		if completed > len(items) {
+			completed = 0
+		}
+		for i := 0; i < completed; i++ {
+			if results[i].LeaseID != items[i].Lease.LeaseID {
+				completed = 0
+				break
+			}
+		}
+		completedResults = results[:completed]
+	}
+	m.observeLost(completedResults)
+	for _, item := range items[:completed] {
+		m.remove(item.Lease)
+	}
+	return items[completed:]
+}
+
+func (m *LeaseManager) queueRetry(pending pendingCompletion) {
+	m.mu.Lock()
+	queued := 0
+	for _, existing := range m.pending {
+		queued += len(existing.items)
+	}
+	if queued+len(pending.items) <= m.backlogCap {
 		m.pending = append(m.pending, pending)
 		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	for _, item := range pending.items {
+		m.remove(item.Lease)
+	}
+	m.observeDropped(len(pending.items))
+}
+
+func (m *LeaseManager) observeDropped(count int) {
+	if count <= 0 {
+		return
+	}
+	m.dropped.Add(uint64(count))
+	if observer, ok := m.observer.(LeaseManagerDropObserver); ok {
+		for range count {
+			observer.CoordinationCompletionDropped()
+		}
 	}
 }
 func (m *LeaseManager) remove(l LeaseIdentity) {
@@ -281,7 +334,8 @@ func (m *LeaseManager) observeLost(results []CompleteResult) {
 		return
 	}
 	for _, result := range results {
-		if result.Result == CompletionLeaseLost || result.Reason == ReasonLeaseLost {
+		if result.Result == CompletionLeaseLost || result.Reason == ReasonLeaseLost ||
+			(result.Result == CompletionAlreadyCompleted && result.OriginalResult == CompletionLeaseLost) {
 			m.observer.CoordinationLeaseLost()
 		}
 	}

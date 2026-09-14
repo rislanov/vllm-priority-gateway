@@ -428,6 +428,33 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	}
 }
 
+type analyticsPingerStub struct{ err error }
+
+func (s analyticsPingerStub) PingAnalytics(context.Context) error { return s.err }
+
+type analyticsHealthStub bool
+
+func (s analyticsHealthStub) Healthy() bool { return bool(s) }
+
+func TestAnalyticsReadinessIsIndependentFromCoordination(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		pinger   any
+		recorder analyticsHealthStub
+		want     string
+	}{
+		{name: "ready", pinger: analyticsPingerStub{}, recorder: true, want: "ready"},
+		{name: "analytics pool unavailable", pinger: analyticsPingerStub{err: errors.New("analytics unavailable")}, recorder: true, want: "degraded"},
+		{name: "recorder unhealthy", pinger: analyticsPingerStub{}, recorder: false, want: "degraded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := analyticsReadiness(context.Background(), test.pinger, test.recorder, time.Second); got != test.want {
+				t.Fatalf("analyticsReadiness() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	const (
 		ordinaryPrompt = "e2e-ordinary-prompt-4f5eb9a7"

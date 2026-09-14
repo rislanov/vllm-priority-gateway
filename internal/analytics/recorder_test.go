@@ -401,6 +401,40 @@ func TestRecorderContinuesAfterFailedBatchAndReportsEachLostRow(t *testing.T) {
 	}
 }
 
+func TestRecorderHealthRecoversAfterSuccessfulWrite(t *testing.T) {
+	store := newFakeRecordStore()
+	writeErr := errors.New("database unavailable")
+	store.insertErrors[1] = writeErr
+	recorder := newRecorder(store, 0, nil, recorderSettings{queueCapacity: 2, batchSize: 1})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := recorder.Close(ctx); !errors.Is(err, writeErr) {
+			t.Errorf("Close() error = %v, want %v", err, writeErr)
+		}
+	})
+
+	reserveAndCompleteResponse(t, recorder, recordEvent("failed"))
+	awaitBatch(t, store)
+	eventuallyRecorderHealth(t, recorder, false)
+
+	reserveAndCompleteResponse(t, recorder, recordEvent("recovered"))
+	awaitBatch(t, store)
+	eventuallyRecorderHealth(t, recorder, true)
+}
+
+func eventuallyRecorderHealth(t *testing.T, recorder *Recorder, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if recorder.Healthy() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Recorder.Healthy() = %t, want %t", recorder.Healthy(), want)
+}
+
 func TestRecorderCleansUpRetentionAtStartup(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	retention := 90 * 24 * time.Hour
@@ -416,6 +450,55 @@ func TestRecorderCleansUpRetentionAtStartup(t *testing.T) {
 	if want := now.Add(-retention); !cutoff.Equal(want) {
 		t.Fatalf("startup cleanup cutoff = %s, want %s", cutoff, want)
 	}
+}
+
+func TestRecorderPersistsWhileRetentionCleanupIsBlocked(t *testing.T) {
+	releaseCleanup := make(chan struct{})
+	store := newFakeRecordStore()
+	store.cleanupBlock = releaseCleanup
+	recorder := newRecorder(store, 24*time.Hour, nil, recorderSettings{
+		queueCapacity: 1,
+		batchSize:     1,
+		now:           func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
+	})
+	t.Cleanup(func() {
+		close(releaseCleanup)
+		closeRecorder(t, recorder)
+	})
+	_ = awaitCleanup(t, store)
+
+	reserveAndCompleteResponse(t, recorder, recordEvent("during-cleanup"))
+	if batch := awaitBatch(t, store); len(batch) != 1 || batch[0].RequestID != "during-cleanup" {
+		t.Fatalf("persisted batch = %+v", batch)
+	}
+}
+
+func TestRecorderWriterSuccessDoesNotMaskCleanupFailure(t *testing.T) {
+	startedAt := time.Unix(1_800_000_000, 0).UTC()
+	actualNow := startedAt
+	cleanupTicks := make(chan time.Time)
+	store := newFakeRecordStore()
+	store.cleanupErrors[1] = errors.New("cleanup unavailable")
+	recorder := newRecorder(store, 24*time.Hour, nil, recorderSettings{
+		queueCapacity: 1,
+		batchSize:     1,
+		cleanup:       cleanupTicks,
+		now:           func() time.Time { return actualNow },
+	})
+	t.Cleanup(func() { closeRecorder(t, recorder) })
+	_ = awaitCleanup(t, store)
+	eventuallyRecorderHealth(t, recorder, false)
+
+	reserveAndCompleteResponse(t, recorder, recordEvent("writer-recovers"))
+	_ = awaitBatch(t, store)
+	if recorder.Healthy() {
+		t.Fatal("successful writer operation masked the independent cleanup failure")
+	}
+
+	actualNow = startedAt.Add(time.Hour)
+	cleanupTicks <- actualNow
+	_ = awaitCleanup(t, store)
+	eventuallyRecorderHealth(t, recorder, true)
 }
 
 func TestRecorderRunsRetentionCleanupAtMostHourly(t *testing.T) {
@@ -698,6 +781,8 @@ type fakeRecordStore struct {
 	insertStarted       chan struct{}
 	batchCalls          chan []RequestRecord
 	cleanupCalls        chan time.Time
+	cleanupBlock        <-chan struct{}
+	cleanupErrors       map[int]error
 	cleanupCount        int
 }
 
@@ -707,6 +792,7 @@ func newFakeRecordStore() *fakeRecordStore {
 		insertStarted: make(chan struct{}, 16),
 		batchCalls:    make(chan []RequestRecord, 16),
 		cleanupCalls:  make(chan time.Time, 16),
+		cleanupErrors: make(map[int]error),
 	}
 }
 
@@ -734,12 +820,21 @@ func (s *fakeRecordStore) InsertUsageBatch(ctx context.Context, records []Reques
 	return err
 }
 
-func (s *fakeRecordStore) DeleteUsageBefore(_ context.Context, cutoff time.Time) (int64, error) {
+func (s *fakeRecordStore) DeleteUsageBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	s.mu.Lock()
 	s.cleanupCount++
+	call := s.cleanupCount
+	err := s.cleanupErrors[call]
 	s.mu.Unlock()
 	s.cleanupCalls <- cutoff
-	return 0, nil
+	if s.cleanupBlock != nil {
+		select {
+		case <-s.cleanupBlock:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return 0, err
 }
 
 func (s *fakeRecordStore) cleanupCallCount() int {

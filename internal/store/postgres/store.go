@@ -75,6 +75,12 @@ func (s *Store) ConfigPool() *pgxpool.Pool       { return s.config }
 func (s *Store) AnalyticsPool() *pgxpool.Pool    { return s.analytics }
 func (s *Store) CoordinationPool() *pgxpool.Pool { return s.coordination }
 
+// PingAnalytics verifies the independently sized analytics pool used by
+// readiness reporting.
+func (s *Store) PingAnalytics(ctx context.Context) error {
+	return s.analytics.Ping(ctx)
+}
+
 type PoolConnectionStats struct {
 	Acquired, Idle, Total int32
 	Canceled              int64

@@ -3,7 +3,12 @@ package postgres_test
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,12 +16,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
+	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination/contracttest"
 	coordpostgres "github.com/rislanov/vllm-priority-gateway/internal/coordination/postgres"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
+	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
+	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
+	"github.com/rislanov/vllm-priority-gateway/internal/routing"
 	basestore "github.com/rislanov/vllm-priority-gateway/internal/store"
 	pgstore "github.com/rislanov/vllm-priority-gateway/internal/store/postgres"
 )
@@ -53,9 +64,29 @@ func resetDatabase(t *testing.T, store *pgstore.Store) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := store.ConfigPool().Exec(ctx, `TRUNCATE TABLE backend_circuit_failures,backend_circuit_failure_receipts,backend_circuit_probes,backend_circuit_state,coordination_rate_state,request_leases,admission_operations,coordination_replicas,client_admission_scopes,pool_admission_scopes,usage_requests,client_model_access,api_keys,backends,clients,model_pools RESTART IDENTITY CASCADE; UPDATE config_meta SET revision=0 WHERE singleton=1`)
+	_, err := store.ConfigPool().Exec(ctx, `TRUNCATE TABLE backend_circuit_active_failures,backend_circuit_failures,backend_circuit_failure_receipts,backend_circuit_probes,backend_circuit_state,coordination_rate_state,request_leases,admission_operations,coordination_replicas,client_admission_scopes,pool_admission_scopes,usage_requests,client_model_access,api_keys,backends,clients,model_pools RESTART IDENTITY CASCADE; UPDATE config_meta SET revision=0 WHERE singleton=1`)
 	if err != nil {
 		t.Fatalf("reset dedicated PostgreSQL test database: %v", err)
+	}
+}
+
+func TestPostgresConfigurationPreservesConflictAndNotFoundCauses(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx := context.Background()
+	params := basestore.CreatePoolParams{PublicModelName: "duplicate-model", UpstreamModelName: "upstream", Enabled: true, MaxGatewayInflight: 1}
+	if _, err := store.CreatePool(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.CreatePool(ctx, params)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		t.Fatalf("duplicate pool error = %v, want wrapped PostgreSQL unique violation", err)
+	}
+	_, err = store.UpdateClient(ctx, 999, basestore.UpdateClientParams{
+		Name: "missing", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 1,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("missing client error = %v, want pgx.ErrNoRows", err)
 	}
 }
 
@@ -274,6 +305,158 @@ func TestPostgresAdmissionContentionAcrossReplicasNeverOversubscribes(t *testing
 	}
 }
 
+func TestTwoGatewaysRenewLongStreamThroughPostgresLeaseManager(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	secret := []byte(strings.Repeat("h", 32))
+	rawKey := "llmgw_test12" + strings.Repeat("a", 37)
+	digest := apikey.Digest(secret, rawKey)
+	if _, err := store.ConfigPool().Exec(context.Background(), "UPDATE api_keys SET secret_hash=$2::bytea WHERE id=$1::bigint", fixture.key.ID, digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	registryValue := registry.New(store)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	coordinator := coordpostgres.NewAdmissionCoordinator(store, time.Second)
+	renewTicks := make(chan time.Time, 1)
+	leases := coordination.NewLeaseManager(context.Background(), coordinator, coordination.LeaseManagerOptions{
+		RenewTicks: renewTicks, CompletionBacklog: 8, ShutdownTimeout: time.Second,
+	})
+	t.Cleanup(func() { leases.Close() })
+	firstForwarder := &blockingGatewayForwarder{started: make(chan struct{}), release: make(chan struct{})}
+	first := newPostgresGatewayService(registryValue, secret, coordinator, leases, firstForwarder, 500*time.Millisecond)
+	secondForwarder := &blockingGatewayForwarder{started: make(chan struct{}), release: make(chan struct{})}
+	close(secondForwarder.release)
+	second := newPostgresGatewayService(registryValue, secret, coordinator, nil, secondForwarder, 500*time.Millisecond)
+
+	firstDone := make(chan *gateway.APIError, 1)
+	go func() {
+		_, _, apiErr := first.Forward(context.Background(), httptest.NewRecorder(), postgresGatewayRequest(rawKey, "long-stream"))
+		firstDone <- apiErr
+	}()
+	select {
+	case <-firstForwarder.started:
+	case apiErr := <-firstDone:
+		t.Fatalf("first gateway returned before upstream: %+v", apiErr)
+	case <-time.After(time.Second):
+		t.Fatal("first gateway did not reach the held upstream")
+	}
+	var initialExpiry time.Time
+	if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT expires_at FROM request_leases").Scan(&initialExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if delay := time.Until(initialExpiry.Add(-200 * time.Millisecond)); delay > 0 {
+		time.Sleep(delay)
+	}
+	renewTicks <- time.Now()
+	var renewedExpiry time.Time
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT expires_at FROM request_leases").Scan(&renewedExpiry); err == nil && renewedExpiry.After(initialExpiry) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !renewedExpiry.After(initialExpiry) {
+		t.Fatalf("lease expiry was not renewed: initial=%s current=%s", initialExpiry, renewedExpiry)
+	}
+	if delay := time.Until(initialExpiry.Add(30 * time.Millisecond)); delay > 0 {
+		time.Sleep(delay)
+	}
+
+	_, _, apiErr := second.Forward(context.Background(), httptest.NewRecorder(), postgresGatewayRequest(rawKey, "competing"))
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("second gateway result=%+v, want distributed concurrency rejection", apiErr)
+	}
+	select {
+	case <-secondForwarder.started:
+		t.Fatal("second gateway reached upstream after the original lease expiry")
+	default:
+	}
+
+	close(firstForwarder.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first gateway error=%+v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first gateway did not finish")
+	}
+}
+
+type postgresGatewayRuntime struct{}
+
+func (postgresGatewayRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
+	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal}
+}
+func (postgresGatewayRuntime) AcquirePool(int64, int) (func(), bool) { return func() {}, true }
+func (postgresGatewayRuntime) Snapshot(backendID int64, _ time.Time) domain.BackendRuntime {
+	return domain.BackendRuntime{BackendID: backendID, Healthy: true, MetricsFresh: true, CircuitAvailable: true}
+}
+func (postgresGatewayRuntime) AcquireBackend(domain.Backend, time.Time) (func(domain.InferenceOutcome), bool) {
+	return func(domain.InferenceOutcome) {}, true
+}
+
+type blockingGatewayForwarder struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingGatewayForwarder) Forward(ctx context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-f.release:
+		request.Target.Complete(domain.InferenceSuccess)
+		return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
+	case <-ctx.Done():
+		request.Target.Complete(domain.InferenceNeutral)
+		return proxy.Result{BackendID: request.Target.Backend.ID, Cancelled: true, Err: ctx.Err()}
+	}
+}
+
+func newPostgresGatewayService(snapshot gateway.SnapshotProvider, secret []byte, coordinator coordination.AdmissionCoordinator, leases *coordination.LeaseManager, forwarder gateway.Forwarder, ttl time.Duration) *gateway.Service {
+	return gateway.New(gateway.Dependencies{
+		Registry: snapshot, HMACSecret: secret, Admission: coordinator, Leases: leases, LeaseTTL: ttl,
+		Runtime: postgresGatewayRuntime{}, Router: routing.New(0.05, routing.FixedSource(0)), Forwarder: forwarder,
+	})
+}
+
+func postgresGatewayRequest(apiKey, requestID string) gateway.ForwardRequest {
+	return gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/chat/completions", APIKey: apiKey, RequestID: requestID,
+		Headers: make(http.Header), Body: []byte(`{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+	}
+}
+
+func TestPostgresAdmissionBackendNeutralContract(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	contracttest.AdmissionBaseline(t, func(t *testing.T, rpm int64) (coordination.AdmissionCoordinator, func() coordination.AdmissionRequest) {
+		resetDatabase(t, store)
+		fixture := createFixture(t, store, rpm)
+		coordinator := coordpostgres.NewAdmissionCoordinator(store, time.Second)
+		return coordinator, func() coordination.AdmissionRequest { return admissionRequest(fixture, uuid.New()) }
+	})
+}
+
+func TestPostgresCircuitBackendNeutralContract(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	contracttest.CircuitBaseline(t, func(t *testing.T) (coordination.CircuitCoordinator, coordination.BackendIdentity) {
+		resetDatabase(t, store)
+		fixture := createFixture(t, store, 0)
+		coordinator, err := coordpostgres.NewCircuitCoordinator(store, time.Second, circuitbreaker.Options{
+			FailureThreshold: 1, FailureWindow: time.Hour, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return coordinator, coordination.BackendIdentity{ID: fixture.backend.ID, Revision: fixture.backend.Revision, Enabled: true}
+	})
+}
+
 func TestPostgresAdmissionReplayAndImmutableInputConflict(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	fixture := createFixture(t, store, 0)
@@ -453,6 +636,134 @@ func TestPostgresExpiredLeaseCannotBeRenewedOrResurrected(t *testing.T) {
 	}
 }
 
+func TestPostgresCleanupDoesNotExpireLeaseRenewedWhileWaitingForLock(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	coordinator := coordpostgres.NewAdmissionCoordinator(store, 2*time.Second)
+	request := admissionRequest(fixture, uuid.New())
+	decision, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || !decision.Admitted() {
+		t.Fatalf("Acquire() = %+v, %v", decision, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := store.CoordinationPool().Exec(ctx, "UPDATE request_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE lease_id=$1::uuid", request.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	renewal, err := store.CoordinationPool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer renewal.Rollback(ctx)
+	if _, err := renewal.Exec(ctx, "UPDATE request_leases SET expires_at=clock_timestamp()+interval '1 minute' WHERE lease_id=$1::uuid", request.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- coordinator.Cleanup(ctx, 1) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var waiting bool
+		err := store.ConfigPool().QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM pg_stat_activity
+			WHERE datname=current_database() AND wait_event_type='Lock'
+			  AND query LIKE 'SELECT lease_id FROM request_leases WHERE lease_id=%FOR UPDATE%'
+		)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cleanup did not reach the lease row lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := renewal.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+	var expiresAt time.Time
+	var marked bool
+	if err := store.CoordinationPool().QueryRow(ctx, `SELECT l.expires_at,o.lease_expired_at IS NOT NULL
+		FROM request_leases l JOIN admission_operations o USING(lease_id) WHERE l.lease_id=$1::uuid`, request.LeaseID).Scan(&expiresAt, &marked); err != nil {
+		t.Fatal(err)
+	}
+	if marked || !expiresAt.After(time.Now()) {
+		t.Fatalf("renewed lease expires_at=%s marked_expired=%t", expiresAt, marked)
+	}
+}
+
+func TestPostgresLockWaitUsesPostLockExpiryAcrossClientPools(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	secondPool, err := store.CreatePool(context.Background(), basestore.CreatePoolParams{
+		PublicModelName: "second-model", UpstreamModelName: "second-upstream", Enabled: true, MaxGatewayInflight: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateClient(context.Background(), fixture.client.ID, basestore.UpdateClientParams{
+		Name: fixture.client.Name, Enabled: true, PriorityClass: fixture.client.PriorityClass,
+		VLLMPriority: fixture.client.VLLMPriority, MaxConcurrency: 1,
+		RequestsPerMinute: fixture.client.RequestsPerMinute, TokensPerMinute: fixture.client.TokensPerMinute,
+		ModelPoolIDs: []int64{fixture.pool.ID, secondPool.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fixture = refreshFixture(t, store, fixture)
+	coordinator := coordpostgres.NewAdmissionCoordinator(store, 2*time.Second)
+	firstRequest := admissionRequest(fixture, uuid.New())
+	firstRequest.LeaseTTL = 200 * time.Millisecond
+	first, err := coordinator.Acquire(context.Background(), firstRequest)
+	if err != nil || !first.Admitted() {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+
+	holder, err := store.CoordinationPool().Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	if _, err := holder.Exec(context.Background(), "SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", fixture.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	renewed := make(chan []coordination.RenewResult, 1)
+	renewErrors := make(chan error, 1)
+	go func() {
+		results, err := coordinator.Renew(context.Background(), []coordination.LeaseIdentity{first.Lease.Identity()})
+		renewed <- results
+		renewErrors <- err
+	}()
+	secondRequest := admissionRequest(fixture, uuid.New())
+	secondRequest.PoolID = secondPool.ID
+	secondRequest.PoolGatewayInflightLimit = secondPool.MaxGatewayInflight
+	secondDecision := make(chan coordination.AdmissionDecision, 1)
+	secondErrors := make(chan error, 1)
+	go func() {
+		decision, err := coordinator.Acquire(context.Background(), secondRequest)
+		secondDecision <- decision
+		secondErrors <- err
+	}()
+	if delay := time.Until(first.Lease.ExpiresAt.Add(20 * time.Millisecond)); delay > 0 {
+		time.Sleep(delay)
+	}
+	if err := holder.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := <-renewed, <-renewErrors
+	if err != nil || len(results) != 1 || results[0].Reason != coordination.ReasonLeaseLost {
+		t.Fatalf("renew after lock wait=%+v err=%v", results, err)
+	}
+	decision, err := <-secondDecision, <-secondErrors
+	if err != nil || !decision.Admitted() {
+		t.Fatalf("other-pool acquire after lock wait=%+v err=%v", decision, err)
+	}
+}
+
 func TestPostgresSoftTPMMissingUsageAndPolicyGenerationReset(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createRateFixture(t, store, 0, 1)
@@ -513,6 +824,191 @@ func TestPostgresAnalyticsBatchIsIdempotentAndQueryable(t *testing.T) {
 	}
 }
 
+func TestPostgresAnalyticsSeriesPreservesNanosecondRangeData(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	from := time.Date(2026, time.September, 14, 10, 0, 0, 123456789, time.UTC)
+	input, output := int64(10), int64(2)
+	record := postgresAnalyticsRecord("fractional-range", from.Add(time.Minute), 1, "client", 1, "model", &input, &output, nil)
+	if err := store.InsertUsageBatch(context.Background(), []analytics.RequestRecord{record}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataset, err := store.Analytics(context.Background(), analytics.Filter{From: from, To: from.Add(15 * time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests, tokens int64
+	for _, point := range dataset.Series {
+		requests += point.RequestCount
+		tokens += point.InputTokens
+	}
+	if requests != 1 || tokens != input {
+		t.Fatalf("series lost fractional-boundary data: requests=%d input_tokens=%d, want 1 and %d", requests, tokens, input)
+	}
+}
+
+func TestPostgresUsageRangeBoundsCeilFractionalMicrosecondsForEveryQueryPath(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx := context.Background()
+	base := time.Date(2026, time.September, 14, 12, 0, 0, 123_456_000, time.UTC)
+	if err := store.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		postgresAnalyticsRecord("at-base", base, 1, "client", 10, "model", nil, nil, nil),
+		postgresAnalyticsRecord("at-next-microsecond", base.Add(time.Microsecond), 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		filter analytics.Filter
+		wantID string
+	}{
+		{
+			name:   "fractional inclusive from excludes the containing stored microsecond",
+			filter: analytics.Filter{From: base.Add(time.Nanosecond), To: base.Add(2 * time.Microsecond)},
+			wantID: "at-next-microsecond",
+		},
+		{
+			name:   "fractional exclusive to includes the containing stored microsecond",
+			filter: analytics.Filter{From: base, To: base.Add(time.Nanosecond)},
+			wantID: "at-base",
+		},
+		{
+			name:   "exact microsecond remains unchanged",
+			filter: analytics.Filter{From: base, To: base.Add(time.Microsecond)},
+			wantID: "at-base",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataset, err := store.Analytics(ctx, test.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			page, err := store.UsageRequests(ctx, test.filter, 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dashboard, dashboardPage, err := store.AnalyticsDashboard(ctx, test.filter, 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var streamed []string
+			if err := store.StreamUsageRequests(ctx, test.filter, func(record analytics.RequestRecord) error {
+				streamed = append(streamed, record.RequestID)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			pageIDs := make([]string, 0, len(page.Requests))
+			for _, record := range page.Requests {
+				pageIDs = append(pageIDs, record.RequestID)
+			}
+			dashboardIDs := make([]string, 0, len(dashboardPage.Requests))
+			for _, record := range dashboardPage.Requests {
+				dashboardIDs = append(dashboardIDs, record.RequestID)
+			}
+			if dataset.Summary.RequestCount != 1 || dashboard.Summary.RequestCount != 1 || page.Total != 1 ||
+				!reflect.DeepEqual(pageIDs, []string{test.wantID}) || dashboardPage.Total != 1 ||
+				!reflect.DeepEqual(dashboardIDs, []string{test.wantID}) ||
+				!reflect.DeepEqual(streamed, []string{test.wantID}) {
+				t.Fatalf("range query mismatch: analytics=%d dashboard=%d page=%+v dashboardPage=%+v stream=%v",
+					dataset.Summary.RequestCount, dashboard.Summary.RequestCount, page, dashboardPage, streamed)
+			}
+		})
+	}
+}
+
+func TestPostgresAnalyticsBoundsExtremeCustomRangeSeries(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx := context.Background()
+	from := time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(9999, time.December, 31, 23, 59, 59, 999_999_999, time.UTC)
+	occurredAt := time.Date(9999, time.December, 31, 23, 59, 59, 998_000_000, time.UTC)
+	if err := store.InsertUsageBatch(ctx, []analytics.RequestRecord{
+		postgresAnalyticsRecord("extreme-range", occurredAt, 1, "client", 10, "model", nil, nil, nil),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dataset, err := store.Analytics(ctx, analytics.Filter{From: from, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataset.Summary.RequestCount != 1 {
+		t.Fatalf("Analytics().Summary.RequestCount = %d, want 1 for the complete RFC 3339 year range", dataset.Summary.RequestCount)
+	}
+	if len(dataset.Series) == 0 || len(dataset.Series) > 366 {
+		t.Fatalf("Analytics().Series length = %d, want 1 through 366 points", len(dataset.Series))
+	}
+	if dataset.Series[len(dataset.Series)-1].RequestCount != 1 {
+		t.Fatalf("last series point = %+v, want the matching request", dataset.Series[len(dataset.Series)-1])
+	}
+}
+
+func TestPostgresAnalyticsMatchesFilterNullAndCacheRatioContract(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	from := time.Date(2026, time.September, 14, 10, 0, 0, 0, time.UTC)
+	to := from.Add(15 * time.Minute)
+	input10, input20, input7 := int64(10), int64(20), int64(7)
+	output2, output3, output1, cache4 := int64(2), int64(3), int64(1), int64(4)
+	records := []analytics.RequestRecord{
+		postgresAnalyticsRecord("before", from.Add(-time.Millisecond), 9, "excluded", 90, "excluded-model", &input7, &output1, nil),
+		postgresAnalyticsRecord("cache-known", from, 1, "client-old", 10, "model-old", &input10, &output2, &cache4),
+		postgresAnalyticsRecord("cache-unknown", from.Add(5*time.Minute), 1, "client-current", 10, "model-current", &input20, &output3, nil),
+		postgresAnalyticsRecord("unmetered", from.Add(10*time.Minute), 2, "client-two", 20, "model-two", nil, nil, nil),
+		postgresAnalyticsRecord("excluded-to", to, 2, "client-two", 20, "model-two", &input7, &output1, nil),
+		postgresAnalyticsRecord("latest-name", to.Add(time.Minute), 1, "client-renamed", 10, "model-renamed", nil, nil, nil),
+	}
+	if err := store.InsertUsageBatch(context.Background(), records); err != nil {
+		t.Fatal(err)
+	}
+	dataset, err := store.Analytics(context.Background(), analytics.Filter{From: from, To: to})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataset.Summary.RequestCount != 3 || dataset.Summary.MeteredRequestCount != 2 || dataset.Summary.InputTokens != 30 || dataset.Summary.OutputTokens != 5 {
+		t.Fatalf("summary=%+v", dataset.Summary)
+	}
+	if dataset.Summary.CacheReadTokens == nil || *dataset.Summary.CacheReadTokens != 4 || dataset.Summary.CacheHitRatio == nil || *dataset.Summary.CacheHitRatio != 0.4 {
+		t.Fatalf("cache summary=%+v", dataset.Summary)
+	}
+	if len(dataset.Series) != 3 || dataset.Series[1].CacheReadTokens != nil || dataset.Series[1].CacheHitRatio != nil || dataset.Series[2].InputTokens != 0 {
+		t.Fatalf("series=%+v", dataset.Series)
+	}
+	wantClients := []analytics.Dimension{{ID: 1, Name: "client-renamed"}, {ID: 2, Name: "client-two"}, {ID: 9, Name: "excluded"}}
+	wantModels := []analytics.Dimension{{ID: 10, Name: "model-renamed"}, {ID: 20, Name: "model-two"}, {ID: 90, Name: "excluded-model"}}
+	if !reflect.DeepEqual(dataset.Clients, wantClients) || !reflect.DeepEqual(dataset.Models, wantModels) {
+		t.Fatalf("dimensions=%+v/%+v", dataset.Clients, dataset.Models)
+	}
+	clientOne, modelTwenty, available, unavailable := int64(1), int64(20), true, false
+	for _, test := range []struct {
+		name   string
+		filter analytics.Filter
+		want   int64
+	}{
+		{name: "client", filter: analytics.Filter{From: from, To: to, ClientID: &clientOne}, want: 2},
+		{name: "model", filter: analytics.Filter{From: from, To: to, ModelPoolID: &modelTwenty}, want: 1},
+		{name: "metered", filter: analytics.Filter{From: from, To: to, UsageAvailable: &available}, want: 2},
+		{name: "unmetered", filter: analytics.Filter{From: from, To: to, UsageAvailable: &unavailable}, want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			filtered, err := store.Analytics(context.Background(), test.filter)
+			if err != nil || filtered.Summary.RequestCount != test.want {
+				t.Fatalf("filtered summary=%+v err=%v, want %d", filtered.Summary, err, test.want)
+			}
+		})
+	}
+}
+
+func postgresAnalyticsRecord(requestID string, occurredAt time.Time, clientID int64, clientName string, modelPoolID int64, modelName string, inputTokens, outputTokens, cacheReadTokens *int64) analytics.RequestRecord {
+	return analytics.RequestRecord{
+		OccurredAt: occurredAt, RequestID: requestID, ClientID: clientID, ClientName: clientName,
+		ModelPoolID: modelPoolID, ModelName: modelName, HTTPStatus: http.StatusOK, DurationMS: 1,
+		UsageAvailable: inputTokens != nil && outputTokens != nil,
+		InputTokens:    inputTokens, OutputTokens: outputTokens, CacheReadTokens: cacheReadTokens,
+	}
+}
+
 func TestPostgresConfigNotificationReloadsCommittedRevision(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -557,10 +1053,38 @@ func TestPostgresConfigNotificationReloadsCommittedRevision(t *testing.T) {
 	}
 }
 
+func TestPostgresAnalyticsRetentionDrainsMultipleBatches(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx := context.Background()
+	_, err := store.AnalyticsPool().Exec(ctx, `INSERT INTO usage_requests(occurred_at,request_id,client_id,client_name,model_pool_id,model_name,backend_name,http_status,duration_ms,retry_count,disconnected,usage_available)
+		SELECT clock_timestamp()-interval '2 hours','retention-'||g::text,1,'client',1,'model','backend',200,1,0,false,false FROM generate_series(1,1001) g`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := analytics.NewRecorder(store, time.Hour, nil, nil)
+	count := 1001
+	deadline := time.Now().Add(time.Second)
+	for count > 0 && time.Now().Before(deadline) {
+		if err = store.AnalyticsPool().QueryRow(ctx, "SELECT count(*) FROM usage_requests").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err = recorder.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.AnalyticsPool().QueryRow(ctx, "SELECT count(*) FROM usage_requests").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("retention left %d expired rows until the next hourly tick", count)
+	}
+}
+
 func TestPostgresCircuitCapacityIsSharedAcrossCoordinators(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createFixture(t, store, 0)
-	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: 20 * time.Millisecond, HalfOpenMaxProbes: 1}
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
 	first, err := coordpostgres.NewCircuitCoordinator(store, time.Second, options)
 	if err != nil {
 		t.Fatal(err)
@@ -584,7 +1108,22 @@ func TestPostgresCircuitCapacityIsSharedAcrossCoordinators(t *testing.T) {
 	if _, err := first.Complete(context.Background(), coordination.CircuitCompletion{AttemptID: acquire.AttemptID, Backend: identity, Generation: closed.Snapshot.Generation, Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(25 * time.Millisecond)
+	if opened := first.Snapshot(f.backend.ID, time.Now()); opened.State != domain.CircuitOpen || opened.FailureCount != 1 {
+		t.Fatalf("local open snapshot=%+v, want one retained failure", opened)
+	}
+	if err := second.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if opened := second.Snapshot(f.backend.ID, time.Now()); opened.State != domain.CircuitOpen || opened.FailureCount != 1 {
+		t.Fatalf("remote open snapshot=%+v, want one retained failure", opened)
+	}
+	time.Sleep(options.OpenCooldown + 50*time.Millisecond)
+	if err := second.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if halfOpen := second.Snapshot(f.backend.ID, time.Now()); halfOpen.State != domain.CircuitHalfOpen || !halfOpen.Available || halfOpen.FailureCount != 1 {
+		t.Fatalf("remote half-open snapshot=%+v, want available with retained failure", halfOpen)
+	}
 	probeRequest := coordination.CircuitAcquireRequest{AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute}
 	probe, err := first.Acquire(context.Background(), probeRequest)
 	if err != nil || probe.Permit == nil {
@@ -596,6 +1135,237 @@ func TestPostgresCircuitCapacityIsSharedAcrossCoordinators(t *testing.T) {
 	denied, err := second.Acquire(context.Background(), probeRequest)
 	if err != nil || denied.Reason != coordination.ReasonProbeCapacityExhausted {
 		t.Fatalf("shared probe denial=%+v err=%v", denied, err)
+	}
+	reopened, err := first.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: probe.Permit.PermitID, Backend: identity, Generation: probe.Permit.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || reopened.State != domain.CircuitOpen || reopened.FailureCount != 2 {
+		t.Fatalf("failed probe completion=%+v err=%v, want two retained failures", reopened, err)
+	}
+	if err := second.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reopened := second.Snapshot(f.backend.ID, time.Now()); reopened.State != domain.CircuitOpen || reopened.FailureCount != 2 {
+		t.Fatalf("remote reopened snapshot=%+v, want two retained failures", reopened)
+	}
+}
+
+func TestPostgresClosedCircuitFastPathsIgnoreOtherBackendLock(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	healthy, err := store.CreateBackend(context.Background(), basestore.CreateBackendParams{
+		ModelPoolID: fixture.pool.ID, Name: "healthy", BaseURL: "http://healthy.invalid", Enabled: true, CapacityHint: 1, RunningSoftLimit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := coordpostgres.NewCircuitCoordinator(store, 100*time.Millisecond, circuitbreaker.Options{
+		FailureThreshold: 2, FailureWindow: time.Minute, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backends := []coordination.BackendIdentity{
+		{ID: fixture.backend.ID, Revision: fixture.backend.Revision, Enabled: true},
+		{ID: healthy.ID, Revision: healthy.Revision, Enabled: true},
+	}
+	if err = coordinator.Reconcile(context.Background(), backends); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.ConfigPool().Exec(context.Background(), "UPDATE backend_circuit_state SET state='half_open' WHERE backend_id=$1", fixture.backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := store.ConfigPool().Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderOpen := true
+	defer func() {
+		if holderOpen {
+			_ = holder.Rollback(context.Background())
+		}
+	}()
+	if _, err = holder.Exec(context.Background(), "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1 FOR UPDATE", fixture.backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = coordinator.Refresh(context.Background()); err == nil {
+		t.Fatal("refresh unexpectedly succeeded while an unrelated backend row was locked")
+	}
+	if status := coordinator.Status(); status.Available {
+		t.Fatalf("failed refresh did not degrade coordinator: %+v", status)
+	}
+
+	request := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(),
+		Backend: backends[1], ProbeTTL: time.Minute,
+	}
+	decision, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || decision.Reason != "" {
+		t.Fatalf("healthy backend acquire=%+v err=%v", decision, err)
+	}
+	if status := coordinator.Status(); status.Available {
+		t.Fatalf("closed acquire incorrectly healed coordinator after failed refresh: %+v", status)
+	}
+
+	_, err = coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: uuid.New(), Backend: backends[1], Generation: decision.Snapshot.Generation,
+		ReportedOutcomeAt: time.Now().UTC(), Outcome: domain.InferenceSuccess,
+	})
+	if err != nil {
+		t.Fatalf("healthy backend completion: %v", err)
+	}
+	if status := coordinator.Status(); status.Available {
+		t.Fatalf("closed completion incorrectly healed coordinator after failed refresh: %+v", status)
+	}
+	if err = holder.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	holderOpen = false
+	if err = coordinator.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh after lock release: %v", err)
+	}
+	if status := coordinator.Status(); !status.Available {
+		t.Fatalf("successful refresh did not restore coordinator: %+v", status)
+	}
+}
+
+func TestPostgresCircuitCompletionReplayCanonicalizesTimestampPrecision(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	coordinator, err := coordpostgres.NewCircuitCoordinator(store, time.Second, circuitbreaker.Options{
+		FailureThreshold: 2, FailureWindow: time.Minute, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := coordination.BackendIdentity{ID: fixture.backend.ID, Revision: fixture.backend.Revision, Enabled: true}
+	request := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: backend, ProbeTTL: time.Minute,
+	}
+	decision, err := coordinator.Acquire(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completion := coordination.CircuitCompletion{
+		AttemptID: request.AttemptID, Backend: backend, Generation: decision.Snapshot.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC().Truncate(time.Microsecond).Add(123 * time.Nanosecond),
+	}
+	if _, err = coordinator.Complete(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = coordinator.Complete(context.Background(), completion); err != nil {
+		t.Fatalf("identical completion replay rejected: %v", err)
+	}
+}
+
+func TestPostgresClosedCircuitAcquireAndNeutralCompletionDoNotTakeStateLock(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	coordinator, err := coordpostgres.NewCircuitCoordinator(store, 50*time.Millisecond, circuitbreaker.Options{
+		FailureThreshold: 2, FailureWindow: time.Minute, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	holder, err := store.ConfigPool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err = holder.Exec(ctx, "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", fixture.backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	backend := coordination.BackendIdentity{ID: fixture.backend.ID, Revision: fixture.backend.Revision, Enabled: true}
+	request := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: backend, ProbeTTL: time.Minute,
+	}
+	decision, err := coordinator.Acquire(ctx, request)
+	if err != nil || decision.Reason != "" {
+		t.Fatalf("closed acquire blocked by state lock: reason=%s err=%v", decision.Reason, err)
+	}
+	if _, err = coordinator.Complete(ctx, coordination.CircuitCompletion{
+		AttemptID: request.AttemptID, Backend: backend, Generation: decision.Snapshot.Generation,
+		Outcome: domain.InferenceNeutral, ReportedOutcomeAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("closed neutral completion blocked by state lock: %v", err)
+	}
+}
+
+func TestPostgresClosedCircuitFailureCountExpiresWithWindow(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 3, FailureWindow: 40 * time.Millisecond, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
+	coordinator, err := coordpostgres.NewCircuitCoordinator(store, time.Second, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := coordination.BackendIdentity{ID: f.backend.ID, Revision: f.backend.Revision, Enabled: true}
+	if err := coordinator.Reconcile(context.Background(), []coordination.BackendIdentity{identity}); err != nil {
+		t.Fatal(err)
+	}
+	request := coordination.CircuitAcquireRequest{AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute}
+	decision, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || decision.Reason != "" {
+		t.Fatalf("closed acquire=%+v err=%v", decision, err)
+	}
+	completion := coordination.CircuitCompletion{
+		AttemptID: request.AttemptID, Backend: identity, Generation: decision.Snapshot.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	}
+	failed, err := coordinator.Complete(context.Background(), completion)
+	if err != nil || failed.State != domain.CircuitClosed || failed.FailureCount != 1 {
+		t.Fatalf("closed failure snapshot=%+v err=%v", failed, err)
+	}
+	var originalReceiptEvent time.Time
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT event_at FROM backend_circuit_failure_receipts WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&originalReceiptEvent); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(options.FailureWindow + 20*time.Millisecond)
+	nextRequest := coordination.CircuitAcquireRequest{AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute}
+	nextDecision, err := coordinator.Acquire(context.Background(), nextRequest)
+	if err != nil || nextDecision.Reason != "" {
+		t.Fatalf("next closed acquire=%+v err=%v", nextDecision, err)
+	}
+	nextFailed, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: nextRequest.AttemptID, Backend: identity, Generation: nextDecision.Snapshot.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || nextFailed.State != domain.CircuitClosed || nextFailed.FailureCount != 1 {
+		t.Fatalf("next closed failure snapshot=%+v err=%v", nextFailed, err)
+	}
+	var originalEvents, originalActiveEvents, originalReceipts int
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT count(*) FROM backend_circuit_failures WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&originalEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT count(*) FROM backend_circuit_active_failures WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&originalActiveEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT count(*) FROM backend_circuit_failure_receipts WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&originalReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if originalEvents != 0 || originalActiveEvents != 0 || originalReceipts != 1 {
+		t.Fatalf("rolling prune left events=%d active_events=%d receipts=%d for original completion, want 0, 0, and 1", originalEvents, originalActiveEvents, originalReceipts)
+	}
+
+	replayed, err := coordinator.Complete(context.Background(), completion)
+	if err != nil || replayed.State != domain.CircuitClosed || replayed.FailureCount != 1 {
+		t.Fatalf("failure replay after rolling prune=%+v err=%v", replayed, err)
+	}
+	var replayEvents, replayActiveEvents int
+	var replayReceiptEvent time.Time
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT count(*) FROM backend_circuit_failures WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&replayEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT count(*) FROM backend_circuit_active_failures WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&replayActiveEvents); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT event_at FROM backend_circuit_failure_receipts WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&replayReceiptEvent); err != nil {
+		t.Fatal(err)
+	}
+	if replayEvents != 0 || replayActiveEvents != 0 || !replayReceiptEvent.Equal(originalReceiptEvent) {
+		t.Fatalf("replay restored pruned event or changed receipt timestamp: events=%d active_events=%d timestamp=%s, want 0, 0, and %s", replayEvents, replayActiveEvents, replayReceiptEvent, originalReceiptEvent)
 	}
 }
 
@@ -658,8 +1428,15 @@ func TestPostgresExpiredProbeReopensCircuitAndCannotBeRevived(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := coordinator.Snapshot(f.backend.ID, time.Now())
-	if snapshot.State != domain.CircuitOpen || snapshot.Generation <= probe.Snapshot.Generation {
+	if snapshot.State != domain.CircuitOpen || snapshot.Generation <= probe.Snapshot.Generation || snapshot.FailureCount != 2 {
 		t.Fatalf("snapshot after expired probe=%+v", snapshot)
+	}
+	if err := coordinator.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	halfOpen := coordinator.Snapshot(f.backend.ID, time.Now())
+	if halfOpen.State != domain.CircuitHalfOpen || halfOpen.Generation != snapshot.Generation+1 || halfOpen.FailureCount != snapshot.FailureCount {
+		t.Fatalf("snapshot after reopened cooldown=%+v, open snapshot=%+v", halfOpen, snapshot)
 	}
 	renewed, err := coordinator.RenewProbes(context.Background(), []coordination.ProbeIdentity{*probe.Permit})
 	if err != nil || len(renewed) != 1 || renewed[0].Reason != coordination.ReasonLeaseLost {
@@ -671,11 +1448,162 @@ func TestPostgresExpiredProbeReopensCircuitAndCannotBeRevived(t *testing.T) {
 	}
 }
 
-func TestPostgresBackendRevisionSupersedesUnfinishedProbe(t *testing.T) {
+func TestPostgresSuccessfulHalfOpenGenerationClearsRetainedFailures(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createFixture(t, store, 0)
 	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Millisecond, HalfOpenMaxProbes: 1}
 	coordinator, identity, _, probe := openHalfOpenProbe(t, store, f, options, time.Minute)
+
+	closed, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: probe.Permit.PermitID, Backend: identity, Generation: probe.Permit.Generation,
+		Outcome: domain.InferenceSuccess, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || closed.State != domain.CircuitClosed || closed.FailureCount != 0 {
+		t.Fatalf("successful probe completion=%+v err=%v", closed, err)
+	}
+	if err := coordinator.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if closed := coordinator.Snapshot(f.backend.ID, time.Now()); closed.State != domain.CircuitClosed || closed.FailureCount != 0 {
+		t.Fatalf("refreshed closed snapshot=%+v", closed)
+	}
+}
+
+func TestPostgresDelayedHalfOpenFailurePrunesRollingHistory(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: 40 * time.Millisecond, OpenCooldown: time.Millisecond, HalfOpenMaxProbes: 1}
+	coordinator, identity, _, probe := openHalfOpenProbe(t, store, f, options, time.Minute)
+	time.Sleep(options.FailureWindow + 20*time.Millisecond)
+
+	reopened, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: probe.Permit.PermitID, Backend: identity, Generation: probe.Permit.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || reopened.State != domain.CircuitOpen || reopened.FailureCount != 1 {
+		t.Fatalf("delayed failed probe completion=%+v err=%v, want only the new rolling failure", reopened, err)
+	}
+}
+
+func TestPostgresRenewReconcilesExpiredPeerBeforeExtendingProbe(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: 100 * time.Millisecond, HalfOpenMaxProbes: 2}
+	coordinator, identity, _, first := openHalfOpenProbe(t, store, f, options, 250*time.Millisecond)
+	secondRequest := coordination.CircuitAcquireRequest{AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute}
+	second, err := coordinator.Acquire(context.Background(), secondRequest)
+	if err != nil || second.Permit == nil {
+		t.Fatalf("second probe=%+v err=%v", second, err)
+	}
+	if delay := time.Until(first.Permit.ExpiresAt) + 20*time.Millisecond; delay > 0 {
+		time.Sleep(delay)
+	}
+
+	renewed, err := coordinator.RenewProbes(context.Background(), []coordination.ProbeIdentity{*second.Permit})
+	if err != nil || len(renewed) != 1 || renewed[0].Reason != coordination.ReasonLeaseLost {
+		t.Fatalf("renew after peer expiry=%+v err=%v, want lease_lost", renewed, err)
+	}
+	rows, err := store.CoordinationPool().Query(context.Background(), "SELECT permit_id,outcome FROM backend_circuit_probes WHERE permit_id=ANY($1::uuid[]) ORDER BY permit_id", []string{first.Permit.PermitID.String(), second.Permit.PermitID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	outcomes := make(map[uuid.UUID]string)
+	for rows.Next() {
+		var id uuid.UUID
+		var outcome string
+		if err := rows.Scan(&id, &outcome); err != nil {
+			t.Fatal(err)
+		}
+		outcomes[id] = outcome
+	}
+	if outcomes[first.Permit.PermitID] != "expired" || outcomes[second.Permit.PermitID] != "superseded" {
+		t.Fatalf("probe outcomes=%v", outcomes)
+	}
+}
+
+func TestPostgresHalfOpenSuccessThenExpiredPeerAndLateFailureStaysOpen(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Millisecond, HalfOpenMaxProbes: 2}
+	coordinator, identity, _, expiring := openHalfOpenProbe(t, store, fixture, options, time.Minute)
+	secondRequest := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Second,
+	}
+	second, err := coordinator.Acquire(context.Background(), secondRequest)
+	if err != nil || second.Permit == nil {
+		t.Fatalf("second probe=%+v err=%v", second, err)
+	}
+	waiting, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: second.Permit.PermitID, Backend: identity, Generation: second.Permit.Generation,
+		Outcome: domain.InferenceSuccess, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || waiting.State != domain.CircuitHalfOpen {
+		t.Fatalf("success with peer outstanding=%+v err=%v", waiting, err)
+	}
+	if _, err := store.CoordinationPool().Exec(
+		context.Background(),
+		"UPDATE backend_circuit_probes SET expires_at=clock_timestamp()-interval '1 second' WHERE permit_id=$1::uuid AND outcome IS NULL",
+		expiring.Permit.PermitID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	opened := coordinator.Snapshot(fixture.backend.ID, time.Now())
+	if opened.State != domain.CircuitOpen || opened.FailureCount != 2 {
+		t.Fatalf("expired peer snapshot=%+v", opened)
+	}
+	late, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: expiring.Permit.PermitID, Backend: identity, Generation: expiring.Permit.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || late.State != domain.CircuitOpen || late.FailureCount != opened.FailureCount {
+		t.Fatalf("late failure=%+v err=%v, opened=%+v", late, err, opened)
+	}
+}
+
+func TestPostgresHalfOpenFailureSupersedesCrashedPeer(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: 100 * time.Millisecond, HalfOpenMaxProbes: 2}
+	coordinator, identity, _, crashed := openHalfOpenProbe(t, store, fixture, options, time.Minute)
+	failingRequest := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute,
+	}
+	failing, err := coordinator.Acquire(context.Background(), failingRequest)
+	if err != nil || failing.Permit == nil {
+		t.Fatalf("failing probe=%+v err=%v", failing, err)
+	}
+	opened, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: failing.Permit.PermitID, Backend: identity, Generation: failing.Permit.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || opened.State != domain.CircuitOpen {
+		t.Fatalf("failed probe=%+v err=%v", opened, err)
+	}
+	var outcome string
+	if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT outcome FROM backend_circuit_probes WHERE permit_id=$1::uuid", crashed.Permit.PermitID).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "superseded" {
+		t.Fatalf("crashed peer outcome=%q", outcome)
+	}
+	late, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
+		AttemptID: crashed.Permit.PermitID, Backend: identity, Generation: crashed.Permit.Generation,
+		Outcome: domain.InferenceSuccess, ReportedOutcomeAt: time.Now().UTC(),
+	})
+	if err != nil || late.State != domain.CircuitOpen || late.Generation != opened.Generation {
+		t.Fatalf("late superseded success=%+v err=%v", late, err)
+	}
+}
+
+func TestPostgresBackendRevisionSupersedesUnfinishedProbe(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, store, 0)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Millisecond, HalfOpenMaxProbes: 1}
+	coordinator, identity, request, probe := openHalfOpenProbe(t, store, f, options, time.Minute)
 	updated, err := store.UpdateBackend(context.Background(), f.backend.ID, basestore.UpdateBackendParams{
 		ModelPoolID: f.backend.ModelPoolID, Name: f.backend.Name, BaseURL: f.backend.BaseURL,
 		Enabled: f.backend.Enabled, Draining: f.backend.Draining, CapacityHint: f.backend.CapacityHint,
@@ -683,6 +1611,16 @@ func TestPostgresBackendRevisionSupersedesUnfinishedProbe(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	replayed, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || replayed.Reason != coordination.ReasonLeaseLost {
+		t.Fatalf("replay after backend revision=%+v err=%v, want lease_lost", replayed, err)
+	}
+	conflict := request
+	conflict.ProbeTTL += time.Second
+	conflicted, err := coordinator.Acquire(context.Background(), conflict)
+	if err != nil || conflicted.Reason != coordination.ReasonIdempotencyConflict {
+		t.Fatalf("conflicting replay after backend revision=%+v err=%v, want idempotency_conflict", conflicted, err)
 	}
 	if _, err := coordinator.Complete(context.Background(), coordination.CircuitCompletion{
 		AttemptID: probe.Permit.PermitID, Backend: identity, Generation: probe.Permit.Generation,
@@ -706,6 +1644,40 @@ func TestPostgresBackendRevisionSupersedesUnfinishedProbe(t *testing.T) {
 	}
 }
 
+func TestPostgresStaleReconcileCannotUndoAuthoritativeBackendDrain(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixture := createFixture(t, store, 0)
+	coordinator, err := coordpostgres.NewCircuitCoordinator(store, time.Second, circuitbreaker.Options{
+		FailureThreshold: 2, FailureWindow: time.Minute, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	stale := coordination.BackendIdentity{ID: fixture.backend.ID, Revision: fixture.backend.Revision, Enabled: true}
+	if err = store.SetBackendDraining(ctx, fixture.backend.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = coordinator.Reconcile(ctx, []coordination.BackendIdentity{stale}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, identity := range []coordination.BackendIdentity{
+		stale,
+		{ID: fixture.backend.ID, Revision: fixture.backend.Revision + 1, Enabled: true},
+	} {
+		decision, acquireErr := coordinator.Acquire(ctx, coordination.CircuitAcquireRequest{
+			AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute,
+		})
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		if decision.Reason != coordination.ReasonStaleBackend {
+			t.Fatalf("Acquire(%+v) = %+v, want stale_backend for authoritative drain", identity, decision)
+		}
+	}
+}
+
 func TestPostgresRejectsIncompatibleLiveReplica(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	base := coordpostgres.ReplicaPolicy{LeaseTTL: time.Minute, LeaseRenewInterval: 10 * time.Second, Circuit: circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}}
@@ -720,6 +1692,67 @@ func TestPostgresRejectsIncompatibleLiveReplica(t *testing.T) {
 	if err := second.Start(context.Background()); err == nil {
 		second.Close()
 		t.Fatal("incompatible live replica was accepted")
+	}
+}
+
+func TestPostgresConcurrentIncompatibleReplicaRegistration(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx := context.Background()
+	barrier, err := store.ConfigPool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer barrier.Rollback(ctx)
+	if _, err = barrier.Exec(ctx, "LOCK TABLE coordination_replicas IN SHARE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	policy := coordpostgres.ReplicaPolicy{
+		LeaseTTL: time.Minute, LeaseRenewInterval: 20 * time.Second,
+		Circuit: circuitbreaker.Options{FailureThreshold: 2, FailureWindow: time.Minute, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1},
+	}
+	firstManager := coordpostgres.NewReplicaManager(store, uuid.New(), policy, 5*time.Second)
+	policy.Circuit.FailureThreshold = 3
+	secondManager := coordpostgres.NewReplicaManager(store, uuid.New(), policy, 5*time.Second)
+	results := make(chan error, 2)
+	go func() { results <- firstManager.Start(ctx) }()
+	go func() { results <- secondManager.Start(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	waiting := 0
+	for waiting < 2 && time.Now().Before(deadline) {
+		if err = store.ConfigPool().QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'INSERT INTO coordination_replicas%'").Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err = barrier.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	firstErr, secondErr := <-results, <-results
+	defer firstManager.Close()
+	defer secondManager.Close()
+	if waiting != 2 {
+		t.Fatalf("could not establish registration barrier; waiting=%d", waiting)
+	}
+	if firstErr == nil && secondErr == nil {
+		t.Fatal("both incompatible replicas registered successfully")
+	}
+}
+
+func TestPostgresRejectsOlderCoordinationContract(t *testing.T) {
+	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	current := coordpostgres.ReplicaPolicy{LeaseTTL: time.Minute, LeaseRenewInterval: 10 * time.Second, Circuit: circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}}
+	first := coordpostgres.NewReplicaManager(store, uuid.New(), current, time.Second)
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	older := current
+	older.ContractVersion = 1
+	second := coordpostgres.NewReplicaManager(store, uuid.New(), older, time.Second)
+	if err := second.Start(context.Background()); err == nil {
+		second.Close()
+		t.Fatal("older coordination contract was accepted alongside version 2")
 	}
 }
 

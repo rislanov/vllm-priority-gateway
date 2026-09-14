@@ -3,6 +3,9 @@ package coordination_test
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,15 +13,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 )
 
 type leaseObserverStub struct {
 	renewFailures atomic.Int32
 	lost          atomic.Int32
+	dropped       atomic.Int32
 }
 
-func (o *leaseObserverStub) CoordinationRenewFailure() { o.renewFailures.Add(1) }
-func (o *leaseObserverStub) CoordinationLeaseLost()    { o.lost.Add(1) }
+func (o *leaseObserverStub) CoordinationRenewFailure()      { o.renewFailures.Add(1) }
+func (o *leaseObserverStub) CoordinationLeaseLost()         { o.lost.Add(1) }
+func (o *leaseObserverStub) CoordinationCompletionDropped() { o.dropped.Add(1) }
 
 type failingRenewCoordinator struct{ managerCoordinator }
 
@@ -174,6 +180,136 @@ func TestLeaseManagerBacklogOverflowFallsBackToTTL(t *testing.T) {
 	}
 	if m.DroppedCompletions() != 1 {
 		t.Fatalf("dropped=%d", m.DroppedCompletions())
+	}
+}
+
+func TestLeaseManagerPublishesDroppedCompletionMetric(t *testing.T) {
+	metrics := observability.NewMetrics()
+	blocked := &blockingCoordinator{started: make(chan struct{})}
+	manager := coordination.NewLeaseManager(context.Background(), blocked, coordination.LeaseManagerOptions{
+		CompletionBacklog: 1, Observer: metrics,
+	})
+	defer manager.Close()
+	first := manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()})
+	second := manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()})
+	third := manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()})
+	first.Complete(nil)
+	<-blocked.started
+	second.Complete(nil)
+	if third.Complete(nil) {
+		t.Fatal("overflow completion accepted")
+	}
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if sample := "llmgw_coordination_dropped_completions_total 1"; !strings.Contains(response.Body.String(), sample) {
+		t.Fatalf("metrics missing %q:\n%s", sample, response.Body.String())
+	}
+}
+
+type failingCompletionCoordinator struct {
+	managerCoordinator
+	called chan struct{}
+}
+
+func (c *failingCompletionCoordinator) Complete(context.Context, []coordination.LeaseCompletion) ([]coordination.CompleteResult, error) {
+	select {
+	case c.called <- struct{}{}:
+	default:
+	}
+	return nil, errors.New("temporary")
+}
+
+func TestLeaseManagerPublishesRetryBacklogDrops(t *testing.T) {
+	observer := &leaseObserverStub{}
+	coordinator := &failingCompletionCoordinator{called: make(chan struct{}, 2)}
+	manager := coordination.NewLeaseManager(context.Background(), coordinator, coordination.LeaseManagerOptions{
+		CompletionBacklog: 1,
+		Observer:          observer,
+	})
+	defer manager.Close()
+	first := manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()})
+	second := manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()})
+	if !first.Complete(nil) {
+		t.Fatal("first completion was not queued")
+	}
+	<-coordinator.called
+	deadline := time.Now().Add(time.Second)
+	for manager.PendingCompletions() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("first failed completion was not moved to the retry backlog")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !second.Complete(nil) {
+		t.Fatal("second completion was not accepted by the direct queue")
+	}
+	for observer.dropped.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("retry backlog drops observed = %d, want 1", observer.dropped.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type shutdownRetryCoordinator struct {
+	managerCoordinator
+	firstStarted chan struct{}
+	drained      chan []coordination.LeaseCompletion
+	calls        atomic.Int32
+}
+
+func (c *shutdownRetryCoordinator) Complete(ctx context.Context, items []coordination.LeaseCompletion) ([]coordination.CompleteResult, error) {
+	if c.calls.Add(1) == 1 {
+		close(c.firstStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	c.drained <- append([]coordination.LeaseCompletion(nil), items...)
+	return make([]coordination.CompleteResult, len(items)), nil
+}
+
+func TestLeaseManagerShutdownRetriesExtractedCompletionBatch(t *testing.T) {
+	coordinator := &shutdownRetryCoordinator{
+		firstStarted: make(chan struct{}),
+		drained:      make(chan []coordination.LeaseCompletion, 1),
+	}
+	manager := coordination.NewLeaseManager(context.Background(), coordinator, coordination.LeaseManagerOptions{
+		CompletionBacklog: 2,
+		ShutdownTimeout:   time.Second,
+	})
+	lease := coordination.LeaseIdentity{LeaseID: uuid.New()}
+	if !manager.Track(lease).Complete(nil) {
+		t.Fatal("completion was not queued")
+	}
+	<-coordinator.firstStarted
+	if err := manager.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case batch := <-coordinator.drained:
+		if len(batch) != 1 || batch[0].Lease.LeaseID != lease.LeaseID {
+			t.Fatalf("shutdown batch = %+v", batch)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not retry the extracted completion batch")
+	}
+}
+
+func TestLeaseManagerShutdownReportsPermanentlyUndeliveredCompletions(t *testing.T) {
+	observer := &leaseObserverStub{}
+	manager := coordination.NewLeaseManager(context.Background(), &failingCompletionCoordinator{called: make(chan struct{}, 2)}, coordination.LeaseManagerOptions{
+		CompletionBacklog: 1,
+		ShutdownTimeout:   25 * time.Millisecond,
+		Observer:          observer,
+	})
+	if !manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()}).Complete(nil) {
+		t.Fatal("completion was not queued")
+	}
+	if err := manager.Close(); err == nil {
+		t.Fatal("Close() hid an undelivered completion")
+	}
+	if manager.DroppedCompletions() != 1 || observer.dropped.Load() != 1 || manager.ActiveCount() != 0 {
+		t.Fatalf("dropped=%d observed=%d active=%d", manager.DroppedCompletions(), observer.dropped.Load(), manager.ActiveCount())
 	}
 }
 

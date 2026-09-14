@@ -12,6 +12,7 @@ import (
 type observedTestAdmission struct {
 	decision AdmissionDecision
 	err      error
+	refresh  error
 	cleaned  bool
 }
 
@@ -28,7 +29,7 @@ func (*observedTestAdmission) Status() Status { return Status{Backend: "postgres
 func (*observedTestAdmission) PoolInflight(int64) int {
 	return 7
 }
-func (*observedTestAdmission) RefreshInflight(context.Context) error { return nil }
+func (f *observedTestAdmission) RefreshInflight(context.Context) error { return f.refresh }
 func (f *observedTestAdmission) Cleanup(context.Context, int) error {
 	f.cleaned = true
 	return nil
@@ -43,6 +44,33 @@ type observedTestObserver struct{ calls []observedCall }
 
 func (o *observedTestObserver) CoordinationOperation(backend, operation, outcome string, _ time.Duration, reason Reason) {
 	o.calls = append(o.calls, observedCall{backend: backend, operation: operation, outcome: outcome, reason: reason})
+}
+
+type coordinationFailureObserverStub struct{ failures []error }
+
+func (o *coordinationFailureObserverStub) CoordinationFailure(err error) {
+	o.failures = append(o.failures, err)
+}
+
+func TestObserveAdmissionReportsRuntimeFailureAtOccurrence(t *testing.T) {
+	want := errors.New("database timeout")
+	next := &observedTestAdmission{refresh: want}
+	failures := &coordinationFailureObserverStub{}
+	wrapped := ObserveAdmission(next, nil, failures)
+	runtime, ok := wrapped.(AdmissionRuntime)
+	if !ok {
+		t.Fatalf("wrapped admission does not preserve runtime capability: %T", wrapped)
+	}
+	if err := runtime.RefreshInflight(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("RefreshInflight()=%v, want %v", err, want)
+	}
+	next.refresh = nil
+	if err := runtime.RefreshInflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(failures.failures) != 1 || !errors.Is(failures.failures[0], want) {
+		t.Fatalf("failures=%v, want [%v]", failures.failures, want)
+	}
 }
 
 func TestObserveAdmissionRecordsBoundedOutcomeAndPreservesRuntimeCapabilities(t *testing.T) {

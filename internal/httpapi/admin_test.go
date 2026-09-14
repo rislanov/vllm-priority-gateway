@@ -166,14 +166,14 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 	}
 }
 
-func TestAdminClientRateBoundaries(t *testing.T) {
+func TestAdminClientPolicyBoundaries(t *testing.T) {
 	handler, _, _ := newAdminFixture(t)
 	csrf := fetchCSRF(t, handler)
 	pool := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{"publicModelName": "limits", "upstreamModelName": "limits", "enabled": true}, http.StatusCreated)
 	poolID := jsonInt64(t, pool, "id")
-	base := map[string]any{"name": "bounded", "enabled": true, "priorityClass": "high", "vllmPriority": -10, "maxConcurrency": 1, "requestsPerMinute": domain.MaxRequestsPerMinute, "tokensPerMinute": domain.MaxTokensPerMinute, "modelPoolIds": []int64{poolID}}
+	base := map[string]any{"name": "bounded", "enabled": true, "priorityClass": "high", "vllmPriority": -10, "maxConcurrency": domain.MaxClientConcurrency, "requestsPerMinute": domain.MaxRequestsPerMinute, "tokensPerMinute": domain.MaxTokensPerMinute, "modelPoolIds": []int64{poolID}}
 	adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients", base, http.StatusCreated)
-	for name, value := range map[string]any{"requestsPerMinute": domain.MaxRequestsPerMinute + 1, "tokensPerMinute": domain.MaxTokensPerMinute + 1} {
+	for name, value := range map[string]any{"maxConcurrency": domain.MaxClientConcurrency + 1, "requestsPerMinute": domain.MaxRequestsPerMinute + 1, "tokensPerMinute": domain.MaxTokensPerMinute + 1} {
 		invalid := maps.Clone(base)
 		invalid["name"] = "invalid-" + name
 		invalid[name] = value
@@ -289,6 +289,18 @@ func TestAdminPoolSafetyJSONRoundTripAndValidation(t *testing.T) {
 		"maxGatewayInflight": 0, "maxWaiting": -1,
 	}, http.StatusBadRequest)
 	assertAdminValidationError(t, updateError, "max waiting cannot be negative")
+
+	boundary := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "boundary", "upstreamModelName": "boundary", "enabled": true,
+		"maxGatewayInflight": domain.MaxPoolGatewayInflight, "maxWaiting": 0,
+	}, http.StatusCreated)
+	assertJSONNumber(t, boundary, "maxGatewayInflight", domain.MaxPoolGatewayInflight)
+
+	overMaximum := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "over-maximum", "upstreamModelName": "over-maximum", "enabled": true,
+		"maxGatewayInflight": domain.MaxPoolGatewayInflight + 1, "maxWaiting": 0,
+	}, http.StatusBadRequest)
+	assertAdminValidationError(t, overMaximum, "max gateway inflight must not exceed 100000")
 }
 
 func TestRevocationPublishesAfterRequestCancellation(t *testing.T) {

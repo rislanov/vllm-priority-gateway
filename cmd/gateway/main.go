@@ -100,10 +100,6 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 			return fmt.Errorf("initialize circuit coordination: %w", err)
 		}
 		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions}, cfg.CoordinationTimeout)
-		if err := replicaManager.Start(ctx); err != nil {
-			return fmt.Errorf("register PostgreSQL coordination replica: %w", err)
-		}
-		defer replicaManager.Close()
 	} else {
 		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
 		circuitCoordinator, err = coordlocal.NewCircuitCoordinator(circuitOptions, time.Now)
@@ -111,85 +107,12 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 			return fmt.Errorf("initialize local circuit coordination: %w", err)
 		}
 	}
-	coordinationObserver := observability.CoordinationMulti(metrics, eventLogger)
-	admissionCoordinator = coordination.ObserveAdmission(admissionCoordinator, coordinationObserver)
-	circuitCoordinator = coordination.ObserveCircuit(circuitCoordinator, coordinationObserver)
-	if postgresDatabase, ok := database.(*pgstore.Store); ok {
-		go postgresDatabase.WatchCircuit(ctx, cfg.MetricsInterval, circuitCoordinator.Refresh, pgstore.WatchHooks{ReloadFailure: func(error) {
-			metrics.CircuitRefreshFailure()
-		}})
-	}
-	transport := &http.Transport{
-		Proxy:             http.ProxyFromEnvironment,
-		DialContext:       (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 64,
-		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: cfg.TLSHandshakeTimeout,
-		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
-	}
-	defer transport.CloseIdleConnections()
-	upstreamClient := &http.Client{Transport: transport}
-	manager := monitor.NewManager(ctx, monitor.Options{
-		HTTPClient: upstreamClient, HealthInterval: cfg.HealthInterval, HealthTimeout: cfg.HealthTimeout,
-		MetricsInterval: cfg.MetricsInterval, MetricsTimeout: cfg.MetricsTimeout, StaleAfter: cfg.MetricsStaleAfter,
-		UnhealthyAfter: cfg.UnhealthyAfter, RecoveryAfter: cfg.RecoveryAfter,
-		Circuit: circuitOptions, CircuitCoordinator: circuitCoordinator, AdmissionRuntime: admissionCoordinator.(coordination.AdmissionRuntime), ReplicaID: replicaID, ProbeTTL: cfg.LeaseTTL,
-		Limits:     pressure.Limits{QueueSoft: cfg.QueueSoftLimit, KVSoft: cfg.KVSoftLimit, KVHard: cfg.KVHardLimit},
-		EWMAWindow: cfg.EWMAWindow, BusyThreshold: cfg.BusyThreshold, SaturatedThreshold: cfg.SaturatedThreshold,
-		PoolThresholds: pressure.Thresholds{
-			Busy: cfg.BusyThreshold, Saturated: cfg.SaturatedThreshold, Emergency: cfg.EmergencyThreshold,
-			BusyRecovery: cfg.BusyRecoveryThreshold, SaturatedRecovery: cfg.SaturatedRecoveryThreshold,
-			EmergencyRecovery: cfg.EmergencyRecoveryThreshold, EnterWindow: cfg.OverloadEnterWindow,
-			RecoveryWindow: cfg.OverloadRecoveryWindow,
-		},
-	})
-	defer manager.Shutdown()
-	if err := manager.Reconcile(backends(registryValue.Snapshot())); err != nil {
-		return fmt.Errorf("start backend monitoring: %w", err)
-	}
-
-	apiKeyUsage := newAPIKeyUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
-	apiKeyUsageClosed := false
-	closeAPIKeyUsage := func() {
-		if !apiKeyUsageClosed {
-			apiKeyUsageClosed = true
-			apiKeyUsage.Close()
-		}
-	}
-	defer closeAPIKeyUsage()
-	requestRecorder := analytics.NewRecorder(database, cfg.AnalyticsRetention, metrics.UsagePersistenceFailure, logger)
-	requestRecorderClosed := false
+	var manager *monitor.Manager
 	var leaseManager *coordination.LeaseManager
-	closeRequestRecorder := func(closeCtx context.Context) error {
-		if requestRecorderClosed {
-			return nil
-		}
-		requestRecorderClosed = true
-		cancelRun()
-		manager.Shutdown()
-		if replicaManager != nil {
-			replicaManager.Close()
-		}
-		if leaseManager != nil {
-			_ = leaseManager.Close()
-		}
-		closeAPIKeyUsage()
-		return closeRecorderStore(closeCtx, requestRecorder, database)
-	}
-	databaseOwnedByRun = false
-	defer func() {
-		if requestRecorderClosed {
-			return
-		}
-		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
-		defer cancel()
-		if err := closeRequestRecorder(closeCtx); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("drain usage recorder: %w", err))
-		}
-	}()
-	leaseManager = coordination.NewLeaseManager(ctx, admissionCoordinator, coordination.LeaseManagerOptions{RenewInterval: cfg.LeaseRenewInterval, CompletionBacklog: cfg.CoordinationCompletionBacklog, ShutdownTimeout: cfg.ShutdownGracePeriod, Observer: metrics})
 	var recoveryManager *coordination.RecoveryManager
+	var reloadConfiguration func(context.Context) error
 	if postgresDatabase, ok := database.(*pgstore.Store); ok {
-		reloadConfiguration := func(parent context.Context) error {
+		reloadConfiguration = func(parent context.Context) error {
 			reloadCtx, cancel := context.WithTimeout(parent, cfg.ConfigPollInterval)
 			defer cancel()
 			captured := revisionGuard.Highest()
@@ -220,9 +143,98 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 				}
 				return admissionCoordinator.(coordination.AdmissionRuntime).RefreshInflight(recoveryCtx)
 			},
-			ReplayFailures:  manager.ReplayCircuitFailures,
-			RefreshCircuits: circuitCoordinator.Refresh,
+			ReplayFailures: func(recoveryCtx context.Context) error {
+				return manager.ReplayCircuitFailures(recoveryCtx)
+			},
+			RefreshCircuits: func(recoveryCtx context.Context) error {
+				return circuitCoordinator.Refresh(recoveryCtx)
+			},
 		}, time.Now, eventLogger)
+		admissionCoordinator.(*coordpostgres.AdmissionCoordinator).SetFailureObserver(recoveryManager)
+		circuitCoordinator.(*coordpostgres.CircuitCoordinator).SetFailureObserver(recoveryManager)
+		replicaManager.SetFailureObserver(recoveryManager)
+		if err := replicaManager.Start(ctx); err != nil {
+			return fmt.Errorf("register PostgreSQL coordination replica: %w", err)
+		}
+		defer replicaManager.Close()
+	}
+	coordinationObserver := observability.CoordinationMulti(metrics, eventLogger)
+	admissionCoordinator = coordination.ObserveAdmission(admissionCoordinator, coordinationObserver)
+	circuitCoordinator = coordination.ObserveCircuit(circuitCoordinator, coordinationObserver)
+	if postgresDatabase, ok := database.(*pgstore.Store); ok {
+		go postgresDatabase.WatchCircuit(ctx, cfg.MetricsInterval, circuitCoordinator.Refresh, pgstore.WatchHooks{ReloadFailure: func(error) {
+			metrics.CircuitRefreshFailure()
+		}})
+	}
+	transport := &http.Transport{
+		Proxy:             http.ProxyFromEnvironment,
+		DialContext:       (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2: true, MaxIdleConns: 256, MaxIdleConnsPerHost: 64,
+		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: cfg.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+	}
+	defer transport.CloseIdleConnections()
+	upstreamClient := &http.Client{Transport: transport}
+	manager = monitor.NewManager(ctx, monitor.Options{
+		HTTPClient: upstreamClient, HealthInterval: cfg.HealthInterval, HealthTimeout: cfg.HealthTimeout,
+		MetricsInterval: cfg.MetricsInterval, MetricsTimeout: cfg.MetricsTimeout, StaleAfter: cfg.MetricsStaleAfter,
+		UnhealthyAfter: cfg.UnhealthyAfter, RecoveryAfter: cfg.RecoveryAfter,
+		Circuit: circuitOptions, CircuitCoordinator: circuitCoordinator, AdmissionRuntime: admissionCoordinator.(coordination.AdmissionRuntime), Observer: metrics, ReplicaID: replicaID, ProbeTTL: cfg.LeaseTTL, ProbeRenewInterval: cfg.LeaseRenewInterval,
+		Limits:     pressure.Limits{QueueSoft: cfg.QueueSoftLimit, KVSoft: cfg.KVSoftLimit, KVHard: cfg.KVHardLimit},
+		EWMAWindow: cfg.EWMAWindow, BusyThreshold: cfg.BusyThreshold, SaturatedThreshold: cfg.SaturatedThreshold,
+		PoolThresholds: pressure.Thresholds{
+			Busy: cfg.BusyThreshold, Saturated: cfg.SaturatedThreshold, Emergency: cfg.EmergencyThreshold,
+			BusyRecovery: cfg.BusyRecoveryThreshold, SaturatedRecovery: cfg.SaturatedRecoveryThreshold,
+			EmergencyRecovery: cfg.EmergencyRecoveryThreshold, EnterWindow: cfg.OverloadEnterWindow,
+			RecoveryWindow: cfg.OverloadRecoveryWindow,
+		},
+	})
+	defer manager.Shutdown()
+	if err := manager.Reconcile(backends(registryValue.Snapshot())); err != nil {
+		return fmt.Errorf("start backend monitoring: %w", err)
+	}
+
+	apiKeyUsage := newAPIKeyUsageRecorder(ctx, projectedKeyUsageStore{destination: database, projection: registryValue})
+	apiKeyUsageClosed := false
+	closeAPIKeyUsage := func() {
+		if !apiKeyUsageClosed {
+			apiKeyUsageClosed = true
+			apiKeyUsage.Close()
+		}
+	}
+	defer closeAPIKeyUsage()
+	requestRecorder := analytics.NewRecorder(database, cfg.AnalyticsRetention, metrics.UsagePersistenceFailure, logger)
+	requestRecorderClosed := false
+	closeRequestRecorder := func(closeCtx context.Context) error {
+		if requestRecorderClosed {
+			return nil
+		}
+		requestRecorderClosed = true
+		cancelRun()
+		manager.Shutdown()
+		if replicaManager != nil {
+			replicaManager.Close()
+		}
+		var leaseErr error
+		if leaseManager != nil {
+			leaseErr = leaseManager.Close()
+		}
+		closeAPIKeyUsage()
+		return errors.Join(leaseErr, closeRecorderStore(closeCtx, requestRecorder, database))
+	}
+	databaseOwnedByRun = false
+	defer func() {
+		if requestRecorderClosed {
+			return
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
+		defer cancel()
+		if err := closeRequestRecorder(closeCtx); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("drain usage recorder: %w", err))
+		}
+	}()
+	leaseManager = coordination.NewLeaseManager(ctx, admissionCoordinator, coordination.LeaseManagerOptions{RenewInterval: cfg.LeaseRenewInterval, CompletionBacklog: cfg.CoordinationCompletionBacklog, ShutdownTimeout: cfg.ShutdownGracePeriod, Observer: metrics})
+	if postgresDatabase, ok := database.(*pgstore.Store); ok {
 		recoveryManager.MarkDegraded(nil)
 		if err := recoveryManager.Recover(ctx); err != nil {
 			return fmt.Errorf("initialize PostgreSQL recovery barrier: %w", err)
@@ -288,18 +300,22 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	router.Get("/healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, map[string]any{"status": "alive"})
 	})
-	router.Get("/readyz", func(writer http.ResponseWriter, _ *http.Request) {
+	router.Get("/readyz", func(writer http.ResponseWriter, request *http.Request) {
 		view := adminService.View()
 		coordinationStatus := coordinationReadiness(admissionCoordinator, circuitCoordinator, replicaManager, revisionGuard, recoveryManager)
+		analyticsStatus := analyticsReadiness(request.Context(), database, requestRecorder, cfg.CoordinationTimeout)
 		status := "ready"
 		configurationStatus := "ready"
 		if coordinationStatus != "ready" {
 			status = "degraded"
 			configurationStatus = coordinationStatus
 		}
+		if analyticsStatus != "ready" {
+			status = "degraded"
+		}
 		writeJSON(writer, http.StatusOK, map[string]any{
 			"status": status, "revision": view.Revision, "backendAvailability": availableBackends(view),
-			"components": map[string]string{"configuration": configurationStatus, "coordination": coordinationStatus, "analytics": coordinationStatus},
+			"components": map[string]string{"configuration": configurationStatus, "coordination": coordinationStatus, "analytics": analyticsStatus},
 		})
 	})
 	router.Get("/coordination-readyz", func(writer http.ResponseWriter, _ *http.Request) {
@@ -406,7 +422,25 @@ func availableBackends(view httpapi.AdminView) int {
 
 func coordinationReadiness(admissionCoordinator coordination.AdmissionCoordinator, circuitCoordinator coordination.CircuitCoordinator, replica *coordpostgres.ReplicaManager, guard *registry.RevisionGuard, recovery *coordination.RecoveryManager) string {
 	if guard != nil && guard.Faulted() {
+		if recovery != nil {
+			recovery.MarkPermanent(errors.New("configuration revision consistency fault"))
+		}
 		return "consistency_fault"
+	}
+	if admissionCoordinator.Status().Permanent || circuitCoordinator.Status().Permanent || replica != nil && replica.Status().Permanent {
+		if recovery != nil {
+			recovery.MarkPermanent(errors.New("PostgreSQL coordination consistency fault"))
+		}
+		return "consistency_fault"
+	}
+	if replica != nil && !replica.Compatible() {
+		return "incompatible"
+	}
+	if !admissionCoordinator.Status().Available || !circuitCoordinator.Status().Available || replica != nil && !replica.Status().Available {
+		if recovery != nil {
+			recovery.MarkDegraded(errors.New("PostgreSQL coordination unavailable"))
+		}
+		return "degraded"
 	}
 	if recovery != nil {
 		switch recovery.Status().State {
@@ -416,19 +450,31 @@ func coordinationReadiness(admissionCoordinator coordination.AdmissionCoordinato
 			return "degraded"
 		}
 	}
-	if admissionCoordinator.Status().Permanent || circuitCoordinator.Status().Permanent {
-		return "consistency_fault"
-	}
-	if !admissionCoordinator.Status().Available || !circuitCoordinator.Status().Available {
+	return "ready"
+}
+
+type analyticsPinger interface {
+	PingAnalytics(context.Context) error
+}
+
+type analyticsHealth interface {
+	Healthy() bool
+}
+
+func analyticsReadiness(parent context.Context, destination any, recorder analyticsHealth, timeout time.Duration) string {
+	if recorder != nil && !recorder.Healthy() {
 		return "degraded"
 	}
-	if replica != nil && replica.Status().Permanent {
-		return "consistency_fault"
+	pinger, ok := destination.(analyticsPinger)
+	if !ok {
+		return "ready"
 	}
-	if replica != nil && !replica.Status().Available {
-		if !replica.Compatible() {
-			return "incompatible"
-		}
+	if timeout <= 0 {
+		timeout = 50 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	if err := pinger.PingAnalytics(ctx); err != nil {
 		return "degraded"
 	}
 	return "ready"

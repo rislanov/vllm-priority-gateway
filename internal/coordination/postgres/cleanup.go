@@ -101,13 +101,15 @@ func (c *AdmissionCoordinator) cleanupExpired(ctx context.Context, items []expir
 		return err
 	}
 	for _, item := range items {
-		_, err = tx.Exec(ctx, "UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours' WHERE lease_id=$1::uuid AND completed_at IS NULL", item.id, now)
-		if err != nil {
-			return err
+		tag, deleteErr := tx.Exec(ctx, "DELETE FROM request_leases WHERE lease_id=$1::uuid AND expires_at<=$2::timestamptz", item.id, now)
+		if deleteErr != nil {
+			return deleteErr
 		}
-		_, err = tx.Exec(ctx, "DELETE FROM request_leases WHERE lease_id=$1::uuid AND expires_at<=$2::timestamptz", item.id, now)
-		if err != nil {
-			return err
+		if tag.RowsAffected() == 1 {
+			_, err = tx.Exec(ctx, "UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours' WHERE lease_id=$1::uuid AND completed_at IS NULL", item.id, now)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit(ctx)

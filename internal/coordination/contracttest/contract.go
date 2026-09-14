@@ -22,6 +22,51 @@ func (c *Clock) Add(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.U
 
 type AdmissionFactory func(*Clock) coordination.AdmissionCoordinator
 
+// AdmissionBaselineFactory builds a backend-specific coordinator and a valid
+// request generator while the assertions remain independent of storage and
+// clock implementation.
+type AdmissionBaselineFactory func(*testing.T, int64) (coordination.AdmissionCoordinator, func() coordination.AdmissionRequest)
+
+func AdmissionBaseline(t *testing.T, factory AdmissionBaselineFactory) {
+	t.Helper()
+	t.Run("lease replay concurrency and completion", func(t *testing.T) {
+		coordinator, request := factory(t, 0)
+		firstRequest := request()
+		first, err := coordinator.Acquire(context.Background(), firstRequest)
+		if err != nil || !first.Admitted() {
+			t.Fatalf("first=%+v err=%v", first, err)
+		}
+		replay, err := coordinator.Acquire(context.Background(), firstRequest)
+		if err != nil || replay.Lease == nil || replay.Lease.LeaseID != firstRequest.LeaseID {
+			t.Fatalf("replay=%+v err=%v", replay, err)
+		}
+		if blocked, err := coordinator.Acquire(context.Background(), request()); err != nil || blocked.Reason != coordination.ReasonConcurrencyExhausted {
+			t.Fatalf("blocked=%+v err=%v", blocked, err)
+		}
+		results, err := coordinator.Complete(context.Background(), []coordination.LeaseCompletion{{Lease: first.Lease.Identity()}})
+		if err != nil || len(results) != 1 || results[0].Result != coordination.CompletionReleased {
+			t.Fatalf("complete=%+v err=%v", results, err)
+		}
+		results, err = coordinator.Complete(context.Background(), []coordination.LeaseCompletion{{Lease: first.Lease.Identity()}})
+		if err != nil || len(results) != 1 || results[0].Result != coordination.CompletionAlreadyCompleted {
+			t.Fatalf("duplicate complete=%+v err=%v", results, err)
+		}
+	})
+	t.Run("RPM debit", func(t *testing.T) {
+		coordinator, request := factory(t, 1)
+		first, err := coordinator.Acquire(context.Background(), request())
+		if err != nil || !first.Admitted() {
+			t.Fatalf("first=%+v err=%v", first, err)
+		}
+		if _, err := coordinator.Complete(context.Background(), []coordination.LeaseCompletion{{Lease: first.Lease.Identity()}}); err != nil {
+			t.Fatal(err)
+		}
+		if blocked, err := coordinator.Acquire(context.Background(), request()); err != nil || blocked.Reason != coordination.ReasonRPMExhausted {
+			t.Fatalf("RPM=%+v err=%v", blocked, err)
+		}
+	})
+}
+
 func Admission(t *testing.T, factory AdmissionFactory) {
 	t.Helper()
 	t.Run("idempotency expiry and unlimited pool accounting", func(t *testing.T) {
@@ -81,6 +126,41 @@ func requestWithRPM(at time.Time, client, pool int64) coordination.AdmissionRequ
 }
 
 type CircuitFactory func(*Clock) coordination.CircuitCoordinator
+
+type CircuitBaselineFactory func(*testing.T) (coordination.CircuitCoordinator, coordination.BackendIdentity)
+
+func CircuitBaseline(t *testing.T, factory CircuitBaselineFactory) {
+	t.Helper()
+	coordinator, backend := factory(t)
+	if err := coordinator.Reconcile(context.Background(), []coordination.BackendIdentity{backend}); err != nil {
+		t.Fatal(err)
+	}
+	request := coordination.CircuitAcquireRequest{
+		AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: backend, ProbeTTL: time.Minute,
+	}
+	decision, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || decision.Reason != "" {
+		t.Fatalf("closed acquire=%+v err=%v", decision, err)
+	}
+	completion := coordination.CircuitCompletion{
+		AttemptID: request.AttemptID, Backend: backend, Generation: decision.Snapshot.Generation,
+		Outcome: domain.InferenceFailure, ReportedOutcomeAt: time.Now().UTC(),
+	}
+	first, err := coordinator.Complete(context.Background(), completion)
+	if err != nil || first.State != domain.CircuitOpen {
+		t.Fatalf("first completion=%+v err=%v", first, err)
+	}
+	replay, err := coordinator.Complete(context.Background(), completion)
+	if err != nil || replay.State != domain.CircuitOpen {
+		t.Fatalf("completion replay=%+v err=%v", replay, err)
+	}
+	request.AttemptID = uuid.New()
+	request.AcquisitionStartedAt = time.Now().UTC()
+	blocked, err := coordinator.Acquire(context.Background(), request)
+	if err != nil || blocked.Reason != coordination.ReasonCircuitOpen {
+		t.Fatalf("open acquire=%+v err=%v", blocked, err)
+	}
+}
 
 func Circuit(t *testing.T, factory CircuitFactory) {
 	t.Helper()

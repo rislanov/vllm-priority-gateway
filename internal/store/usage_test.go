@@ -105,6 +105,30 @@ func TestAnalyticsRangeFiltersAggregatesAndPartialCache(t *testing.T) {
 	}
 }
 
+func TestSQLiteUsageRetentionDeletesOneBoundedBatch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	cutoff := time.Unix(1_800_000_000, 0).UTC()
+	records := make([]analytics.RequestRecord, 1001)
+	for index := range records {
+		records[index] = analyticsUsageRecord(fmt.Sprintf("retention-%d", index), cutoff.Add(-time.Hour), 1, "client", 1, "model", nil, nil, nil)
+	}
+	if err := db.InsertUsageBatch(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := db.DeleteUsageBefore(ctx, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1000 {
+		t.Fatalf("deleted = %d, want one 1000-row batch", deleted)
+	}
+	page, err := db.UsageRequests(ctx, analytics.Filter{From: cutoff.Add(-2 * time.Hour), To: cutoff}, 10, 0)
+	if err != nil || page.Total != 1 {
+		t.Fatalf("remaining page = %+v err=%v", page, err)
+	}
+}
+
 func TestUsageRangeBoundsCeilFractionalMillisecondsForEveryQueryPath(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)

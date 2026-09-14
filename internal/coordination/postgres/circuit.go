@@ -27,9 +27,10 @@ type CircuitCoordinator struct {
 	timeout time.Duration
 	options circuitbreaker.Options
 
-	mu     sync.RWMutex
-	cache  map[int64]coordination.CircuitSnapshot
-	status coordination.Status
+	mu       sync.RWMutex
+	cache    map[int64]coordination.CircuitSnapshot
+	status   coordination.Status
+	failures failurePublisher
 }
 
 func NewCircuitCoordinator(store *pgstore.Store, timeout time.Duration, options circuitbreaker.Options) (*CircuitCoordinator, error) {
@@ -52,6 +53,10 @@ func (c *CircuitCoordinator) Status() coordination.Status {
 	return c.status
 }
 
+func (c *CircuitCoordinator) SetFailureObserver(observer coordination.CoordinationFailureObserver) {
+	c.failures.set(observer)
+}
+
 func (c *CircuitCoordinator) setStatus(ok bool, reason coordination.Reason) {
 	c.mu.Lock()
 	if c.status.Permanent {
@@ -65,6 +70,9 @@ func (c *CircuitCoordinator) setStatus(ok bool, reason coordination.Reason) {
 		c.status.LastSuccess = time.Now().UTC()
 	}
 	c.mu.Unlock()
+	if !ok {
+		c.failures.unavailable()
+	}
 }
 func (c *CircuitCoordinator) setPermanent() {
 	c.mu.Lock()
@@ -73,6 +81,7 @@ func (c *CircuitCoordinator) setPermanent() {
 	c.status.Permanent = true
 	c.status.Reason = coordination.ReasonCoordinationUnavailable
 	c.mu.Unlock()
+	c.failures.permanent()
 }
 
 func (c *CircuitCoordinator) Snapshot(backendID int64, _ time.Time) coordination.CircuitSnapshot {
@@ -114,22 +123,33 @@ func (c *CircuitCoordinator) Reconcile(parent context.Context, values []coordina
 	for _, value := range values {
 		var revision int64
 		err = tx.QueryRow(ctx, "SELECT backend_revision FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", value.ID).Scan(&revision)
-		if errors.Is(err, pgx.ErrNoRows) {
-			_, err = tx.Exec(ctx, "INSERT INTO backend_circuit_state(backend_id,backend_revision,state,generation,half_open_succeeded,updated_at) VALUES($1::bigint,$2::bigint,'closed',0,false,clock_timestamp())", value.ID, value.Revision)
+		stateExists := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
 		}
+		authoritative, err := lockBackendIdentity(ctx, tx, value.ID)
 		if err != nil {
 			return err
 		}
-		if revision != 0 && revision != value.Revision {
-			if err := terminalizeProbes(ctx, tx, value.ID, "superseded"); err != nil {
-				return err
-			}
-			_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=clock_timestamp() WHERE backend_id=$1::bigint", value.ID, value.Revision)
+		if !stateExists {
+			_, err = tx.Exec(ctx, "INSERT INTO backend_circuit_state(backend_id,backend_revision,state,generation,half_open_succeeded,updated_at) VALUES($1::bigint,$2::bigint,'closed',0,false,clock_timestamp())", value.ID, authoritative.Revision)
 			if err != nil {
 				return err
 			}
 		}
-		if !value.Enabled || value.Draining {
+		if stateExists && revision != authoritative.Revision {
+			if err := terminalizeProbes(ctx, tx, value.ID, "superseded"); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", value.ID); err != nil {
+				return err
+			}
+			_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=clock_timestamp() WHERE backend_id=$1::bigint", value.ID, authoritative.Revision)
+			if err != nil {
+				return err
+			}
+		}
+		if !authoritative.Enabled || authoritative.Draining {
 			if err := terminalizeProbes(ctx, tx, value.ID, "superseded"); err != nil {
 				return err
 			}
@@ -170,19 +190,19 @@ func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 	}()
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
-	ids, err := c.halfOpenBackendIDs(ctx)
+	ids, err := c.reconcilableBackendIDs(ctx)
 	if err != nil {
 		c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		return err
 	}
 	for _, id := range ids {
-		if err := c.reconcileBackendExpiry(ctx, id); err != nil {
+		if err := c.reconcileBackendState(ctx, id); err != nil {
 			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 			return err
 		}
 	}
 	rows, err := c.pool.Query(ctx, `SELECT s.backend_id,s.backend_revision,s.state,s.generation,s.opened_at,s.half_open_succeeded,
-		(SELECT count(*) FROM backend_circuit_failures f WHERE f.backend_id=s.backend_id AND f.backend_revision=s.backend_revision AND f.circuit_generation=s.generation AND f.event_at>=clock_timestamp()-$1::interval),
+		(SELECT count(*) FROM backend_circuit_active_failures f WHERE f.backend_id=s.backend_id AND f.backend_revision=s.backend_revision AND (s.state<>'closed' OR f.event_at>=clock_timestamp()-$1::interval)),
 		(SELECT count(*) FROM backend_circuit_probes p WHERE p.backend_id=s.backend_id AND p.backend_revision=s.backend_revision AND p.circuit_generation=s.generation AND p.outcome IS NULL AND p.expires_at>clock_timestamp())
 		FROM backend_circuit_state s`, c.options.FailureWindow)
 	if err != nil {
@@ -227,8 +247,8 @@ func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 	return nil
 }
 
-func (c *CircuitCoordinator) halfOpenBackendIDs(ctx context.Context) ([]int64, error) {
-	rows, err := c.pool.Query(ctx, "SELECT backend_id FROM backend_circuit_state WHERE state='half_open' ORDER BY backend_id")
+func (c *CircuitCoordinator) reconcilableBackendIDs(ctx context.Context) ([]int64, error) {
+	rows, err := c.pool.Query(ctx, "SELECT backend_id FROM backend_circuit_state WHERE state='half_open' OR (state='open' AND opened_at IS NOT NULL AND opened_at+$1::interval<=clock_timestamp()) ORDER BY backend_id", c.options.OpenCooldown)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +256,7 @@ func (c *CircuitCoordinator) halfOpenBackendIDs(ctx context.Context) ([]int64, e
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (id int64, err error) { err = row.Scan(&id); return })
 }
 
-func (c *CircuitCoordinator) reconcileBackendExpiry(ctx context.Context, backendID int64) error {
+func (c *CircuitCoordinator) reconcileBackendState(ctx context.Context, backendID int64) error {
 	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
@@ -249,18 +269,29 @@ func (c *CircuitCoordinator) reconcileBackendExpiry(ctx context.Context, backend
 	if err != nil {
 		return err
 	}
-	if state.State != domain.CircuitHalfOpen {
-		return tx.Commit(ctx)
-	}
-	if _, err = tx.Exec(ctx, "SELECT permit_id FROM backend_circuit_probes WHERE backend_id=$1::bigint AND outcome IS NULL ORDER BY permit_id FOR UPDATE", backendID); err != nil {
-		return err
+	if state.State == domain.CircuitHalfOpen {
+		if _, err = tx.Exec(ctx, "SELECT permit_id FROM backend_circuit_probes WHERE backend_id=$1::bigint AND outcome IS NULL ORDER BY permit_id FOR UPDATE", backendID); err != nil {
+			return err
+		}
 	}
 	var now time.Time
 	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return err
 	}
-	if _, _, err = c.reconcileExpired(ctx, tx, state, now); err != nil {
+	state, expired, err := c.reconcileExpired(ctx, tx, state, now)
+	if err != nil {
 		return err
+	}
+	if !expired && state.State == domain.CircuitOpen && !state.RetryAt.IsZero() && !now.Before(state.RetryAt) {
+		state.State = domain.CircuitHalfOpen
+		state.Generation++
+		state.RetryAt = time.Time{}
+		state.ProbesInFlight = 0
+		state.Available = true
+		if _, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET state='half_open',generation=$2::bigint,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", backendID, state.Generation, now); err != nil {
+			return err
+		}
+		_, _ = tx.Exec(ctx, "SELECT pg_notify('llmgw_circuit_changed',$1::text)", backendID)
 	}
 	return tx.Commit(ctx)
 }
@@ -269,9 +300,13 @@ func (c *CircuitCoordinator) Acquire(parent context.Context, request coordinatio
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 	var decision coordination.CircuitDecision
+	var handled bool
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
-		decision, err = c.acquire(ctx, request)
+		decision, handled, err = c.acquireClosed(ctx, request)
+		if err == nil && !handled {
+			decision, err = c.acquire(ctx, request)
+		}
 		if err == nil || !retryableCoordinationError(err) || ctx.Err() != nil {
 			break
 		}
@@ -279,7 +314,9 @@ func (c *CircuitCoordinator) Acquire(parent context.Context, request coordinatio
 	if err != nil {
 		var reason coordination.ReasonError
 		if errors.As(err, &reason) {
-			c.setStatus(true, "")
+			if !handled {
+				c.setStatus(true, "")
+			}
 			return decision, err
 		}
 		if permanentCoordinationError(err) {
@@ -292,6 +329,9 @@ func (c *CircuitCoordinator) Acquire(parent context.Context, request coordinatio
 			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		}
 		return coordination.CircuitDecision{Reason: coordination.ReasonCoordinationUnavailable}, err
+	}
+	if handled {
+		return decision, nil
 	}
 	c.setStatus(true, "")
 	_ = c.Refresh(parent)
@@ -309,12 +349,21 @@ func (c *CircuitCoordinator) acquire(ctx context.Context, request coordination.C
 		return coordination.CircuitDecision{}, err
 	}
 	state, err := lockCircuitState(ctx, tx, request.Backend.ID)
-	if errors.Is(err, pgx.ErrNoRows) || state.Backend.Revision != request.Backend.Revision || !request.Backend.Enabled || request.Backend.Draining {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return commitCircuitDecision(ctx, tx, coordination.CircuitDecision{Reason: coordination.ReasonStaleBackend})
 	}
 	if err != nil {
 		return coordination.CircuitDecision{}, err
 	}
+	authoritative, err := lockBackendIdentity(ctx, tx, request.Backend.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return commitCircuitDecision(ctx, tx, coordination.CircuitDecision{Reason: coordination.ReasonStaleBackend})
+	}
+	if err != nil {
+		return coordination.CircuitDecision{}, err
+	}
+	state.Backend.Enabled = authoritative.Enabled
+	state.Backend.Draining = authoritative.Draining
 	if _, err = tx.Exec(ctx, "SELECT permit_id FROM backend_circuit_probes WHERE backend_id=$1::bigint AND outcome IS NULL ORDER BY permit_id FOR UPDATE", request.Backend.ID); err != nil {
 		return coordination.CircuitDecision{}, err
 	}
@@ -325,6 +374,12 @@ func (c *CircuitCoordinator) acquire(ctx context.Context, request coordination.C
 	state, changed, err := c.reconcileExpired(ctx, tx, state, now)
 	if err != nil {
 		return coordination.CircuitDecision{}, err
+	}
+	if state.State == domain.CircuitClosed {
+		state.FailureCount, err = currentClosedFailureCount(ctx, tx, state, now, c.options.FailureWindow)
+		if err != nil {
+			return coordination.CircuitDecision{}, err
+		}
 	}
 	var stored []byte
 	var backendRevision, generation int64
@@ -343,6 +398,9 @@ func (c *CircuitCoordinator) acquire(ctx context.Context, request coordination.C
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return coordination.CircuitDecision{}, err
+	}
+	if state.Backend.Revision != authoritative.Revision || authoritative.Revision != request.Backend.Revision || !authoritative.Enabled || authoritative.Draining {
+		return commitCircuitDecision(ctx, tx, coordination.CircuitDecision{Snapshot: state, Reason: coordination.ReasonStaleBackend})
 	}
 	if request.AcquisitionStartedAt.After(now.Add(5*time.Minute)) || !request.AcquisitionStartedAt.After(now.Add(-circuitCompletionRetention)) {
 		return commitCircuitDecision(ctx, tx, coordination.CircuitDecision{Snapshot: state, Reason: coordination.ReasonStaleOperation})
@@ -388,12 +446,70 @@ func (c *CircuitCoordinator) acquire(ctx context.Context, request coordination.C
 	return commitCircuitDecision(ctx, tx, coordination.CircuitDecision{Snapshot: state, Permit: &permit})
 }
 
+func (c *CircuitCoordinator) acquireClosed(ctx context.Context, request coordination.CircuitAcquireRequest) (coordination.CircuitDecision, bool, error) {
+	state, authoritative, now, retainedPermit, err := c.readCommittedCircuit(ctx, request.Backend.ID, request.AttemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return coordination.CircuitDecision{Reason: coordination.ReasonStaleBackend}, true, nil
+	}
+	if err != nil {
+		return coordination.CircuitDecision{}, false, err
+	}
+	if retainedPermit {
+		return coordination.CircuitDecision{}, false, nil
+	}
+	if state.Backend.Revision != authoritative.Revision || authoritative.Revision != request.Backend.Revision || !authoritative.Enabled || authoritative.Draining {
+		return coordination.CircuitDecision{Snapshot: state, Reason: coordination.ReasonStaleBackend}, true, nil
+	}
+	if !validCircuitOperationTime(request.AcquisitionStartedAt, now) {
+		return coordination.CircuitDecision{Snapshot: state, Reason: coordination.ReasonStaleOperation}, true, nil
+	}
+	if state.State != domain.CircuitClosed {
+		return coordination.CircuitDecision{}, false, nil
+	}
+	state.Available = true
+	return coordination.CircuitDecision{Snapshot: state}, true, nil
+}
+
+func (c *CircuitCoordinator) readCommittedCircuit(ctx context.Context, backendID int64, attemptID uuid.UUID) (coordination.CircuitSnapshot, coordination.BackendIdentity, time.Time, bool, error) {
+	var snapshot coordination.CircuitSnapshot
+	authoritative := coordination.BackendIdentity{ID: backendID}
+	var state string
+	var opened *time.Time
+	var now time.Time
+	var retainedPermit bool
+	err := c.pool.QueryRow(ctx, `WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS now)
+		SELECT s.backend_id,s.backend_revision,s.state,s.generation,s.opened_at,
+		(SELECT count(*) FROM backend_circuit_active_failures f, observed o
+		 WHERE f.backend_id=s.backend_id AND f.backend_revision=s.backend_revision AND f.event_at>=o.now-$3::interval),
+		b.revision,b.enabled,b.draining,
+		EXISTS(SELECT 1 FROM backend_circuit_probes p WHERE p.permit_id=$2::uuid),o.now
+		FROM backend_circuit_state s
+		JOIN backends b ON b.id=s.backend_id
+		CROSS JOIN observed o
+		WHERE s.backend_id=$1::bigint`, backendID, attemptID, c.options.FailureWindow).Scan(
+		&snapshot.Backend.ID, &snapshot.Backend.Revision, &state, &snapshot.Generation, &opened, &snapshot.FailureCount,
+		&authoritative.Revision, &authoritative.Enabled, &authoritative.Draining, &retainedPermit, &now,
+	)
+	if err != nil {
+		return snapshot, authoritative, time.Time{}, false, err
+	}
+	snapshot.Backend.Enabled = authoritative.Enabled
+	snapshot.Backend.Draining = authoritative.Draining
+	snapshot.State = domain.CircuitState(state)
+	if opened != nil {
+		snapshot.RetryAt = opened.Add(c.options.OpenCooldown)
+	}
+	return snapshot, authoritative, now, retainedPermit, nil
+}
+
 func lockCircuitState(ctx context.Context, tx pgx.Tx, backendID int64) (coordination.CircuitSnapshot, error) {
 	var snapshot coordination.CircuitSnapshot
 	var state string
 	var opened *time.Time
 	var succeeded bool
-	err := tx.QueryRow(ctx, "SELECT backend_id,backend_revision,state,generation,opened_at,half_open_succeeded FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", backendID).Scan(&snapshot.Backend.ID, &snapshot.Backend.Revision, &state, &snapshot.Generation, &opened, &succeeded)
+	err := tx.QueryRow(ctx, `SELECT s.backend_id,s.backend_revision,s.state,s.generation,s.opened_at,
+		(SELECT count(*) FROM backend_circuit_active_failures f WHERE f.backend_id=s.backend_id AND f.backend_revision=s.backend_revision),s.half_open_succeeded
+		FROM backend_circuit_state s WHERE s.backend_id=$1::bigint FOR UPDATE`, backendID).Scan(&snapshot.Backend.ID, &snapshot.Backend.Revision, &state, &snapshot.Generation, &opened, &snapshot.FailureCount, &succeeded)
 	if err != nil {
 		return snapshot, err
 	}
@@ -402,6 +518,37 @@ func lockCircuitState(ctx context.Context, tx pgx.Tx, backendID int64) (coordina
 		snapshot.RetryAt = opened.Add(0)
 	}
 	return snapshot, nil
+}
+
+func lockBackendIdentity(ctx context.Context, tx pgx.Tx, backendID int64) (coordination.BackendIdentity, error) {
+	identity := coordination.BackendIdentity{ID: backendID}
+	err := tx.QueryRow(ctx, "SELECT revision,enabled,draining FROM backends WHERE id=$1::bigint FOR UPDATE", backendID).Scan(&identity.Revision, &identity.Enabled, &identity.Draining)
+	return identity, err
+}
+
+func currentClosedFailureCount(ctx context.Context, tx pgx.Tx, state coordination.CircuitSnapshot, now time.Time, window time.Duration) (int, error) {
+	var count int
+	err := tx.QueryRow(ctx, "SELECT count(*) FROM backend_circuit_active_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint AND event_at>=$3::timestamptz", state.Backend.ID, state.Backend.Revision, now.Add(-window)).Scan(&count)
+	return count, err
+}
+
+func recordActiveFailure(ctx context.Context, tx pgx.Tx, state coordination.CircuitSnapshot, attemptID uuid.UUID, eventAt time.Time, window time.Duration) (int, time.Time, error) {
+	if _, err := tx.Exec(ctx, `INSERT INTO backend_circuit_active_failures(attempt_id,backend_id,backend_revision,event_at)
+		VALUES($1::uuid,$2::bigint,$3::bigint,$4::timestamptz) ON CONFLICT (attempt_id) DO NOTHING`, attemptID, state.Backend.ID, state.Backend.Revision, eventAt); err != nil {
+		return 0, time.Time{}, err
+	}
+	var latest time.Time
+	if err := tx.QueryRow(ctx, "SELECT max(event_at) FROM backend_circuit_active_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint", state.Backend.ID, state.Backend.Revision).Scan(&latest); err != nil {
+		return 0, time.Time{}, err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint AND event_at<$3::timestamptz", state.Backend.ID, state.Backend.Revision, latest.Add(-window)); err != nil {
+		return 0, time.Time{}, err
+	}
+	var count int
+	if err := tx.QueryRow(ctx, "SELECT count(*) FROM backend_circuit_active_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint", state.Backend.ID, state.Backend.Revision).Scan(&count); err != nil {
+		return 0, time.Time{}, err
+	}
+	return count, latest, nil
 }
 
 func (c *CircuitCoordinator) reconcileExpired(ctx context.Context, tx pgx.Tx, state coordination.CircuitSnapshot, now time.Time) (coordination.CircuitSnapshot, bool, error) {
@@ -429,6 +576,10 @@ func (c *CircuitCoordinator) reconcileExpired(ctx context.Context, tx pgx.Tx, st
 	}
 	state.State = domain.CircuitOpen
 	state.Generation++
+	state.FailureCount, expiredAt, err = recordActiveFailure(ctx, tx, state, permitID, expiredAt, c.options.FailureWindow)
+	if err != nil {
+		return state, false, err
+	}
 	state.RetryAt = expiredAt.Add(c.options.OpenCooldown)
 	state.ProbesInFlight = 0
 	state.Available = false
@@ -444,12 +595,17 @@ func commitCircuitDecision(ctx context.Context, tx pgx.Tx, decision coordination
 }
 
 func (c *CircuitCoordinator) Complete(parent context.Context, completion coordination.CircuitCompletion) (coordination.CircuitSnapshot, error) {
+	completion.ReportedOutcomeAt = canonicalPostgresTimestamp(completion.ReportedOutcomeAt)
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 	var snapshot coordination.CircuitSnapshot
+	var handled bool
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
-		snapshot, err = c.complete(ctx, completion)
+		snapshot, handled, err = c.completeClosedNonFailure(ctx, completion)
+		if err == nil && !handled {
+			snapshot, err = c.complete(ctx, completion)
+		}
 		if err == nil || !retryableCoordinationError(err) || ctx.Err() != nil {
 			break
 		}
@@ -457,7 +613,9 @@ func (c *CircuitCoordinator) Complete(parent context.Context, completion coordin
 	if err != nil {
 		var reason coordination.ReasonError
 		if errors.As(err, &reason) {
-			c.setStatus(true, "")
+			if !handled {
+				c.setStatus(true, "")
+			}
 			return snapshot, err
 		}
 		if permanentCoordinationError(err) {
@@ -471,9 +629,16 @@ func (c *CircuitCoordinator) Complete(parent context.Context, completion coordin
 		}
 		return snapshot, err
 	}
+	if handled {
+		return snapshot, nil
+	}
 	c.setStatus(true, "")
 	_ = c.Refresh(parent)
 	return snapshot, nil
+}
+
+func canonicalPostgresTimestamp(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
 }
 
 func (c *CircuitCoordinator) complete(ctx context.Context, completion coordination.CircuitCompletion) (coordination.CircuitSnapshot, error) {
@@ -502,6 +667,12 @@ func (c *CircuitCoordinator) complete(ctx context.Context, completion coordinati
 	state, _, err = c.reconcileExpired(ctx, tx, state, now)
 	if err != nil {
 		return state, err
+	}
+	if state.State == domain.CircuitClosed {
+		state.FailureCount, err = currentClosedFailureCount(ctx, tx, state, now, c.options.FailureWindow)
+		if err != nil {
+			return state, err
+		}
 	}
 	var acquisition time.Time
 	var revision, generation int64
@@ -543,6 +714,10 @@ func (c *CircuitCoordinator) complete(ctx context.Context, completion coordinati
 			if err := terminalizeGeneration(ctx, tx, completion.Backend.ID, completion.Generation, completion.AttemptID, now); err != nil {
 				return state, err
 			}
+			state.FailureCount, eventAt, err = recordActiveFailure(ctx, tx, state, completion.AttemptID, eventAt, c.options.FailureWindow)
+			if err != nil {
+				return state, err
+			}
 			state.State = domain.CircuitOpen
 			state.Generation++
 			state.RetryAt = eventAt.Add(c.options.OpenCooldown)
@@ -567,7 +742,9 @@ func (c *CircuitCoordinator) complete(ctx context.Context, completion coordinati
 			state.Generation++
 			state.FailureCount = 0
 			state.Available = true
-			_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET state='closed',generation=$2::bigint,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", completion.Backend.ID, state.Generation, now)
+			if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", completion.Backend.ID); err == nil {
+				_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET state='closed',generation=$2::bigint,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", completion.Backend.ID, state.Generation, now)
+			}
 		}
 		if err == nil {
 			_, _ = tx.Exec(ctx, "SELECT pg_notify('llmgw_circuit_changed',$1::text)", completion.Backend.ID)
@@ -616,13 +793,14 @@ func (c *CircuitCoordinator) complete(ctx context.Context, completion coordinati
 		if err != nil {
 			return state, err
 		}
-		_, err = tx.Exec(ctx, "DELETE FROM backend_circuit_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint AND circuit_generation=$3::bigint AND event_at<$4::timestamptz", completion.Backend.ID, completion.Backend.Revision, completion.Generation, now.Add(-c.options.FailureWindow))
+		var count int
+		var latest time.Time
+		count, latest, err = recordActiveFailure(ctx, tx, state, completion.AttemptID, eventAt, c.options.FailureWindow)
 		if err != nil {
 			return state, err
 		}
-		var count int
-		var latest time.Time
-		if err = tx.QueryRow(ctx, "SELECT count(*),max(event_at) FROM backend_circuit_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint AND circuit_generation=$3::bigint", completion.Backend.ID, completion.Backend.Revision, completion.Generation).Scan(&count, &latest); err != nil {
+		_, err = tx.Exec(ctx, "DELETE FROM backend_circuit_failures WHERE backend_id=$1::bigint AND backend_revision=$2::bigint AND circuit_generation=$3::bigint AND event_at<$4::timestamptz", completion.Backend.ID, completion.Backend.Revision, completion.Generation, latest.Add(-c.options.FailureWindow))
+		if err != nil {
 			return state, err
 		}
 		state.FailureCount = count
@@ -638,6 +816,27 @@ func (c *CircuitCoordinator) complete(ctx context.Context, completion coordinati
 		}
 	}
 	return state, tx.Commit(ctx)
+}
+
+func (c *CircuitCoordinator) completeClosedNonFailure(ctx context.Context, completion coordination.CircuitCompletion) (coordination.CircuitSnapshot, bool, error) {
+	if completion.Outcome == domain.InferenceFailure {
+		return coordination.CircuitSnapshot{}, false, nil
+	}
+	state, _, now, retainedPermit, err := c.readCommittedCircuit(ctx, completion.Backend.ID, completion.AttemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return coordination.CircuitSnapshot{}, false, nil
+	}
+	if err != nil {
+		return coordination.CircuitSnapshot{}, false, err
+	}
+	if retainedPermit || state.State != domain.CircuitClosed {
+		return coordination.CircuitSnapshot{}, false, nil
+	}
+	if !validCircuitOperationTime(completion.ReportedOutcomeAt, now) {
+		return state, true, coordination.ReasonError{Reason: coordination.ReasonStaleOperation}
+	}
+	state.Available = true
+	return state, true, nil
 }
 
 func validCircuitOperationTime(at, now time.Time) bool {
@@ -663,11 +862,15 @@ func (c *CircuitCoordinator) RenewProbes(parent context.Context, probes []coordi
 		}
 	} else {
 		c.setStatus(true, "")
+		_ = c.Refresh(parent)
 	}
 	return results, err
 }
 
 func (c *CircuitCoordinator) renewProbes(parent context.Context, probes []coordination.ProbeIdentity) ([]coordination.RenewResult, error) {
+	if len(probes) == 0 {
+		return []coordination.RenewResult{}, nil
+	}
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 	ordered := append([]coordination.ProbeIdentity(nil), probes...)
@@ -691,19 +894,46 @@ func (c *CircuitCoordinator) renewProbes(parent context.Context, probes []coordi
 			backendIDs = append(backendIDs, probe.Backend.ID)
 		}
 	}
+	states := make(map[int64]coordination.CircuitSnapshot, len(backendIDs))
 	for _, id := range backendIDs {
-		if _, err = tx.Exec(ctx, "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", id); err != nil {
+		state, lockErr := lockCircuitState(ctx, tx, id)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		states[id] = state
+	}
+	permitIDs := make([]string, len(ordered))
+	for i, probe := range ordered {
+		permitIDs[i] = probe.PermitID.String()
+	}
+	rows, err := tx.Query(ctx, `SELECT permit_id FROM backend_circuit_probes
+		WHERE backend_id=ANY($1::bigint[]) AND (outcome IS NULL OR permit_id=ANY($2::uuid[]))
+		ORDER BY backend_id,permit_id FOR UPDATE`, backendIDs, permitIDs)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var permitID uuid.UUID
+		if err = rows.Scan(&permitID); err != nil {
+			rows.Close()
 			return nil, err
 		}
 	}
-	for _, probe := range ordered {
-		if _, err = tx.Exec(ctx, "SELECT permit_id FROM backend_circuit_probes WHERE permit_id=$1::uuid FOR UPDATE", probe.PermitID); err != nil {
-			return nil, err
-		}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
 	}
+	rows.Close()
 	var now time.Time
 	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return nil, err
+	}
+	for _, id := range backendIDs {
+		state, _, reconcileErr := c.reconcileExpired(ctx, tx, states[id], now)
+		if reconcileErr != nil {
+			return nil, reconcileErr
+		}
+		states[id] = state
 	}
 	resultByID := make(map[uuid.UUID]coordination.RenewResult, len(ordered))
 	for _, probe := range ordered {

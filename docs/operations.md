@@ -38,6 +38,8 @@ Both guards return the bounded `429 gateway_overloaded` envelope before per-clie
 
 Circuit and pool leases are process-local in the SQLite profile. PostgreSQL mode distributes both across compatible gateway replicas.
 
+The single-replica local coordinators retain idempotency history for up to 24 hours, with at most 65,536 admission receipts and 65,536 circuit attempts in memory. At either bound, the oldest terminal records are evicted in `O(log N)` time before admitting new work; a stream of rejected or completed requests therefore cannot grow heap or disk without bound and cannot consume active-operation capacity. The coordinator fails closed only when its entire bound is occupied by active operations. Retention is best-effort under capacity pressure and does not survive a process restart. Deploy PostgreSQL when durable cross-replica coordination is required.
+
 ## Draining a backend
 
 Before planned vLLM maintenance:

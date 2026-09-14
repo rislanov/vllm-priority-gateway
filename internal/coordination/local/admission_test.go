@@ -73,6 +73,48 @@ func TestCompletionDebitsSoftTPMOnceAfterRefillAndReleasesLease(t *testing.T) {
 	}
 }
 
+func TestLateCompletionDebitsLatestTPMPolicyGeneration(t *testing.T) {
+	now := time.Now().UTC()
+	coordinator := local.NewAdmissionCoordinator(func() time.Time { return now })
+	ctx := context.Background()
+	oldRequest := request(uuid.New(), now)
+	oldRequest.ClientPolicyRevision = 1
+	oldRequest.EffectiveClientLimit = 3
+	oldRequest.ConfiguredClientLimit = 3
+	oldRequest.PoolGatewayInflightLimit = 0
+	oldRequest.TokensPerMinute = 100
+	oldDecision, err := coordinator.Acquire(ctx, oldRequest)
+	if err != nil || !oldDecision.Admitted() {
+		t.Fatalf("old admission = %+v, %v", oldDecision, err)
+	}
+	currentRequest := request(uuid.New(), now)
+	currentRequest.RequestID = "current"
+	currentRequest.ClientPolicyRevision = 2
+	currentRequest.EffectiveClientLimit = 3
+	currentRequest.ConfiguredClientLimit = 3
+	currentRequest.PoolGatewayInflightLimit = 0
+	currentRequest.TokensPerMinute = 10
+	currentDecision, err := coordinator.Acquire(ctx, currentRequest)
+	if err != nil || !currentDecision.Admitted() {
+		t.Fatalf("current admission = %+v, %v", currentDecision, err)
+	}
+	if _, err = coordinator.Complete(ctx, []coordination.LeaseCompletion{{
+		Lease: oldDecision.Lease.Identity(), Usage: &coordination.TokenUsage{InputTokens: 50},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	nextRequest := currentRequest
+	nextRequest.LeaseID = uuid.New()
+	nextRequest.RequestID = "next"
+	next, err := coordinator.Acquire(ctx, nextRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Reason != coordination.ReasonTPMExhausted {
+		t.Fatalf("new policy debit disappeared after old completion: %+v", next)
+	}
+}
+
 func TestRenewNeverResurrectsExpiredLease(t *testing.T) {
 	now := time.Now().UTC()
 	c := local.NewAdmissionCoordinator(func() time.Time { return now })

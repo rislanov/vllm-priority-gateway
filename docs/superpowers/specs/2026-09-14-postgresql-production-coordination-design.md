@@ -37,6 +37,7 @@ PostgreSQL is both the durable configuration/analytics store and the distributed
 - Persistent on-disk last-known-good configuration outside PostgreSQL.
 - Automatic PostgreSQL provisioning, failover, backup, or replica management.
 - PostgreSQL table partition automation for analytics.
+- Administrative deletion of clients, pools, or backends. Production V1 uses disable and backend drain/resume; tombstone columns and cascading relationships are defensive schema preparation, not a supported delete lifecycle.
 - OIDC, RBAC, audit logging, billing, daily/monthly budgets, or Kubernetes discovery.
 - Cancelling admitted inference when a distributed lease cannot be renewed.
 
@@ -214,6 +215,8 @@ internal/store/postgres/migrations/
   000003_coordination.down.sql
 ```
 
+The active circuit-failure history and its reconciliation index are part of `000003_coordination` before the initial PostgreSQL profile release. There is no supported mixed deployment in which an older migration-3 circuit writer runs against this schema; coordination contract version 2 rejects such a replica, and migration files become immutable only after this release boundary.
+
 Startup applies `Up`; `migrate.ErrNoChange` is success. A dirty migration, unsupported database version, migration lock timeout, or schema newer than the binary prevents readiness and startup completion. Production startup never runs `Down` automatically.
 
 The PostgreSQL driver advisory lock prevents concurrent gateway replicas from applying migrations simultaneously. Migrations must use the direct migration URL when the runtime URL passes through a transaction-mode pooler.
@@ -320,7 +323,7 @@ retain_until = max(terminal_at, operation_started_at) + 24h
 
 Cleanup may delete a terminal receipt only when `retain_until <= v_now`. An unseen operation is accepted as new only when `operation_started_at > v_now - 24h` and `operation_started_at <= v_now + 5m`; both comparisons use a post-lock PostgreSQL timestamp. At the exact instant a future-skewed receipt becomes eligible for deletion, the strict lower bound therefore makes the same operation stale. Removal of an old receipt cannot turn its UUID into a fresh admission. These windows and boundary operators are part of the coordination contract and replica fingerprint.
 
-Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit. Deleting configuration tombstones the corresponding scope instead of cascading through active leases or retained receipts; physical scope deletion waits until no coordination row references that identity. IDs are never reused.
+Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit. Production V1 does not expose administrative deletion; disable and drain preserve the scope identity and retained receipts. IDs are never reused.
 
 Every request lease always records both client and pool identity. Pool limit zero disables only the rejection check; it does not disable lease creation, renewal, distributed pool-inflight accounting, or later transition to a positive limit.
 
@@ -468,6 +471,12 @@ backend_circuit_failures
   circuit_generation     BIGINT
   event_at               TIMESTAMPTZ
 
+backend_circuit_active_failures
+  attempt_id             UUID PRIMARY KEY
+  backend_id             BIGINT
+  backend_revision       BIGINT
+  event_at               TIMESTAMPTZ
+
 backend_circuit_probes
   permit_id              UUID PRIMARY KEY -- exactly the acquiring attempt UUID
   acquisition_started_at TIMESTAMPTZ NOT NULL
@@ -514,13 +523,13 @@ CircuitCompletionRetention = 24h
 
 The raw reported timestamp is retained for audit and exact replay; `event_at` is the immutable rolling-window timestamp and clamps only future clock skew to first database processing time. An unseen completion is accepted only when `reported_outcome_at > v_now - CircuitCompletionRetention` and `reported_outcome_at <= v_now + 5m`. Cleanup first removes any rolling event and then deletes a receipt only at `retain_until <= v_now`; the foreign key also cascades defensively. The strict-boundary argument is the same as for admission receipts.
 
-A qualifying closed-state failure inserts `backend_circuit_failures` with the same attempt UUID and immutable `event_at`. Failure-window pruning deletes event rows with `event_at < v_now - FailureWindow`; it never deletes failure receipts. Threshold counting uses distinct retained attempt IDs for the current backend revision and circuit generation. If the threshold is reached, `opened_at` is the latest retained `event_at`. A delayed event already outside the rolling window records its receipt but does not enter the failure table or affect circuit state.
+A qualifying closed-state failure inserts `backend_circuit_failures` with the same attempt UUID and immutable `event_at`. `backend_circuit_active_failures` is the authoritative rolling history for the current backend revision and circuit lifecycle: it includes qualifying closed-state failures, half-open failures, and expired probes, so reopening a circuit does not discard still-relevant failures merely because the generation changed. Inserting a failure prunes active events relative to the latest retained event, and closed-state reads additionally count only events within `v_now - FailureWindow`. A successful half-open generation, backend revision change, disabling, or draining clears the active lifecycle. Failure receipts remain independent and are never removed by rolling-window pruning. If the threshold is reached, `opened_at` is the latest retained `event_at`. A delayed event already outside the rolling window records its receipt but does not affect circuit state.
 
 This separates retry deduplication from the rolling window. Deleting failure A from the rolling table cannot make a later redelivery fresh: its receipt still suppresses the duplicate, and even after receipt retention the strict timestamp gate rejects it rather than assigning a new event time.
 
 Half-open completion is idempotent through the durable probe permit. Its first completion stores the stable reported outcome timestamp, immutable `event_at = min(reported_outcome_at, processed_at)`, post-lock processing timestamp, outcome, and `retain_until = max(processed_at, reported_outcome_at, acquisition_started_at) + CircuitCompletionRetention`. A duplicate must match those immutable inputs and returns without another transition; a mismatch returns `idempotency_conflict`. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
 
-Every transition that invalidates a circuit generation or backend identity terminalizes all its unfinished permits in the same transaction. This includes an ordinary half-open failure, expiry reopening, backend revision replacement, disabling, draining, and deletion. Under the backend state lock and permit locks ordered by UUID, the transition preserves already-terminal outcomes, marks remaining unfinished permits `superseded` (except the triggering failure or expired permit), sets `processed_at = v_now`, and assigns `retain_until = max(v_now, acquisition_started_at) + CircuitCompletionRetention`. No fabricated reported outcome timestamp is stored. Backend mutations lock the affected circuit state and permits before changing identity, and commit invalidation atomically with the configuration change; stale replica reconciliation cannot recreate an older identity. Backend circuit-state rows remain as tombstones while retained permits or failure receipts reference them. Late renewal/acquisition replay returns `lease_lost`, and a completion for a superseded or expired permit is a stale no-op rather than an outcome conflict. A bounded cleanup removes terminal permits only after `retain_until <= v_now`, including permits from deleted backends and old generations. An unfinished permit is never age-deleted.
+Every transition that invalidates a circuit generation or backend identity terminalizes all its unfinished permits in the same transaction. This includes an ordinary half-open failure, expiry reopening, backend revision replacement, disabling, and draining. Under the backend state lock and permit locks ordered by UUID, the transition preserves already-terminal outcomes, marks remaining unfinished permits `superseded` (except the triggering failure or expired permit), sets `processed_at = v_now`, and assigns `retain_until = max(v_now, acquisition_started_at) + CircuitCompletionRetention`. No fabricated reported outcome timestamp is stored. Backend mutations lock the affected circuit state and permits before changing identity, and commit invalidation atomically with the configuration change; stale replica reconciliation cannot recreate an older identity. Backend circuit-state rows can act as tombstones while retained permits or failure receipts reference an older revision. Late renewal/acquisition replay returns `lease_lost`, and a completion for a superseded or expired permit is a stale no-op rather than an outcome conflict. A bounded cleanup removes terminal permits only after `retain_until <= v_now`, including permits from old backend revisions and generations. An unfinished permit is never age-deleted. Administrative deletion is out of scope for Production V1; disabling and draining are the supported lifecycle operations.
 
 An expired half-open probe is a conservative circuit failure, not a neutral completion. Expiry reconciliation locks the circuit row, re-checks the permit and generation, selects the earliest expired unfinished permit, marks it `expired`, marks every other unfinished permit from the same generation `superseded`, assigns terminal retention to those permits, transitions the circuit to `open`, clears `half_open_succeeded`, increments generation, and sets `opened_at` to the selected permit's `expires_at`. It emits the ordinary circuit-change notification. This transition applies even when another probe in the generation already succeeded.
 
@@ -548,12 +557,13 @@ Every PostgreSQL-mode gateway generates a random replica UUID and maintains a ro
 replica_id
 started_at
 heartbeat_at
+heartbeat_expires_at
 binary_version
 coordination_contract_version
 policy_fingerprint
 ```
 
-The fingerprint covers lease TTL/renewal semantics, circuit thresholds and windows, half-open probe capacity, rate algorithm version, and coordination contract version. Registration rejects a replica when another non-expired replica has an incompatible fingerprint.
+The fingerprint covers lease TTL/renewal semantics, circuit thresholds and windows, half-open probe capacity, rate algorithm version, and coordination contract version. Each heartbeat persists its own `heartbeat_expires_at`, so another replica never decides liveness using the joining replica's TTL. Registration and heartbeat both use the same serializable activation transaction and retry transient serialization conflicts; either path rejects activation when another non-expired replica has an incompatible fingerprint.
 
 The first implementation requires a full stop/start without overlap when coordination-critical settings change. This restriction prevents mixed circuit and lease semantics. Ordinary configuration and client-policy changes continue using online revision propagation.
 
@@ -633,7 +643,7 @@ The default suite requires no PostgreSQL process and includes:
 - local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, future-skewed receipt retention/cleanup boundaries, completion idempotency, and refill-before-debit TPM completion;
 - deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, stale-generation no-ops, and `commit -> lost response -> rolling prune -> duplicate completion` with the original event timestamp;
 - circuit-acquire contract tests for a lost response with probe capacity one, concurrent identical retries, fingerprint conflicts, retry after completion/expiry/invalidation, and future-skewed acquire timestamps at terminal permit cleanup boundaries;
-- circuit permit cleanup tests for `failure + crashed peer`, backend revision replacement, disabling/draining/deletion with unfinished probes, stale completion, and eventual removal of superseded permits;
+- circuit permit cleanup tests for `failure + crashed peer`, backend revision replacement, disabling/draining with unfinished probes, stale completion, and eventual removal of superseded permits;
 - gateway tests using deterministic fake coordinators;
 - emergency-mode and recovery state-machine tests;
 - revision-regression confirmation tests: a delayed older snapshot/poll does not trip the consistency fault, while a fresh primary read started after observing a higher revision and returning a lower revision does;

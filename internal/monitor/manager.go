@@ -23,11 +23,16 @@ type managedWorker struct {
 	breaker    *circuitbreaker.Breaker
 }
 
+type circuitReplayDropObserver interface {
+	CoordinationCircuitReplayDropped(reason string, count int)
+}
+
 type Manager struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	observerDone chan struct{}
-	options      Options
+	ctx            context.Context
+	cancel         context.CancelFunc
+	observerDone   chan struct{}
+	probeRenewDone chan struct{}
+	options        Options
 
 	mu             sync.Mutex
 	workers        map[int64]*managedWorker
@@ -38,6 +43,9 @@ type Manager struct {
 	shutdown       bool
 	probes         map[uuid.UUID]coordination.ProbeIdentity
 	circuitBacklog []coordination.CircuitCompletion
+
+	replayMu   sync.Mutex
+	replayDone chan struct{}
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
@@ -47,14 +55,21 @@ func NewManager(ctx context.Context, options Options) *Manager {
 			OpenCooldown: 15 * time.Second, HalfOpenMaxProbes: 1,
 		}
 	}
+	if options.ProbeRenewInterval <= 0 {
+		options.ProbeRenewInterval = options.ProbeTTL / 3
+		if options.ProbeRenewInterval <= 0 {
+			options.ProbeRenewInterval = 30 * time.Second
+		}
+	}
 	managerCtx, cancel := context.WithCancel(ctx)
 	manager := &Manager{
-		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
+		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), probeRenewDone: make(chan struct{}), options: options,
 		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
 		poolRuntime: make(map[int64]domain.PoolRuntime), poolInflight: make(map[int64]int),
 		probes: make(map[uuid.UUID]coordination.ProbeIdentity),
 	}
 	go manager.runPoolObserver()
+	go manager.runProbeRenewer()
 	return manager
 }
 
@@ -122,7 +137,7 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 	}
 	m.mu.Unlock()
 	waitWorkers(stopped)
-	m.observePools(time.Now())
+	m.observePoolRuntime(time.Now())
 	return nil
 }
 
@@ -212,11 +227,14 @@ func (m *Manager) observePools(at time.Time) {
 		if m.options.CircuitCoordinator.Refresh(m.ctx) == nil {
 			_ = m.ReplayCircuitFailures(m.ctx)
 		}
-		m.renewProbes()
 	}
 	if m.options.AdmissionRuntime != nil {
 		_ = m.options.AdmissionRuntime.RefreshInflight(m.ctx)
 	}
+	m.observePoolRuntime(at)
+}
+
+func (m *Manager) observePoolRuntime(at time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.shutdown {
@@ -234,6 +252,29 @@ func (m *Manager) observePools(at time.Time) {
 	}
 	for poolID := range active {
 		m.poolRuntime[poolID] = m.observePoolLocked(poolID, at)
+	}
+}
+
+func (m *Manager) runProbeRenewer() {
+	defer close(m.probeRenewDone)
+	if m.options.CircuitCoordinator == nil {
+		return
+	}
+	ticks := m.options.ProbeRenewTicks
+	stop := func() {}
+	if ticks == nil {
+		ticker := time.NewTicker(m.options.ProbeRenewInterval)
+		ticks = ticker.C
+		stop = ticker.Stop
+	}
+	defer stop()
+	for {
+		select {
+		case <-ticks:
+			m.renewProbes()
+		case <-m.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -407,6 +448,12 @@ func (m *Manager) snapshotManaged(managed *managedWorker, at time.Time) domain.B
 // ReplayCircuitFailures delivers still-relevant, immutable failure events and
 // retains only those whose durable completion is still unavailable.
 func (m *Manager) ReplayCircuitFailures(ctx context.Context) error {
+	done, err := m.beginCircuitReplay(ctx)
+	if err != nil {
+		return err
+	}
+	defer m.endCircuitReplay(done)
+
 	m.mu.Lock()
 	pending := m.circuitBacklog
 	m.circuitBacklog = nil
@@ -417,8 +464,10 @@ func (m *Manager) ReplayCircuitFailures(ctx context.Context) error {
 	now := time.Now().UTC()
 	kept := pending[:0]
 	var replayErr error
+	expired := 0
 	for _, completion := range pending {
 		if !completion.ReportedOutcomeAt.After(now.Add(-24 * time.Hour)) {
+			expired++
 			continue
 		}
 		if _, err := m.options.CircuitCoordinator.Complete(ctx, completion); err != nil && replayableCircuitError(err) {
@@ -428,21 +477,65 @@ func (m *Manager) ReplayCircuitFailures(ctx context.Context) error {
 	}
 	m.mu.Lock()
 	merged := append(append([]coordination.CircuitCompletion(nil), kept...), m.circuitBacklog...)
+	overflow := 0
 	if len(merged) > 4096 {
+		overflow = len(merged) - 4096
 		merged = merged[len(merged)-4096:]
 	}
 	m.circuitBacklog = merged
 	m.mu.Unlock()
+	m.observeCircuitReplayDropped("expired", expired)
+	m.observeCircuitReplayDropped("overflow", overflow)
 	return replayErr
+}
+
+func (m *Manager) beginCircuitReplay(ctx context.Context) (chan struct{}, error) {
+	for {
+		m.replayMu.Lock()
+		if m.replayDone == nil {
+			done := make(chan struct{})
+			m.replayDone = done
+			m.replayMu.Unlock()
+			return done, nil
+		}
+		active := m.replayDone
+		m.replayMu.Unlock()
+		select {
+		case <-active:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (m *Manager) endCircuitReplay(done chan struct{}) {
+	m.replayMu.Lock()
+	if m.replayDone == done {
+		m.replayDone = nil
+		close(done)
+	}
+	m.replayMu.Unlock()
 }
 
 func (m *Manager) bufferCircuitFailure(completion coordination.CircuitCompletion) {
 	m.mu.Lock()
 	m.circuitBacklog = append(m.circuitBacklog, completion)
+	dropped := 0
 	if len(m.circuitBacklog) > 4096 {
+		dropped = len(m.circuitBacklog) - 4096
 		m.circuitBacklog = m.circuitBacklog[len(m.circuitBacklog)-4096:]
 	}
 	m.mu.Unlock()
+	m.observeCircuitReplayDropped("overflow", dropped)
+}
+
+func (m *Manager) observeCircuitReplayDropped(reason string, count int) {
+	if count <= 0 {
+		return
+	}
+	if observer, ok := m.options.Observer.(circuitReplayDropObserver); ok {
+		observer.CoordinationCircuitReplayDropped(reason, count)
+	}
 }
 
 func replayableCircuitError(err error) bool {
@@ -462,13 +555,23 @@ func (m *Manager) renewProbes() {
 	}
 	results, err := m.options.CircuitCoordinator.RenewProbes(m.ctx, probes)
 	if err != nil {
+		if m.options.Observer != nil {
+			m.options.Observer.CoordinationRenewFailure()
+		}
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	lost := 0
 	for _, result := range results {
 		if result.Reason == coordination.ReasonLeaseLost {
 			delete(m.probes, result.Lease.LeaseID)
+			lost++
+		}
+	}
+	m.mu.Unlock()
+	for index := 0; index < lost; index++ {
+		if m.options.Observer != nil {
+			m.options.Observer.CoordinationLeaseLost()
 		}
 	}
 }
@@ -517,6 +620,7 @@ func (m *Manager) Shutdown() {
 	m.mu.Unlock()
 	waitWorkers(workers)
 	<-m.observerDone
+	<-m.probeRenewDone
 }
 
 func waitWorkers(workers []*managedWorker) {

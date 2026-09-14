@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,8 +15,11 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination/contracttest"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination/local"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
+	"github.com/rislanov/vllm-priority-gateway/internal/observability"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/routing"
@@ -51,6 +55,30 @@ func (f *staleAdmission) Complete(context.Context, []coordination.LeaseCompletio
 	return nil, nil
 }
 func (f *staleAdmission) Status() coordination.Status { return coordination.Status{Available: true} }
+
+type staleThenAdmit struct{ staleAdmission }
+
+func (f *staleThenAdmit) Acquire(_ context.Context, request coordination.AdmissionRequest) (coordination.AdmissionDecision, error) {
+	f.calls++
+	if f.calls == 1 {
+		return coordination.AdmissionDecision{Reason: coordination.ReasonStaleConfiguration}, nil
+	}
+	return coordination.AdmissionDecision{Lease: &coordination.LeaseIdentity{
+		LeaseID: request.LeaseID, ClientID: request.ClientID, PoolID: request.PoolID, TTL: request.LeaseTTL,
+	}}, nil
+}
+
+type captureModelForwarder struct{ model string }
+
+func (f *captureModelForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(request.Body, &payload)
+	f.model = payload.Model
+	request.Target.Complete(domain.InferenceSuccess)
+	return proxy.Result{Status: http.StatusOK}
+}
 
 type reloadableSnapshotProvider struct {
 	*mutableSnapshotProvider
@@ -90,6 +118,95 @@ func TestServiceStaleConfigurationReloadsAndReauthenticates(t *testing.T) {
 	}
 }
 
+func TestServiceStaleConfigurationRebuildsUpstreamPayload(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Revision: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 1}
+	pool := domain.ModelPool{ID: 10, Revision: 1, PublicModelName: "public-model", UpstreamModelName: "old-upstream", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	mutable := &mutableSnapshotProvider{}
+	mutable.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	provider := &reloadableSnapshotProvider{mutableSnapshotProvider: mutable}
+	provider.reload = func() {
+		pool.UpstreamModelName = "new-upstream"
+		pool.Revision = 2
+		updated := testSnapshot(client, key, pool, []domain.Backend{backend})
+		updated.Revision = 2
+		mutable.Set(updated)
+	}
+	runtime := newPoolRuntime(domain.PoolRuntime{PoolID: pool.ID, State: domain.PoolNormal, AvailableBackends: 1}, []domain.BackendRuntime{{BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true}})
+	forwarder := &captureModelForwarder{}
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Admission: &staleThenAdmit{},
+		Runtime: runtime, Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+		Now: func() time.Time { return poolTestNow },
+	})
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
+	})
+	if apiErr != nil {
+		t.Fatal(apiErr)
+	}
+	if forwarder.model != "new-upstream" {
+		t.Fatalf("forwarded model = %q after refresh, want new-upstream", forwarder.model)
+	}
+}
+
+func TestServiceTracksAndRenewsActiveAdmissionLease(t *testing.T) {
+	clock := contracttest.NewClock(poolTestNow)
+	coordinator := local.NewAdmissionCoordinator(clock.Now)
+	leases := coordination.NewLeaseManager(context.Background(), coordinator, coordination.LeaseManagerOptions{RenewTicks: make(chan time.Time)})
+	defer leases.Close()
+
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 1}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true, MaxGatewayInflight: 1}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	runtime := newPoolRuntime(domain.PoolRuntime{PoolID: pool.ID, State: domain.PoolNormal, AvailableBackends: 1}, []domain.BackendRuntime{{BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true}})
+	forwarder := newPoolBlockingForwarder()
+	defer forwarder.releaseAll()
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+		Now: clock.Now, Admission: coordinator, Leases: leases, ReplicaID: uuid.New(), LeaseTTL: time.Minute,
+	})
+	request := gateway.ForwardRequest{Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(`{"model":"public-model"}`), APIKey: rawKey}
+
+	first := forwardPoolAsync(service, context.Background(), request)
+	forwarder.waitStarted(t)
+	if got := leases.ActiveCount(); got != 1 {
+		t.Fatalf("active request lease handles = %d, want 1", got)
+	}
+
+	clock.Add(40 * time.Second)
+	if err := leases.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	clock.Add(30 * time.Second)
+	second := forwardPoolAsync(service, context.Background(), request)
+	select {
+	case <-forwarder.started:
+		t.Error("second upstream request admitted while the first lease should still be active")
+	case result := <-second:
+		if result.apiErr == nil || result.apiErr.HTTPStatus != http.StatusTooManyRequests {
+			t.Errorf("second request result = %+v, want 429", result)
+		}
+		forwarder.releaseAll()
+		<-first
+		return
+	case <-time.After(time.Second):
+		t.Error("second request did not make progress")
+	}
+	forwarder.releaseAll()
+	<-first
+	<-second
+}
+
 func TestServiceEmergencyAdmissionIsLimitedToCriticalAndHigh(t *testing.T) {
 	forwarder := newPoolBlockingForwarder()
 	service, request, _ := newPoolService(t, poolServiceOptions{priority: domain.PriorityHigh, forwarder: forwarder, coordinator: unavailableAdmission{}, emergency: coordination.NewEmergencyAdmission(1, 1)})
@@ -108,6 +225,37 @@ func TestServiceEmergencyAdmissionIsLimitedToCriticalAndHigh(t *testing.T) {
 	_, _, apiErr := normal.Forward(context.Background(), httptest.NewRecorder(), normalRequest)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusServiceUnavailable {
 		t.Fatalf("normal outage response=%+v", apiErr)
+	}
+}
+
+func TestServicePublishesEmergencyAdmissionMetricsFromRealDecisions(t *testing.T) {
+	metrics := observability.NewMetrics()
+	forwarder := newPoolBlockingForwarder()
+	service, request, _ := newPoolService(t, poolServiceOptions{
+		priority: domain.PriorityHigh, forwarder: forwarder, coordinator: unavailableAdmission{},
+		emergency: coordination.NewEmergencyAdmission(1, 1), observer: metrics,
+	})
+	first := forwardPoolAsync(service, context.Background(), request)
+	forwarder.waitStarted(t)
+	second := <-forwardPoolAsync(service, context.Background(), request)
+	if second.apiErr == nil || second.apiErr.HTTPStatus != http.StatusServiceUnavailable {
+		forwarder.releaseAll()
+		<-first
+		t.Fatalf("second emergency request = %+v, want 503", second.apiErr)
+	}
+	forwarder.releaseAll()
+	<-first
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	text := response.Body.String()
+	for _, sample := range []string{
+		`llmgw_coordination_emergency_total{outcome="admitted",priority_class="high"} 1`,
+		`llmgw_coordination_emergency_total{outcome="rejected",priority_class="high"} 1`,
+	} {
+		if !strings.Contains(text, sample) {
+			t.Fatalf("emergency metrics missing %q:\n%s", sample, text)
+		}
 	}
 }
 
@@ -578,6 +726,7 @@ type poolServiceOptions struct {
 	coordinator               coordination.AdmissionCoordinator
 	emergency                 *coordination.EmergencyAdmission
 	coordinationReady         func() bool
+	observer                  gateway.Observer
 }
 
 func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service, gateway.ForwardRequest, *poolRuntimeStub) {
@@ -643,7 +792,7 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
 		Now: func() time.Time { return poolTestNow }, RetryAfter: 2 * time.Second,
 		Admission: options.coordinator, Emergency: options.emergency, ReplicaID: uuid.New(), LeaseTTL: time.Minute,
-		CoordinationReady: options.coordinationReady,
+		CoordinationReady: options.coordinationReady, Observer: options.observer,
 	})
 	return service, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
@@ -862,5 +1011,59 @@ func assertPoolReleased(t *testing.T, runtime *poolRuntimeStub, wantAcquisitions
 	}
 	if got := runtime.PoolInflight(); got != 0 {
 		t.Fatalf("pool inflight after exit = %d, want 0", got)
+	}
+}
+
+type policyUpdateDuringInference struct{ update func() }
+
+func (f *policyUpdateDuringInference) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	if f.update != nil {
+		f.update()
+		f.update = nil
+	}
+	request.Target.Complete(domain.InferenceSuccess)
+	return proxy.Result{Status: http.StatusOK, Usage: &domain.TokenUsage{InputTokens: 50}}
+}
+
+func TestServiceCompletionUsesPolicyPublishedDuringInference(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Revision: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2, TokensPerMinute: 100}
+	pool := domain.ModelPool{ID: 10, Revision: 1, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	forwarder := &policyUpdateDuringInference{update: func() {
+		client.Revision = 2
+		client.TokensPerMinute = 10
+		next := testSnapshot(client, key, pool, []domain.Backend{backend})
+		next.Revision = 2
+		provider.Set(next)
+	}}
+	coordinator := local.NewAdmissionCoordinator(func() time.Time { return poolTestNow })
+	observedCoordinator := coordination.ObserveAdmission(coordinator, observability.NewMetrics())
+	leases := coordination.NewLeaseManager(context.Background(), observedCoordinator, coordination.LeaseManagerOptions{RenewTicks: make(chan time.Time)})
+	defer leases.Close()
+	runtime := newPoolRuntime(domain.PoolRuntime{PoolID: pool.ID, State: domain.PoolNormal, AvailableBackends: 1}, []domain.BackendRuntime{{BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true}})
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router:    routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)),
+		Forwarder: forwarder, Now: func() time.Time { return poolTestNow }, Admission: observedCoordinator,
+		Leases: leases, ReplicaID: uuid.New(), LeaseTTL: time.Minute,
+	})
+	request := gateway.ForwardRequest{Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(`{"model":"public-model"}`), APIKey: rawKey}
+	if _, _, err := service.Forward(context.Background(), httptest.NewRecorder(), request); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for leases.ActiveCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if leases.ActiveCount() != 0 {
+		t.Fatal("asynchronous admission completion was not delivered")
+	}
+	if _, _, err := service.Forward(context.Background(), httptest.NewRecorder(), request); err == nil || err.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("first admission after policy update ignored prior 50-token completion: %+v", err)
 	}
 }

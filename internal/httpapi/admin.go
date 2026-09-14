@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
@@ -649,7 +650,7 @@ func writeAdminError(writer http.ResponseWriter, err error) {
 	case errors.Is(err, errAdminMutationsUnavailable):
 		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
 		message = "Configuration mutations are temporarily unavailable"
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, sql.ErrNoRows), errors.Is(err, pgx.ErrNoRows):
 		status, code = http.StatusNotFound, "not_found"
 	case errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23505"):
 		status, code = http.StatusConflict, "conflict"

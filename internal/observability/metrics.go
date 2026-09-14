@@ -55,12 +55,14 @@ type Metrics struct {
 	renewFailures          prometheus.Counter
 	lostLeases             prometheus.Counter
 	pendingCompletions     prometheus.Gauge
+	droppedCompletions     prometheus.Counter
 	emergency              *prometheus.CounterVec
 	rateRejections         *prometheus.CounterVec
 	missingUsage           prometheus.Counter
 	circuitCacheAge        prometheus.Gauge
 	circuitRefreshFailures prometheus.Counter
 	circuitReplayBacklog   prometheus.Gauge
+	circuitReplayDropped   *prometheus.CounterVec
 	compatibleReplicas     prometheus.Gauge
 	runtimeMu              sync.Mutex
 	runtimeTopologyKnown   bool
@@ -170,12 +172,14 @@ func NewMetrics() *Metrics {
 	m.renewFailures = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_renew_failures_total", Help: "Admission or probe renewal failures."})
 	m.lostLeases = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_lost_leases_total", Help: "Leases reported lost during renewal or completion."})
 	m.pendingCompletions = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_pending_completions", Help: "Locally queued durable completions."})
+	m.droppedCompletions = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_dropped_completions_total", Help: "Admission completions dropped because the local durable-completion backlog was full."})
 	m.emergency = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_emergency_total", Help: "Emergency admission decisions."}, []string{"priority_class", "outcome"})
 	m.rateRejections = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_rate_rejections_total", Help: "Distributed rate-limit rejections."}, []string{"kind"})
 	m.missingUsage = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_missing_usage_total", Help: "Completed requests without token usage for soft TPM accounting."})
 	m.circuitCacheAge = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_circuit_cache_age_seconds", Help: "Age of the last successful distributed circuit refresh."})
 	m.circuitRefreshFailures = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_circuit_refresh_failures_total", Help: "Distributed circuit refresh failures."})
 	m.circuitReplayBacklog = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_circuit_replay_backlog", Help: "Buffered circuit failures awaiting replay."})
+	m.circuitReplayDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_circuit_replay_dropped_total", Help: "Circuit replay events dropped because they expired or overflowed the bounded backlog."}, []string{"reason"})
 	m.compatibleReplicas = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_compatible_replicas", Help: "Active compatible PostgreSQL gateway replicas."})
 	m.registry.MustRegister(
 		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight,
@@ -184,9 +188,9 @@ func NewMetrics() *Metrics {
 		m.poolAvailableBackends, m.ttft, m.disconnects, m.backendFailures, m.retries,
 		m.inputTokens, m.outputTokens, m.cacheReadTokens, m.usageParseFails, m.usagePersistFail,
 		m.coordinationOperations, m.coordinationDecisions, m.coordinationLatency, m.postgresPool, m.postgresPoolFailures, m.configReconnects, m.configPollAge,
-		m.activeLeases, m.localLeaseHandles, m.renewFailures, m.lostLeases, m.pendingCompletions,
+		m.activeLeases, m.localLeaseHandles, m.renewFailures, m.lostLeases, m.pendingCompletions, m.droppedCompletions,
 		m.emergency, m.rateRejections, m.missingUsage, m.circuitCacheAge, m.circuitRefreshFailures,
-		m.circuitReplayBacklog, m.compatibleReplicas,
+		m.circuitReplayBacklog, m.circuitReplayDropped, m.compatibleReplicas,
 	)
 	return m
 }
@@ -256,10 +260,16 @@ func (m *Metrics) CoordinationRateRejected(kind string) {
 }
 func (m *Metrics) CoordinationRenewFailure()      { m.renewFailures.Inc() }
 func (m *Metrics) CoordinationLeaseLost()         { m.lostLeases.Inc() }
+func (m *Metrics) CoordinationCompletionDropped() { m.droppedCompletions.Inc() }
 func (m *Metrics) CoordinationMissingUsage()      { m.missingUsage.Inc() }
 func (m *Metrics) ConfigNotificationReconnect()   { m.configReconnects.Inc() }
 func (m *Metrics) ConfigPollSuccess(at time.Time) { m.lastConfigPoll.Store(at.UnixNano()) }
 func (m *Metrics) CircuitRefreshFailure()         { m.circuitRefreshFailures.Inc() }
+func (m *Metrics) CoordinationCircuitReplayDropped(reason string, count int) {
+	if count > 0 {
+		m.circuitReplayDropped.WithLabelValues(bounded(reason, "expired", "overflow")).Add(float64(count))
+	}
+}
 
 func bounded(value string, allowed ...string) string {
 	for _, candidate := range allowed {

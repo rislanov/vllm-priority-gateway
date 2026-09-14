@@ -23,6 +23,7 @@ type AdmissionCoordinator struct {
 	mu       sync.RWMutex
 	status   coordination.Status
 	inflight map[int64]int
+	failures failurePublisher
 }
 
 func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *AdmissionCoordinator {
@@ -38,7 +39,12 @@ func (c *AdmissionCoordinator) PoolInflight(poolID int64) int {
 }
 func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultErr error) {
 	defer func() {
-		if resultErr == nil || !permanentCoordinationError(resultErr) {
+		if resultErr == nil {
+			c.setStatus(true, "")
+			return
+		}
+		if !permanentCoordinationError(resultErr) {
+			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 			return
 		}
 		c.setPermanent()
@@ -76,6 +82,9 @@ func (c *AdmissionCoordinator) Status() coordination.Status {
 	defer c.mu.RUnlock()
 	return c.status
 }
+func (c *AdmissionCoordinator) SetFailureObserver(observer coordination.CoordinationFailureObserver) {
+	c.failures.set(observer)
+}
 func (c *AdmissionCoordinator) setStatus(ok bool, reason coordination.Reason) {
 	c.mu.Lock()
 	if c.status.Permanent {
@@ -89,6 +98,9 @@ func (c *AdmissionCoordinator) setStatus(ok bool, reason coordination.Reason) {
 		c.status.LastSuccess = time.Now().UTC()
 	}
 	c.mu.Unlock()
+	if !ok {
+		c.failures.unavailable()
+	}
 }
 func (c *AdmissionCoordinator) setPermanent() {
 	c.mu.Lock()
@@ -97,6 +109,7 @@ func (c *AdmissionCoordinator) setPermanent() {
 	c.status.Permanent = true
 	c.status.Reason = coordination.ReasonCoordinationUnavailable
 	c.mu.Unlock()
+	c.failures.permanent()
 }
 func (c *AdmissionCoordinator) deadline(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, c.timeout)
@@ -464,7 +477,7 @@ func (c *AdmissionCoordinator) Complete(parent context.Context, items []coordina
 			} else {
 				c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 			}
-			return nil, err
+			return out[:i], err
 		}
 		out[i] = r
 	}

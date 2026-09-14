@@ -118,8 +118,22 @@ type CompleteResult struct {
 type AdmissionCoordinator interface {
 	Acquire(context.Context, AdmissionRequest) (AdmissionDecision, error)
 	Renew(context.Context, []LeaseIdentity) ([]RenewResult, error)
+	// Complete applies completions in input order. When it returns an error,
+	// results may contain the durably completed input prefix; callers must retry
+	// only the remaining suffix.
 	Complete(context.Context, []LeaseCompletion) ([]CompleteResult, error)
 	Status() Status
+}
+
+type ClientRatePolicy struct {
+	ClientID          int64
+	Revision          int64
+	RequestsPerMinute int64
+	TokensPerMinute   int64
+}
+
+type AdmissionPolicyObserver interface {
+	ObserveClientRatePolicy(ClientRatePolicy)
 }
 
 type AdmissionRuntime interface {

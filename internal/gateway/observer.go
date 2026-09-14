@@ -49,6 +49,11 @@ type Observer interface {
 	Complete(RequestEvent)
 }
 
+// CoordinationEmergencyObserver receives bounded emergency-admission outcomes.
+type CoordinationEmergencyObserver interface {
+	CoordinationEmergency(domain.PriorityClass, bool)
+}
+
 // ResponseCompleteReservation is an opaque, in-memory lifecycle handle. The
 // gateway stages the enriched event through the handle that reserved capacity;
 // it must never be added to durable records, API responses, logs, or metrics.

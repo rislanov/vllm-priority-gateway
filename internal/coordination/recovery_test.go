@@ -104,3 +104,29 @@ func TestRecoveryManagerObservesOnlyActualStateTransitions(t *testing.T) {
 		t.Fatalf("transitions=%v want=%v", observer.transitions, want)
 	}
 }
+
+func TestRecoveryManagerDoesNotClearFailureRaisedDuringRecovery(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	manager := coordination.NewRecoveryManager(coordination.RecoverySteps{
+		Ping: func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		},
+	}, time.Now)
+	manager.MarkDegraded(errors.New("initial outage"))
+	done := make(chan error, 1)
+	go func() { done <- manager.Recover(context.Background()) }()
+	<-started
+	concurrentFailure := errors.New("coordination failed during recovery")
+	manager.CoordinationFailure(concurrentFailure)
+	close(release)
+	if err := <-done; !errors.Is(err, concurrentFailure) {
+		t.Fatalf("Recover()=%v, want concurrent failure", err)
+	}
+	status := manager.Status()
+	if status.State != coordination.RecoveryDegraded || !errors.Is(status.LastError, concurrentFailure) {
+		t.Fatalf("status=%+v", status)
+	}
+}

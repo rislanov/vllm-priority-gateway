@@ -43,6 +43,7 @@ type RecoveryManager struct {
 	recoverMu sync.Mutex
 	mu        sync.RWMutex
 	status    RecoveryStatus
+	failures  uint64
 	observer  RecoveryObserver
 }
 
@@ -72,6 +73,7 @@ func (m *RecoveryManager) MarkDegraded(err error) {
 	previous := m.status.State
 	m.status.State = RecoveryDegraded
 	m.status.LastError = err
+	m.failures++
 	m.mu.Unlock()
 	m.observeTransition(previous, RecoveryDegraded)
 }
@@ -81,15 +83,29 @@ func (m *RecoveryManager) MarkPermanent(err error) {
 	previous := m.status.State
 	m.status.State = RecoveryPermanentFault
 	m.status.LastError = err
+	m.failures++
 	m.mu.Unlock()
 	m.observeTransition(previous, RecoveryPermanentFault)
+}
+
+func (m *RecoveryManager) CoordinationFailure(err error) {
+	var permanent PermanentError
+	if errors.As(err, &permanent) {
+		m.MarkPermanent(err)
+		return
+	}
+	m.MarkDegraded(err)
 }
 
 func (m *RecoveryManager) Recover(ctx context.Context) error {
 	m.recoverMu.Lock()
 	defer m.recoverMu.Unlock()
 
-	if status := m.Status(); status.State == RecoveryPermanentFault {
+	m.mu.RLock()
+	status := m.status
+	startingFailures := m.failures
+	m.mu.RUnlock()
+	if status.State == RecoveryPermanentFault {
 		return PermanentError{Err: status.LastError}
 	}
 	steps := []func(context.Context) error{
@@ -115,6 +131,14 @@ func (m *RecoveryManager) Recover(ctx context.Context) error {
 		}
 	}
 	m.mu.Lock()
+	if m.failures != startingFailures {
+		status := m.status
+		m.mu.Unlock()
+		if status.State == RecoveryPermanentFault {
+			return PermanentError{Err: status.LastError}
+		}
+		return status.LastError
+	}
 	previous := m.status.State
 	m.status = RecoveryStatus{State: RecoveryReady, LastSuccess: m.now().UTC()}
 	m.mu.Unlock()

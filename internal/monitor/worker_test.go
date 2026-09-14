@@ -111,6 +111,25 @@ func TestWorkerMetricsPressureAndStaleness(t *testing.T) {
 	}
 }
 
+func TestWorkerTreatsConcurrentNewerMetricsSampleAsFresh(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	worker, err := monitor.NewWorker(testBackend(server.URL, 1, 1), monitorOptions(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	worker.PollHealth(context.Background(), now)
+	worker.PollHealth(context.Background(), now)
+	if err := worker.PollMetrics(context.Background(), now.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := worker.Snapshot(now); !snapshot.MetricsFresh || snapshot.State != domain.BackendHealthy {
+		t.Fatalf("snapshot taken during concurrent metrics update = %+v", snapshot)
+	}
+}
+
 func TestWorkerDoesNotFollowHealthOrMetricsRedirects(t *testing.T) {
 	var redirectedRequests atomic.Int64
 	sink := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

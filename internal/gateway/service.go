@@ -344,16 +344,22 @@ func (s *Service) Forward(
 	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 		return proxy.Result{}, reservation, modelNotAllowed()
 	}
-	affinityKey := ""
-	if sessionID != "" {
-		affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
-	}
 	payload, err := forceStreamingUsage(payload, request.Path)
 	if err != nil {
 		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream request")
 	}
-	payload, err = replaceModel(payload, pool.UpstreamModelName)
-	if err != nil {
+	basePayload := payload
+	affinityKey := ""
+	rebuildDerived := func() error {
+		if sessionID == "" {
+			affinityKey = ""
+		} else {
+			affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
+		}
+		payload, err = replaceModel(basePayload, pool.UpstreamModelName)
+		return err
+	}
+	if err = rebuildDerived(); err != nil {
 		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
 	}
 	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
@@ -375,6 +381,7 @@ func (s *Service) Forward(
 		}
 		if !s.coordinationReady() {
 			releaseEmergency, ok := s.emergency.Acquire(client.PriorityClass, client.ID, limit)
+			s.observeEmergency(client.PriorityClass, ok)
 			if !ok {
 				return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
 			}
@@ -404,6 +411,9 @@ func (s *Service) Forward(
 				if !poolOK || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
 					return proxy.Result{}, reservation, modelNotAllowed()
 				}
+				if err = rebuildDerived(); err != nil {
+					return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
+				}
 				poolRuntime, releasePool, poolErr = s.acquirePool(ctx, client.ID, pool)
 				if poolErr != nil {
 					return proxy.Result{}, reservation, poolErr
@@ -419,6 +429,7 @@ func (s *Service) Forward(
 					return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
 				}
 				releaseEmergency, ok := s.emergency.Acquire(client.PriorityClass, client.ID, limit)
+				s.observeEmergency(client.PriorityClass, ok)
 				if !ok {
 					return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
 				}
@@ -427,9 +438,21 @@ func (s *Service) Forward(
 				return proxy.Result{}, reservation, coordinationAPIError(decision.Reason, s.retryAfter, decision.RetryAt, s.now().UTC())
 			} else {
 				event.SoftTPMExpected = client.TokensPerMinute > 0
+				var leaseHandle *coordination.LeaseHandle
+				if s.leases != nil {
+					leaseHandle = s.leases.Track(decision.Lease.Identity())
+				}
 				complete := func(usage *coordination.TokenUsage) {
-					if s.leases != nil {
-						s.leases.Track(decision.Lease.Identity()).Complete(usage)
+					if observer, ok := s.admission.(coordination.AdmissionPolicyObserver); ok {
+						if current, exists := s.registry.Snapshot().Clients[client.ID]; exists {
+							observer.ObserveClientRatePolicy(coordination.ClientRatePolicy{
+								ClientID: current.ID, Revision: current.Revision,
+								RequestsPerMinute: current.RequestsPerMinute, TokensPerMinute: current.TokensPerMinute,
+							})
+						}
+					}
+					if leaseHandle != nil {
+						leaseHandle.Complete(usage)
 						return
 					}
 					_, _ = s.admission.Complete(context.WithoutCancel(ctx), []coordination.LeaseCompletion{{Lease: decision.Lease.Identity(), Usage: usage}})
@@ -534,6 +557,12 @@ func (s *Service) Forward(
 		return result, reservation, upstreamError()
 	}
 	return result, reservation, nil
+}
+
+func (s *Service) observeEmergency(class domain.PriorityClass, admitted bool) {
+	if observer, ok := s.observer.(CoordinationEmergencyObserver); ok {
+		observer.CoordinationEmergency(class, admitted)
+	}
 }
 
 func (s *Service) acquirePool(ctx context.Context, clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {

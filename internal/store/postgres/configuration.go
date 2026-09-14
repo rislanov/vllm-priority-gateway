@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -15,24 +14,24 @@ import (
 func (s *Store) mutation(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.config.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return errors.New("begin PostgreSQL configuration transaction")
+		return fmt.Errorf("begin PostgreSQL configuration transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	if _, err = tx.Exec(ctx, "SET LOCAL synchronous_commit = on"); err != nil {
-		return errors.New("set PostgreSQL configuration durability")
+		return fmt.Errorf("set PostgreSQL configuration durability: %w", err)
 	}
 	if err = fn(tx); err != nil {
 		return err
 	}
 	var revision int64
 	if err = tx.QueryRow(ctx, "UPDATE config_meta SET revision=revision+1 WHERE singleton=1 RETURNING revision").Scan(&revision); err != nil {
-		return errors.New("increment PostgreSQL configuration revision")
+		return fmt.Errorf("increment PostgreSQL configuration revision: %w", err)
 	}
 	if _, err = tx.Exec(ctx, "SELECT pg_notify('llmgw_config_changed', $1::text)", fmt.Sprint(revision)); err != nil {
-		return errors.New("notify PostgreSQL configuration change")
+		return fmt.Errorf("notify PostgreSQL configuration change: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return errors.New("commit PostgreSQL configuration transaction")
+		return fmt.Errorf("commit PostgreSQL configuration transaction: %w", err)
 	}
 	return nil
 }
@@ -47,10 +46,10 @@ func (s *Store) CreateClient(ctx context.Context, p basestore.CreateClientParams
 	v.UpdatedAt = now
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `INSERT INTO clients(name,enabled,priority_class,vllm_priority,max_concurrency,requests_per_minute,tokens_per_minute,created_at,updated_at) VALUES($1::text,$2::boolean,$3::text,$4::integer,$5::integer,$6::bigint,$7::bigint,$8::timestamptz,$8::timestamptz) RETURNING id`, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, now).Scan(&v.ID); err != nil {
-			return errors.New("insert PostgreSQL client")
+			return fmt.Errorf("insert PostgreSQL client: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO client_admission_scopes(client_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now); err != nil {
-			return errors.New("create PostgreSQL client admission scope")
+			return fmt.Errorf("create PostgreSQL client admission scope: %w", err)
 		}
 		return replaceAccess(ctx, tx, v.ID, p.ModelPoolIDs)
 	})
@@ -65,10 +64,10 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 		// canonical order is a deliberately conservative way to make that union
 		// stable while admission remains deadlock-free.
 		if _, err := tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes ORDER BY pool_id FOR UPDATE"); err != nil {
-			return errors.New("lock PostgreSQL pool admission scopes")
+			return fmt.Errorf("lock PostgreSQL pool admission scopes: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", id); err != nil {
-			return errors.New("lock PostgreSQL client admission scope")
+			return fmt.Errorf("lock PostgreSQL client admission scope: %w", err)
 		}
 		var previous domain.Client
 		if err := tx.QueryRow(ctx, "SELECT max_concurrency,revision,created_at FROM clients WHERE id=$1::bigint FOR UPDATE", id).Scan(&previous.MaxConcurrency, &previous.Revision, &v.CreatedAt); err != nil {
@@ -80,8 +79,11 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 		v.Revision = previous.Revision + 1
 		v.UpdatedAt = time.Now().UTC()
 		tag, err := tx.Exec(ctx, `UPDATE clients SET name=$2::text,enabled=$3::boolean,priority_class=$4::text,vllm_priority=$5::integer,max_concurrency=$6::integer,requests_per_minute=$7::bigint,tokens_per_minute=$8::bigint,revision=revision+1,updated_at=$9::timestamptz WHERE id=$1::bigint`, id, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, v.UpdatedAt)
-		if err != nil || tag.RowsAffected() != 1 {
-			return errors.New("update PostgreSQL client")
+		if err != nil {
+			return fmt.Errorf("update PostgreSQL client: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("update PostgreSQL client: %w", pgx.ErrNoRows)
 		}
 		return replaceAccess(ctx, tx, id, p.ModelPoolIDs)
 	})
@@ -90,7 +92,7 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 
 func replaceAccess(ctx context.Context, tx pgx.Tx, clientID int64, poolIDs []int64) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM client_model_access WHERE client_id=$1::bigint", clientID); err != nil {
-		return errors.New("clear PostgreSQL client access")
+		return fmt.Errorf("clear PostgreSQL client access: %w", err)
 	}
 	seen := map[int64]bool{}
 	for _, id := range poolIDs {
@@ -99,7 +101,7 @@ func replaceAccess(ctx context.Context, tx pgx.Tx, clientID int64, poolIDs []int
 		}
 		seen[id] = true
 		if _, err := tx.Exec(ctx, "INSERT INTO client_model_access(client_id,model_pool_id,enabled) VALUES($1::bigint,$2::bigint,true)", clientID, id); err != nil {
-			return errors.New("grant PostgreSQL client access")
+			return fmt.Errorf("grant PostgreSQL client access: %w", err)
 		}
 	}
 	return nil
@@ -115,10 +117,12 @@ func (s *Store) CreatePool(ctx context.Context, p basestore.CreatePoolParams) (d
 	v.UpdatedAt = now
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `INSERT INTO model_pools(public_model_name,upstream_model_name,enabled,max_gateway_inflight,max_waiting,created_at,updated_at) VALUES($1::text,$2::text,$3::boolean,$4::integer,$5::integer,$6::timestamptz,$6::timestamptz) RETURNING id`, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.MaxWaiting, now).Scan(&v.ID); err != nil {
-			return errors.New("insert PostgreSQL model pool")
+			return fmt.Errorf("insert PostgreSQL model pool: %w", err)
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO pool_admission_scopes(pool_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now)
-		return err
+		if _, err := tx.Exec(ctx, "INSERT INTO pool_admission_scopes(pool_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now); err != nil {
+			return fmt.Errorf("create PostgreSQL pool admission scope: %w", err)
+		}
+		return nil
 	})
 	return v, err
 }
@@ -139,8 +143,11 @@ func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePool
 		v.Revision = old.Revision + 1
 		v.UpdatedAt = time.Now().UTC()
 		tag, err := tx.Exec(ctx, `UPDATE model_pools SET public_model_name=$2::text,upstream_model_name=$3::text,enabled=$4::boolean,max_gateway_inflight=$5::integer,max_waiting=$6::integer,revision=revision+1,updated_at=$7::timestamptz WHERE id=$1::bigint`, id, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.MaxWaiting, v.UpdatedAt)
-		if err != nil || tag.RowsAffected() != 1 {
-			return errors.New("update PostgreSQL model pool")
+		if err != nil {
+			return fmt.Errorf("update PostgreSQL model pool: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("update PostgreSQL model pool: %w", pgx.ErrNoRows)
 		}
 		return nil
 	})
@@ -157,10 +164,12 @@ func (s *Store) CreateBackend(ctx context.Context, p basestore.CreateBackendPara
 	v.UpdatedAt = now
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `INSERT INTO backends(model_pool_id,name,base_url,enabled,draining,capacity_hint,running_soft_limit,upstream_api_key_env,created_at,updated_at) VALUES($1::bigint,$2::text,$3::text,$4::boolean,$5::boolean,$6::double precision,$7::double precision,$8::text,$9::timestamptz,$9::timestamptz) RETURNING id`, v.ModelPoolID, v.Name, v.BaseURL, v.Enabled, v.Draining, v.CapacityHint, v.RunningSoftLimit, v.UpstreamAPIKeyEnv, now).Scan(&v.ID); err != nil {
-			return errors.New("insert PostgreSQL backend")
+			return fmt.Errorf("insert PostgreSQL backend: %w", err)
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO backend_circuit_state(backend_id,backend_revision,state,generation,half_open_succeeded,updated_at) VALUES($1::bigint,1,'closed',0,false,$2::timestamptz)", v.ID, now)
-		return err
+		if _, err := tx.Exec(ctx, "INSERT INTO backend_circuit_state(backend_id,backend_revision,state,generation,half_open_succeeded,updated_at) VALUES($1::bigint,1,'closed',0,false,$2::timestamptz)", v.ID, now); err != nil {
+			return fmt.Errorf("create PostgreSQL backend circuit state: %w", err)
+		}
+		return nil
 	})
 	return v, err
 }
@@ -184,9 +193,15 @@ func (s *Store) UpdateBackend(ctx context.Context, id int64, p basestore.UpdateB
 		if err != nil {
 			return err
 		}
+		if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", id); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `UPDATE backends SET model_pool_id=$2::bigint,name=$3::text,base_url=$4::text,enabled=$5::boolean,draining=$6::boolean,capacity_hint=$7::double precision,running_soft_limit=$8::double precision,upstream_api_key_env=$9::text,revision=revision+1,updated_at=$10::timestamptz WHERE id=$1::bigint`, id, v.ModelPoolID, v.Name, v.BaseURL, v.Enabled, v.Draining, v.CapacityHint, v.RunningSoftLimit, v.UpstreamAPIKeyEnv, v.UpdatedAt)
-		if err != nil || tag.RowsAffected() != 1 {
-			return errors.New("update PostgreSQL backend")
+		if err != nil {
+			return fmt.Errorf("update PostgreSQL backend: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("update PostgreSQL backend: %w", pgx.ErrNoRows)
 		}
 		_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", id, v.Revision, v.UpdatedAt)
 		return err
@@ -205,6 +220,9 @@ func (s *Store) SetBackendDraining(ctx context.Context, id int64, draining bool)
 		}
 		now, err := supersedeProbes(ctx, tx, id)
 		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", id); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, "UPDATE backends SET draining=$2::boolean,revision=revision+1,updated_at=$3::timestamptz WHERE id=$1::bigint", id, draining, now)
@@ -248,7 +266,7 @@ func (s *Store) RevokeAPIKey(ctx context.Context, id int64) error {
 func (s *Store) TouchKeyLastUsed(ctx context.Context, id int64, at time.Time) error {
 	_, err := s.config.Exec(ctx, "UPDATE api_keys SET last_used_at=GREATEST(COALESCE(last_used_at,$2::timestamptz),$2::timestamptz) WHERE id=$1::bigint", id, at.UTC())
 	if err != nil {
-		return errors.New("update PostgreSQL API key usage")
+		return fmt.Errorf("update PostgreSQL API key usage: %w", err)
 	}
 	return nil
 }
@@ -256,7 +274,7 @@ func (s *Store) TouchKeyLastUsed(ctx context.Context, id int64, at time.Time) er
 func (s *Store) LoadSnapshot(ctx context.Context) (registry.Data, error) {
 	tx, err := s.config.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return registry.Data{}, errors.New("begin PostgreSQL configuration snapshot")
+		return registry.Data{}, fmt.Errorf("begin PostgreSQL configuration snapshot: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	var out registry.Data
@@ -294,7 +312,7 @@ func (s *Store) LoadSnapshot(ctx context.Context) (registry.Data, error) {
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return registry.Data{}, errors.New("commit PostgreSQL configuration snapshot")
+		return registry.Data{}, fmt.Errorf("commit PostgreSQL configuration snapshot: %w", err)
 	}
 	return out, nil
 }
@@ -302,7 +320,7 @@ func (s *Store) LoadSnapshot(ctx context.Context) (registry.Data, error) {
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 	var revision int64
 	if err := s.config.QueryRow(ctx, "SELECT revision FROM config_meta WHERE singleton=1").Scan(&revision); err != nil {
-		return 0, errors.New("read PostgreSQL configuration revision")
+		return 0, fmt.Errorf("read PostgreSQL configuration revision: %w", err)
 	}
 	return revision, nil
 }

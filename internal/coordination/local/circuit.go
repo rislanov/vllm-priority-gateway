@@ -12,6 +12,8 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
 
+const defaultLocalCircuitAttemptCapacity = 65_536
+
 type circuitEntry struct {
 	identity coordination.BackendIdentity
 	breaker  *circuitbreaker.Breaker
@@ -29,24 +31,39 @@ type circuitAttempt struct {
 	retainUntil time.Time
 }
 type CircuitCoordinator struct {
-	mu       sync.Mutex
-	options  circuitbreaker.Options
-	now      func() time.Time
-	circuits map[int64]*circuitEntry
-	attempts map[uuid.UUID]*circuitAttempt
+	mu               sync.Mutex
+	options          circuitbreaker.Options
+	now              func() time.Time
+	circuits         map[int64]*circuitEntry
+	attempts         map[uuid.UUID]*circuitAttempt
+	expiries         expiryQueue
+	terminalExpiries expiryQueue
+	attemptCapacity  int
 }
 
 func NewCircuitCoordinator(options circuitbreaker.Options, now func() time.Time) (*CircuitCoordinator, error) {
+	return newCircuitCoordinator(options, now, defaultLocalCircuitAttemptCapacity)
+}
+
+func newCircuitCoordinator(options circuitbreaker.Options, now func() time.Time, attemptCapacity int) (*CircuitCoordinator, error) {
 	if _, err := circuitbreaker.New(options); err != nil {
 		return nil, err
 	}
 	if now == nil {
 		now = time.Now
 	}
-	return &CircuitCoordinator{options: options, now: now, circuits: make(map[int64]*circuitEntry), attempts: make(map[uuid.UUID]*circuitAttempt)}, nil
+	if attemptCapacity <= 0 {
+		attemptCapacity = defaultLocalCircuitAttemptCapacity
+	}
+	return &CircuitCoordinator{options: options, now: now, circuits: make(map[int64]*circuitEntry), attempts: make(map[uuid.UUID]*circuitAttempt), attemptCapacity: attemptCapacity}, nil
 }
 func (c *CircuitCoordinator) Status() coordination.Status {
-	return coordination.Status{Backend: "local", Available: true, LastSuccess: c.now().UTC()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now().UTC()
+	c.expire(now)
+	available := len(c.attempts) < c.attemptCapacity || c.hasTerminalAttempt()
+	return coordination.Status{Backend: "local", Available: available, LastSuccess: now}
 }
 func (c *CircuitCoordinator) Refresh(context.Context) error { return nil }
 func (c *CircuitCoordinator) Reconcile(ctx context.Context, values []coordination.BackendIdentity) error {
@@ -111,6 +128,9 @@ func (c *CircuitCoordinator) Acquire(ctx context.Context, req coordination.Circu
 		}
 		return coordination.CircuitDecision{Snapshot: c.snapshot(req.Backend.ID, now), Permit: old.permit}, nil
 	}
+	if !c.makeAttemptRoom() {
+		return coordination.CircuitDecision{Snapshot: c.snapshot(req.Backend.ID, now), Reason: coordination.ReasonCoordinationUnavailable}, nil
+	}
 	entry := c.circuits[req.Backend.ID]
 	if entry == nil || entry.identity != req.Backend || !req.Backend.Enabled || req.Backend.Draining {
 		return coordination.CircuitDecision{Reason: coordination.ReasonStaleBackend}, nil
@@ -132,6 +152,7 @@ func (c *CircuitCoordinator) Acquire(ctx context.Context, req coordination.Circu
 		permit := coordination.ProbeIdentity{PermitID: req.AttemptID, Backend: req.Backend, Generation: snap.Generation, ReplicaID: req.ReplicaID, ExpiresAt: now.Add(req.ProbeTTL), TTL: req.ProbeTTL}
 		attempt.permit = &permit
 		attempt.ttl = req.ProbeTTL
+		c.expiries.add(circuitPermitExpiry, req.AttemptID, permit.ExpiresAt)
 	}
 	c.attempts[req.AttemptID] = attempt
 	return coordination.CircuitDecision{Snapshot: snap, Permit: attempt.permit}, nil
@@ -167,6 +188,7 @@ func (c *CircuitCoordinator) Complete(ctx context.Context, value coordination.Ci
 		attempt.terminal = true
 	}
 	attempt.retainUntil = circuitRetentionBoundary(now, attempt.acquiredAt, value.ReportedOutcomeAt)
+	c.terminalExpiries.add(circuitAttemptExpiry, value.AttemptID, attempt.retainUntil)
 	return c.snapshot(value.Backend.ID, now), nil
 }
 func (c *CircuitCoordinator) RenewProbes(ctx context.Context, probes []coordination.ProbeIdentity) ([]coordination.RenewResult, error) {
@@ -193,6 +215,7 @@ func (c *CircuitCoordinator) RenewProbes(ctx context.Context, probes []coordinat
 			continue
 		}
 		a.permit.ExpiresAt = now.Add(ttl)
+		c.expiries.add(circuitPermitExpiry, p.PermitID, a.permit.ExpiresAt)
 		out[i] = coordination.RenewResult{Lease: coordination.LeaseIdentity{
 			LeaseID: p.PermitID, ExpiresAt: a.permit.ExpiresAt, TTL: ttl,
 		}}
@@ -200,26 +223,72 @@ func (c *CircuitCoordinator) RenewProbes(ctx context.Context, probes []coordinat
 	return out, nil
 }
 func (c *CircuitCoordinator) expire(now time.Time) {
-	for _, a := range c.attempts {
-		if !a.terminal && a.permit != nil && !a.permit.ExpiresAt.After(now) {
-			a.complete(domain.InferenceFailure, a.permit.ExpiresAt)
-			a.terminal = true
-			a.retainUntil = circuitRetentionBoundary(now, a.acquiredAt, a.permit.ExpiresAt)
+	for {
+		expiry, ok := c.expiries.due(now)
+		if !ok {
+			break
+		}
+		attempt := c.attempts[expiry.id]
+		if attempt == nil {
+			continue
+		}
+		switch expiry.kind {
+		case circuitPermitExpiry:
+			if attempt.terminal || attempt.permit == nil || !attempt.permit.ExpiresAt.Equal(expiry.at) || attempt.permit.ExpiresAt.After(now) {
+				continue
+			}
+			attempt.complete(domain.InferenceFailure, attempt.permit.ExpiresAt)
+			attempt.terminal = true
+			attempt.retainUntil = circuitRetentionBoundary(now, attempt.acquiredAt, attempt.permit.ExpiresAt)
+			c.terminalExpiries.add(circuitAttemptExpiry, expiry.id, attempt.retainUntil)
 		}
 	}
-	for id, attempt := range c.attempts {
-		if attempt.terminal && !attempt.retainUntil.IsZero() && !attempt.retainUntil.After(now) {
-			delete(c.attempts, id)
+	for {
+		expiry, ok := c.terminalExpiries.due(now)
+		if !ok {
+			return
+		}
+		attempt := c.attempts[expiry.id]
+		if attempt != nil && attempt.terminal && attempt.retainUntil.Equal(expiry.at) && !attempt.retainUntil.After(now) {
+			delete(c.attempts, expiry.id)
 		}
 	}
 }
+
 func (c *CircuitCoordinator) invalidate(id int64, now time.Time) {
-	for _, a := range c.attempts {
+	for attemptID, a := range c.attempts {
 		if a.backend.ID == id && !a.terminal {
 			a.terminal = true
 			a.retainUntil = circuitRetentionBoundary(now, a.acquiredAt)
+			c.terminalExpiries.add(circuitAttemptExpiry, attemptID, a.retainUntil)
 		}
 	}
+}
+
+func (c *CircuitCoordinator) makeAttemptRoom() bool {
+	for len(c.attempts) >= c.attemptCapacity {
+		if !c.hasTerminalAttempt() {
+			return false
+		}
+		expiry, ok := c.terminalExpiries.popOldest()
+		if !ok {
+			return false
+		}
+		delete(c.attempts, expiry.id)
+	}
+	return true
+}
+
+func (c *CircuitCoordinator) hasTerminalAttempt() bool {
+	for c.terminalExpiries.Len() > 0 {
+		expiry := c.terminalExpiries[0]
+		attempt := c.attempts[expiry.id]
+		if attempt != nil && attempt.terminal && !attempt.retainUntil.IsZero() && attempt.retainUntil.Equal(expiry.at) {
+			return true
+		}
+		_, _ = c.terminalExpiries.popOldest()
+	}
+	return false
 }
 
 func circuitRetentionBoundary(values ...time.Time) time.Time {

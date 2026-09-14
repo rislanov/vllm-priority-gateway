@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -88,6 +87,7 @@ func scanPGUsage(r pgx.CollectableRow) (v analytics.RequestRecord, err error) {
 }
 
 func (s *Store) Analytics(ctx context.Context, f analytics.Filter) (analytics.Dataset, error) {
+	f = canonicalPostgresAnalyticsFilter(f)
 	tx, err := s.analytics.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return analytics.Dataset{}, err
@@ -100,6 +100,7 @@ func (s *Store) Analytics(ctx context.Context, f analytics.Filter) (analytics.Da
 	return out, err
 }
 func (s *Store) AnalyticsDashboard(ctx context.Context, f analytics.Filter, limit, offset int) (analytics.Dataset, analytics.RequestPage, error) {
+	f = canonicalPostgresAnalyticsFilter(f)
 	tx, err := s.analytics.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return analytics.Dataset{}, analytics.RequestPage{}, err
@@ -116,7 +117,7 @@ func (s *Store) AnalyticsDashboard(ctx context.Context, f analytics.Filter, limi
 	return d, p, err
 }
 func (s *Store) UsageRequests(ctx context.Context, f analytics.Filter, limit, offset int) (analytics.RequestPage, error) {
-	return usagePage(ctx, s.analytics, f, limit, offset)
+	return usagePage(ctx, s.analytics, canonicalPostgresAnalyticsFilter(f), limit, offset)
 }
 func usagePage(ctx context.Context, q pgQuerier, f analytics.Filter, limit, offset int) (analytics.RequestPage, error) {
 	if limit <= 0 {
@@ -141,6 +142,7 @@ func usagePage(ctx context.Context, q pgQuerier, f analytics.Filter, limit, offs
 	return out, err
 }
 func (s *Store) StreamUsageRequests(ctx context.Context, f analytics.Filter, yield func(analytics.RequestRecord) error) error {
+	f = canonicalPostgresAnalyticsFilter(f)
 	if !f.From.Before(f.To) {
 		return nil
 	}
@@ -165,141 +167,160 @@ func (s *Store) StreamUsageRequests(ctx context.Context, f analytics.Filter, yie
 	return rows.Err()
 }
 
-type breakdownKey struct{ client, pool int64 }
-
 func analyticsDataset(ctx context.Context, q pgQuerier, f analytics.Filter) (analytics.Dataset, error) {
 	out := analytics.Dataset{Series: []analytics.SeriesPoint{}, Breakdown: []analytics.BreakdownRow{}, Clients: []analytics.Dimension{}, Models: []analytics.Dimension{}}
+	f = canonicalPostgresAnalyticsFilter(f)
 	if !f.From.Before(f.To) {
 		return out, nil
 	}
-	records, err := queryRecords(ctx, q, f, "ASC", 0, 0)
+	predicate, arguments := usagePredicate(f)
+	if err := queryAnalyticsSummary(ctx, q, predicate, arguments, &out.Summary); err != nil {
+		return out, err
+	}
+	var err error
+	out.Series, err = queryAnalyticsSeries(ctx, q, f, predicate, arguments)
 	if err != nil {
 		return out, err
 	}
-	width := bucketWidth(f.To.Sub(f.From))
-	series := map[int64]*analytics.SeriesPoint{}
-	seriesKnownInput := map[int64]int64{}
-	breakdowns := map[breakdownKey]*analytics.BreakdownRow{}
-	breakdownKnownInput := map[breakdownKey]int64{}
-	var summaryCache, summaryKnown int64
-	var summaryHasCache bool
-	for _, r := range records {
-		out.Summary.RequestCount++
-		if r.UsageAvailable {
-			out.Summary.MeteredRequestCount++
-		}
-		if r.InputTokens != nil {
-			out.Summary.InputTokens += *r.InputTokens
-		}
-		if r.OutputTokens != nil {
-			out.Summary.OutputTokens += *r.OutputTokens
-		}
-		if r.CacheReadTokens != nil && r.InputTokens != nil {
-			summaryHasCache = true
-			summaryCache += *r.CacheReadTokens
-			summaryKnown += *r.InputTokens
-		}
-		bucket := f.From.UTC().Add(r.OccurredAt.Sub(f.From.UTC()) / width * width).UnixNano()
-		p := series[bucket]
-		if p == nil {
-			p = &analytics.SeriesPoint{BucketStart: time.Unix(0, bucket).UTC()}
-			series[bucket] = p
-		}
-		p.RequestCount++
-		if r.InputTokens != nil {
-			p.InputTokens += *r.InputTokens
-		}
-		if r.OutputTokens != nil {
-			p.OutputTokens += *r.OutputTokens
-		}
-		if r.CacheReadTokens != nil && r.InputTokens != nil {
-			if p.CacheReadTokens == nil {
-				p.CacheReadTokens = ptr(int64(0))
-			}
-			*p.CacheReadTokens += *r.CacheReadTokens
-			seriesKnownInput[bucket] += *r.InputTokens
-			known := seriesKnownInput[bucket]
-			if known > 0 {
-				ratio := float64(*p.CacheReadTokens) / float64(known)
-				p.CacheHitRatio = &ratio
-			}
-		}
-		key := breakdownKey{r.ClientID, r.ModelPoolID}
-		b := breakdowns[key]
-		if b == nil {
-			b = &analytics.BreakdownRow{ClientID: r.ClientID, ModelPoolID: r.ModelPoolID}
-			breakdowns[key] = b
-		}
-		b.ClientName = r.ClientName
-		b.ModelName = r.ModelName
-		b.RequestCount++
-		if r.UsageAvailable {
-			b.MeteredRequestCount++
-		}
-		if r.InputTokens != nil {
-			b.InputTokens += *r.InputTokens
-		}
-		if r.OutputTokens != nil {
-			b.OutputTokens += *r.OutputTokens
-		}
-		if r.CacheReadTokens != nil && r.InputTokens != nil {
-			if b.CacheReadTokens == nil {
-				b.CacheReadTokens = ptr(int64(0))
-				b.UncachedInputTokens = ptr(int64(0))
-			}
-			*b.CacheReadTokens += *r.CacheReadTokens
-			*b.UncachedInputTokens += *r.InputTokens - *r.CacheReadTokens
-			breakdownKnownInput[key] += *r.InputTokens
-			if breakdownKnownInput[key] > 0 {
-				ratio := float64(*b.CacheReadTokens) / float64(breakdownKnownInput[key])
-				b.CacheHitRatio = &ratio
-			}
-		}
-	}
-	if out.Summary.RequestCount > 0 {
-		out.Summary.UsageCoverage = float64(out.Summary.MeteredRequestCount) / float64(out.Summary.RequestCount)
-	}
-	if summaryHasCache {
-		out.Summary.CacheReadTokens = ptr(summaryCache)
-		out.Summary.UncachedInputTokens = ptr(summaryKnown - summaryCache)
-		if summaryKnown > 0 {
-			v := float64(summaryCache) / float64(summaryKnown)
-			out.Summary.CacheHitRatio = &v
-		}
-	}
-	keys := make([]int64, 0, len(series))
-	for k := range series {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	if len(keys) > 0 {
-		for at := f.From.UTC(); at.Before(f.To); at = at.Add(width) {
-			key := at.UnixNano()
-			if p := series[key]; p != nil {
-				out.Series = append(out.Series, *p)
-			} else {
-				out.Series = append(out.Series, analytics.SeriesPoint{BucketStart: at})
-			}
-		}
-	}
-	bkeys := make([]breakdownKey, 0, len(breakdowns))
-	for k := range breakdowns {
-		bkeys = append(bkeys, k)
-	}
-	sort.Slice(bkeys, func(i, j int) bool {
-		if bkeys[i].client == bkeys[j].client {
-			return bkeys[i].pool < bkeys[j].pool
-		}
-		return bkeys[i].client < bkeys[j].client
-	})
-	for _, k := range bkeys {
-		out.Breakdown = append(out.Breakdown, *breakdowns[k])
+	out.Breakdown, err = queryAnalyticsBreakdown(ctx, q, predicate, arguments)
+	if err != nil {
+		return out, err
 	}
 	out.Clients, err = queryDimensions(ctx, q, "client_id", "client_name")
 	if err == nil {
 		out.Models, err = queryDimensions(ctx, q, "model_pool_id", "model_name")
 	}
 	return out, err
+}
+
+func queryAnalyticsSummary(ctx context.Context, q pgQuerier, predicate string, arguments []any, summary *analytics.Summary) error {
+	var cacheRead, uncachedInput, cacheKnownInput *int64
+	err := q.QueryRow(ctx, `SELECT COUNT(*),
+		COALESCE(SUM(usage_available::integer),0),
+		COALESCE(SUM(input_tokens),0),
+		COALESCE(SUM(output_tokens),0),
+		SUM(cache_read_tokens),
+		SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens-cache_read_tokens END),
+		SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens END)
+		FROM usage_requests WHERE `+predicate, arguments...).Scan(
+		&summary.RequestCount, &summary.MeteredRequestCount, &summary.InputTokens, &summary.OutputTokens,
+		&cacheRead, &uncachedInput, &cacheKnownInput,
+	)
+	if err != nil {
+		return err
+	}
+	summary.UsageCoverage = ratio(summary.MeteredRequestCount, summary.RequestCount)
+	setCacheAggregates(cacheRead, uncachedInput, cacheKnownInput, &summary.CacheReadTokens, &summary.UncachedInputTokens, &summary.CacheHitRatio)
+	return nil
+}
+
+func queryAnalyticsSeries(ctx context.Context, q pgQuerier, f analytics.Filter, predicate string, arguments []any) ([]analytics.SeriesPoint, error) {
+	widthSeconds := analyticsBucketWidthSeconds(f.From, f.To)
+	arguments = append(append([]any(nil), arguments...), widthSeconds)
+	widthArg := len(arguments)
+	bucket := fmt.Sprintf(`$1::timestamptz + floor(extract(epoch FROM (occurred_at-$1::timestamptz))/$%d::numeric)::bigint*$%d::bigint*interval '1 second'`, widthArg, widthArg)
+	rows, err := q.Query(ctx, `SELECT `+bucket+` AS bucket_start,
+		COUNT(*),COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
+		SUM(cache_read_tokens),SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens END)
+		FROM usage_requests WHERE `+predicate+` GROUP BY bucket_start ORDER BY bucket_start ASC`, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	points := make([]analytics.SeriesPoint, 0)
+	for rows.Next() {
+		var point analytics.SeriesPoint
+		var cacheRead, cacheKnownInput *int64
+		if err := rows.Scan(&point.BucketStart, &point.RequestCount, &point.InputTokens, &point.OutputTokens, &cacheRead, &cacheKnownInput); err != nil {
+			return nil, err
+		}
+		point.BucketStart = point.BucketStart.UTC()
+		point.CacheReadTokens = cacheRead
+		if cacheRead != nil && cacheKnownInput != nil && *cacheKnownInput > 0 {
+			point.CacheHitRatio = ptr(float64(*cacheRead) / float64(*cacheKnownInput))
+		}
+		points = append(points, point)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(points) == 0 {
+		return points, nil
+	}
+	byBucket := make(map[int64]analytics.SeriesPoint, len(points))
+	for _, point := range points {
+		byBucket[point.BucketStart.UnixMicro()] = point
+	}
+	fromMicros := f.From.UnixMicro()
+	toMicros := f.To.UnixMicro()
+	widthMicros := widthSeconds * int64(time.Second/time.Microsecond)
+	bucketCount := ceilDividePositive(toMicros-fromMicros, widthMicros)
+	dense := make([]analytics.SeriesPoint, 0, int(bucketCount))
+	for atMicros := fromMicros; atMicros < toMicros; atMicros += widthMicros {
+		at := time.UnixMicro(atMicros).UTC()
+		if point, exists := byBucket[atMicros]; exists {
+			dense = append(dense, point)
+		} else {
+			dense = append(dense, analytics.SeriesPoint{BucketStart: at})
+		}
+	}
+	return dense, nil
+}
+
+func queryAnalyticsBreakdown(ctx context.Context, q pgQuerier, predicate string, arguments []any) ([]analytics.BreakdownRow, error) {
+	rows, err := q.Query(ctx, `WITH grouped AS (
+		SELECT client_id,model_pool_id,COUNT(*) AS request_count,
+			COALESCE(SUM(usage_available::integer),0) AS metered_request_count,
+			COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,
+			SUM(cache_read_tokens) AS cache_read_tokens,
+			SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens-cache_read_tokens END) AS uncached_input_tokens,
+			SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens END) AS cache_known_input_tokens
+		FROM usage_requests WHERE `+predicate+` GROUP BY client_id,model_pool_id
+	), latest AS (
+		SELECT DISTINCT ON (client_id,model_pool_id) client_id,model_pool_id,client_name,model_name
+		FROM usage_requests WHERE `+predicate+`
+		ORDER BY client_id,model_pool_id,occurred_at DESC,id DESC
+	)
+	SELECT grouped.client_id,latest.client_name,grouped.model_pool_id,latest.model_name,
+		grouped.request_count,grouped.metered_request_count,grouped.input_tokens,grouped.output_tokens,
+		grouped.cache_read_tokens,grouped.uncached_input_tokens,grouped.cache_known_input_tokens
+	FROM grouped JOIN latest USING (client_id,model_pool_id)
+	ORDER BY grouped.client_id,grouped.model_pool_id`, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]analytics.BreakdownRow, 0)
+	for rows.Next() {
+		var row analytics.BreakdownRow
+		var cacheRead, uncachedInput, cacheKnownInput *int64
+		if err := rows.Scan(&row.ClientID, &row.ClientName, &row.ModelPoolID, &row.ModelName,
+			&row.RequestCount, &row.MeteredRequestCount, &row.InputTokens, &row.OutputTokens,
+			&cacheRead, &uncachedInput, &cacheKnownInput); err != nil {
+			return nil, err
+		}
+		setCacheAggregates(cacheRead, uncachedInput, cacheKnownInput, &row.CacheReadTokens, &row.UncachedInputTokens, &row.CacheHitRatio)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func setCacheAggregates(cacheRead, uncachedInput, cacheKnownInput *int64, cacheReadTarget, uncachedInputTarget **int64, cacheHitRatioTarget **float64) {
+	if cacheRead == nil {
+		return
+	}
+	*cacheReadTarget = cacheRead
+	*uncachedInputTarget = uncachedInput
+	if cacheKnownInput != nil && *cacheKnownInput > 0 {
+		*cacheHitRatioTarget = ptr(float64(*cacheRead) / float64(*cacheKnownInput))
+	}
+}
+
+func ratio(numerator, denominator int64) float64 {
+	if denominator == 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
 }
 func queryDimensions(ctx context.Context, q pgQuerier, id, name string) ([]analytics.Dimension, error) {
 	rows, err := q.Query(ctx, fmt.Sprintf(`SELECT DISTINCT ON (%s) %s,%s FROM usage_requests ORDER BY %s,occurred_at DESC,id DESC`, id, id, name, id))
@@ -309,15 +330,46 @@ func queryDimensions(ctx context.Context, q pgQuerier, id, name string) ([]analy
 	defer rows.Close()
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (v analytics.Dimension, err error) { err = r.Scan(&v.ID, &v.Name); return })
 }
-func bucketWidth(span time.Duration) time.Duration {
-	if span <= 24*time.Hour {
-		return 5 * time.Minute
+func canonicalPostgresAnalyticsFilter(f analytics.Filter) analytics.Filter {
+	f.From = postgresTimestampCeiling(f.From)
+	f.To = postgresTimestampCeiling(f.To)
+	return f
+}
+
+func postgresTimestampCeiling(value time.Time) time.Time {
+	value = value.UTC()
+	result := value.Truncate(time.Microsecond)
+	if result.Before(value) {
+		result = result.Add(time.Microsecond)
 	}
-	if span <= 7*24*time.Hour {
-		return time.Hour
+	return result
+}
+
+func analyticsBucketWidthSeconds(from, to time.Time) int64 {
+	const (
+		fiveMinutesSeconds = int64((5 * time.Minute) / time.Second)
+		hourSeconds        = int64(time.Hour / time.Second)
+		daySeconds         = int64((24 * time.Hour) / time.Second)
+		microsPerSecond    = int64(time.Second / time.Microsecond)
+		maxPoints          = int64(366)
+	)
+	rangeWidthMicros := to.UnixMicro() - from.UnixMicro()
+	switch {
+	case rangeWidthMicros <= 24*hourSeconds*microsPerSecond:
+		return fiveMinutesSeconds
+	case rangeWidthMicros <= 7*24*hourSeconds*microsPerSecond:
+		return hourSeconds
+	default:
+		wholeDays := ceilDividePositive(rangeWidthMicros, daySeconds*microsPerSecond)
+		return ceilDividePositive(wholeDays, maxPoints) * daySeconds
 	}
-	days := (span + 24*time.Hour - 1) / (24 * time.Hour)
-	step := (days + 365) / 366
-	return step * 24 * time.Hour
+}
+
+func ceilDividePositive(dividend, divisor int64) int64 {
+	quotient := dividend / divisor
+	if dividend%divisor != 0 {
+		quotient++
+	}
+	return quotient
 }
 func ptr[T any](v T) *T { return &v }

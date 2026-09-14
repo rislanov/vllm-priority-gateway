@@ -56,7 +56,11 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve SQLite path: %w", err)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absolutePath)}).String() +
+	urlPath := filepath.ToSlash(absolutePath)
+	if filepath.VolumeName(absolutePath) != "" && !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	dsn := (&url.URL{Scheme: "file", Path: urlPath}).String() +
 		"?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	CoordinationContractVersion = 1
+	CoordinationContractVersion = 2
 	RateAlgorithmVersion        = 1
 )
 
@@ -57,6 +58,7 @@ type ReplicaManager struct {
 	incompatible bool
 	cancel       context.CancelFunc
 	done         chan struct{}
+	failures     failurePublisher
 }
 
 func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy ReplicaPolicy, timeout time.Duration) *ReplicaManager {
@@ -89,6 +91,25 @@ func (m *ReplicaManager) Start(parent context.Context) error {
 	m.cancel = cancel
 	go m.run(ctx)
 	return nil
+}
+
+func isSerializationFailure(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) && postgresError.Code == "40001"
+}
+
+func retryReplicaHeartbeat(ctx context.Context, operation func(context.Context) error) error {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		err = operation(ctx)
+		if err == nil || !isSerializationFailure(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func (m *ReplicaManager) run(ctx context.Context) {
@@ -130,9 +151,29 @@ func (m *ReplicaManager) Compatible() bool {
 	return !m.incompatible
 }
 
+func (m *ReplicaManager) SetFailureObserver(observer coordination.CoordinationFailureObserver) {
+	m.failures.set(observer)
+}
+
 func (m *ReplicaManager) Check(ctx context.Context) error { return m.heartbeat(ctx, false) }
 
 func (m *ReplicaManager) heartbeat(parent context.Context, registration bool) (resultErr error) {
+	ctx, cancel := context.WithTimeout(parent, m.timeout)
+	defer cancel()
+	resultErr = retryReplicaHeartbeat(ctx, func(attemptCtx context.Context) error {
+		return m.heartbeatOnce(attemptCtx, registration)
+	})
+	if resultErr != nil {
+		var reason coordination.ReasonError
+		if !permanentCoordinationError(resultErr) && !errors.As(resultErr, &reason) {
+			m.failed()
+		}
+		m.failures.report(resultErr)
+	}
+	return resultErr
+}
+
+func (m *ReplicaManager) heartbeatOnce(parent context.Context, registration bool) (resultErr error) {
 	defer func() {
 		if resultErr == nil || !permanentCoordinationError(resultErr) {
 			return
@@ -145,30 +186,25 @@ func (m *ReplicaManager) heartbeat(parent context.Context, registration bool) (r
 			resultErr = coordination.PermanentError{Err: resultErr}
 		}
 	}()
-	ctx, cancel := context.WithTimeout(parent, m.timeout)
-	defer cancel()
-	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := m.pool.BeginTx(parent, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
-		m.failed()
 		return err
 	}
-	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, "SET LOCAL synchronous_commit=on"); err != nil {
-		m.failed()
+	defer tx.Rollback(parent)
+	if _, err = tx.Exec(parent, "SET LOCAL synchronous_commit=on"); err != nil {
 		return err
 	}
 	var now time.Time
-	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
-		m.failed()
+	if err = tx.QueryRow(parent, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return err
 	}
-	window := m.policy.LeaseTTL
-	if window <= 0 {
-		window = 90 * time.Second
+	ttl := m.policy.LeaseTTL
+	if ttl <= 0 {
+		ttl = 90 * time.Second
 	}
+	expiresAt := now.Add(ttl)
 	var incompatible int
-	if err = tx.QueryRow(ctx, "SELECT count(*) FROM coordination_replicas WHERE replica_id<>$1::uuid AND heartbeat_at>$2::timestamptz AND policy_fingerprint<>$3::bytea", m.replicaID, now.Add(-window), m.fingerprint[:]).Scan(&incompatible); err != nil {
-		m.failed()
+	if err = tx.QueryRow(parent, "SELECT count(*) FROM coordination_replicas WHERE replica_id<>$1::uuid AND heartbeat_expires_at>$2::timestamptz AND policy_fingerprint<>$3::bytea", m.replicaID, now, m.fingerprint[:]).Scan(&incompatible); err != nil {
 		return err
 	}
 	if incompatible > 0 {
@@ -179,27 +215,24 @@ func (m *ReplicaManager) heartbeat(parent context.Context, registration bool) (r
 		return coordination.ReasonError{Reason: coordination.ReasonIdempotencyConflict}
 	}
 	if registration {
-		_, err = tx.Exec(ctx, `INSERT INTO coordination_replicas(replica_id,started_at,heartbeat_at,binary_version,coordination_contract_version,policy_fingerprint)
-			VALUES($1::uuid,$2::timestamptz,$3::timestamptz,$4::text,$5::integer,$6::bytea)
-			ON CONFLICT(replica_id) DO UPDATE SET started_at=excluded.started_at,heartbeat_at=excluded.heartbeat_at,binary_version=excluded.binary_version,coordination_contract_version=excluded.coordination_contract_version,policy_fingerprint=excluded.policy_fingerprint`, m.replicaID, m.startedAt, now, m.binary, CoordinationContractVersion, m.fingerprint[:])
+		_, err = tx.Exec(parent, `INSERT INTO coordination_replicas(replica_id,started_at,heartbeat_at,heartbeat_expires_at,binary_version,coordination_contract_version,policy_fingerprint)
+			VALUES($1::uuid,$2::timestamptz,$3::timestamptz,$4::timestamptz,$5::text,$6::integer,$7::bytea)
+			ON CONFLICT(replica_id) DO UPDATE SET started_at=excluded.started_at,heartbeat_at=excluded.heartbeat_at,heartbeat_expires_at=excluded.heartbeat_expires_at,binary_version=excluded.binary_version,coordination_contract_version=excluded.coordination_contract_version,policy_fingerprint=excluded.policy_fingerprint`, m.replicaID, m.startedAt, now, expiresAt, m.binary, CoordinationContractVersion, m.fingerprint[:])
 	} else {
-		tag, updateErr := tx.Exec(ctx, "UPDATE coordination_replicas SET heartbeat_at=$2::timestamptz WHERE replica_id=$1::uuid AND policy_fingerprint=$3::bytea", m.replicaID, now, m.fingerprint[:])
+		tag, updateErr := tx.Exec(parent, "UPDATE coordination_replicas SET heartbeat_at=$2::timestamptz,heartbeat_expires_at=$3::timestamptz WHERE replica_id=$1::uuid AND policy_fingerprint=$4::bytea", m.replicaID, now, expiresAt, m.fingerprint[:])
 		err = updateErr
 		if err == nil && tag.RowsAffected() == 0 {
 			err = errors.New("replica registration was lost")
 		}
 	}
 	if err != nil {
-		m.failed()
 		return err
 	}
 	var active int
-	if err = tx.QueryRow(ctx, "SELECT count(*) FROM coordination_replicas WHERE heartbeat_at>$1::timestamptz AND policy_fingerprint=$2::bytea", now.Add(-window), m.fingerprint[:]).Scan(&active); err != nil {
-		m.failed()
+	if err = tx.QueryRow(parent, "SELECT count(*) FROM coordination_replicas WHERE heartbeat_expires_at>$1::timestamptz AND policy_fingerprint=$2::bytea", now, m.fingerprint[:]).Scan(&active); err != nil {
 		return err
 	}
-	if err = tx.Commit(ctx); err != nil {
-		m.failed()
+	if err = tx.Commit(parent); err != nil {
 		return err
 	}
 	m.mu.Lock()

@@ -35,6 +35,17 @@ LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT=2
 
 Lease renewal must not exceed one third of the lease TTL. Circuit failure windows are limited to 23h55m because durable circuit completion receipts are retained for 24 hours and accept at most five minutes of positive clock skew.
 
+All newly created or changed policies are bounded before persistence:
+
+| Policy field | Maximum | `0` semantics |
+|---|---:|---|
+| Client `MaxConcurrency` | 10,000 | client admission disabled (requests are rejected) |
+| Pool `MaxGatewayInflight` | 100,000 | unlimited pool gateway inflight |
+| Client `RequestsPerMinute` | 10,000,000 | RPM disabled |
+| Client `TokensPerMinute` | 10,000,000,000,000 | soft TPM disabled |
+
+PostgreSQL applies these maxima to every row. SQLite migration version 4 preserves a pre-existing `MaxConcurrency > 10,000` or `MaxGatewayInflight > 100,000` value only when an update leaves that exact value unchanged. A legacy value may be lowered directly into the supported range; any changed value that remains above the maximum, any increase, and any newly created over-maximum value are rejected. RPM and TPM have no grandfathering because those fields did not exist before version 4. The Admin HTML forms expose the same maxima and warn when editing a grandfathered SQLite concurrency value.
+
 ## Database, migration, and security ownership
 
 Use PostgreSQL 16 or newer. Give the migration identity schema ownership and migration DDL privileges; give the runtime identity only the DML, sequence, `LISTEN`, and notification permissions required by the created schema. Do not put credentials in logs or metrics. Restrict both roles by network policy, require server verification, rotate credentials through the deployment secret mechanism, and monitor all three connection pools.
@@ -49,9 +60,9 @@ Back up configuration and analytics with ordinary PostgreSQL physical or logical
 
 Admission locks pool scopes before client scopes and uses one post-lock server timestamp. A request UUID is a durable, fingerprinted receipt: retrying an ambiguous result with identical inputs cannot debit RPM twice or allocate a second lease. Active leases enforce client and pool concurrency globally. A central scheduler renews long streams and durably retries bounded completion batches. RPM is a continuously refilled one-minute client bucket debited at admission. TPM is a soft client bucket checked at admission and debited from upstream-reported input plus output usage at completion; natural overshoot is allowed, and missing usage is observable but uncharged.
 
-Circuit state, rolling failure receipts, generations, and half-open probe permits are global. Every upstream attempt is authorized even though routing reads a local cache. Probe capacity is shared by replicas, expired probes reopen the circuit conservatively, and stale generations cannot heal or penalize the current generation. Backend revision changes, disabling, draining, and deletion supersede unfinished permits atomically.
+Circuit state, rolling failure receipts, generations, and half-open probe permits are global. Every upstream attempt is authorized even though routing reads a local cache. Probe capacity is shared by replicas, expired probes reopen the circuit conservatively, and stale generations cannot heal or penalize the current generation. Backend revision changes, disabling, and draining supersede unfinished permits atomically. The current Admin API has no delete operation; operators must disable or drain topology records rather than assuming a deletion lifecycle exists.
 
-Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, and circuit policy. An incompatible live replica prevents startup. Coordination-critical setting changes therefore require a full stop/start without overlap.
+Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, and circuit policy. Every row carries the expiry calculated from that replica's own TTL. Registration and heartbeat serialize through the same compatibility transaction, so an incompatible live replica prevents both startup and reactivation. Coordination-critical setting changes therefore require a full stop/start without overlap.
 
 ## Outage and recovery
 
@@ -59,7 +70,7 @@ An admitted response or stream continues during a PostgreSQL outage. The last-kn
 
 Last-known open and half-open circuits admit no local work. A last-known closed circuit may be opened by the local conservative breaker but never healed locally. Failure completions retain their original attempt ID, outcome, and timestamp for replay; events older than the fixed 24-hour receipt window are discarded.
 
-Recovery is complete only after database ping, replica compatibility check, fresh configuration load, lease reconciliation, failure replay, and circuit refresh. A confirmed writable-primary revision lower than the highest revision previously observed is a permanent consistency fault: keep coordination unavailable and reject emergency work until an operator resolves the history.
+Recovery is complete only after database ping, replica compatibility check, fresh configuration load, lease reconciliation, failure replay, and circuit refresh. Coordination operation failures latch degraded state at occurrence; a later successful worker operation cannot clear it, and a recovery barrier waits for any active failure replay. A confirmed writable-primary revision lower than the highest revision previously observed is a permanent consistency fault: keep coordination unavailable and reject emergency work until an operator resolves the history.
 
 `synchronous_commit=on` guarantees local WAL durability only unless synchronous standbys are configured. HA operators own synchronous replication, quorum availability, promotion policy, and fencing of the former primary. Validate that losing synchronous durability blocks commits instead of silently weakening them.
 
@@ -69,7 +80,7 @@ If a promotion or restore may have lost acknowledged commits, do **not** use ord
 
 | Endpoint | Semantics |
 |---|---|
-| `/readyz` | HTTP 200 after startup; reports `degraded` and configuration/coordination/analytics components during a transient database outage |
+| `/readyz` | HTTP 200 after startup; reports `degraded`; `configuration` reflects the coordination/config-freshness result, while `analytics` is evaluated independently |
 | `/inference-readyz` | Load-balancer signal; HTTP 200 when an eligible backend and applicable normal or emergency capacity can serve |
 | `/coordination-readyz` | Strict distributed-admission gate; HTTP 503 unless coordination, replica compatibility, config freshness, and circuit refresh are current |
 

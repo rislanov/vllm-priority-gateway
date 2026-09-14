@@ -97,7 +97,9 @@ func (s *SQLite) InsertUsageBatch(ctx context.Context, records []analytics.Reque
 
 func (s *SQLite) DeleteUsageBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx,
-		`DELETE FROM usage_requests WHERE occurred_at_ms < ?`, cutoff.UTC().UnixMilli(),
+		`DELETE FROM usage_requests WHERE id IN (
+			SELECT id FROM usage_requests WHERE occurred_at_ms < ? ORDER BY occurred_at_ms,id LIMIT 1000
+		)`, cutoff.UTC().UnixMilli(),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("delete expired usage requests: %w", err)

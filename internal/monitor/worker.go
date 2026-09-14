@@ -29,8 +29,11 @@ type Options struct {
 	Circuit            circuitbreaker.Options
 	CircuitCoordinator coordination.CircuitCoordinator
 	AdmissionRuntime   coordination.AdmissionRuntime
+	Observer           coordination.LeaseManagerObserver
 	ReplicaID          uuid.UUID
 	ProbeTTL           time.Duration
+	ProbeRenewInterval time.Duration
+	ProbeRenewTicks    <-chan time.Time
 	Limits             pressure.Limits
 	EWMAWindow         time.Duration
 	BusyThreshold      float64
@@ -186,7 +189,13 @@ func (w *Worker) Snapshot(at time.Time) domain.BackendRuntime {
 	snapshot := w.runtime
 	w.mu.Unlock()
 	age := at.Sub(snapshot.LastMetricsAt)
-	snapshot.MetricsFresh = !snapshot.LastMetricsAt.IsZero() && age >= 0 && age <= w.options.StaleAfter
+	// Health, metrics, and pool observers use independent tickers. A metrics
+	// sample can therefore be stamped just after the pool observer's tick even
+	// though it is the newest sample available to that observer.
+	if age < 0 {
+		age = 0
+	}
+	snapshot.MetricsFresh = !snapshot.LastMetricsAt.IsZero() && age <= w.options.StaleAfter
 	snapshot.State = w.state(snapshot)
 	return snapshot
 }

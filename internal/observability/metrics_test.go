@@ -63,6 +63,7 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	metrics.CoordinationRenewFailure()
 	metrics.CoordinationLeaseLost()
 	metrics.CircuitRefreshFailure()
+	metrics.CoordinationCircuitReplayDropped("expired", 1)
 	metrics.SetBackend("qwen", "gpu-1", domain.BackendRuntime{
 		Pressure: .4, Running: 3, Waiting: 1, KVCacheUsage: .7,
 		CircuitState: domain.CircuitClosed, CircuitFailures: 4,
@@ -93,8 +94,10 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		"llmgw_postgres_pool_connections", "llmgw_coordination_active_leases",
 		"llmgw_postgres_pool_acquisition_failures_total",
 		"llmgw_coordination_local_lease_handles", "llmgw_coordination_pending_completions",
+		"llmgw_coordination_dropped_completions_total",
 		"llmgw_coordination_emergency_total", "llmgw_coordination_rate_rejections_total",
 		"llmgw_coordination_missing_usage_total", "llmgw_coordination_circuit_replay_backlog",
+		"llmgw_coordination_circuit_replay_dropped_total",
 		"llmgw_coordination_compatible_replicas", "llmgw_config_notification_reconnects_total",
 		"llmgw_config_revision_poll_age_seconds", "llmgw_coordination_renew_failures_total",
 		"llmgw_coordination_lost_leases_total", "llmgw_coordination_circuit_cache_age_seconds",
