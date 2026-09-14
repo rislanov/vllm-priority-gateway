@@ -128,7 +128,7 @@ type CircuitCoordinator interface {
 }
 ```
 
-`CircuitAcquireRequest` carries a gateway-generated stable attempt UUID. `CircuitCompletion` carries that UUID, the acquired backend identity and circuit generation, the immutable outcome, and the outcome timestamp captured once when the upstream attempt completes. Retries and outage replay must preserve all of those fields byte-for-byte.
+`CircuitAcquireRequest` carries a gateway-generated stable attempt UUID, one acquisition-start timestamp, replica identity, requested backend identity, and probe TTL. Automatic acquisition retries preserve these inputs. `CircuitCompletion` carries that UUID, the acquired backend identity and circuit generation, the immutable outcome, and the outcome timestamp captured once when the upstream attempt completes. Retries and outage replay must preserve all of those fields byte-for-byte.
 
 The public contracts use typed reasons rather than backend error strings. The required reasons are `concurrency_exhausted`, `rpm_exhausted`, `tpm_exhausted`, `stale_configuration`, `stale_backend`, `circuit_open`, `probe_capacity_exhausted`, `coordination_unavailable`, `lease_lost`, `stale_operation`, and `idempotency_conflict`.
 
@@ -188,7 +188,17 @@ LLMGW_COORDINATION_TIMEOUT=50ms
 
 `LLMGW_DATABASE_MIGRATION_URL` is optional and defaults to `LLMGW_DATABASE_URL`. It exists so runtime traffic may use a transaction-pooled endpoint while migrations use a direct PostgreSQL session. A dedicated `LISTEN` connection prefers the migration URL when supplied; if a session connection cannot be maintained, revision polling remains authoritative.
 
+All three runtime pools explicitly use `pgx.QueryExecModeExec`, including direct connections. The initial release does not use named prepared statements, explicit SQL `PREPARE`, or per-query execution-mode overrides. An incompatible `default_query_exec_mode` in the runtime URL is rejected during startup rather than silently changing this contract. Runtime SQL supplies explicit casts where parameter type inference needs them. This keeps transaction pooling compatible even when the pooler does not track prepared statements; a direct migration connection alone would not provide that compatibility. Pooler validation must exercise server-connection reassignment between transactions, not only a successful ping. See the [pgx PgBouncer compatibility contract](https://pkg.go.dev/github.com/jackc/pgx/v5#hdr-PgBouncer).
+
 URLs are parsed and validated but never emitted in logs, metrics, Admin JSON, or error bodies. Production documentation recommends TLS with certificate verification and a read-write primary endpoint.
+
+### 7.1 PostgreSQL durability and failover contract
+
+Correct distributed coordination requires one writable database history that preserves every acknowledged configuration and coordination commit across an automatic failover. The deployment must fence the former primary before another primary accepts writes, and may promote only a standby that contains every acknowledged commit. A read-write endpoint by itself is not evidence of either property.
+
+Configuration and coordination transactions explicitly use `SET LOCAL synchronous_commit = on`. For PostgreSQL streaming-replication HA, operators must also configure synchronous standbys and a failover policy that promotes a sufficiently durable standby, without automatically falling back to asynchronous commits when synchronous replicas are unavailable. `synchronous_commit = on` without synchronous standbys guarantees local durability only. Equivalent managed-database guarantees are acceptable when documented and validated. Provisioning and controlling failover remain operator responsibilities; the gateway cannot certify fencing or promotion safety from a connection check. The [PostgreSQL synchronous replication documentation](https://www.postgresql.org/docs/16/warm-standby.html#SYNCHRONOUS-REPLICATION) defines the underlying commit guarantees.
+
+Automatic promotion with possible loss of acknowledged commits and restoring an older backup are outside the normal outage-recovery contract. Before making such a database writable to gateways, operators must stop ingress and all gateway replicas, fence the previous database history, reconcile configuration against acknowledged changes including key revocations, and ensure old upstream work has drained or been terminated. Only then may a new deployment register and serve. The ordinary recovery sequence in section 16 must not be used to assert that lost leases, receipts, rate debits, or configuration have been recovered. The runbook must distinguish this disaster-recovery procedure from a lossless failover.
 
 ## 8. Schema Migrations
 
@@ -459,7 +469,9 @@ backend_circuit_failures
   event_at               TIMESTAMPTZ
 
 backend_circuit_probes
-  permit_id              UUID PRIMARY KEY
+  permit_id              UUID PRIMARY KEY -- exactly the acquiring attempt UUID
+  acquisition_started_at TIMESTAMPTZ NOT NULL
+  input_fingerprint      BYTEA NOT NULL
   backend_id             BIGINT
   backend_revision       BIGINT
   circuit_generation     BIGINT
@@ -474,9 +486,13 @@ backend_circuit_probes
 
 ### 14.1 Acquire
 
-Before circuit acquisition, the gateway generates a stable attempt UUID. `acquire_circuit` first verifies that the requested backend revision is still current, enabled, and not draining. An older replica receives `stale_backend` and cannot recreate old state. The completion closure retains that UUID and, on its process-local `sync.Once`, captures one immutable `reported_outcome_at`. Retry and PostgreSQL-outage replay send the exact same attempt UUID, outcome, and reported timestamp.
+Before circuit acquisition, the gateway generates a stable attempt UUID and captures `acquisition_started_at` once. A probe's `permit_id` is that attempt UUID; its fingerprint covers the requested backend identity, replica identity, acquisition-start timestamp, and probe TTL. The completion closure retains that UUID and, on its process-local `sync.Once`, captures one immutable `reported_outcome_at`. Retry and PostgreSQL-outage replay send the exact same attempt UUID, outcome, and reported timestamp.
 
-A closed-state fast path reads the committed state without taking a write lock. A request racing with a newly opened circuit is treated as already admitted, matching ordinary circuit-breaker semantics. Open-to-half-open transition and half-open probe acquisition lock the backend state row and re-check every condition atomically.
+Before either checking probe capacity or taking the closed-state fast path, `acquire_circuit` looks up a retained permit by attempt UUID. Different immutable acquisition inputs return `idempotency_conflict`. For a matching permit it locks the backend state and relevant permits in the circuit lock order, captures a post-lock timestamp, and reconciles expiry. A still-unfinished, unexpired permit for the current eligible backend revision and half-open generation returns the same permit and current expiry without allocating capacity or extending TTL. A completed, expired, or superseded permit, or a permit from an invalidated identity/generation, returns `lease_lost`; the same attempt must never acquire a replacement permit. A retained-permit retry is resolved before the unseen-operation age gate, so a long-running active probe remains recoverable.
+
+For an unseen attempt, the function verifies that the requested backend revision is current, enabled, and not draining; otherwise it returns `stale_backend`. It accepts `acquisition_started_at` only when `acquisition_started_at > v_now - 24h` and `acquisition_started_at <= v_now + 5m`. A closed-state fast path then reads committed state without taking a write lock or creating a permit. A request racing with a newly opened circuit is treated as already admitted, matching ordinary circuit-breaker semantics. This read-only decision has no durable acquisition receipt; an ambiguous retry may re-evaluate it because the gateway must not start upstream work before receiving a successful acquisition result.
+
+Open-to-half-open transition and half-open probe acquisition lock the backend state row, re-check the attempt UUID and backend eligibility, and resolve existing permits before checking capacity. Concurrent same-attempt calls therefore converge on one permit even when capacity is one. After all relevant locks, the function captures `v_now`, reconciles expiry, checks the unseen-operation age gate and capacity, and inserts at most one permit. A lost response after commit may be retried with identical inputs within the bounded coordination retry budget. An authoritative denial may be re-evaluated as a new attempt with a new UUID and timestamp. New attempts cannot revive retained terminal permits, and receipt cleanup cannot make an old timestamp eligible again.
 
 Half-open capacity is global across replicas. Probe permits have a TTL, are scheduled for renewal by the same process-level lease scheduler through `CircuitCoordinator.RenewProbes`, and are counted only for the matching backend revision and circuit generation. Admission-lease completion and circuit-probe completion remain separate idempotent operations because one client request may make more than one backend attempt.
 
@@ -502,7 +518,9 @@ A qualifying closed-state failure inserts `backend_circuit_failures` with the sa
 
 This separates retry deduplication from the rolling window. Deleting failure A from the rolling table cannot make a later redelivery fresh: its receipt still suppresses the duplicate, and even after receipt retention the strict timestamp gate rejects it rather than assigning a new event time.
 
-Half-open completion is idempotent through the durable probe permit. Its first completion stores the stable reported outcome timestamp, immutable `event_at = min(reported_outcome_at, processed_at)`, post-lock processing timestamp, outcome, and `retain_until` calculated with `CircuitCompletionRetention`. A duplicate must match those immutable inputs and returns without another transition; a mismatch returns `idempotency_conflict`. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
+Half-open completion is idempotent through the durable probe permit. Its first completion stores the stable reported outcome timestamp, immutable `event_at = min(reported_outcome_at, processed_at)`, post-lock processing timestamp, outcome, and `retain_until = max(processed_at, reported_outcome_at, acquisition_started_at) + CircuitCompletionRetention`. A duplicate must match those immutable inputs and returns without another transition; a mismatch returns `idempotency_conflict`. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
+
+Every transition that invalidates a circuit generation or backend identity terminalizes all its unfinished permits in the same transaction. This includes an ordinary half-open failure, expiry reopening, backend revision replacement, disabling, draining, and deletion. Under the backend state lock and permit locks ordered by UUID, the transition preserves already-terminal outcomes, marks remaining unfinished permits `superseded` (except the triggering failure or expired permit), sets `processed_at = v_now`, and assigns `retain_until = max(v_now, acquisition_started_at) + CircuitCompletionRetention`. No fabricated reported outcome timestamp is stored. Backend mutations lock the affected circuit state and permits before changing identity, and commit invalidation atomically with the configuration change; stale replica reconciliation cannot recreate an older identity. Backend circuit-state rows remain as tombstones while retained permits or failure receipts reference them. Late renewal/acquisition replay returns `lease_lost`, and a completion for a superseded or expired permit is a stale no-op rather than an outcome conflict. A bounded cleanup removes terminal permits only after `retain_until <= v_now`, including permits from deleted backends and old generations. An unfinished permit is never age-deleted.
 
 An expired half-open probe is a conservative circuit failure, not a neutral completion. Expiry reconciliation locks the circuit row, re-checks the permit and generation, selects the earliest expired unfinished permit, marks it `expired`, marks every other unfinished permit from the same generation `superseded`, assigns terminal retention to those permits, transitions the circuit to `open`, clears `half_open_succeeded`, increments generation, and sets `opened_at` to the selected permit's `expires_at`. It emits the ordinary circuit-change notification. This transition applies even when another probe in the generation already succeeded.
 
@@ -520,7 +538,7 @@ Routing and dashboards read a local cache of distributed circuit snapshots. Post
 
 The authoritative acquire still executes before an upstream attempt. A stale cache may cause the router to consider a backend first, but PostgreSQL can reject the permit; the gateway excludes that backend and selects another. Stale cache cannot exceed global half-open capacity.
 
-Changing a route-affecting backend field increments backend revision and creates a new circuit identity. Old rolling failure rows become inert and are removed by window cleanup. Completion receipts and terminal probe permits remain until their independent `retain_until` so a delayed retry cannot recreate old state.
+Changing a route-affecting backend field increments backend revision and creates a new circuit identity. The configuration transaction terminalizes old unfinished permits as required in section 14.2. Old rolling failure rows become inert and are removed by window cleanup. Completion receipts and terminal probe permits remain until their independent `retain_until` so a delayed retry cannot recreate old state.
 
 ## 15. Replica Compatibility
 
@@ -543,7 +561,7 @@ Replica heartbeat and lease renewal share the coordination lifecycle but not an 
 
 ## 16. PostgreSQL Failure Policy
 
-PostgreSQL coordination errors are classified as timeout, unavailable, stale state, serialization/deadlock retry, constraint/corruption, and permanent incompatibility. At most one bounded retry is allowed for retryable transaction conflicts inside the coordination timeout.
+PostgreSQL coordination errors are classified as timeout, unavailable, stale state, serialization/deadlock retry, constraint/corruption, and permanent incompatibility. At most one bounded retry is allowed inside the original coordination timeout, shared between retryable transaction conflicts and ambiguous acquisition results. Admission and circuit acquisition retries preserve their original UUIDs, timestamps, and immutable inputs; they never start another upstream attempt to resolve database uncertainty.
 
 After successful startup, loss of PostgreSQL enters degraded mode:
 
@@ -568,7 +586,9 @@ LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT=2
 
 Zero disables emergency admission for that class. Because limits are per replica during the outage, deployment documentation states the aggregate worst case as `replica_count * class_cap`.
 
-Recovery requires a successful database ping, replica-fingerprint check, configuration revision reload, lease reconciliation, local failure replay, and circuit cache refresh. The gateway exits degraded mode only after all mandatory steps succeed.
+Recovery requires a successful database ping, replica-fingerprint check, configuration revision reload, lease reconciliation, local failure replay, and circuit cache refresh. The gateway exits degraded mode only after all mandatory steps succeed. This sequence assumes the database preserved acknowledged commits under section 7.1.
+
+A delayed notification, poll result, or concurrent snapshot load with an older revision is discarded under the ordinary monotonic-publication rule; it is not by itself a database regression. To confirm a suspected regression, capture the highest database revision already observed by this process, then start a fresh independent read of `config_meta.revision` on the writable primary, outside any earlier snapshot transaction. Compare that result with the captured revision, not a higher revision learned while the verification read was in flight. Only a lower revision from this verification is a permanent consistency fault: keep coordination readiness false and reject new inference, including emergency admission, until operator recovery; do not publish the older snapshot or clear the fault after a successful ping. Absence of a confirmed regression does not prove a failover was lossless.
 
 ## 17. Readiness and API Errors
 
@@ -612,8 +632,11 @@ The default suite requires no PostgreSQL process and includes:
 - SQLite migration tests for rate-policy and revision additions, including pre-existing `MaxConcurrency=10_001` and `MaxGatewayInflight=100_001` rows that remain loadable and unchanged while new/increased above-maximum values are rejected and lowering succeeds;
 - local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, future-skewed receipt retention/cleanup boundaries, completion idempotency, and refill-before-debit TPM completion;
 - deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, stale-generation no-ops, and `commit -> lost response -> rolling prune -> duplicate completion` with the original event timestamp;
+- circuit-acquire contract tests for a lost response with probe capacity one, concurrent identical retries, fingerprint conflicts, retry after completion/expiry/invalidation, and future-skewed acquire timestamps at terminal permit cleanup boundaries;
+- circuit permit cleanup tests for `failure + crashed peer`, backend revision replacement, disabling/draining/deletion with unfinished probes, stale completion, and eventual removal of superseded permits;
 - gateway tests using deterministic fake coordinators;
 - emergency-mode and recovery state-machine tests;
+- revision-regression confirmation tests: a delayed older snapshot/poll does not trip the consistency fault, while a fresh primary read started after observing a higher revision and returning a lower revision does;
 - `LeaseManager` renewal, completion, backlog, cancellation, and shutdown race tests;
 - domain and transport boundary tests for every concurrency and rate maximum, including change-aware SQLite grandfathering;
 - circuit-cache notification/poll/reconnect tests with fake transports;
@@ -633,10 +656,13 @@ make test-postgres
 
 `make test-postgres-docker` may provision PostgreSQL 16 for local use, but neither target is called by the default CI configuration.
 
+Transaction-pooler validation is a separate opt-in target, `make test-postgres-pooler`, requiring both `LLMGW_POSTGRES_TEST_DSN` for the direct database and `LLMGW_POSTGRES_POOLER_TEST_DSN` for a transaction-mode PgBouncer connected to that same database with prepared-statement tracking disabled. It must force server-connection reassignment. The ordinary `make test-postgres` does not require PgBouncer and does not claim pooler compatibility coverage.
+
 The opt-in suite covers:
 
 - concurrent migration startup and dirty-state refusal;
 - PostgreSQL 16 version enforcement;
+- in the pooler target, runtime CRUD, snapshot, analytics, and coordination through transaction-mode PgBouncer with prepared-statement tracking disabled, forcing reassignment between transactions while migrations use a direct connection;
 - CRUD, referential integrity, revision increments, and analytics parity;
 - LISTEN notification, polling fallback, reconnect, and missed-event recovery;
 - aggregate client and pool concurrency across two gateways;
@@ -653,6 +679,8 @@ The opt-in suite covers:
 - distributed circuit rolling window, open, cooldown, half-open capacity, completion ordering, neutral outcomes, and stale generations;
 - closed failure commit followed by lost response, event pruning, and duplicate completion, proving the original attempt cannot be inserted with a fresh event timestamp;
 - `success + crashed probe` expiry reopening and `success + expired probe + late failure` stale completion;
+- half-open acquire `commit -> lost response -> same UUID` at capacity one, proving one permit and no false exhaustion, plus replay after completion, generation change, backend invalidation, and retention cleanup;
+- ordinary half-open failure with a crashed peer and backend mutations with unfinished probes, proving atomic superseding, stale replay safety, and bounded terminal cleanup;
 - PostgreSQL outage, emergency admission, failure replay, and recovery;
 - incompatible replica fingerprint rejection;
 - deadlock/serialization behavior under concurrent admission and circuit transitions;
@@ -661,19 +689,21 @@ The opt-in suite covers:
 
 Performance results are reported with environment and database topology; they are not treated as portable guarantees.
 
+HA deployments additionally require validation on their actual failover topology: acknowledge a lease/RPM debit and an API-key revocation, fail the primary, and verify the promoted primary retains those records and receipts while the former primary is fenced. Verify that losing synchronous durability blocks commits rather than silently switching to asynchronous writes. A negative recovery test with a regressed configuration revision must keep the gateway fail-closed. A standalone PostgreSQL process and the ordinary outage test do not establish these guarantees. Record the managed-provider guarantee or synchronous replication/promotion settings in acceptance evidence.
+
 ## 20. Rollout
 
 This feature does not import SQLite data. A PostgreSQL deployment starts with a new schema and is configured explicitly through the existing Admin API/UI.
 
 Recommended rollout:
 
-1. provision an HA PostgreSQL 16+ primary endpoint and credentials;
+1. provision PostgreSQL 16+ and credentials with the durability, synchronous failover, and former-primary fencing guarantees in section 7.1;
 2. run migration/status validation with the gateway binary and direct migration URL;
 3. start one PostgreSQL-mode gateway replica;
 4. configure clients, keys, pools, and backends;
 5. run compatibility, streaming, analytics, lease, rate, and circuit smoke tests;
 6. start a second compatible gateway replica;
-7. run multi-replica concurrency, config-propagation, circuit, and outage tests;
+7. run multi-replica concurrency, config-propagation, circuit, outage, pooler (when used), and topology-specific lossless failover tests;
 8. place both replicas behind the production load balancer;
 9. calibrate coordination timeout, connection pools, emergency caps, and circuit thresholds from observed telemetry.
 
@@ -685,8 +715,8 @@ Update the English and Russian READMEs, deployment guide, operations guide, tech
 
 - profile selection and compatibility matrix;
 - PostgreSQL 16+ and pgx requirements;
-- migration and direct-connection requirements;
-- PostgreSQL roles, TLS, backup, and HA ownership;
+- migration, direct-connection, runtime query-mode, and transaction-pooler requirements;
+- PostgreSQL roles, TLS, backup, synchronous durability, failover fencing, HA ownership, and the separate disaster-recovery procedure for acknowledged-data loss;
 - configuration propagation and expected delay;
 - distributed lease and circuit semantics;
 - RPM and soft TPM behavior;
