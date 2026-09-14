@@ -110,7 +110,7 @@ type AdmissionCoordinator interface {
 }
 ```
 
-`AdmissionRequest` contains the request and replica identifiers, immutable configuration revision, authenticated API-key ID, client and pool IDs, the priority-adjusted effective client concurrency limit, pool gateway-inflight limit, client RPM/TPM policy, lease TTL, and the decision timestamp. `AdmissionDecision` contains either a lease identity or one bounded rejection reason with an optional retry time.
+`AdmissionRequest` contains the request and replica identifiers, immutable configuration revision, authenticated API-key ID, client and pool IDs, the priority-adjusted effective client concurrency limit, pool gateway-inflight limit, client RPM/TPM policy, lease TTL, and the decision timestamp. The local coordinator uses the supplied timestamp for deterministic tests; the PostgreSQL coordinator uses database server time and never trusts the caller timestamp for expiry or refill decisions. `AdmissionDecision` contains either a lease identity or one bounded rejection reason with an optional retry time.
 
 The circuit contract is:
 
@@ -150,6 +150,17 @@ Zero disables the corresponding limit. Limits are client-wide; this feature does
 Clients, model pools, and backends gain monotonically increasing row revisions. A row revision changes only when that row is updated. Backend revision is the circuit identity and changes when any route-affecting backend field changes. The global configuration revision continues changing for every policy mutation.
 
 Admin JSON and HTML forms expose the two client rate limits. Validation rejects negative values and values above the documented safe numeric maxima. The OpenAI-compatible public API remains unchanged.
+
+The shared domain validation applies these explicit implementation limits before any persistence work:
+
+```text
+MaxClientConcurrency       = 10_000
+MaxPoolGatewayInflight     = 100_000
+MaxRequestsPerMinute       = 10_000_000
+MaxTokensPerMinute         = 10_000_000_000_000
+```
+
+The same bounds are enforced by SQLite constraints, PostgreSQL constraints, Admin JSON, Admin forms, and coordinator input validation. Concurrency values remain Go `int` values and the selected bounds fit a signed 32-bit integer. Rate values use Go `int64` and fit PostgreSQL `BIGINT`. Validation runs before scope creation, migration backfill, or any loop whose work is proportional to a configured value.
 
 ## 7. PostgreSQL Driver and Pools
 
@@ -214,6 +225,8 @@ Every Admin configuration mutation executes in one transaction:
 5. commit;
 6. reload the local immutable registry and reconcile monitors.
 
+A mutation that changes or deletes a client or pool first locks the affected admission scope rows in the same global order used by admission: all pool IDs ascending, then all client IDs ascending. The mutation changes policy and the global revision only after those locks are held. This makes admission linearize either entirely before or entirely after a concurrent limit reduction.
+
 PostgreSQL delivers the notification after commit. Every gateway replica also polls `config_meta.revision` at `LLMGW_CONFIG_POLL_INTERVAL` with jitter. Reconnect immediately checks the revision before resuming the wait loop.
 
 `LoadSnapshot` uses one read-only `REPEATABLE READ` transaction. It reads the global revision and every configuration collection, validates the assembled data, and publishes it only when the entire snapshot is valid and newer than the current registry revision.
@@ -239,42 +252,60 @@ Analytics uses its own pgx pool. Analytics failure does not rewrite an inference
 
 ## 11. Distributed Admission Leases
 
-PostgreSQL uses pre-created bounded slot rows rather than a `COUNT(*)` query or one shared inflight counter.
+PostgreSQL records every active request in one lease ledger, including requests admitted while a pool limit is unlimited. Small persistent scope rows provide the serialization point for admission decisions without turning a limit into a number of pre-created database rows.
 
 ```text
-client_lease_slots
-  client_id      BIGINT
-  slot_no        INTEGER
-  lease_id       UUID NULL
-  request_id     TEXT NULL
-  replica_id     UUID NULL
-  expires_at     TIMESTAMPTZ NULL
-  PRIMARY KEY (client_id, slot_no)
+client_admission_scopes
+  client_id      BIGINT PRIMARY KEY
+  updated_at     TIMESTAMPTZ
 
-pool_lease_slots
-  pool_id        BIGINT
-  slot_no        INTEGER
-  lease_id       UUID NULL
-  request_id     TEXT NULL
-  replica_id     UUID NULL
-  expires_at     TIMESTAMPTZ NULL
-  PRIMARY KEY (pool_id, slot_no)
+pool_admission_scopes
+  pool_id        BIGINT PRIMARY KEY
+  updated_at     TIMESTAMPTZ
+
+request_leases
+  lease_id       UUID PRIMARY KEY
+  request_id     TEXT NOT NULL
+  replica_id     UUID NOT NULL
+  client_id      BIGINT NOT NULL
+  pool_id        BIGINT NOT NULL
+  acquired_at    TIMESTAMPTZ NOT NULL
+  expires_at     TIMESTAMPTZ NOT NULL
 ```
 
-Creating or increasing a configured limit creates missing slots in the same PostgreSQL transaction as the configuration mutation. Reducing a limit leaves higher-numbered rows in place but excludes them from new acquisition. An existing owner above the new limit may renew and complete; admitted inference is not preempted. Pool limit zero skips pool-slot acquisition and retains the existing unlimited meaning.
+`request_leases` has non-unique indexes on `client_id` and `pool_id`; `expires_at` is deliberately not indexed so renewal remains eligible for HOT updates. Lease UUID is the acquire/completion idempotency key. Client-supplied or repeated request IDs are diagnostic values and are not uniqueness keys.
 
-`try_acquire_admission` is one PL/pgSQL statement-level transaction. It:
+Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit.
 
-1. checks global configuration revision and current enabled policy;
-2. refreshes and checks the soft TPM balance;
-3. claims one eligible pool slot when the pool has a positive limit;
-4. claims one client slot at or below the priority-adjusted effective limit;
-5. refreshes and debits one RPM token;
-6. returns the lease identity and decision metadata.
+Every request lease always records both client and pool identity. Pool limit zero disables only the rejection check; it does not disable lease creation, renewal, distributed pool-inflight accounting, or later transition to a positive limit.
 
-Slot selection uses `FOR UPDATE SKIP LOCKED`. All callers acquire pool scope before client scope. Failure at any step rolls back every slot and rate-state change. Skipping a transaction that is concurrently claiming the final apparent slot is an intentionally conservative rejection; the system must never over-admit.
+`try_acquire_admission` executes atomically in one PostgreSQL transaction. It captures one PostgreSQL server timestamp for every expiry and refill comparison, then:
 
-Lease identity includes the lease UUID, client ID/slot, optional pool ID/slot, request ID, replica ID, and expiry. Renewal and release address rows by their primary key plus lease UUID, avoiding an index on frequently updated ownership columns.
+1. locks the requested pool scope row and then the requested client scope row;
+2. re-reads and checks the global configuration revision, API key, client, pool, enabled policy, and configured limits while those locks are held;
+3. counts all unexpired leases for the pool, regardless of the previous or current pool limit;
+4. counts all unexpired leases for the client, including leases admitted under a larger administrative or priority-adjusted limit;
+5. rejects when a positive pool limit is not greater than total pool inflight;
+6. rejects when the effective client limit is not greater than total client inflight;
+7. refreshes and checks the soft TPM balance;
+8. refreshes and debits one RPM token;
+9. inserts exactly one request lease containing both client and pool identity;
+10. returns the lease identity and decision metadata.
+
+The supplied effective client limit must be between zero and the current configured client maximum read in step 2. A global revision mismatch returns `stale_configuration`; the gateway reloads and recomputes the effective limit from fresh policy and pool state rather than scaling a stale value inside SQL.
+
+All acquisition, renewal, policy-change, and completion paths lock scopes in the global order `all pool IDs ascending, then all client IDs ascending`. A single-request acquisition therefore locks its pool before its client. Scope locking serializes every membership-changing operation that could affect the two counts. Failure at any step rolls back lease and rate-state changes.
+
+The atomic invariant is:
+
+```text
+admit only if active_pool_leases < positive_pool_limit (when enabled)
+          and active_client_leases < effective_client_limit
+```
+
+Counts include leases created under an older, larger limit. The implementation must not infer inflight from slot ordinals or configured capacity.
+
+Lease identity includes the lease UUID, client ID, pool ID, request ID, replica ID, and expiry. Renewal never resurrects an expired lease: it locks the same pool/client scopes and updates only a matching lease whose existing expiry is still in the future according to the transaction's PostgreSQL server timestamp.
 
 Lease TTL and renewal settings are:
 
@@ -283,9 +314,9 @@ LLMGW_LEASE_TTL=90s
 LLMGW_LEASE_RENEW_INTERVAL=30s
 ```
 
-The renewal interval must be positive and no greater than one third of the TTL. PostgreSQL server time is authoritative for expiry. A crashed gateway stops renewing and its slots become claimable after TTL.
+The renewal interval must be positive and no greater than one third of the TTL. PostgreSQL server time is authoritative for expiry. A crashed gateway stops renewing and its lease stops contributing to active counts after TTL.
 
-Tables use a reduced fillfactor and aggressive per-table autovacuum settings because ownership fields are updated frequently. `expires_at` is not indexed; each acquisition scans only the bounded slot range for one client or pool, allowing ownership renewal to remain eligible for HOT updates.
+`request_leases` uses a reduced fillfactor and aggressive per-table autovacuum settings because expiry is updated frequently. A bounded cleanup worker deletes expired ledger rows in batches; correctness never depends on physical deletion because counts and renewals always test expiry. Distributed pool/client inflight snapshots use a batched `GROUP BY` over unexpired ledger rows and are cached no longer than the metrics interval.
 
 ## 12. Lease Manager and Completion
 
@@ -293,11 +324,13 @@ Each gateway process runs one central `LeaseManager`. It owns active distributed
 
 Completion contains optional actual usage. A PostgreSQL completion function:
 
-1. inserts an idempotency record keyed by lease UUID;
+1. locks the pool and client scope rows named by the immutable lease identity in the global order;
+2. checks whether a completion idempotency record already exists for the lease UUID;
+3. when the completion is new, inserts that record and debits the client's soft token balance by `input_tokens + output_tokens`;
+4. deletes the request lease only when its lease UUID, client ID, and pool ID match;
+5. returns `released`, `already_completed`, or `lease_lost`.
 
-2. if the record is new, debits the client's soft token balance by `input_tokens + output_tokens`;
-3. clears client and pool slots only when their primary key and lease UUID still match;
-4. returns whether the lease was released, already completed, expired, or replaced.
+Actual usage is debited once even when the request lease already expired or bounded cleanup removed it: the upstream work still consumed tokens. The immutable lease handle supplies the trusted client and pool identity, while the conditional delete prevents a stale completion from removing any other request. All steps commit or roll back together.
 
 `cache_read_tokens` is a subset of input tokens and is not added again. Missing or invalid usage releases the lease without a token debit and increments a bounded-cardinality unmetered-completion metric.
 
@@ -307,9 +340,9 @@ Completion delivery is asynchronous and idempotent. The manager retries transien
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
 ```
 
-When the backlog is full, the response remains successful, slot cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Completion idempotency records are retained for 24 hours, longer than the manager's retry horizon, and deleted in bounded batches.
+When the backlog is full, the response remains successful, lease cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Completion idempotency records are retained for 24 hours, longer than the manager's retry horizon, and deleted in bounded batches.
 
-An active stream is never cancelled solely because renewal failed. The manager continues retrying. If the lease expires and another request claims the slot, a later renewal returns `lease_lost`; the original stream continues and telemetry records temporary overcommit risk.
+An active stream is never cancelled solely because renewal failed. The manager continues retrying. If the lease expires and another request uses the newly available capacity, a later renewal returns `lease_lost`; the original stream continues and telemetry records temporary overcommit risk.
 
 ## 13. Distributed Rate Limits
 
@@ -358,7 +391,7 @@ backend_circuit_probes
   replica_id             UUID
   expires_at             TIMESTAMPTZ
   completed_at           TIMESTAMPTZ NULL
-  outcome                success | failure | neutral | NULL
+  outcome                success | failure | neutral | expired | superseded | NULL
 ```
 
 ### 14.1 Acquire
@@ -374,6 +407,14 @@ Half-open capacity is global across replicas. Probe permits have a TTL, are sche
 Closed-state success and neutral outcomes do not write circuit state. A qualifying failure inserts a unique failure event using the attempt ID as its idempotency key, prunes timestamps outside the rolling window, and opens the circuit when the threshold is reached.
 
 Half-open completion is idempotent through the durable probe permit. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
+
+An expired half-open probe is a conservative circuit failure, not a neutral completion. Expiry reconciliation locks the circuit row, re-checks the permit and generation, selects the earliest expired unfinished permit, marks it `expired`, marks every other unfinished permit from the same generation `superseded`, transitions the circuit to `open`, clears `half_open_succeeded`, increments generation, and sets `opened_at` to the selected permit's `expires_at`. It emits the ordinary circuit-change notification. This transition applies even when another probe in the generation already succeeded.
+
+Expiry reconciliation runs before every half-open acquire, renewal, and completion and in the periodic circuit refresh worker, so no operation can treat an expired generation as drained successfully. A completion that first discovers its own permit has expired performs the expiry transition and then returns a stale outcome without applying the reported success, failure, or neutral result.
+
+Probe admission resumes only after the new open cooldown measured from that expiry timestamp. If an acquire operation discovers the expiry after this cooldown has already elapsed, it may reconcile the expired generation, advance the now-open circuit to a fresh half-open generation, and issue the requesting attempt a new permit while retaining the same circuit-row lock. A background reconciliation only changes state; it never creates a permit without a requesting attempt. An expired permit cannot be renewed or revived. Any later completion from the expired or superseded generation is a stale no-op and cannot modify failure history or the new generation.
+
+This rule intentionally prefers temporary unavailability over closing a circuit while a probe whose ownership was lost may still be executing upstream.
 
 The distributed implementation must pass the same delayed-failure, failure-wins ordering, multi-probe, neutral, cooldown, and stale-callback cases as the current local breaker.
 
@@ -472,10 +513,12 @@ The default suite requires no PostgreSQL process and includes:
 
 - every existing SQLite unit, integration, race, vet, and build check;
 - SQLite migration tests for rate-policy and revision additions;
-- local coordinator contract tests;
+- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, expiry without resurrection, and completion idempotency;
+- deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, and stale-generation no-ops;
 - gateway tests using deterministic fake coordinators;
 - emergency-mode and recovery state-machine tests;
 - `LeaseManager` renewal, completion, backlog, cancellation, and shutdown race tests;
+- domain and transport boundary tests for every concurrency and rate maximum;
 - circuit-cache notification/poll/reconnect tests with fake transports;
 - migration manifest tests for unique versions, matched up/down files, and embedded coverage;
 - compile-time interface assertions for local and PostgreSQL implementations.
@@ -500,11 +543,15 @@ The opt-in suite covers:
 - CRUD, referential integrity, revision increments, and analytics parity;
 - LISTEN notification, polling fallback, reconnect, and missed-event recovery;
 - aggregate client and pool concurrency across two gateways;
-- conservative no-over-admission under slot contention;
+- no over-admission when effective client limits fall below owners acquired under a larger limit;
+- unlimited-pool accounting and `0 -> positive` pool-limit transitions with existing inflight;
+- administrative client/pool limit reductions with existing inflight;
+- conservative no-over-admission under scope-lock contention;
 - long-stream renewal, crash expiry, idempotent completion, and lost-lease detection;
 - distributed RPM refill and rejection;
 - soft TPM completion debit, natural overshoot, missing usage, and policy reset;
 - distributed circuit rolling window, open, cooldown, half-open capacity, completion ordering, neutral outcomes, and stale generations;
+- `success + crashed probe` expiry reopening and `success + expired probe + late failure` stale completion;
 - PostgreSQL outage, emergency admission, failure replay, and recovery;
 - incompatible replica fingerprint rejection;
 - deadlock/serialization behavior under concurrent admission and circuit transitions;
@@ -552,7 +599,7 @@ Update the English and Russian READMEs, deployment guide, operations guide, tech
 This design is executed through three sequential implementation plans in the same `codex/postgresql` branch:
 
 1. **PostgreSQL persistence foundation** — configuration/analytics interfaces, pgx pools, `golang-migrate`, PostgreSQL repositories, config reload, notifications, client rate fields, and SQLite compatibility.
-2. **PostgreSQL admission and rate coordination** — coordination contracts, local backend, PostgreSQL slots/rate functions, lease manager, emergency admission, metrics, and contract tests.
+2. **PostgreSQL admission and rate coordination** — coordination contracts, local backend, PostgreSQL scope locks/lease ledger/rate functions, lease manager, emergency admission, metrics, and contract tests.
 3. **Distributed circuit breaker and HA validation** — circuit SQL state machine, local cache, notification/poll refresh, failure replay, readiness, observability, and opt-in multi-replica validation.
 
 Each plan must end in a buildable, testable state and preserve the default SQLite profile. Redis can be added only by implementing the published coordination contracts and passing the same contract suite.
