@@ -23,17 +23,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
 
-type AdminStore interface {
-	CreateClient(context.Context, store.CreateClientParams) (domain.Client, error)
-	UpdateClient(context.Context, int64, store.UpdateClientParams) (domain.Client, error)
-	CreateAPIKey(context.Context, store.CreateAPIKeyParams) (domain.APIKey, error)
-	RevokeAPIKey(context.Context, int64) error
-	CreatePool(context.Context, store.CreatePoolParams) (domain.ModelPool, error)
-	UpdatePool(context.Context, int64, store.UpdatePoolParams) (domain.ModelPool, error)
-	CreateBackend(context.Context, store.CreateBackendParams) (domain.Backend, error)
-	UpdateBackend(context.Context, int64, store.UpdateBackendParams) (domain.Backend, error)
-	SetBackendDraining(context.Context, int64, bool) error
-}
+type AdminStore = store.AdminStore
 
 type AdminRegistry interface {
 	Reload(context.Context) error
@@ -96,12 +86,14 @@ func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
 }
 
 type ClientInput struct {
-	Name           string               `json:"name"`
-	Enabled        bool                 `json:"enabled"`
-	PriorityClass  domain.PriorityClass `json:"priorityClass"`
-	VLLMPriority   int                  `json:"vllmPriority"`
-	MaxConcurrency int                  `json:"maxConcurrency"`
-	ModelPoolIDs   []int64              `json:"modelPoolIds"`
+	Name              string               `json:"name"`
+	Enabled           bool                 `json:"enabled"`
+	PriorityClass     domain.PriorityClass `json:"priorityClass"`
+	VLLMPriority      int                  `json:"vllmPriority"`
+	MaxConcurrency    int                  `json:"maxConcurrency"`
+	RequestsPerMinute int64                `json:"requestsPerMinute"`
+	TokensPerMinute   int64                `json:"tokensPerMinute"`
+	ModelPoolIDs      []int64              `json:"modelPoolIds"`
 }
 
 type PoolInput struct {
@@ -128,14 +120,17 @@ type KeyInput struct {
 }
 
 type AdminClient struct {
-	ID             int64                `json:"id"`
-	Name           string               `json:"name"`
-	Enabled        bool                 `json:"enabled"`
-	PriorityClass  domain.PriorityClass `json:"priorityClass"`
-	VLLMPriority   int                  `json:"vllmPriority"`
-	MaxConcurrency int                  `json:"maxConcurrency"`
-	ModelPoolIDs   []int64              `json:"modelPoolIds"`
-	Models         []string             `json:"models"`
+	ID                int64                `json:"id"`
+	Revision          int64                `json:"revision"`
+	Name              string               `json:"name"`
+	Enabled           bool                 `json:"enabled"`
+	PriorityClass     domain.PriorityClass `json:"priorityClass"`
+	VLLMPriority      int                  `json:"vllmPriority"`
+	MaxConcurrency    int                  `json:"maxConcurrency"`
+	RequestsPerMinute int64                `json:"requestsPerMinute"`
+	TokensPerMinute   int64                `json:"tokensPerMinute"`
+	ModelPoolIDs      []int64              `json:"modelPoolIds"`
+	Models            []string             `json:"models"`
 }
 
 type AdminKey struct {
@@ -152,6 +147,7 @@ type AdminKey struct {
 
 type AdminPool struct {
 	ID                 int64              `json:"id"`
+	Revision           int64              `json:"revision"`
 	PublicModelName    string             `json:"publicModelName"`
 	UpstreamModelName  string             `json:"upstreamModelName"`
 	Enabled            bool               `json:"enabled"`
@@ -162,6 +158,7 @@ type AdminPool struct {
 
 type AdminBackend struct {
 	ID                int64                 `json:"id"`
+	Revision          int64                 `json:"revision"`
 	ModelPoolID       int64                 `json:"modelPoolId"`
 	ModelPool         string                `json:"modelPool"`
 	Name              string                `json:"name"`
@@ -198,8 +195,9 @@ func (s *AdminService) View() AdminView {
 
 	for _, client := range snapshot.Clients {
 		item := AdminClient{
-			ID: client.ID, Name: client.Name, Enabled: client.Enabled, PriorityClass: client.PriorityClass,
+			ID: client.ID, Revision: client.Revision, Name: client.Name, Enabled: client.Enabled, PriorityClass: client.PriorityClass,
 			VLLMPriority: client.VLLMPriority, MaxConcurrency: client.MaxConcurrency,
+			RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute,
 		}
 		for poolID, allowed := range snapshot.Access[client.ID] {
 			if !allowed {
@@ -232,7 +230,7 @@ func (s *AdminService) View() AdminView {
 	}
 	for _, pool := range snapshot.PoolsByID {
 		view.Pools = append(view.Pools, AdminPool{
-			ID: pool.ID, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
+			ID: pool.ID, Revision: pool.Revision, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
 			Enabled: pool.Enabled, MaxGatewayInflight: pool.MaxGatewayInflight, MaxWaiting: pool.MaxWaiting,
 			Runtime: s.runtime.PoolSnapshot(pool.ID, at),
 		})
@@ -240,7 +238,7 @@ func (s *AdminService) View() AdminView {
 	for _, backend := range snapshot.BackendsByID {
 		pool := snapshot.PoolsByID[backend.ModelPoolID]
 		view.Backends = append(view.Backends, AdminBackend{
-			ID: backend.ID, ModelPoolID: backend.ModelPoolID, ModelPool: pool.PublicModelName,
+			ID: backend.ID, Revision: backend.Revision, ModelPoolID: backend.ModelPoolID, ModelPool: pool.PublicModelName,
 			Name: backend.Name, BaseURL: backend.BaseURL, Enabled: backend.Enabled, Draining: backend.Draining,
 			CapacityHint: backend.CapacityHint, RunningSoftLimit: backend.RunningSoftLimit,
 			UpstreamAPIKeyEnv: backend.UpstreamAPIKeyEnv, Runtime: s.runtime.Snapshot(backend.ID, at),

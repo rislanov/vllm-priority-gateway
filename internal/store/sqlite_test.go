@@ -23,6 +23,9 @@ var initialMigration string
 //go:embed migrations/003_usage_analytics.sql
 var analyticsMigration string
 
+//go:embed migrations/002_pool_safety.sql
+var poolSafetyMigration string
+
 func openTestDB(t *testing.T) *store.SQLite {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "gateway.db")
@@ -48,8 +51,8 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 3 {
-		t.Fatalf("fresh database user_version = %d, want 3", got)
+	if got := sqliteUserVersion(t, path); got != 4 {
+		t.Fatalf("fresh database user_version = %d, want 4", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -66,6 +69,55 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("database permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestSQLiteMigrationPreservesGrandfatheredConcurrencyAndEnforcesNewWrites(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(initialMigration + poolSafetyMigration + analyticsMigration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`
+		INSERT INTO clients (name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at)
+		VALUES ('legacy-client', 1, 'normal', 0, 10001, '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z');
+		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at)
+		VALUES ('legacy-model', 'legacy-model', 1, 100001, 0, '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z');
+		PRAGMA user_version = 3;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() grandfathered database: %v", err)
+	}
+	defer db.Close()
+	clients, err := db.ListClients(ctx)
+	if err != nil || len(clients) != 1 || clients[0].MaxConcurrency != 10001 {
+		t.Fatalf("clients = %+v, %v", clients, err)
+	}
+	pools, err := db.ListPools(ctx)
+	if err != nil || len(pools) != 1 || pools[0].MaxGatewayInflight != 100001 {
+		t.Fatalf("pools = %+v, %v", pools, err)
+	}
+	if _, err := db.UpdateClient(ctx, clients[0].ID, store.UpdateClientParams{Name: "legacy-client", Enabled: true, PriorityClass: domain.PriorityNormal, MaxConcurrency: 10001}); err != nil {
+		t.Fatalf("preserve legacy client: %v", err)
+	}
+	if _, err := db.UpdatePool(ctx, pools[0].ID, store.UpdatePoolParams{PublicModelName: "legacy-model", UpstreamModelName: "legacy-model", Enabled: true, MaxGatewayInflight: 100001}); err != nil {
+		t.Fatalf("preserve legacy pool: %v", err)
+	}
+	if _, err := db.CreateClient(ctx, store.CreateClientParams{Name: "too-large", PriorityClass: domain.PriorityNormal, MaxConcurrency: 10001}); err == nil {
+		t.Fatal("above-maximum client create succeeded")
+	}
+	if _, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "too-large", UpstreamModelName: "too-large", MaxGatewayInflight: 100001}); err == nil {
+		t.Fatal("above-maximum pool create succeeded")
 	}
 }
 
@@ -94,8 +146,8 @@ func TestSQLiteMigratesVersionOnePoolSafetyDefaults(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() migrated database error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 3 {
-		t.Fatalf("migrated user_version = %d, want 3", got)
+	if got := sqliteUserVersion(t, path); got != 4 {
+		t.Fatalf("migrated user_version = %d, want 4", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -208,7 +260,7 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 		);
 		CREATE TABLE future_schema_marker (value TEXT NOT NULL);
 		INSERT INTO future_schema_marker (value) VALUES ('preserve-me');
-		PRAGMA user_version = 4;`); err != nil {
+		PRAGMA user_version = 5;`); err != nil {
 		futureDB.Close()
 		t.Fatalf("prepare future database: %v", err)
 	}
@@ -218,8 +270,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 
 	if opened, err := store.Open(context.Background(), path); err == nil {
 		opened.Close()
-		t.Fatal("Open() succeeded for future schema version 4")
-	} else if !strings.Contains(err.Error(), "SQLite schema version 4 is newer than supported version 3") {
+		t.Fatal("Open() succeeded for future schema version 5")
+	} else if !strings.Contains(err.Error(), "SQLite schema version 5 is newer than supported version 4") {
 		t.Fatalf("Open() error = %v, want future schema rejection", err)
 	}
 
@@ -233,8 +285,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read rejected user_version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("rejected user_version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("rejected user_version = %d, want 5", version)
 	}
 
 	var publicModelName, upstreamModelName, marker string
@@ -278,8 +330,8 @@ func TestSQLiteMigratesLegacyVersionZeroDatabaseWithExistingTables(t *testing.T)
 	if pools[0].MaxGatewayInflight != 0 || pools[0].MaxWaiting != 0 {
 		t.Fatalf("legacy safety limits = (%d, %d), want (0, 0)", pools[0].MaxGatewayInflight, pools[0].MaxWaiting)
 	}
-	if got := sqliteUserVersion(t, path); got != 3 {
-		t.Fatalf("legacy user_version = %d, want 3", got)
+	if got := sqliteUserVersion(t, path); got != 4 {
+		t.Fatalf("legacy user_version = %d, want 4", got)
 	}
 }
 
@@ -329,8 +381,8 @@ func TestSQLiteMigratesPreVersionedUsageAnalyticsDatabase(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() migrated analytics database error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 3 {
-		t.Fatalf("migrated analytics user_version = %d, want 3", got)
+	if got := sqliteUserVersion(t, path); got != 4 {
+		t.Fatalf("migrated analytics user_version = %d, want 4", got)
 	}
 
 	upgraded, err := sql.Open("sqlite", path)

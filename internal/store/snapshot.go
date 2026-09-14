@@ -42,7 +42,7 @@ func (s *SQLite) LoadSnapshot(ctx context.Context) (registry.Data, error) {
 
 func snapshotClients(ctx context.Context, tx *sql.Tx) ([]domain.Client, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at
+		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at
 		FROM clients ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot clients: %w", err)
@@ -80,7 +80,7 @@ func snapshotKeys(ctx context.Context, tx *sql.Tx) ([]domain.APIKey, error) {
 
 func snapshotPools(ctx context.Context, tx *sql.Tx) ([]domain.ModelPool, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at
+		SELECT id, revision, public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at
 		FROM model_pools ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot model pools: %w", err)
@@ -120,7 +120,7 @@ func snapshotAccess(ctx context.Context, tx *sql.Tx) ([]domain.ClientModelAccess
 
 func snapshotBackends(ctx context.Context, tx *sql.Tx) ([]domain.Backend, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, model_pool_id, name, base_url, enabled, draining, capacity_hint,
+		SELECT id, revision, model_pool_id, name, base_url, enabled, draining, capacity_hint,
 		running_soft_limit, upstream_api_key_env, created_at, updated_at
 		FROM backends ORDER BY id`)
 	if err != nil {

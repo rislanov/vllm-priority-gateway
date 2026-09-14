@@ -7,12 +7,14 @@ import (
 )
 
 type CreateClientParams struct {
-	Name           string
-	Enabled        bool
-	PriorityClass  domain.PriorityClass
-	VLLMPriority   int
-	MaxConcurrency int
-	ModelPoolIDs   []int64
+	Name              string
+	Enabled           bool
+	PriorityClass     domain.PriorityClass
+	VLLMPriority      int
+	MaxConcurrency    int
+	RequestsPerMinute int64
+	TokensPerMinute   int64
+	ModelPoolIDs      []int64
 }
 
 type UpdateClientParams = CreateClientParams

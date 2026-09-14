@@ -25,6 +25,7 @@ var migrations = []struct {
 	{version: 1, path: "migrations/001_initial.sql"},
 	{version: 2, path: "migrations/002_pool_safety.sql"},
 	{version: 3, path: "migrations/003_usage_analytics.sql"},
+	{version: 4, path: "migrations/004_postgresql_compatibility.sql"},
 }
 
 type SQLite struct {
@@ -118,6 +119,14 @@ func (s *SQLite) applyMigration(ctx context.Context, version int, path string) e
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, string(contents)); err != nil {
 		return fmt.Errorf("apply migration %d: %w", version, err)
+	}
+	if version == 4 {
+		for _, name := range []string{"clients_max_concurrency_insert", "clients_max_concurrency_update", "pools_max_inflight_insert", "pools_max_inflight_update"} {
+			var count int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?`, name).Scan(&count); err != nil || count != 1 {
+				return fmt.Errorf("verify migration %d trigger %s", version, name)
+			}
+		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
 		return fmt.Errorf("record migration %d: %w", version, err)

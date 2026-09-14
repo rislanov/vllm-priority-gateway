@@ -12,6 +12,7 @@ func (s *SQLite) CreateClient(ctx context.Context, params CreateClientParams) (d
 	client := domain.Client{
 		Name: params.Name, Enabled: params.Enabled, PriorityClass: params.PriorityClass,
 		VLLMPriority: params.VLLMPriority, MaxConcurrency: params.MaxConcurrency,
+		RequestsPerMinute: params.RequestsPerMinute, TokensPerMinute: params.TokensPerMinute, Revision: 1,
 	}
 	if err := client.Validate(); err != nil {
 		return domain.Client{}, err
@@ -26,10 +27,10 @@ func (s *SQLite) CreateClient(ctx context.Context, params CreateClientParams) (d
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO clients (name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO clients (name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, revision, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
-		client.MaxConcurrency, timestamp(now), timestamp(now),
+		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, client.Revision, timestamp(now), timestamp(now),
 	)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("insert client: %w", err)
@@ -54,9 +55,7 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	client := domain.Client{
 		ID: id, Name: params.Name, Enabled: params.Enabled, PriorityClass: params.PriorityClass,
 		VLLMPriority: params.VLLMPriority, MaxConcurrency: params.MaxConcurrency,
-	}
-	if err := client.Validate(); err != nil {
-		return domain.Client{}, err
+		RequestsPerMinute: params.RequestsPerMinute, TokensPerMinute: params.TokensPerMinute,
 	}
 	tx, err := s.begin(ctx)
 	if err != nil {
@@ -64,9 +63,14 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	}
 	defer tx.Rollback()
 	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM clients WHERE id = ?`, id).Scan(&created); err != nil {
+	var previous domain.Client
+	if err := tx.QueryRowContext(ctx, `SELECT max_concurrency, revision, created_at FROM clients WHERE id = ?`, id).Scan(&previous.MaxConcurrency, &previous.Revision, &created); err != nil {
 		return domain.Client{}, fmt.Errorf("find client %d: %w", id, err)
 	}
+	if err := client.ValidateUpdate(previous); err != nil {
+		return domain.Client{}, err
+	}
+	client.Revision = previous.Revision + 1
 	client.CreatedAt, err = parseTimestamp(created)
 	if err != nil {
 		return domain.Client{}, err
@@ -74,9 +78,9 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	client.UpdatedAt = s.now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE clients SET name = ?, enabled = ?, priority_class = ?, vllm_priority = ?,
-		max_concurrency = ?, updated_at = ? WHERE id = ?`,
+		max_concurrency = ?, requests_per_minute = ?, tokens_per_minute = ?, revision = ?, updated_at = ? WHERE id = ?`,
 		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
-		client.MaxConcurrency, timestamp(client.UpdatedAt), id,
+		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, client.Revision, timestamp(client.UpdatedAt), id,
 	)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("update client: %w", err)
@@ -98,7 +102,7 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 
 func (s *SQLite) ListClients(ctx context.Context) ([]domain.Client, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, enabled, priority_class, vllm_priority, max_concurrency, created_at, updated_at
+		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at
 		FROM clients ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list clients: %w", err)
@@ -162,8 +166,8 @@ func scanClient(row scanner) (domain.Client, error) {
 	var enabled int
 	var created, updated string
 	if err := row.Scan(
-		&client.ID, &client.Name, &enabled, &client.PriorityClass, &client.VLLMPriority,
-		&client.MaxConcurrency, &created, &updated,
+		&client.ID, &client.Revision, &client.Name, &enabled, &client.PriorityClass, &client.VLLMPriority,
+		&client.MaxConcurrency, &client.RequestsPerMinute, &client.TokensPerMinute, &created, &updated,
 	); err != nil {
 		return domain.Client{}, fmt.Errorf("scan client: %w", err)
 	}

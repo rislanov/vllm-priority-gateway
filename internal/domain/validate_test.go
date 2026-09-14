@@ -59,6 +59,44 @@ func TestClientValidateRejectsInvalidPolicy(t *testing.T) {
 	}
 }
 
+func TestClientValidateEnforcesProductionPolicyBounds(t *testing.T) {
+	valid := domain.Client{Name: "client", PriorityClass: domain.PriorityNormal, MaxConcurrency: domain.MaxClientConcurrency, RequestsPerMinute: domain.MaxRequestsPerMinute, TokensPerMinute: domain.MaxTokensPerMinute}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() boundary error = %v", err)
+	}
+	for name, mutate := range map[string]func(*domain.Client){
+		"concurrency": func(client *domain.Client) { client.MaxConcurrency++ },
+		"rpm":         func(client *domain.Client) { client.RequestsPerMinute++ },
+		"tpm":         func(client *domain.Client) { client.TokensPerMinute++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := valid
+			mutate(&client)
+			if err := client.Validate(); err == nil {
+				t.Fatalf("Validate(%+v) accepted above-maximum policy", client)
+			}
+		})
+	}
+}
+
+func TestClientValidateUpdatePermitsOnlyUnchangedOrLoweredGrandfatheredConcurrency(t *testing.T) {
+	previous := domain.Client{Name: "client", PriorityClass: domain.PriorityNormal, MaxConcurrency: domain.MaxClientConcurrency + 1}
+	for _, value := range []int{previous.MaxConcurrency, domain.MaxClientConcurrency} {
+		updated := previous
+		updated.MaxConcurrency = value
+		if err := updated.ValidateUpdate(previous); err != nil {
+			t.Fatalf("ValidateUpdate(%d) error = %v", value, err)
+		}
+	}
+	for _, value := range []int{previous.MaxConcurrency + 1, domain.MaxClientConcurrency + 2} {
+		updated := previous
+		updated.MaxConcurrency = value
+		if err := updated.ValidateUpdate(previous); err == nil {
+			t.Fatalf("ValidateUpdate(%d) accepted changed grandfathered value", value)
+		}
+	}
+}
+
 func TestModelPoolValidateRequiresBothNames(t *testing.T) {
 	for _, pool := range []domain.ModelPool{
 		{PublicModelName: "", UpstreamModelName: "upstream"},
@@ -103,6 +141,35 @@ func TestModelPoolValidateRejectsNegativeSafetyLimits(t *testing.T) {
 		if err := pool.Validate(); err == nil {
 			t.Fatalf("Validate(%+v) unexpectedly succeeded", pool)
 		}
+	}
+}
+
+func TestModelPoolValidateEnforcesProductionInflightBound(t *testing.T) {
+	pool := domain.ModelPool{PublicModelName: "public", UpstreamModelName: "upstream", MaxGatewayInflight: domain.MaxPoolGatewayInflight}
+	if err := pool.Validate(); err != nil {
+		t.Fatalf("Validate() boundary error = %v", err)
+	}
+	pool.MaxGatewayInflight++
+	if err := pool.Validate(); err == nil {
+		t.Fatal("Validate() accepted max gateway inflight above production bound")
+	}
+}
+
+func TestModelPoolValidateUpdatePermitsOnlyUnchangedOrLoweredGrandfatheredInflight(t *testing.T) {
+	previous := domain.ModelPool{PublicModelName: "public", UpstreamModelName: "upstream", MaxGatewayInflight: domain.MaxPoolGatewayInflight + 1}
+	unchanged := previous
+	if err := unchanged.ValidateUpdate(previous); err != nil {
+		t.Fatalf("unchanged grandfathered value: %v", err)
+	}
+	lowered := previous
+	lowered.MaxGatewayInflight = domain.MaxPoolGatewayInflight
+	if err := lowered.ValidateUpdate(previous); err != nil {
+		t.Fatalf("lowered grandfathered value: %v", err)
+	}
+	increased := previous
+	increased.MaxGatewayInflight++
+	if err := increased.ValidateUpdate(previous); err == nil {
+		t.Fatal("changed grandfathered value unexpectedly accepted")
 	}
 }
 

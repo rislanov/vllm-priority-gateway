@@ -16,6 +16,7 @@ type Options struct {
 }
 
 type Snapshot struct {
+	Generation     uint64
 	State          domain.CircuitState
 	FailureCount   int
 	RetryAt        time.Time
@@ -80,6 +81,7 @@ func (b *Breaker) Snapshot(now time.Time) Snapshot {
 	}
 
 	snapshot := Snapshot{
+		Generation:     b.generation,
 		State:          b.state,
 		FailureCount:   len(b.failures),
 		ProbesInFlight: b.probesInFlight,
