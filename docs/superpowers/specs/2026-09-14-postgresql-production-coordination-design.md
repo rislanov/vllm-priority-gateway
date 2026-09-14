@@ -128,6 +128,8 @@ type CircuitCoordinator interface {
 }
 ```
 
+`CircuitAcquireRequest` carries a gateway-generated stable attempt UUID. `CircuitCompletion` carries that UUID, the acquired backend identity and circuit generation, the immutable outcome, and the outcome timestamp captured once when the upstream attempt completes. Retries and outage replay must preserve all of those fields byte-for-byte.
+
 The public contracts use typed reasons rather than backend error strings. The required reasons are `concurrency_exhausted`, `rpm_exhausted`, `tpm_exhausted`, `stale_configuration`, `stale_backend`, `circuit_open`, `probe_capacity_exhausted`, `coordination_unavailable`, `lease_lost`, `stale_operation`, and `idempotency_conflict`.
 
 ### 5.3 Runtime ownership
@@ -300,7 +302,13 @@ request_leases
 
 `admission_operations` is the durable idempotency receipt; the active ledger is not used as an operation history. Its fingerprint covers every immutable admission input, including request/replica identity, configuration revision, API-key/client/pool identity, resolved limits and rate policy, operation timestamp, and TTL. It contains no API-key secret or request body. Reuse of a lease UUID with a different fingerprint returns `idempotency_conflict` and performs no rate or lease mutation.
 
-Acquire receipts and completion idempotency share this row. `pending` is an internal, uncommitted claim state; the function must change it to `admitted` or `rejected` before commit. Active receipts are never age-deleted. Rejected receipts and admitted receipts that have completed or expired are retained for 24 hours after their terminal timestamp. An unseen operation whose stable start timestamp is more than 24 hours old or more than five minutes ahead of PostgreSQL server time returns `stale_operation`; therefore removal of an old receipt cannot turn its UUID into a fresh admission. These windows are part of the coordination contract and replica fingerprint.
+Acquire receipts and completion idempotency share this row. `pending` is an internal, uncommitted claim state; the function must change it to `admitted` or `rejected` before commit. Active receipts are never age-deleted. `terminal_at` means the latest applicable non-null timestamp among rejection `decided_at`, `lease_expired_at`, and `completed_at`; a late completion after expiry therefore extends retention. For a rejected, completed, or expired operation, PostgreSQL sets:
+
+```text
+retain_until = max(terminal_at, operation_started_at) + 24h
+```
+
+Cleanup may delete a terminal receipt only when `retain_until <= v_now`. An unseen operation is accepted as new only when `operation_started_at > v_now - 24h` and `operation_started_at <= v_now + 5m`; both comparisons use a post-lock PostgreSQL timestamp. At the exact instant a future-skewed receipt becomes eligible for deletion, the strict lower bound therefore makes the same operation stale. Removal of an old receipt cannot turn its UUID into a fresh admission. These windows and boundary operators are part of the coordination contract and replica fingerprint.
 
 Creating a client or pool creates its corresponding scope row. A client or pool limit update locks that scope row before committing the new policy and global configuration revision. Reducing a limit does not cancel existing owners. It immediately prevents new acquisition while the total active count is at or above the new limit. Deleting configuration tombstones the corresponding scope instead of cascading through active leases or retained receipts; physical scope deletion waits until no coordination row references that identity. IDs are never reused.
 
@@ -377,7 +385,7 @@ Completion contains optional actual usage. A PostgreSQL completion function:
 
 Actual usage is debited once even when the request lease already expired or bounded cleanup removed it: the upstream work still consumed tokens. The durable receipt, rather than caller-supplied scope fields, supplies the trusted client and pool identity. The conditional delete prevents a stale completion from removing any other request. Receipt update, rate normalization/debit, and lease deletion commit or roll back together.
 
-A completion with no retained receipt returns `stale_operation`; a receipt for an admission that was rejected returns `lease_lost`. Neither case mutates a rate row. A late completion for an expired admitted receipt remains valid during the 24-hour retention window and performs the one actual-usage debit described above. If the current client no longer exists or its TPM limit is zero, completion skips the TPM row while still recording completion and releasing any matching lease.
+A completion with no retained receipt returns `stale_operation`; a receipt for an admission that was rejected returns `lease_lost`. Neither case mutates a rate row. A late completion for an expired admitted receipt remains valid until its calculated `retain_until` and performs the one actual-usage debit described above. If the current client no longer exists or its TPM limit is zero, completion skips the TPM row while still recording completion and releasing any matching lease.
 
 `cache_read_tokens` is a subset of input tokens and is not added again. Missing or invalid usage releases the lease without a token debit and increments a bounded-cardinality unmetered-completion metric.
 
@@ -387,7 +395,7 @@ Completion delivery is asynchronous and idempotent. The manager retries transien
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
 ```
 
-When the backlog is full, the response remains successful, lease cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Terminal admission receipts are retained for 24 hours, longer than the manager's retry horizon, and deleted in bounded batches.
+When the backlog is full, the response remains successful, lease cleanup falls back to TTL, the soft TPM debit may be lost, and a dedicated failure counter increments. This is permitted only because TPM was explicitly selected as a soft limit. Terminal admission receipts remain until `max(terminal_at, operation_started_at) + 24h`, longer than the manager's retry horizon, and are deleted in bounded batches.
 
 An active stream is never cancelled solely because renewal failed. The manager continues retrying. If the lease expires and another request uses the newly available capacity, a later renewal returns `lease_lost`; the original stream continues and telemetry records temporary overcommit risk.
 
@@ -432,11 +440,23 @@ backend_circuit_state
   half_open_succeeded    BOOLEAN
   updated_at             TIMESTAMPTZ
 
-backend_circuit_failures
-  failure_id             UUID PRIMARY KEY
+backend_circuit_failure_receipts
+  attempt_id             UUID PRIMARY KEY
   backend_id             BIGINT
   backend_revision       BIGINT
-  failed_at              TIMESTAMPTZ
+  circuit_generation     BIGINT
+  reported_outcome_at    TIMESTAMPTZ
+  event_at               TIMESTAMPTZ
+  first_processed_at     TIMESTAMPTZ
+  applied                BOOLEAN
+  retain_until           TIMESTAMPTZ
+
+backend_circuit_failures
+  attempt_id             UUID PRIMARY KEY REFERENCES backend_circuit_failure_receipts(attempt_id) ON DELETE CASCADE
+  backend_id             BIGINT
+  backend_revision       BIGINT
+  circuit_generation     BIGINT
+  event_at               TIMESTAMPTZ
 
 backend_circuit_probes
   permit_id              UUID PRIMARY KEY
@@ -445,27 +465,46 @@ backend_circuit_probes
   circuit_generation     BIGINT
   replica_id             UUID
   expires_at             TIMESTAMPTZ
-  completed_at           TIMESTAMPTZ NULL
+  reported_outcome_at    TIMESTAMPTZ NULL
+  event_at               TIMESTAMPTZ NULL
+  processed_at           TIMESTAMPTZ NULL
   outcome                success | failure | neutral | expired | superseded | NULL
+  retain_until           TIMESTAMPTZ NULL
 ```
 
 ### 14.1 Acquire
 
-`acquire_circuit` first verifies that the requested backend revision is still current, enabled, and not draining. An older replica receives `stale_backend` and cannot recreate old state.
+Before circuit acquisition, the gateway generates a stable attempt UUID. `acquire_circuit` first verifies that the requested backend revision is still current, enabled, and not draining. An older replica receives `stale_backend` and cannot recreate old state. The completion closure retains that UUID and, on its process-local `sync.Once`, captures one immutable `reported_outcome_at`. Retry and PostgreSQL-outage replay send the exact same attempt UUID, outcome, and reported timestamp.
 
 A closed-state fast path reads the committed state without taking a write lock. A request racing with a newly opened circuit is treated as already admitted, matching ordinary circuit-breaker semantics. Open-to-half-open transition and half-open probe acquisition lock the backend state row and re-check every condition atomically.
 
 Half-open capacity is global across replicas. Probe permits have a TTL, are scheduled for renewal by the same process-level lease scheduler through `CircuitCoordinator.RenewProbes`, and are counted only for the matching backend revision and circuit generation. Admission-lease completion and circuit-probe completion remain separate idempotent operations because one client request may make more than one backend attempt.
 
-Every time-dependent circuit mutation locks the backend circuit-state row and all affected permit rows in deterministic permit-ID order before capturing `v_now := clock_timestamp()`. Probe expiry, renewal eligibility, cooldown, failure-window pruning, and completion timestamps use that post-lock value. Circuit SQL never substitutes a transaction-start timestamp.
+Every time-dependent circuit mutation locks the backend circuit-state row, affected permit or failure rows, and the applicable failure receipt in deterministic ID order before capturing `v_now := clock_timestamp()`. Probe expiry, renewal eligibility, cooldown, failure-window pruning, and database processing timestamps use that post-lock value. The reported outcome timestamp is never regenerated during retry. Circuit SQL never substitutes a transaction-start timestamp.
 
 ### 14.2 Completion
 
-Closed-state success and neutral outcomes do not write circuit state. A qualifying failure inserts a unique failure event using the attempt ID as its idempotency key, prunes timestamps outside the rolling window, and opens the circuit when the threshold is reached.
+Closed-state success and neutral outcomes rely on the process-local once-only completion handle and do not write PostgreSQL circuit state. A qualifying closed-state failure locks the backend circuit-state row first and resolves `backend_circuit_failure_receipts` by attempt UUID before changing failure history. The state lock serializes first receipt creation for that backend. An existing receipt with identical backend identity, acquire generation, and reported timestamp returns its recorded result without inserting, pruning, or refreshing a failure event. Reuse with different immutable fields returns `idempotency_conflict`. A new failure locks current-generation failure rows by attempt ID before capturing `v_now`, then records:
 
-Half-open completion is idempotent through the durable probe permit. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
+```text
+first_processed_at = post-lock v_now
+event_at = min(reported_outcome_at, first_processed_at)
+retain_until = max(first_processed_at, reported_outcome_at) + CircuitCompletionRetention
+CircuitCompletionRetention = 24h
+0 < FailureWindow <= CircuitCompletionRetention - 5m
+```
 
-An expired half-open probe is a conservative circuit failure, not a neutral completion. Expiry reconciliation locks the circuit row, re-checks the permit and generation, selects the earliest expired unfinished permit, marks it `expired`, marks every other unfinished permit from the same generation `superseded`, transitions the circuit to `open`, clears `half_open_succeeded`, increments generation, and sets `opened_at` to the selected permit's `expires_at`. It emits the ordinary circuit-change notification. This transition applies even when another probe in the generation already succeeded.
+`CircuitCompletionRetention` is a fixed coordination-contract constant, not the configured rolling window or a value recomputed from it. The five-minute gap in the maximum supported `FailureWindow` covers the full accepted positive clock skew, so a receipt cannot become deletable while its event could still enter any supported rolling window. Configuration validation rejects a larger failure window before startup, and the limit is part of the replica fingerprint.
+
+The raw reported timestamp is retained for audit and exact replay; `event_at` is the immutable rolling-window timestamp and clamps only future clock skew to first database processing time. An unseen completion is accepted only when `reported_outcome_at > v_now - CircuitCompletionRetention` and `reported_outcome_at <= v_now + 5m`. Cleanup first removes any rolling event and then deletes a receipt only at `retain_until <= v_now`; the foreign key also cascades defensively. The strict-boundary argument is the same as for admission receipts.
+
+A qualifying closed-state failure inserts `backend_circuit_failures` with the same attempt UUID and immutable `event_at`. Failure-window pruning deletes event rows with `event_at < v_now - FailureWindow`; it never deletes failure receipts. Threshold counting uses distinct retained attempt IDs for the current backend revision and circuit generation. If the threshold is reached, `opened_at` is the latest retained `event_at`. A delayed event already outside the rolling window records its receipt but does not enter the failure table or affect circuit state.
+
+This separates retry deduplication from the rolling window. Deleting failure A from the rolling table cannot make a later redelivery fresh: its receipt still suppresses the duplicate, and even after receipt retention the strict timestamp gate rejects it rather than assigning a new event time.
+
+Half-open completion is idempotent through the durable probe permit. Its first completion stores the stable reported outcome timestamp, immutable `event_at = min(reported_outcome_at, processed_at)`, post-lock processing timestamp, outcome, and `retain_until` calculated with `CircuitCompletionRetention`. A duplicate must match those immutable inputs and returns without another transition; a mismatch returns `idempotency_conflict`. Failure reopens immediately. Success closes only after every already-admitted probe in the generation has completed without failure. Success plus neutral completion closes after the successful generation drains. Neutral-only completion releases probe capacity without closing. Stale-generation outcomes cannot heal or penalize a newer circuit generation.
+
+An expired half-open probe is a conservative circuit failure, not a neutral completion. Expiry reconciliation locks the circuit row, re-checks the permit and generation, selects the earliest expired unfinished permit, marks it `expired`, marks every other unfinished permit from the same generation `superseded`, assigns terminal retention to those permits, transitions the circuit to `open`, clears `half_open_succeeded`, increments generation, and sets `opened_at` to the selected permit's `expires_at`. It emits the ordinary circuit-change notification. This transition applies even when another probe in the generation already succeeded.
 
 Expiry reconciliation runs before every half-open acquire, renewal, and completion and in the periodic circuit refresh worker, so no operation can treat an expired generation as drained successfully. A completion that first discovers its own permit has expired performs the expiry transition and then returns a stale outcome without applying the reported success, failure, or neutral result.
 
@@ -481,7 +520,7 @@ Routing and dashboards read a local cache of distributed circuit snapshots. Post
 
 The authoritative acquire still executes before an upstream attempt. A stale cache may cause the router to consider a backend first, but PostgreSQL can reject the permit; the gateway excludes that backend and selects another. Stale cache cannot exceed global half-open capacity.
 
-Changing a route-affecting backend field increments backend revision and creates a new circuit identity. Old failure and probe rows become inert and are removed by bounded cleanup.
+Changing a route-affecting backend field increments backend revision and creates a new circuit identity. Old rolling failure rows become inert and are removed by window cleanup. Completion receipts and terminal probe permits remain until their independent `retain_until` so a delayed retry cannot recreate old state.
 
 ## 15. Replica Compatibility
 
@@ -516,7 +555,8 @@ After successful startup, loss of PostgreSQL enters degraded mode:
 - last-known open circuits remain unavailable;
 - last-known half-open circuits do not admit local probes;
 - last-known closed circuits may be made unavailable by a local conservative breaker but cannot heal locally;
-- bounded local failure events are replayed with original timestamps and idempotency IDs after recovery;
+- bounded local failure events are replayed after recovery with the exact original attempt IDs, outcomes, and reported timestamps captured by their `sync.Once` completion; replay preserves `event_at` semantics and never substitutes recovery time;
+- buffered failures older than `CircuitCompletionRetention` are discarded as observably stale because they are already outside the maximum rolling window and cannot affect current circuit state;
 - success observed during the outage never closes distributed circuit state.
 
 Emergency limits are process-wide class caps, additionally bounded by the client's effective local concurrency:
@@ -570,8 +610,8 @@ The default suite requires no PostgreSQL process and includes:
 
 - every existing SQLite unit, integration, race, vet, and build check;
 - SQLite migration tests for rate-policy and revision additions, including pre-existing `MaxConcurrency=10_001` and `MaxGatewayInflight=100_001` rows that remain loadable and unchanged while new/increased above-maximum values are rejected and lowering succeeds;
-- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, completion idempotency, and refill-before-debit TPM completion;
-- deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, and stale-generation no-ops;
+- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, future-skewed receipt retention/cleanup boundaries, completion idempotency, and refill-before-debit TPM completion;
+- deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, stale-generation no-ops, and `commit -> lost response -> rolling prune -> duplicate completion` with the original event timestamp;
 - gateway tests using deterministic fake coordinators;
 - emergency-mode and recovery state-machine tests;
 - `LeaseManager` renewal, completion, backlog, cancellation, and shutdown race tests;
@@ -606,10 +646,12 @@ The opt-in suite covers:
 - conservative no-over-admission under scope-lock contention;
 - renewal waiting across lease expiry while a same-client request in another pool acquires the freed capacity;
 - acquire response loss after commit followed by the same UUID before expiry, after expiry, and after completion, proving no second RPM debit or lease;
+- an acquire timestamp four minutes ahead of PostgreSQL time, terminal receipt cleanup at `max(terminal_at, operation_started_at) + 24h`, and same-UUID replay rejection at the exact boundary;
 - long-stream renewal, crash expiry, idempotent completion, and lost-lease detection;
 - distributed RPM refill and rejection;
 - soft TPM completion normalization/refill/debit ordering, natural overshoot, missing usage, and policy reset;
 - distributed circuit rolling window, open, cooldown, half-open capacity, completion ordering, neutral outcomes, and stale generations;
+- closed failure commit followed by lost response, event pruning, and duplicate completion, proving the original attempt cannot be inserted with a fresh event timestamp;
 - `success + crashed probe` expiry reopening and `success + expired probe + late failure` stale completion;
 - PostgreSQL outage, emergency admission, failure replay, and recovery;
 - incompatible replica fingerprint rejection;
