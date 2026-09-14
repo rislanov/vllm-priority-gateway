@@ -29,7 +29,7 @@ OpenAI-клиент
 │ Lightweight vLLM Priority Gateway                       │
 │ auth → доступ к модели → admission → affinity/routing   │
 │ streaming proxy │ health/pressure │ Admin UI/API        │
-│ analytics       │ Prometheus      │ SQLite registry     │
+│ analytics       │ Prometheus      │ SQLite/PostgreSQL   │
 └───────────────────────────┬──────────────────────────────┘
                             │ управляемый X-Vllm-Priority
                    ┌────────┴────────┐
@@ -37,7 +37,7 @@ OpenAI-клиент
               vLLM backend A    vLLM backend B
 ```
 
-Для развёртывания нужны один статический Go-бинарник и один каталог состояния SQLite. Текущая версия намеренно рассчитана на один экземпляр gateway и небольшой пул backend-серверов под управлением оператора. Redis, PostgreSQL, message broker, Kubernetes controller и отдельная сборка frontend не требуются.
+Для развёртывания нужен один статический Go-бинарник и явно выбранный профиль: SQLite по умолчанию для одного экземпляра либо PostgreSQL 16+ для согласованной работы нескольких реплик. Redis, message broker, Kubernetes controller и отдельная сборка frontend не требуются. Подробности — в [руководстве PostgreSQL production](docs/postgresql-production.md).
 
 ## Основные возможности
 
@@ -245,8 +245,9 @@ POST /v1/responses
 | Endpoint | Назначение |
 |---|---|
 | `/healthz` | Liveness процесса |
-| `/readyz` | Готовность SQLite и registry |
+| `/readyz` | Готовность management plane и состояния компонентов |
 | `/inference-readyz` | Доступная inference capacity; HTTP `503`, если её нет |
+| `/coordination-readyz` | Строгая готовность распределённой PostgreSQL-координации |
 | `/metrics` | Метрики Prometheus |
 | `/admin` | Интерфейс оператора |
 
@@ -288,6 +289,7 @@ make build
 make build-linux-amd64
 make build-e2e-linux-amd64
 make container-smoke  # нужен запущенный Docker daemon
+LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 ```
 
 В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть production quick start.
@@ -296,9 +298,9 @@ make container-smoke  # нужен запущенный Docker daemon
 
 ## Текущие ограничения
 
-- Только один экземпляр gateway; admission leases и runtime state backend-серверов находятся в памяти процесса.
+- Профиль SQLite поддерживает одну реплику; для распределённых admission, rate limit и circuit state используется PostgreSQL 16+.
 - Статическая регистрация backend-серверов оператором; нет service discovery и autoscaling.
-- Нет распределённых rate limits, token budgets, billing и GPU/NVML scheduling.
+- Нет billing, жёсткого резервирования токенов, Redis backend и GPU/NVML scheduling; PostgreSQL TPM намеренно мягкий и списывает сообщённый upstream usage.
 - Priority admission отклоняет новую низкоприоритетную работу, но не прерывает уже допущенную генерацию.
 - Мягкая session affinity улучшает locality, не анализируя KV blocks и содержимое prefix.
 - Для управления используется Basic auth. TLS, OIDC/RBAC, audit trail и secret manager должны предоставляться окружением.

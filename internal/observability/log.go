@@ -4,7 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 )
 
@@ -41,6 +43,47 @@ func (l *Logger) Complete(event gateway.RequestEvent) {
 		slog.Bool("disconnect", event.Disconnect),
 		slog.Int("retryCount", event.RetryCount),
 	)
+}
+
+// CoordinationOperation records bounded coordination metadata without request,
+// lease, permit, client, or API-key identifiers.
+func (l *Logger) CoordinationOperation(backend, operation, outcome string, duration time.Duration, reason coordination.Reason) {
+	l.logger.LogAttrs(context.Background(), slog.LevelDebug, "coordination operation",
+		slog.String("backend", backend),
+		slog.String("operation", operation),
+		slog.String("outcome", outcome),
+		slog.String("reason", string(reason)),
+		slog.Int64("durationMs", duration.Milliseconds()),
+	)
+}
+
+func (l *Logger) CoordinationRecoveryTransition(from, to coordination.RecoveryState) {
+	l.logger.LogAttrs(context.Background(), slog.LevelWarn, "coordination recovery transition",
+		slog.String("backend", "postgres"),
+		slog.String("from", string(from)),
+		slog.String("to", string(to)),
+	)
+}
+
+type coordinationObservers struct {
+	values []coordination.OperationObserver
+}
+
+// CoordinationMulti combines bounded coordination observers in declaration order.
+func CoordinationMulti(values ...coordination.OperationObserver) coordination.OperationObserver {
+	combined := make([]coordination.OperationObserver, 0, len(values))
+	for _, observer := range values {
+		if observer != nil {
+			combined = append(combined, observer)
+		}
+	}
+	return &coordinationObservers{values: combined}
+}
+
+func (o *coordinationObservers) CoordinationOperation(backend, operation, outcome string, duration time.Duration, reason coordination.Reason) {
+	for _, observer := range o.values {
+		observer.CoordinationOperation(backend, operation, outcome, duration, reason)
+	}
 }
 
 type observers struct {

@@ -5,7 +5,9 @@ CREATE TABLE admission_operations (
  request_id TEXT NOT NULL, replica_id UUID NOT NULL, client_id BIGINT NOT NULL, pool_id BIGINT NOT NULL,
  decision TEXT NOT NULL CHECK(decision IN ('pending','admitted','rejected')), rejection_reason TEXT, retry_at TIMESTAMPTZ,
  decided_at TIMESTAMPTZ, lease_expired_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
- completion_result TEXT CHECK(completion_result IN ('released','lease_lost')), retain_until TIMESTAMPTZ);
+ completion_result TEXT CHECK(completion_result IN ('released','lease_lost')), retain_until TIMESTAMPTZ,
+ CHECK((decision='rejected')=(rejection_reason IS NOT NULL)),
+ CHECK((completed_at IS NULL)=(completion_result IS NULL)));
 CREATE TABLE request_leases (
  lease_id UUID PRIMARY KEY REFERENCES admission_operations(lease_id), request_id TEXT NOT NULL, replica_id UUID NOT NULL,
  client_id BIGINT NOT NULL, pool_id BIGINT NOT NULL, acquired_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL) WITH (fillfactor=70, autovacuum_vacuum_scale_factor=0.02, autovacuum_analyze_scale_factor=0.01);

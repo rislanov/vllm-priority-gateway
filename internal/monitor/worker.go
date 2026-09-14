@@ -10,7 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
@@ -25,6 +27,10 @@ type Options struct {
 	UnhealthyAfter     int
 	RecoveryAfter      int
 	Circuit            circuitbreaker.Options
+	CircuitCoordinator coordination.CircuitCoordinator
+	AdmissionRuntime   coordination.AdmissionRuntime
+	ReplicaID          uuid.UUID
+	ProbeTTL           time.Duration
 	Limits             pressure.Limits
 	EWMAWindow         time.Duration
 	BusyThreshold      float64
@@ -39,8 +45,12 @@ func (o Options) validate() error {
 	if o.UnhealthyAfter <= 0 || o.RecoveryAfter <= 0 {
 		return errors.New("monitor transition counts must be positive")
 	}
-	if _, err := circuitbreaker.New(o.Circuit); err != nil {
-		return fmt.Errorf("circuit breaker options: %w", err)
+	if o.CircuitCoordinator == nil {
+		if _, err := circuitbreaker.New(o.Circuit); err != nil {
+			return fmt.Errorf("circuit breaker options: %w", err)
+		}
+	} else if o.ProbeTTL <= 0 || o.ReplicaID == uuid.Nil {
+		return errors.New("distributed circuit requires a positive probe TTL and replica ID")
 	}
 	if err := o.Limits.Validate(); err != nil {
 		return err

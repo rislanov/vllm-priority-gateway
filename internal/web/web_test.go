@@ -346,7 +346,7 @@ func TestAdminPagesHaveSemanticNavigationFormsAndTables(t *testing.T) {
 		text    string
 	}{
 		{path: "/admin", headers: []string{"Pool", "State", "Pressure", "Backend", "Running", "Waiting", "KV cache"}, text: "Gateway overview"},
-		{path: "/admin/clients", headers: []string{"Name", "Class", "vLLM priority", "Max concurrency", "Models", "Status", "Actions"}, text: "Create client"},
+		{path: "/admin/clients", headers: []string{"Name", "Class", "vLLM priority", "Max concurrency", "RPM / TPM", "Models", "Status", "Actions"}, text: "Create client"},
 		{path: "/admin/keys", headers: []string{"Prefix", "Client", "Created", "Expires", "Last used", "Status", "Actions"}, text: "Generate API key"},
 		{path: "/admin/backends", headers: []string{"Name", "Model pool", "URL", "State", "Pressure", "Enabled", "Draining", "Actions"}, text: "Create backend"},
 	}
@@ -453,7 +453,7 @@ func TestClientEditPagePrefillsExistingPolicy(t *testing.T) {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, expected := range []string{"Edit client: payments", `value="payments"`, `value="-100"`, `value="24"`, `value="1" checked`} {
+	for _, expected := range []string{"Edit client: payments", `value="payments"`, `value="-100"`, `value="24"`, `value="600"`, `value="60000"`, `value="1" checked`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("edit page missing %q: %s", expected, body)
 		}
@@ -649,7 +649,7 @@ func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := database.CreateClient(context.Background(), store.CreateClientParams{Name: "payments", Enabled: true, PriorityClass: domain.PriorityCritical, VLLMPriority: -100, MaxConcurrency: 24, ModelPoolIDs: []int64{pool.ID}})
+	client, err := database.CreateClient(context.Background(), store.CreateClientParams{Name: "payments", Enabled: true, PriorityClass: domain.PriorityCritical, VLLMPriority: -100, MaxConcurrency: 24, RequestsPerMinute: 600, TokensPerMinute: 60000, ModelPoolIDs: []int64{pool.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}

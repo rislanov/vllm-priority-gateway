@@ -249,3 +249,7 @@ Copy the binary to an operator host and run it with the same environment variabl
 - Resilience mode rejects the gateway URL: run the gateway and test on the same host and use `localhost` or a loopback IP.
 - The circuit never opens: align `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` with the gateway threshold and confirm all siblings were drained.
 - Health or metrics becomes stale while inference is faulted: the proxy is not passing management paths to real vLLM, so circuit-isolation evidence is invalid.
+
+## PostgreSQL multi-replica extension
+
+The real-vLLM modes above validate inference behavior but do not establish distributed database correctness. Before a PostgreSQL rollout, also run `make test-postgres`, the PgBouncer target when applicable, and two gateway replicas against the same dedicated database. Verify aggregate client/pool limits, RPM/soft-TPM behavior, global half-open capacity, config propagation, outage emergency caps, recovery replay, and `/coordination-readyz`. HA acceptance must use the actual synchronous-replication/promotion topology and prove retained acknowledged coordination and revocation records with the former primary fenced. Follow [PostgreSQL production profile](postgresql-production.md); never run destructive database tests against the production database.

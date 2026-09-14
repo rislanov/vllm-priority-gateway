@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -41,23 +42,25 @@ type AdminRuntime interface {
 }
 
 type AdminDependencies struct {
-	Store      AdminStore
-	Analytics  analytics.QueryStore
-	Registry   AdminRegistry
-	Runtime    AdminRuntime
-	HMACSecret []byte
-	Random     io.Reader
-	Now        func() time.Time
+	Store            AdminStore
+	Analytics        analytics.QueryStore
+	Registry         AdminRegistry
+	Runtime          AdminRuntime
+	HMACSecret       []byte
+	Random           io.Reader
+	Now              func() time.Time
+	MutationsAllowed func() bool
 }
 
 type AdminService struct {
-	store      AdminStore
-	analytics  analytics.QueryStore
-	registry   AdminRegistry
-	runtime    AdminRuntime
-	hmacSecret []byte
-	random     io.Reader
-	now        func() time.Time
+	store            AdminStore
+	analytics        analytics.QueryStore
+	registry         AdminRegistry
+	runtime          AdminRuntime
+	hmacSecret       []byte
+	random           io.Reader
+	now              func() time.Time
+	mutationsAllowed func() bool
 
 	randomMu sync.Mutex
 	stateMu  sync.RWMutex
@@ -82,7 +85,17 @@ func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
 	return &AdminService{
 		store: dependencies.Store, analytics: dependencies.Analytics, registry: dependencies.Registry, runtime: dependencies.Runtime,
 		hmacSecret: append([]byte(nil), dependencies.HMACSecret...), random: randomSource, now: now,
+		mutationsAllowed: dependencies.MutationsAllowed,
 	}, nil
+}
+
+var errAdminMutationsUnavailable = errors.New("configuration mutations are temporarily unavailable")
+
+func (s *AdminService) requireMutationAvailability() error {
+	if s.mutationsAllowed != nil && !s.mutationsAllowed() {
+		return errAdminMutationsUnavailable
+	}
+	return nil
 }
 
 type ClientInput struct {
@@ -252,6 +265,9 @@ func (s *AdminService) View() AdminView {
 }
 
 func (s *AdminService) CreateClient(ctx context.Context, input ClientInput) (AdminClient, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminClient{}, err
+	}
 	created, err := s.store.CreateClient(ctx, store.CreateClientParams(input))
 	if err != nil {
 		return AdminClient{}, err
@@ -263,6 +279,9 @@ func (s *AdminService) CreateClient(ctx context.Context, input ClientInput) (Adm
 }
 
 func (s *AdminService) UpdateClient(ctx context.Context, id int64, input ClientInput) (AdminClient, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminClient{}, err
+	}
 	updated, err := s.store.UpdateClient(ctx, id, store.UpdateClientParams(input))
 	if err != nil {
 		return AdminClient{}, err
@@ -274,6 +293,9 @@ func (s *AdminService) UpdateClient(ctx context.Context, id int64, input ClientI
 }
 
 func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyInput) (CreatedKey, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return CreatedKey{}, err
+	}
 	s.randomMu.Lock()
 	plain, err := apikey.Generate(s.random)
 	s.randomMu.Unlock()
@@ -297,6 +319,9 @@ func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyI
 }
 
 func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
+	if err := s.requireMutationAvailability(); err != nil {
+		return err
+	}
 	if err := s.store.RevokeAPIKey(ctx, id); err != nil {
 		return err
 	}
@@ -307,6 +332,9 @@ func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
 }
 
 func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPool, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminPool{}, err
+	}
 	pool, err := s.store.CreatePool(ctx, store.CreatePoolParams(input))
 	if err != nil {
 		return AdminPool{}, err
@@ -318,6 +346,9 @@ func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPo
 }
 
 func (s *AdminService) UpdatePool(ctx context.Context, id int64, input PoolInput) (AdminPool, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminPool{}, err
+	}
 	pool, err := s.store.UpdatePool(ctx, id, store.UpdatePoolParams(input))
 	if err != nil {
 		return AdminPool{}, err
@@ -329,6 +360,9 @@ func (s *AdminService) UpdatePool(ctx context.Context, id int64, input PoolInput
 }
 
 func (s *AdminService) CreateBackend(ctx context.Context, input BackendInput) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	backend, err := s.store.CreateBackend(ctx, store.CreateBackendParams(input))
 	if err != nil {
 		return AdminBackend{}, err
@@ -340,6 +374,9 @@ func (s *AdminService) CreateBackend(ctx context.Context, input BackendInput) (A
 }
 
 func (s *AdminService) UpdateBackend(ctx context.Context, id int64, input BackendInput) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	backend, err := s.store.UpdateBackend(ctx, id, store.UpdateBackendParams(input))
 	if err != nil {
 		return AdminBackend{}, err
@@ -351,6 +388,9 @@ func (s *AdminService) UpdateBackend(ctx context.Context, id int64, input Backen
 }
 
 func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, draining bool) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	if err := s.store.SetBackendDraining(ctx, id, draining); err != nil {
 		return AdminBackend{}, err
 	}
@@ -604,13 +644,24 @@ func writeAdminResult(writer http.ResponseWriter, status int, value any, err err
 func writeAdminError(writer http.ResponseWriter, err error) {
 	message := err.Error()
 	status, code := http.StatusBadRequest, "validation_error"
+	var pgErr *pgconn.PgError
 	switch {
+	case errors.Is(err, errAdminMutationsUnavailable):
+		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
+		message = "Configuration mutations are temporarily unavailable"
 	case errors.Is(err, sql.ErrNoRows):
 		status, code = http.StatusNotFound, "not_found"
+	case errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23505"):
+		status, code = http.StatusConflict, "conflict"
+		message = "Configuration conflicts with an existing or referenced resource"
+	case errors.As(err, &pgErr) && pgErr.Code == "23514":
+		message = "Configuration value is outside the supported range"
 	case strings.Contains(message, "UNIQUE constraint failed"), strings.Contains(message, "FOREIGN KEY constraint failed"):
 		status, code = http.StatusConflict, "conflict"
 	case strings.Contains(message, "publish configuration"), strings.Contains(message, "reconcile backend monitors"):
 		status, code = http.StatusServiceUnavailable, "configuration_degraded"
+	case strings.Contains(message, "PostgreSQL"):
+		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
 	}
 	writeAdminJSONError(writer, status, code, message)
 }

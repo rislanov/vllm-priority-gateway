@@ -369,9 +369,10 @@ func (c Config) validateDatabaseProfile() error {
 			if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
 				return errors.New("invalid PostgreSQL connection URL")
 			}
-			if mode := parsed.Query().Get("default_query_exec_mode"); mode != "" && mode != "exec" {
-				return errors.New("PostgreSQL runtime URL requires default_query_exec_mode=exec")
-			}
+		}
+		runtimeURL, _ := url.Parse(c.DatabaseURL)
+		if mode := runtimeURL.Query().Get("default_query_exec_mode"); mode != "" && mode != "exec" {
+			return errors.New("PostgreSQL runtime URL requires default_query_exec_mode=exec")
 		}
 	default:
 		return fmt.Errorf("unsupported LLMGW_DATABASE_DRIVER %q", c.DatabaseDriver)

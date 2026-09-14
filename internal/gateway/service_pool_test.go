@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
@@ -20,6 +22,132 @@ import (
 )
 
 var poolTestNow = time.Unix(1_700_000_000, 0).UTC()
+
+type unavailableAdmission struct{}
+
+func (unavailableAdmission) Acquire(context.Context, coordination.AdmissionRequest) (coordination.AdmissionDecision, error) {
+	return coordination.AdmissionDecision{Reason: coordination.ReasonCoordinationUnavailable}, errors.New("offline")
+}
+func (unavailableAdmission) Renew(context.Context, []coordination.LeaseIdentity) ([]coordination.RenewResult, error) {
+	return nil, errors.New("offline")
+}
+func (unavailableAdmission) Complete(context.Context, []coordination.LeaseCompletion) ([]coordination.CompleteResult, error) {
+	return nil, errors.New("offline")
+}
+func (unavailableAdmission) Status() coordination.Status {
+	return coordination.Status{Backend: "postgres", Degraded: true}
+}
+
+type staleAdmission struct{ calls int }
+
+func (f *staleAdmission) Acquire(_ context.Context, _ coordination.AdmissionRequest) (coordination.AdmissionDecision, error) {
+	f.calls++
+	return coordination.AdmissionDecision{Reason: coordination.ReasonStaleConfiguration}, nil
+}
+func (f *staleAdmission) Renew(context.Context, []coordination.LeaseIdentity) ([]coordination.RenewResult, error) {
+	return nil, nil
+}
+func (f *staleAdmission) Complete(context.Context, []coordination.LeaseCompletion) ([]coordination.CompleteResult, error) {
+	return nil, nil
+}
+func (f *staleAdmission) Status() coordination.Status { return coordination.Status{Available: true} }
+
+type reloadableSnapshotProvider struct {
+	*mutableSnapshotProvider
+	reload func()
+}
+
+func (p *reloadableSnapshotProvider) Reload(context.Context) error { p.reload(); return nil }
+
+func TestServiceStaleConfigurationReloadsAndReauthenticates(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Revision: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 1}
+	pool := domain.ModelPool{ID: 10, Revision: 1, PublicModelName: "public-model", UpstreamModelName: "upstream", Enabled: true}
+	backend := retryBackend(20, "gpu", "http://gpu.invalid")
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	mutable := &mutableSnapshotProvider{}
+	mutable.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	provider := &reloadableSnapshotProvider{mutableSnapshotProvider: mutable}
+	provider.reload = func() {
+		updated := testSnapshot(client, key, pool, []domain.Backend{backend})
+		revoked := poolTestNow
+		values := updated.KeyCandidates[key.Prefix]
+		values[0].RevokedAt = &revoked
+		updated.KeyCandidates[key.Prefix] = values
+		updated.Revision = 2
+		mutable.Set(updated)
+	}
+	runtime := newPoolRuntime(domain.PoolRuntime{PoolID: pool.ID, State: domain.PoolNormal, AvailableBackends: 1}, []domain.BackendRuntime{{BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true}})
+	coordinator := &staleAdmission{}
+	service := gateway.New(gateway.Dependencies{Registry: provider, HMACSecret: secret, Admission: coordinator, Emergency: coordination.NewEmergencyAdmission(1, 1), ReplicaID: uuid.New(), LeaseTTL: time.Minute, Runtime: runtime, Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: &poolCompletionForwarder{}, Now: func() time.Time { return poolTestNow }})
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header), Body: []byte(`{"model":"public-model"}`), APIKey: rawKey})
+	if apiErr == nil || apiErr.Code != "invalid_api_key" {
+		t.Fatalf("stale reload response=%+v", apiErr)
+	}
+	if coordinator.calls != 1 {
+		t.Fatalf("coordinator calls=%d, revoked key should not retry admission", coordinator.calls)
+	}
+}
+
+func TestServiceEmergencyAdmissionIsLimitedToCriticalAndHigh(t *testing.T) {
+	forwarder := newPoolBlockingForwarder()
+	service, request, _ := newPoolService(t, poolServiceOptions{priority: domain.PriorityHigh, forwarder: forwarder, coordinator: unavailableAdmission{}, emergency: coordination.NewEmergencyAdmission(1, 1)})
+	firstDone := forwardPoolAsync(service, context.Background(), request)
+	forwarder.waitStarted(t)
+	second := <-forwardPoolAsync(service, context.Background(), request)
+	if second.apiErr == nil || second.apiErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("second=%+v", second.apiErr)
+	}
+	forwarder.releaseAll()
+	if first := <-firstDone; first.apiErr != nil {
+		t.Fatalf("first=%+v", first.apiErr)
+	}
+
+	normal, normalRequest, _ := newPoolService(t, poolServiceOptions{priority: domain.PriorityNormal, coordinator: unavailableAdmission{}, emergency: coordination.NewEmergencyAdmission(1, 1)})
+	_, _, apiErr := normal.Forward(context.Background(), httptest.NewRecorder(), normalRequest)
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("normal outage response=%+v", apiErr)
+	}
+}
+
+func TestServiceKeepsNormalClosedUntilRecoveryBarrierAndUsesEmergencyForHigh(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		priority   domain.PriorityClass
+		wantStatus int
+	}{
+		{name: "normal remains closed", priority: domain.PriorityNormal, wantStatus: http.StatusServiceUnavailable},
+		{name: "high uses emergency", priority: domain.PriorityHigh, wantStatus: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := &staleAdmission{}
+			service, request, _ := newPoolService(t, poolServiceOptions{
+				priority: test.priority, coordinator: coordinator, emergency: coordination.NewEmergencyAdmission(1, 1),
+				coordinationReady: func() bool { return false },
+			})
+			result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+			status := result.Status
+			if apiErr != nil {
+				status = apiErr.HTTPStatus
+			}
+			if status != test.wantStatus || coordinator.calls != 0 {
+				t.Fatalf("status=%d error=%+v coordinatorCalls=%d", status, apiErr, coordinator.calls)
+			}
+		})
+	}
+}
+
+func TestInferenceReadinessRequiresEmergencyCapacityWhileCoordinationIsDown(t *testing.T) {
+	high, _, _ := newPoolService(t, poolServiceOptions{priority: domain.PriorityHigh, coordinator: unavailableAdmission{}, emergency: coordination.NewEmergencyAdmission(0, 1)})
+	if got := high.InferenceReadiness(); got.Status != "ready" {
+		t.Fatalf("high readiness=%+v", got)
+	}
+	normal, _, _ := newPoolService(t, poolServiceOptions{priority: domain.PriorityNormal, coordinator: unavailableAdmission{}, emergency: coordination.NewEmergencyAdmission(1, 1)})
+	if got := normal.InferenceReadiness(); got.Status != "unavailable" {
+		t.Fatalf("normal readiness=%+v", got)
+	}
+}
 
 func TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion(t *testing.T) {
 	forwarder := newPoolBlockingForwarder()
@@ -447,6 +575,9 @@ type poolServiceOptions struct {
 	backends                  []domain.Backend
 	publishPoolOnSnapshot     *domain.ModelPool
 	mutatePoolOnEverySnapshot func(domain.ModelPool) domain.ModelPool
+	coordinator               coordination.AdmissionCoordinator
+	emergency                 *coordination.EmergencyAdmission
+	coordinationReady         func() bool
 }
 
 func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service, gateway.ForwardRequest, *poolRuntimeStub) {
@@ -511,6 +642,8 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 		Registry: provider, HMACSecret: secret, Limiter: admission.NewLimiter(), Runtime: runtime,
 		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
 		Now: func() time.Time { return poolTestNow }, RetryAfter: 2 * time.Second,
+		Admission: options.coordinator, Emergency: options.emergency, ReplicaID: uuid.New(), LeaseTTL: time.Minute,
+		CoordinationReady: options.coordinationReady,
 	})
 	return service, gateway.ForwardRequest{
 		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),

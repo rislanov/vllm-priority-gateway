@@ -1,23 +1,24 @@
 package postgres
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
-func TestMigrationManifestIsCompleteAndOrdered(t *testing.T) {
-	want := []string{
-		"migrations/000001_configuration.up.sql", "migrations/000001_configuration.down.sql",
-		"migrations/000002_analytics.up.sql", "migrations/000002_analytics.down.sql",
-		"migrations/000003_coordination.up.sql", "migrations/000003_coordination.down.sql",
-	}
-	got, err := MigrationManifest()
+func TestEmbeddedMigrationManifestHasContiguousUpDownPairs(t *testing.T) {
+	manifest, err := MigrationManifest()
 	if err != nil {
-		t.Fatalf("MigrationManifest() error = %v", err)
+		t.Fatal(err)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("manifest = %v", got)
+	want := []string{
+		"migrations/000001_configuration.up.sql",
+		"migrations/000001_configuration.down.sql",
+		"migrations/000002_analytics.up.sql",
+		"migrations/000002_analytics.down.sql",
+		"migrations/000003_coordination.up.sql",
+		"migrations/000003_coordination.down.sql",
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("manifest[%d] = %q, want %q", i, got[i], want[i])
-		}
+	if !reflect.DeepEqual(manifest, want) {
+		t.Fatalf("MigrationManifest() = %v, want %v", manifest, want)
 	}
 }

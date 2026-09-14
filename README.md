@@ -29,7 +29,7 @@ OpenAI client
 │ Lightweight vLLM Priority Gateway                       │
 │ auth → model access → admission → affinity/live routing │
 │ streaming proxy │ health/pressure │ Admin UI/API        │
-│ analytics       │ Prometheus      │ SQLite registry     │
+│ analytics       │ Prometheus      │ SQLite/PostgreSQL   │
 └───────────────────────────┬──────────────────────────────┘
                             │ controlled X-Vllm-Priority
                    ┌────────┴────────┐
@@ -37,13 +37,13 @@ OpenAI client
               vLLM backend A    vLLM backend B
 ```
 
-The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small, operator-managed backend pool; it does not require Redis, PostgreSQL, a message broker, a Kubernetes controller, or a frontend build chain.
+The deployment footprint is one static Go binary plus an explicitly selected persistence profile: SQLite for one replica (the default), or PostgreSQL 16+ for coordinated multi-replica production. Redis, a message broker, a Kubernetes controller, and a frontend build chain are not required. See the [PostgreSQL production profile](docs/postgresql-production.md).
 
 ## Key capabilities
 
 - OpenAI-compatible `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, and `POST /v1/responses`.
 - High-entropy client keys stored as HMAC-SHA-256 digests, never as plaintext.
-- Per-client enablement, priority class, integer vLLM priority, concurrency limit, and explicit model access.
+- Per-client enablement, priority class, integer vLLM priority, concurrency, RPM and soft-TPM limits, and explicit model access.
 - Public-to-upstream model rewriting and static multi-backend model pools.
 - Independent backend health and Prometheus polling with EWMA pressure and hysteretic pool states.
 - Priority-aware admission, bounded `429` errors, least-pressure routing, soft session affinity, draining, and one conservative pre-first-byte retry.
@@ -245,8 +245,9 @@ Common runtime endpoints:
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | Process liveness |
-| `/readyz` | SQLite and registry readiness |
+| `/readyz` | Management readiness and component state |
 | `/inference-readyz` | Usable inference capacity; HTTP `503` when unavailable |
+| `/coordination-readyz` | Strict PostgreSQL coordination readiness |
 | `/metrics` | Prometheus telemetry |
 | `/admin` | Operator UI |
 
@@ -288,6 +289,7 @@ make build
 make build-linux-amd64
 make build-e2e-linux-amd64
 make container-smoke  # requires a running Docker daemon
+LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 ```
 
 The repository also contains a deterministic fake vLLM and load generator for tests; they are development tools and are not part of the production quick start.
@@ -296,9 +298,9 @@ The implementation and deterministic acceptance suite are code-complete. The opt
 
 ## Current scope and limitations
 
-- Exactly one gateway replica; admission leases and backend runtime state are process-local.
+- SQLite supports exactly one gateway replica; select PostgreSQL 16+ for distributed admission, rate limits, and circuits across replicas.
 - Static operator-managed backend registration; no service discovery or autoscaling.
-- No distributed rate limits, token budgets, billing, or GPU/NVML scheduling.
+- No billing, hard token reservation, Redis backend, or GPU/NVML scheduling; PostgreSQL TPM is deliberately soft and uses reported completion usage.
 - Priority admission rejects new lower-priority work but does not preempt an admitted generation.
 - Soft session affinity improves locality without inspecting KV blocks or prefix contents.
 - Basic auth is the current management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external responsibilities.
@@ -310,6 +312,7 @@ See the [technical specification](docs/technical-specification.md) for the broad
 
 - [Production deployment](docs/deployment.md)
 - [Operations guide](docs/operations.md)
+- [PostgreSQL production profile](docs/postgresql-production.md)
 - [Technical specification](docs/technical-specification.md)
 - [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md)
 - [Real-GPU test plan](docs/real-gpu-testing.md)

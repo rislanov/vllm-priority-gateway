@@ -34,6 +34,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	return runMigrations(db)
 }
+
 func runMigrations(db *sql.DB) error {
 	source, err := iofs.New(migrationFS, "migrations")
 	if err != nil {
@@ -41,15 +42,15 @@ func runMigrations(db *sql.DB) error {
 	}
 	driver, err := pgxmigrate.WithInstance(db, &pgxmigrate.Config{})
 	if err != nil {
-		return fmt.Errorf("initialize PostgreSQL migration driver: %w", err)
+		return errors.New("initialize PostgreSQL migration driver")
 	}
 	m, err := migrate.NewWithInstance("iofs", source, "pgx5", driver)
 	if err != nil {
-		return fmt.Errorf("initialize PostgreSQL migrations: %w", err)
+		return errors.New("initialize PostgreSQL migrations")
 	}
 	defer m.Close()
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("apply PostgreSQL migrations: %w", err)
+		return errors.New("apply PostgreSQL migrations")
 	}
 	return nil
 }

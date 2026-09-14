@@ -4,13 +4,14 @@ This guide covers the runtime behavior that operators need after deployment. For
 
 ## Readiness endpoints
 
-The gateway exposes three intentionally different health signals:
+The gateway exposes four intentionally different health signals:
 
 | Endpoint | Meaning |
 |---|---|
 | `/healthz` | The process is alive. |
-| `/readyz` | SQLite and the in-memory configuration registry are ready. Admin access remains available even if inference capacity is zero. |
+| `/readyz` | Selected persistence profile and in-memory registry initialized; component states report PostgreSQL degradation. Admin access remains available if inference capacity is zero. |
 | `/inference-readyz` | At least one enabled pool and backend are eligible for inference. Returns HTTP `503` when no inference capacity is available. |
+| `/coordination-readyz` | Strict PostgreSQL coordination, compatibility, configuration-freshness, and circuit-refresh gate. Returns HTTP `503` while degraded. |
 
 Use `/inference-readyz` as the load-balancer signal for client traffic. Removing a gateway from service cannot create GPU capacity, so transient pool congestion does not make this endpoint fail.
 
@@ -24,7 +25,7 @@ This is locality-aware routing, not a distributed KV-block index. A session can 
 
 ## Circuit breaker and pool safety
 
-Each managed backend has a process-local inference circuit. With the default configuration, five qualifying failures in 30 seconds open the circuit for 15 seconds; one half-open probe is then allowed. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against the circuit. Downstream cancellation and write failure are neutral.
+Each managed backend has a circuit: process-local in SQLite mode and PostgreSQL-coordinated in PostgreSQL mode. With the default configuration, five qualifying failures in 30 seconds open it for 15 seconds; one half-open probe is then allowed. Connection, DNS, TLS, response-header, upstream `5xx`, and upstream response-body failures count against the circuit. Downstream cancellation and write failure are neutral.
 
 An upstream `5xx` is forwarded and is not retried. The gateway performs only one conservative retry for transport failures that occur before response headers are received.
 
@@ -35,7 +36,7 @@ Each model pool has two optional guards:
 
 Both guards return the bounded `429 gateway_overloaded` envelope before per-client priority can bypass capacity protection. Zero disables the corresponding limit; calibrate non-zero values against the selected model, GPU, and vLLM configuration.
 
-Circuit and pool leases are process-local and are correct only for the documented single-gateway topology.
+Circuit and pool leases are process-local in the SQLite profile. PostgreSQL mode distributes both across compatible gateway replicas.
 
 ## Draining a backend
 
@@ -89,3 +90,7 @@ Metric labels are bounded to configured names and enums. Request IDs, key prefix
 - Upstream API keys are read only from named gateway environment variables and are never stored in SQLite.
 
 The current release does not implement TLS, OIDC, RBAC, an audit log, or a secret manager. Those controls must be supplied by the deployment environment.
+
+## PostgreSQL coordination operations
+
+In PostgreSQL mode, client/pool inflight, RPM, soft TPM, circuit generations, and half-open permits are global rather than process-local. `/readyz` remains HTTP 200 and reports degraded components through a transient database outage; `/coordination-readyz` is the strict database/compatibility/config/circuit gate. Normal and Background fail closed during an outage, while Critical and High use only configured per-replica emergency caps. Alert on coordination operation failures/latency, PostgreSQL pool saturation, renewal loss, pending completions, circuit-cache age/replay backlog, and compatible replica count. The full recovery sequence, failover durability boundary, and separate acknowledged-data-loss disaster-recovery procedure are in [PostgreSQL production profile](postgresql-production.md).

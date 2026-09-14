@@ -38,6 +38,7 @@ type RequestEvent struct {
 	RetryCount        int
 	Usage             *domain.TokenUsage
 	UsageParseFailure string
+	SoftTPMExpected   bool
 }
 
 // Observer receives synchronous request-lifecycle events. Implementations

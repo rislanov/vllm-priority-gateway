@@ -1828,7 +1828,7 @@ Retry-After
 
 It is better to reject a background request than to keep 10,000 HTTP connections waiting for a GPU.
 
-This protection is implemented for one gateway process. Pool fields are exposed through SQLite, Admin JSON/forms, immutable registry snapshots, and runtime dashboards. Distributed enforcement across gateway replicas remains out of scope.
+This protection is process-local in the SQLite profile and globally enforced through PostgreSQL leases in the PostgreSQL profile. Pool fields are exposed through both stores, Admin JSON/forms, immutable registry snapshots, and runtime dashboards.
 
 Inference capacity has its own unauthenticated `GET /inference-readyz`: HTTP `200`/`status: ready` when at least one enabled pool has a healthy, metrics-fresh, secret-ready, non-draining backend whose circuit has capacity; otherwise HTTP `503`/`status: unavailable`. The body includes configuration `revision`, `poolAvailability`, and `backendAvailability`. Pool congestion does not make inference readiness flap. `GET /readyz` remains separate management-plane readiness and stays HTTP `200` during an inference outage.
 
@@ -2632,3 +2632,11 @@ This is a fundamental architectural boundary.
 ```
 
 **The Gateway's primary product function is not conventional round-robin load balancing, but serving as a QoS layer for scarce GPU resources.**
+
+---
+
+# 69. Persistence and distributed coordination profiles
+
+Production implements two explicit profiles. SQLite remains the default single-replica configuration/analytics store with local coordination. PostgreSQL 16+ stores configuration and analytics and coordinates multi-replica admission leases, continuously refilled client RPM, soft completion-debited TPM, circuit generations, durable failure receipts, and global half-open permits. Backend-neutral store and coordinator interfaces preserve Redis/Valkey as a future option without making it a Production V1 dependency.
+
+PostgreSQL operations use three independently bounded pgx pools, `exec` query mode for transaction-pooler compatibility, direct forward-only migrations, deterministic scope locks, post-lock server timestamps, synchronous commits, fingerprinted 24-hour idempotency receipts, compatible-replica registration, notification-plus-poll config/circuit caches, conservative emergency admission, and distinct management/inference/coordination readiness. The normative operational contract is [PostgreSQL production profile](postgresql-production.md); the detailed implementation design is [PostgreSQL Production Persistence and Distributed Coordination Design](superpowers/specs/2026-09-14-postgresql-production-coordination-design.md).

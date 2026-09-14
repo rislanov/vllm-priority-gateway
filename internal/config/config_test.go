@@ -75,6 +75,16 @@ func TestLoadAcceptsCompletePostgresProfile(t *testing.T) {
 	}
 }
 
+func TestLoadAllowsMigrationURLToUseSessionQueryMode(t *testing.T) {
+	env := validEnvironment()
+	env["LLMGW_DATABASE_DRIVER"] = "postgres"
+	env["LLMGW_DATABASE_URL"] = "postgres://gateway:secret@db.example/llmgw?default_query_exec_mode=exec"
+	env["LLMGW_DATABASE_MIGRATION_URL"] = "postgres://migrator:secret@primary.example/llmgw?default_query_exec_mode=cache_statement"
+	if _, err := config.Load(lookup(env)); err != nil {
+		t.Fatalf("Load() rejected direct migration query mode: %v", err)
+	}
+}
+
 func TestLoadRejectsIncompleteOrMixedDatabaseProfiles(t *testing.T) {
 	tests := []map[string]string{
 		{"LLMGW_DATABASE_DRIVER": "postgres"},

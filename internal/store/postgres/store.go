@@ -74,3 +74,21 @@ func (s *Store) Close() error {
 func (s *Store) ConfigPool() *pgxpool.Pool       { return s.config }
 func (s *Store) AnalyticsPool() *pgxpool.Pool    { return s.analytics }
 func (s *Store) CoordinationPool() *pgxpool.Pool { return s.coordination }
+
+type PoolConnectionStats struct {
+	Acquired, Idle, Total int32
+	Canceled              int64
+}
+
+func (s *Store) PoolStats() map[string]PoolConnectionStats {
+	return map[string]PoolConnectionStats{
+		"configuration": poolConnectionStats(s.config),
+		"analytics":     poolConnectionStats(s.analytics),
+		"coordination":  poolConnectionStats(s.coordination),
+	}
+}
+
+func poolConnectionStats(pool *pgxpool.Pool) PoolConnectionStats {
+	stats := pool.Stat()
+	return PoolConnectionStats{Acquired: stats.AcquiredConns(), Idle: stats.IdleConns(), Total: stats.TotalConns(), Canceled: stats.CanceledAcquireCount()}
+}

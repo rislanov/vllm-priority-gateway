@@ -2,12 +2,15 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
@@ -26,13 +29,15 @@ type Manager struct {
 	observerDone chan struct{}
 	options      Options
 
-	mu           sync.Mutex
-	workers      map[int64]*managedWorker
-	poolMachine  map[int64]*pressure.PoolMachine
-	poolRuntime  map[int64]domain.PoolRuntime
-	poolInflight map[int64]int
-	nextGen      uint64
-	shutdown     bool
+	mu             sync.Mutex
+	workers        map[int64]*managedWorker
+	poolMachine    map[int64]*pressure.PoolMachine
+	poolRuntime    map[int64]domain.PoolRuntime
+	poolInflight   map[int64]int
+	nextGen        uint64
+	shutdown       bool
+	probes         map[uuid.UUID]coordination.ProbeIdentity
+	circuitBacklog []coordination.CircuitCompletion
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
@@ -47,12 +52,22 @@ func NewManager(ctx context.Context, options Options) *Manager {
 		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), options: options,
 		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
 		poolRuntime: make(map[int64]domain.PoolRuntime), poolInflight: make(map[int64]int),
+		probes: make(map[uuid.UUID]coordination.ProbeIdentity),
 	}
 	go manager.runPoolObserver()
 	return manager
 }
 
 func (m *Manager) Reconcile(backends []domain.Backend) error {
+	if m.options.CircuitCoordinator != nil {
+		identities := make([]coordination.BackendIdentity, 0, len(backends))
+		for _, backend := range backends {
+			identities = append(identities, coordination.BackendIdentity{ID: backend.ID, Revision: backend.Revision, Enabled: backend.Enabled, Draining: backend.Draining})
+		}
+		if err := m.options.CircuitCoordinator.Reconcile(m.ctx, identities); err != nil {
+			return fmt.Errorf("reconcile distributed circuits: %w", err)
+		}
+	}
 	desired := make(map[int64]domain.Backend, len(backends))
 	for _, backend := range backends {
 		if !backend.Enabled {
@@ -118,7 +133,7 @@ func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime 
 	if managed == nil {
 		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy}
 	}
-	return snapshotManaged(managed, at)
+	return m.snapshotManaged(managed, at)
 }
 
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
@@ -129,6 +144,9 @@ func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
 		runtime = domain.PoolRuntime{PoolID: poolID, State: domain.PoolUnavailable}
 	}
 	runtime.GatewayInflight = m.poolInflight[poolID]
+	if m.options.AdmissionRuntime != nil {
+		runtime.GatewayInflight = m.options.AdmissionRuntime.PoolInflight(poolID)
+	}
 	runtime.TotalWaiting = m.currentPoolWaitingLocked(poolID, at)
 	return runtime
 }
@@ -190,6 +208,15 @@ func (m *Manager) runPoolObserver() {
 }
 
 func (m *Manager) observePools(at time.Time) {
+	if m.options.CircuitCoordinator != nil {
+		if m.options.CircuitCoordinator.Refresh(m.ctx) == nil {
+			_ = m.ReplayCircuitFailures(m.ctx)
+		}
+		m.renewProbes()
+	}
+	if m.options.AdmissionRuntime != nil {
+		_ = m.options.AdmissionRuntime.RefreshInflight(m.ctx)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.shutdown {
@@ -219,7 +246,7 @@ func (m *Manager) observePoolLocked(poolID int64, at time.Time) domain.PoolRunti
 		if managed.worker.Backend().ModelPoolID != poolID {
 			continue
 		}
-		snapshot := snapshotManaged(managed, at)
+		snapshot := m.snapshotManaged(managed, at)
 		if !snapshot.Healthy || !snapshot.MetricsFresh || managed.worker.Backend().Draining {
 			continue
 		}
@@ -259,6 +286,74 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 		m.mu.Unlock()
 		return nil, false
 	}
+	if m.options.CircuitCoordinator != nil {
+		m.mu.Unlock()
+		attemptID := uuid.New()
+		identity := coordination.BackendIdentity{ID: expected.ID, Revision: expected.Revision, Enabled: expected.Enabled, Draining: expected.Draining}
+		decision, err := m.options.CircuitCoordinator.Acquire(m.ctx, coordination.CircuitAcquireRequest{AttemptID: attemptID, AcquisitionStartedAt: at.UTC(), ReplicaID: m.options.ReplicaID, Backend: identity, ProbeTTL: m.options.ProbeTTL})
+		if err != nil {
+			var permanent coordination.PermanentError
+			if errors.As(err, &permanent) {
+				return nil, false
+			}
+			cached := m.options.CircuitCoordinator.Snapshot(expected.ID, at)
+			if cached.State != domain.CircuitClosed {
+				return nil, false
+			}
+			m.mu.Lock()
+			managed = m.workers[expected.ID]
+			if managed == nil || managed.worker.Backend() != expected {
+				m.mu.Unlock()
+				return nil, false
+			}
+			completeLocal, localOK := managed.breaker.Acquire(at)
+			if !localOK || managed.breaker.Snapshot(at).State != domain.CircuitClosed {
+				m.mu.Unlock()
+				return nil, false
+			}
+			managed.worker.incrementInflight(1)
+			m.mu.Unlock()
+			var once sync.Once
+			return func(outcome domain.InferenceOutcome) {
+				once.Do(func() {
+					reported := time.Now().UTC()
+					completeLocal(outcome, reported)
+					if outcome == domain.InferenceFailure {
+						m.bufferCircuitFailure(coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: cached.Generation, Outcome: outcome, ReportedOutcomeAt: reported})
+					}
+					managed.worker.incrementInflight(-1)
+				})
+			}, true
+		}
+		if decision.Reason != "" {
+			return nil, false
+		}
+		m.mu.Lock()
+		managed = m.workers[expected.ID]
+		if managed == nil || managed.worker.Backend() != expected {
+			m.mu.Unlock()
+			return nil, false
+		}
+		managed.worker.incrementInflight(1)
+		if decision.Permit != nil {
+			m.probes[decision.Permit.PermitID] = *decision.Permit
+		}
+		m.mu.Unlock()
+		var once sync.Once
+		return func(outcome domain.InferenceOutcome) {
+			once.Do(func() {
+				reported := time.Now().UTC()
+				completion := coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: decision.Snapshot.Generation, Outcome: outcome, ReportedOutcomeAt: reported}
+				if _, err := m.options.CircuitCoordinator.Complete(context.WithoutCancel(m.ctx), completion); err != nil && outcome == domain.InferenceFailure && replayableCircuitError(err) {
+					m.bufferCircuitFailure(completion)
+				}
+				m.mu.Lock()
+				delete(m.probes, attemptID)
+				managed.worker.incrementInflight(-1)
+				m.mu.Unlock()
+			})
+		}, true
+	}
 	completeCircuit, ok := managed.breaker.Acquire(at)
 	if !ok {
 		m.mu.Unlock()
@@ -277,6 +372,9 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 
 func snapshotManaged(managed *managedWorker, at time.Time) domain.BackendRuntime {
 	snapshot := managed.worker.Snapshot(at)
+	if managed.breaker == nil {
+		return snapshot
+	}
 	circuit := managed.breaker.Snapshot(at)
 	snapshot.CircuitState = circuit.State
 	snapshot.CircuitFailures = circuit.FailureCount
@@ -286,10 +384,105 @@ func snapshotManaged(managed *managedWorker, at time.Time) domain.BackendRuntime
 	return snapshot
 }
 
+func (m *Manager) snapshotManaged(managed *managedWorker, at time.Time) domain.BackendRuntime {
+	if m.options.CircuitCoordinator == nil {
+		return snapshotManaged(managed, at)
+	}
+	snapshot := managed.worker.Snapshot(at)
+	circuit := m.options.CircuitCoordinator.Snapshot(managed.worker.Backend().ID, at)
+	if !m.options.CircuitCoordinator.Status().Available && circuit.State == domain.CircuitClosed {
+		local := managed.breaker.Snapshot(at)
+		if local.State != domain.CircuitClosed {
+			circuit.Available = false
+		}
+	}
+	snapshot.CircuitState = circuit.State
+	snapshot.CircuitFailures = circuit.FailureCount
+	snapshot.CircuitRetryAt = circuit.RetryAt
+	snapshot.CircuitProbesInFlight = circuit.ProbesInFlight
+	snapshot.CircuitAvailable = circuit.Available
+	return snapshot
+}
+
+// ReplayCircuitFailures delivers still-relevant, immutable failure events and
+// retains only those whose durable completion is still unavailable.
+func (m *Manager) ReplayCircuitFailures(ctx context.Context) error {
+	m.mu.Lock()
+	pending := m.circuitBacklog
+	m.circuitBacklog = nil
+	m.mu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	kept := pending[:0]
+	var replayErr error
+	for _, completion := range pending {
+		if !completion.ReportedOutcomeAt.After(now.Add(-24 * time.Hour)) {
+			continue
+		}
+		if _, err := m.options.CircuitCoordinator.Complete(ctx, completion); err != nil && replayableCircuitError(err) {
+			kept = append(kept, completion)
+			replayErr = errors.Join(replayErr, err)
+		}
+	}
+	m.mu.Lock()
+	merged := append(append([]coordination.CircuitCompletion(nil), kept...), m.circuitBacklog...)
+	if len(merged) > 4096 {
+		merged = merged[len(merged)-4096:]
+	}
+	m.circuitBacklog = merged
+	m.mu.Unlock()
+	return replayErr
+}
+
+func (m *Manager) bufferCircuitFailure(completion coordination.CircuitCompletion) {
+	m.mu.Lock()
+	m.circuitBacklog = append(m.circuitBacklog, completion)
+	if len(m.circuitBacklog) > 4096 {
+		m.circuitBacklog = m.circuitBacklog[len(m.circuitBacklog)-4096:]
+	}
+	m.mu.Unlock()
+}
+
+func replayableCircuitError(err error) bool {
+	var reason coordination.ReasonError
+	return !errors.As(err, &reason)
+}
+
+func (m *Manager) renewProbes() {
+	m.mu.Lock()
+	probes := make([]coordination.ProbeIdentity, 0, len(m.probes))
+	for _, probe := range m.probes {
+		probes = append(probes, probe)
+	}
+	m.mu.Unlock()
+	if len(probes) == 0 {
+		return
+	}
+	results, err := m.options.CircuitCoordinator.RenewProbes(m.ctx, probes)
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, result := range results {
+		if result.Reason == coordination.ReasonLeaseLost {
+			delete(m.probes, result.Lease.LeaseID)
+		}
+	}
+}
+
 func (m *Manager) WorkerCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.workers)
+}
+
+func (m *Manager) CircuitReplayBacklog() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.circuitBacklog)
 }
 
 func (m *Manager) HasWorker(id int64) bool {

@@ -383,6 +383,21 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	if readyResponse.StatusCode != http.StatusOK || readiness.Status != "ready" || readiness.Revision != 0 || readiness.BackendAvailability != 0 {
 		t.Fatalf("readiness = %d %+v", readyResponse.StatusCode, readiness)
 	}
+	coordinationResponse, err := client.Get("http://" + listener.Addr().String() + "/coordination-readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var coordinationReadiness struct {
+		Status   string `json:"status"`
+		Revision int64  `json:"revision"`
+	}
+	if err := json.NewDecoder(coordinationResponse.Body).Decode(&coordinationReadiness); err != nil {
+		t.Fatal(err)
+	}
+	coordinationResponse.Body.Close()
+	if coordinationResponse.StatusCode != http.StatusOK || coordinationReadiness.Status != "ready" || coordinationReadiness.Revision != 0 {
+		t.Fatalf("coordination readiness = %d %+v", coordinationResponse.StatusCode, coordinationReadiness)
+	}
 	inferenceResponse, err := client.Get("http://" + listener.Addr().String() + "/inference-readyz")
 	if err != nil {
 		t.Fatal(err)

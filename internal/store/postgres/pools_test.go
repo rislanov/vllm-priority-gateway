@@ -5,6 +5,13 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	basestore "github.com/rislanov/vllm-priority-gateway/internal/store"
+)
+
+var (
+	_ basestore.ConfigurationStore = (*Store)(nil)
+	_ basestore.AnalyticsStore     = (*Store)(nil)
+	_ basestore.LifecycleStore     = (*Store)(nil)
 )
 
 func TestParsePoolConfigForcesExecModeAndBoundsConnections(t *testing.T) {
