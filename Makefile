@@ -16,7 +16,7 @@ test-real-vllm:
 test-postgres:
 	@test -n "$(LLMGW_POSTGRES_TEST_DSN)" || { printf '%s\n' 'LLMGW_POSTGRES_TEST_DSN is required' >&2; exit 2; }
 	$(GO) test -count=1 -v -timeout 1m ./internal/coordination/postgres -run 'Test(ExpiredReplicaHeartbeatCannotRaceIncompatibleRegistration|ShorterReplicaTTLDoesNotExpireHealthyPeer|HeartbeatFailureLatchesRecoveryAcrossLaterSuccess)'
-	$(GO) test -count=1 -v -timeout 1m ./cmd/gateway -run 'TestTransientCoordinationFailureLatchesRecovery'
+	$(GO) test -count=1 -v -timeout 1m ./cmd/gateway -run 'Test(TransientCoordinationFailureLatchesRecovery|CircuitRefreshResultTimeoutLatchesRecovery)'
 	$(GO) test -count=1 -v -timeout 10m ./tests/postgres
 
 test-postgres-docker:

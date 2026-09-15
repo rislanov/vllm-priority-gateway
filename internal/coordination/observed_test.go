@@ -48,6 +48,46 @@ func (o *observedTestObserver) CoordinationOperation(backend, operation, outcome
 
 type coordinationFailureObserverStub struct{ failures []error }
 
+type observedCleanupAdmission struct {
+	AdmissionCoordinator
+	err error
+}
+
+func (c observedCleanupAdmission) CleanupBatch(context.Context, int) (bool, error) {
+	return true, c.err
+}
+
+type observedCleanupCircuit struct {
+	CircuitCoordinator
+	err error
+}
+
+func (c observedCleanupCircuit) CleanupBatch(context.Context, int) (bool, error) {
+	return true, c.err
+}
+
+func TestObservedCleanupPreservesProgressAndFailure(t *testing.T) {
+	want := errors.New("cleanup database failure")
+	for _, fail := range []error{nil, want} {
+		observer := &coordinationFailureObserverStub{}
+		admission := ObserveAdmission(observedCleanupAdmission{err: fail}, nil, observer)
+		circuit := ObserveCircuit(observedCleanupCircuit{err: fail}, nil, observer)
+		for _, wrapped := range []any{admission, circuit} {
+			cleaner, ok := wrapped.(CleanupBatcher)
+			if !ok {
+				t.Fatalf("wrapper lost batch cleanup: %T", wrapped)
+			}
+			more, err := cleaner.CleanupBatch(context.Background(), 256)
+			if !more || !errors.Is(err, fail) {
+				t.Fatalf("cleanup progress/error lost: more=%t err=%v want=%v", more, err, fail)
+			}
+		}
+		if fail != nil && len(observer.failures) != 2 || fail == nil && len(observer.failures) != 0 {
+			t.Fatalf("unexpected cleanup failures: %v", observer.failures)
+		}
+	}
+}
+
 func (o *coordinationFailureObserverStub) CoordinationFailure(err error) {
 	o.failures = append(o.failures, err)
 }
@@ -124,5 +164,55 @@ func TestOperationOutcomeTreatsTypedSemanticErrorAsDecision(t *testing.T) {
 	}
 	if got := operationReason(err); got != ReasonStaleOperation {
 		t.Fatalf("reason=%q", got)
+	}
+}
+
+type observedTestCircuit struct {
+	CircuitCoordinator
+	err error
+}
+
+func (f *observedTestCircuit) Refresh(context.Context) error { return f.err }
+func (*observedTestCircuit) Status() Status                  { return Status{Backend: "postgres", Available: true} }
+
+func TestFailureObservationDistinguishesCallerCancellation(t *testing.T) {
+	for _, operation := range []string{"admission acquire", "admission refresh", "circuit refresh"} {
+		for _, scenario := range []struct {
+			name         string
+			cancelCaller bool
+			err          error
+			want         RecoveryState
+		}{
+			{"caller cancellation", true, context.Canceled, RecoveryReady},
+			{"internal timeout", false, context.DeadlineExceeded, RecoveryDegraded},
+			{"database error despite canceled caller", true, errors.New("connection reset"), RecoveryDegraded},
+			{"permanent fault despite canceled caller", true, PermanentError{Err: context.Canceled}, RecoveryPermanentFault},
+		} {
+			t.Run(operation+"/"+scenario.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if scenario.cancelCaller {
+					cancel()
+				}
+				recovery := NewRecoveryManager(RecoverySteps{}, time.Now)
+				admission := ObserveAdmission(&observedTestAdmission{err: scenario.err, refresh: scenario.err}, nil, recovery)
+				circuit := ObserveCircuit(&observedTestCircuit{err: scenario.err}, nil, recovery)
+				var err error
+				switch operation {
+				case "admission acquire":
+					_, err = admission.Acquire(ctx, AdmissionRequest{})
+				case "admission refresh":
+					err = admission.(AdmissionRuntime).RefreshInflight(ctx)
+				case "circuit refresh":
+					err = circuit.Refresh(ctx)
+				}
+				if !errors.Is(err, scenario.err) {
+					t.Fatalf("returned %v, want %v", err, scenario.err)
+				}
+				if got := recovery.Status().State; got != scenario.want {
+					t.Fatalf("recovery=%s, want %s", got, scenario.want)
+				}
+			})
+		}
 	}
 }

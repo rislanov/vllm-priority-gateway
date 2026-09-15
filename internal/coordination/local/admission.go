@@ -234,7 +234,7 @@ func (c *AdmissionCoordinator) Complete(ctx context.Context, completions []coord
 			}
 			state := c.normalized(rec.request.ClientID, "tpm", policy.revision, policy.tpm, now)
 			if policy.tpm > 0 {
-				state.balance -= float64(item.Usage.InputTokens + item.Usage.OutputTokens)
+				state.balance -= (float64(item.Usage.InputTokens) + float64(item.Usage.OutputTokens))
 			}
 		}
 		result := coordination.CompletionLeaseLost
@@ -370,11 +370,7 @@ func retentionBoundary(operationStarted, terminal time.Time) time.Time {
 }
 func fingerprint(v any) [32]byte { encoded, _ := json.Marshal(v); return sha256.Sum256(encoded) }
 func retryAt(balance float64, capacity int64, now time.Time) time.Time {
-	missing := 1 - balance
-	if missing < 0 {
-		missing = 0
-	}
-	return now.Add(time.Duration(missing / float64(capacity) * float64(time.Minute)))
+	return coordination.RateRetryAt(balance, capacity, now)
 }
 
 var _ coordination.AdmissionCoordinator = (*AdmissionCoordinator)(nil)

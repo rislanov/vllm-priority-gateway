@@ -141,6 +141,12 @@ type AdmissionRuntime interface {
 	RefreshInflight(context.Context) error
 }
 
+// CleanupBatcher removes bounded amounts of expired coordination state.
+// More reports that a category filled its batch and may have further work.
+type CleanupBatcher interface {
+	CleanupBatch(context.Context, int) (more bool, err error)
+}
+
 type BackendIdentity struct {
 	ID       int64
 	Revision int64

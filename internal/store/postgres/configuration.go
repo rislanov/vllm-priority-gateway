@@ -36,6 +36,13 @@ func (s *Store) mutation(ctx context.Context, fn func(pgx.Tx) error) error {
 	return nil
 }
 
+func configurationOperationError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s PostgreSQL configuration: %w", operation, err)
+}
+
 func (s *Store) CreateClient(ctx context.Context, p basestore.CreateClientParams) (domain.Client, error) {
 	v := domain.Client{Name: p.Name, Enabled: p.Enabled, PriorityClass: p.PriorityClass, VLLMPriority: p.VLLMPriority, MaxConcurrency: p.MaxConcurrency, RequestsPerMinute: p.RequestsPerMinute, TokensPerMinute: p.TokensPerMinute, Revision: 1}
 	if err := v.Validate(); err != nil {
@@ -71,7 +78,7 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 		}
 		var previous domain.Client
 		if err := tx.QueryRow(ctx, "SELECT max_concurrency,revision,created_at FROM clients WHERE id=$1::bigint FOR UPDATE", id).Scan(&previous.MaxConcurrency, &previous.Revision, &v.CreatedAt); err != nil {
-			return err
+			return configurationOperationError("read client", err)
 		}
 		if err := v.ValidateUpdate(previous); err != nil {
 			return err
@@ -131,11 +138,11 @@ func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePool
 	v := domain.ModelPool{ID: id, PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, MaxWaiting: p.MaxWaiting}
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", id); err != nil {
-			return err
+			return configurationOperationError("lock pool admission scope", err)
 		}
 		var old domain.ModelPool
 		if err := tx.QueryRow(ctx, "SELECT max_gateway_inflight,revision,created_at FROM model_pools WHERE id=$1::bigint FOR UPDATE", id).Scan(&old.MaxGatewayInflight, &old.Revision, &v.CreatedAt); err != nil {
-			return err
+			return configurationOperationError("read model pool", err)
 		}
 		if err := v.ValidateUpdate(old); err != nil {
 			return err
@@ -182,10 +189,10 @@ func (s *Store) UpdateBackend(ctx context.Context, id int64, p basestore.UpdateB
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		var oldRev int64
 		if _, err := tx.Exec(ctx, "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", id); err != nil {
-			return err
+			return configurationOperationError("lock backend circuit", err)
 		}
 		if err := tx.QueryRow(ctx, "SELECT revision,created_at FROM backends WHERE id=$1::bigint FOR UPDATE", id).Scan(&oldRev, &v.CreatedAt); err != nil {
-			return err
+			return configurationOperationError("read backend", err)
 		}
 		v.Revision = oldRev + 1
 		var err error
@@ -194,7 +201,7 @@ func (s *Store) UpdateBackend(ctx context.Context, id int64, p basestore.UpdateB
 			return err
 		}
 		if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", id); err != nil {
-			return err
+			return configurationOperationError("clear backend failures", err)
 		}
 		tag, err := tx.Exec(ctx, `UPDATE backends SET model_pool_id=$2::bigint,name=$3::text,base_url=$4::text,enabled=$5::boolean,draining=$6::boolean,capacity_hint=$7::double precision,running_soft_limit=$8::double precision,upstream_api_key_env=$9::text,revision=revision+1,updated_at=$10::timestamptz WHERE id=$1::bigint`, id, v.ModelPoolID, v.Name, v.BaseURL, v.Enabled, v.Draining, v.CapacityHint, v.RunningSoftLimit, v.UpstreamAPIKeyEnv, v.UpdatedAt)
 		if err != nil {
@@ -204,7 +211,7 @@ func (s *Store) UpdateBackend(ctx context.Context, id int64, p basestore.UpdateB
 			return fmt.Errorf("update PostgreSQL backend: %w", pgx.ErrNoRows)
 		}
 		_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", id, v.Revision, v.UpdatedAt)
-		return err
+		return configurationOperationError("update backend circuit", err)
 	})
 	return v, err
 }
@@ -213,42 +220,43 @@ func (s *Store) SetBackendDraining(ctx context.Context, id int64, draining bool)
 	return s.mutation(ctx, func(tx pgx.Tx) error {
 		var rev int64
 		if _, err := tx.Exec(ctx, "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", id); err != nil {
-			return err
+			return configurationOperationError("lock backend circuit", err)
 		}
 		if err := tx.QueryRow(ctx, "SELECT revision FROM backends WHERE id=$1::bigint FOR UPDATE", id).Scan(&rev); err != nil {
-			return err
+			return configurationOperationError("read backend revision", err)
 		}
 		now, err := supersedeProbes(ctx, tx, id)
 		if err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", id); err != nil {
-			return err
+			return configurationOperationError("clear backend failures", err)
 		}
 		_, err = tx.Exec(ctx, "UPDATE backends SET draining=$2::boolean,revision=revision+1,updated_at=$3::timestamptz WHERE id=$1::bigint", id, draining, now)
 		if err == nil {
 			_, err = tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", id, rev+1, now)
 		}
-		return err
+		return configurationOperationError("set backend draining", err)
 	})
 }
 
 func supersedeProbes(ctx context.Context, tx pgx.Tx, id int64) (time.Time, error) {
 	if _, err := tx.Exec(ctx, "SELECT permit_id FROM backend_circuit_probes WHERE backend_id=$1::bigint AND outcome IS NULL ORDER BY permit_id FOR UPDATE", id); err != nil {
-		return time.Time{}, err
+		return time.Time{}, configurationOperationError("lock backend probes", err)
 	}
 	var now time.Time
 	if err := tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
-		return time.Time{}, err
+		return time.Time{}, configurationOperationError("read probe supersession time", err)
 	}
 	_, err := tx.Exec(ctx, `UPDATE backend_circuit_probes SET outcome='superseded',processed_at=$2::timestamptz,retain_until=GREATEST($2::timestamptz,acquisition_started_at)+interval '24 hours' WHERE backend_id=$1::bigint AND outcome IS NULL`, id, now)
-	return now, err
+	return now, configurationOperationError("supersede backend probes", err)
 }
 
 func (s *Store) CreateAPIKey(ctx context.Context, p basestore.CreateAPIKeyParams) (domain.APIKey, error) {
 	v := domain.APIKey{ClientID: p.ClientID, Prefix: p.Prefix, SecretHash: p.SecretHash, ExpiresAt: p.ExpiresAt, CreatedAt: time.Now().UTC()}
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, "INSERT INTO api_keys(client_id,prefix,secret_hash,created_at,expires_at) VALUES($1::bigint,$2::text,$3::bytea,$4::timestamptz,$5::timestamptz) RETURNING id", v.ClientID, v.Prefix, v.SecretHash[:], v.CreatedAt, v.ExpiresAt).Scan(&v.ID)
+		err := tx.QueryRow(ctx, "INSERT INTO api_keys(client_id,prefix,secret_hash,created_at,expires_at) VALUES($1::bigint,$2::text,$3::bytea,$4::timestamptz,$5::timestamptz) RETURNING id", v.ClientID, v.Prefix, v.SecretHash[:], v.CreatedAt, v.ExpiresAt).Scan(&v.ID)
+		return configurationOperationError("insert API key", err)
 	})
 	return v, err
 }
@@ -256,7 +264,10 @@ func (s *Store) CreateAPIKey(ctx context.Context, p basestore.CreateAPIKeyParams
 func (s *Store) RevokeAPIKey(ctx context.Context, id int64) error {
 	return s.mutation(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, "UPDATE api_keys SET revoked_at=clock_timestamp() WHERE id=$1::bigint AND revoked_at IS NULL", id)
-		if err != nil || tag.RowsAffected() != 1 {
+		if err != nil {
+			return configurationOperationError("revoke API key", err)
+		}
+		if tag.RowsAffected() != 1 {
 			return pgx.ErrNoRows
 		}
 		return nil

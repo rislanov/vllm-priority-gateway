@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Circuit completion retention is fixed at 24h; failure window is positive and no greater than retention minus 5m.
+- PostgreSQL circuit completion retention is fixed at 24h; failure window is positive and no greater than retention minus 5m. Local terminal attempts have the bounded-eviction exception in design section 5.2, so their nominal 24-hour replay history is best-effort under capacity pressure.
 - Acquire/completion retries preserve attempt UUID, acquisition/outcome timestamp, identity, generation, and fingerprint byte-for-byte.
 - Failure wins over success for a half-open generation; neutral-only drains without healing; expired probes reopen conservatively.
 - Identity changes atomically supersede unfinished permits; stale generations are no-ops and cannot heal or penalize new generations.

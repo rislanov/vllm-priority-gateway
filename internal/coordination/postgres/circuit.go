@@ -95,24 +95,12 @@ func (c *CircuitCoordinator) Snapshot(backendID int64, _ time.Time) coordination
 
 func (c *CircuitCoordinator) Reconcile(parent context.Context, values []coordination.BackendIdentity) (resultErr error) {
 	defer func() {
-		if resultErr == nil {
-			return
-		}
-		if permanentCoordinationError(resultErr) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(resultErr, &permanent) {
-				resultErr = coordination.PermanentError{Err: resultErr}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		resultErr = recordCoordinationError(parent, resultErr, c)
 	}()
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		return err
 	}
 	defer tx.Rollback(ctx)
@@ -156,7 +144,6 @@ func (c *CircuitCoordinator) Reconcile(parent context.Context, values []coordina
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {
-		c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		return err
 	}
 	if err = c.Refresh(parent); err != nil {
@@ -179,25 +166,16 @@ func terminalizeProbes(ctx context.Context, tx pgx.Tx, backendID int64, outcome 
 
 func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 	defer func() {
-		if resultErr == nil || !permanentCoordinationError(resultErr) {
-			return
-		}
-		c.setPermanent()
-		var permanent coordination.PermanentError
-		if !errors.As(resultErr, &permanent) {
-			resultErr = coordination.PermanentError{Err: resultErr}
-		}
+		resultErr = recordCoordinationError(parent, resultErr, c)
 	}()
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 	ids, err := c.reconcilableBackendIDs(ctx)
 	if err != nil {
-		c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		return err
 	}
 	for _, id := range ids {
 		if err := c.reconcileBackendState(ctx, id); err != nil {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 			return err
 		}
 	}
@@ -206,7 +184,6 @@ func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 		(SELECT count(*) FROM backend_circuit_probes p WHERE p.backend_id=s.backend_id AND p.backend_revision=s.backend_revision AND p.circuit_generation=s.generation AND p.outcome IS NULL AND p.expires_at>clock_timestamp())
 		FROM backend_circuit_state s`, c.options.FailureWindow)
 	if err != nil {
-		c.setStatus(false, coordination.ReasonCoordinationUnavailable)
 		return err
 	}
 	defer rows.Close()
@@ -319,15 +296,7 @@ func (c *CircuitCoordinator) Acquire(parent context.Context, request coordinatio
 			}
 			return decision, err
 		}
-		if permanentCoordinationError(err) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(err, &permanent) {
-				err = coordination.PermanentError{Err: err}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		err = recordCoordinationError(parent, err, c)
 		return coordination.CircuitDecision{Reason: coordination.ReasonCoordinationUnavailable}, err
 	}
 	if handled {
@@ -618,15 +587,7 @@ func (c *CircuitCoordinator) Complete(parent context.Context, completion coordin
 			}
 			return snapshot, err
 		}
-		if permanentCoordinationError(err) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(err, &permanent) {
-				err = coordination.PermanentError{Err: err}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		err = recordCoordinationError(parent, err, c)
 		return snapshot, err
 	}
 	if handled {
@@ -851,15 +812,7 @@ func terminalizeGeneration(ctx context.Context, tx pgx.Tx, backendID, generation
 func (c *CircuitCoordinator) RenewProbes(parent context.Context, probes []coordination.ProbeIdentity) ([]coordination.RenewResult, error) {
 	results, err := c.renewProbes(parent, probes)
 	if err != nil {
-		if permanentCoordinationError(err) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(err, &permanent) {
-				err = coordination.PermanentError{Err: err}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		err = recordCoordinationError(parent, err, c)
 	} else {
 		c.setStatus(true, "")
 		_ = c.Refresh(parent)

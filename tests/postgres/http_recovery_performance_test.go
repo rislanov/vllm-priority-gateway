@@ -52,6 +52,11 @@ type postgresHTTPGateway struct {
 	transport *http.Transport
 }
 
+type postgresHTTPGatewayOptions struct {
+	CoordinationTimeout time.Duration
+	CanceledHandlerDone chan<- struct{}
+}
+
 func newPostgresHTTPGateway(
 	t *testing.T,
 	ctx context.Context,
@@ -60,8 +65,16 @@ func newPostgresHTTPGateway(
 	coordinationReady func() bool,
 	emergency *coordination.EmergencyAdmission,
 	refreshInterval time.Duration,
+	settings ...postgresHTTPGatewayOptions,
 ) *postgresHTTPGateway {
 	t.Helper()
+	var configuration postgresHTTPGatewayOptions
+	if len(settings) > 0 {
+		configuration = settings[0]
+	}
+	if configuration.CoordinationTimeout <= 0 {
+		configuration.CoordinationTimeout = 150 * time.Millisecond
+	}
 	if refreshInterval <= 0 {
 		refreshInterval = 15 * time.Millisecond
 	}
@@ -73,8 +86,8 @@ func newPostgresHTTPGateway(
 	if err := registryValue.Reload(ctx); err != nil {
 		t.Fatal(err)
 	}
-	admissionCoordinator := coordpostgres.NewAdmissionCoordinator(store, 150*time.Millisecond)
-	circuitCoordinator, err := coordpostgres.NewCircuitCoordinator(store, 150*time.Millisecond, options)
+	admissionCoordinator := coordpostgres.NewAdmissionCoordinator(store, configuration.CoordinationTimeout)
+	circuitCoordinator, err := coordpostgres.NewCircuitCoordinator(store, configuration.CoordinationTimeout, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +118,18 @@ func newPostgresHTTPGateway(
 		ReplicaID: uuid.New(), LeaseTTL: 2 * time.Second, Emergency: emergency, CoordinationReady: coordinationReady,
 		Runtime: manager, Router: routing.New(.02, routing.FixedSource(0)), Forwarder: proxy.New(client), RetryAfter: 20 * time.Millisecond,
 	})
-	server := httptest.NewServer(httpapi.NewPublicHandler(service, 1<<20, nil))
+	publicHandler := httpapi.NewPublicHandler(service, 1<<20, nil)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		defer func() {
+			if configuration.CanceledHandlerDone != nil && request.Context().Err() != nil {
+				select {
+				case configuration.CanceledHandlerDone <- struct{}{}:
+				default:
+				}
+			}
+		}()
+		publicHandler.ServeHTTP(writer, request)
+	}))
 	gatewayValue := &postgresHTTPGateway{
 		server: server, client: client, registry: registryValue, manager: manager, leases: leases,
 		admission: admissionCoordinator, circuit: circuitCoordinator, transport: transport,

@@ -91,13 +91,11 @@ func TestPostgresConfigurationPreservesConflictAndNotFoundCauses(t *testing.T) {
 }
 
 func TestPostgresConcurrentMigrationStartup(t *testing.T) {
-	runtimeURL := os.Getenv("LLMGW_POSTGRES_TEST_DSN")
-	if runtimeURL == "" {
-		t.Skip("LLMGW_POSTGRES_TEST_DSN is not set")
-	}
+	runtimeURL := emptyMigrationSchema(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	const replicas = 4
+	start := make(chan struct{})
 	stores := make(chan *pgstore.Store, replicas)
 	errorsSeen := make(chan error, replicas)
 	var group sync.WaitGroup
@@ -105,6 +103,7 @@ func TestPostgresConcurrentMigrationStartup(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
+			<-start
 			store, err := pgstore.Open(ctx, pgstore.Options{
 				DatabaseURL: runtimeURL, MigrationURL: runtimeURL,
 				ConfigMaxConns: 2, AnalyticsMaxConns: 2, CoordinationMaxConns: 2,
@@ -116,14 +115,26 @@ func TestPostgresConcurrentMigrationStartup(t *testing.T) {
 			stores <- store
 		}()
 	}
+	close(start)
 	group.Wait()
 	close(stores)
 	close(errorsSeen)
+	opened := make([]*pgstore.Store, 0, replicas)
 	for store := range stores {
-		_ = store.Close()
+		opened = append(opened, store)
+		t.Cleanup(func() { _ = store.Close() })
+	}
+	for _, store := range opened {
+		assertCurrentMigrationSchema(t, ctx, store)
+		if _, err := store.LoadSnapshot(ctx); err != nil {
+			t.Errorf("replica cannot read migrated configuration: %v", err)
+		}
 	}
 	for err := range errorsSeen {
 		t.Errorf("concurrent migration startup: %v", err)
+	}
+	if len(opened) != replicas {
+		t.Errorf("successful concurrent startups = %d, want %d", len(opened), replicas)
 	}
 }
 

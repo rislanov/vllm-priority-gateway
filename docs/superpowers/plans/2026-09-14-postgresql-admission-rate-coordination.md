@@ -14,7 +14,7 @@
 
 - All membership-changing locks use pool IDs ascending, then client IDs ascending, then lease and receipt UUIDs.
 - Time-dependent decisions capture one `clock_timestamp()` only after correctness-relevant locks.
-- Admission receipt replay window is strict `> now-24h` and `<= now+5m`; cleanup uses `retain_until <= now`.
+- PostgreSQL admission receipt replay window is strict `> now-24h` and `<= now+5m`; cleanup uses `retain_until <= now`. Local receipt history has the bounded-eviction exception specified in design section 5.2.
 - Lease TTL defaults to 90s; renewal defaults to 30s and must be positive and at most one third of TTL.
 - RPM debits once only on successful admission; TPM is soft and debits actual input plus output tokens once on completion.
 - Integration tests are written but not run.
@@ -29,7 +29,7 @@
 - Create: `internal/coordination/contracttest/admission.go`
 - Test: `internal/coordination/local/admission_test.go`
 
-**Interfaces:** Implement `AdmissionCoordinator.Acquire`, `Renew`, `Complete`, and `Status` using typed reasons and immutable lease identities. The local coordinator records unlimited-pool leases and applies the same idempotency, expiry, RPM, and soft-TPM semantics with an injectable clock.
+**Interfaces:** Implement `AdmissionCoordinator.Acquire`, `Renew`, `Complete`, and `Status` using typed reasons and immutable lease identities. The local coordinator records unlimited-pool leases and applies the same expiry, RPM, soft-TPM, and retained-receipt idempotency semantics with an injectable clock. Local terminal receipts may be evicted at the 65,536-record bound; replay guarantees last only while the receipt is retained, unlike PostgreSQL's strict durable window.
 
 - [ ] Write reusable contract cases for reductions, unlimited transitions, replay conflicts, expiry, completion idempotency, and refill-before-debit; verify RED against a skeleton.
 - [ ] Implement the local coordinator by wrapping existing limit semantics and explicit token buckets.

@@ -43,15 +43,7 @@ func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultEr
 			c.setStatus(true, "")
 			return
 		}
-		if !permanentCoordinationError(resultErr) {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-			return
-		}
-		c.setPermanent()
-		var permanent coordination.PermanentError
-		if !errors.As(resultErr, &permanent) {
-			resultErr = coordination.PermanentError{Err: resultErr}
-		}
+		resultErr = recordCoordinationError(parent, resultErr, c)
 	}()
 	ctx, cancel := c.deadline(parent)
 	defer cancel()
@@ -127,15 +119,7 @@ func (c *AdmissionCoordinator) Acquire(parent context.Context, r coordination.Ad
 		}
 	}
 	if err != nil {
-		if permanentCoordinationError(err) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(err, &permanent) {
-				err = coordination.PermanentError{Err: err}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		err = recordCoordinationError(parent, err, c)
 		return coordination.AdmissionDecision{Reason: coordination.ReasonCoordinationUnavailable}, err
 	}
 	c.setStatus(true, "")
@@ -345,7 +329,7 @@ func normalizeRate(ctx context.Context, tx pgx.Tx, client int64, kind string, re
 		}
 	}
 	if balance < 1 {
-		retry := now.Add(time.Duration((1 - balance) / float64(capacity) * float64(time.Minute)))
+		retry := coordination.RateRetryAt(balance, capacity, now)
 		_, err := tx.Exec(ctx, "UPDATE coordination_rate_state SET policy_revision=$3::bigint,balance=$4::double precision,last_refill_at=$5::timestamptz WHERE client_id=$1::bigint AND rate_kind=$2::text", client, kind, revision, balance, now)
 		return false, retry, err
 	}
@@ -366,15 +350,7 @@ func (c *AdmissionCoordinator) Renew(parent context.Context, leases []coordinati
 	defer cancel()
 	out, err := c.renew(ctx, leases)
 	if err != nil {
-		if permanentCoordinationError(err) {
-			c.setPermanent()
-			var permanent coordination.PermanentError
-			if !errors.As(err, &permanent) {
-				err = coordination.PermanentError{Err: err}
-			}
-		} else {
-			c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-		}
+		err = recordCoordinationError(parent, err, c)
 	} else {
 		c.setStatus(true, "")
 		_ = c.RefreshInflight(parent)
@@ -468,15 +444,7 @@ func (c *AdmissionCoordinator) Complete(parent context.Context, items []coordina
 	for i, item := range items {
 		r, err := c.completeOne(ctx, item)
 		if err != nil {
-			if permanentCoordinationError(err) {
-				c.setPermanent()
-				var permanent coordination.PermanentError
-				if !errors.As(err, &permanent) {
-					err = coordination.PermanentError{Err: err}
-				}
-			} else {
-				c.setStatus(false, coordination.ReasonCoordinationUnavailable)
-			}
+			err = recordCoordinationError(parent, err, c)
 			return out[:i], err
 		}
 		out[i] = r
@@ -564,7 +532,7 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 			return coordination.CompleteResult{}, normErr
 		}
 		_ = ok
-		_, err = tx.Exec(ctx, "UPDATE coordination_rate_state SET balance=balance-$2::double precision,last_refill_at=$3::timestamptz WHERE client_id=$1::bigint AND rate_kind='tpm'", client, float64(item.Usage.InputTokens+item.Usage.OutputTokens), now)
+		_, err = tx.Exec(ctx, "UPDATE coordination_rate_state SET balance=balance-$2::double precision,last_refill_at=$3::timestamptz WHERE client_id=$1::bigint AND rate_kind='tpm'", client, (float64(item.Usage.InputTokens) + float64(item.Usage.OutputTokens)), now)
 		if err != nil {
 			return coordination.CompleteResult{}, err
 		}

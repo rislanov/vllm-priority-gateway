@@ -13,18 +13,83 @@ import (
 type fakeNotificationConn struct {
 	waits  atomic.Int32
 	closes atomic.Int32
+	exec   func(context.Context) error
 	wait   func(context.Context, int32) (*pgconn.Notification, error)
+	close  func(context.Context) error
 }
 
-func (*fakeNotificationConn) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+func (c *fakeNotificationConn) Exec(ctx context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+	if c.exec != nil {
+		return pgconn.CommandTag{}, c.exec(ctx)
+	}
 	return pgconn.NewCommandTag("LISTEN"), nil
 }
 func (c *fakeNotificationConn) WaitForNotification(ctx context.Context) (*pgconn.Notification, error) {
 	return c.wait(ctx, c.waits.Add(1))
 }
-func (c *fakeNotificationConn) Close(context.Context) error {
+func (c *fakeNotificationConn) Close(ctx context.Context) error {
 	c.closes.Add(1)
+	if c.close != nil {
+		return c.close(ctx)
+	}
 	return nil
+}
+
+func TestWatchPollingSurvivesStalledNotificationOperations(t *testing.T) {
+	for _, operation := range []string{"connect", "listen", "close_after_listen_failure", "close_after_session_failure"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			var reloads atomic.Int32
+			done := make(chan struct{})
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("watcher did not stop after cancellation")
+				}
+			})
+			stall := func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			connect := func(connectCtx context.Context, _ string) (notificationConn, error) {
+				if operation == "connect" {
+					return nil, stall(connectCtx)
+				}
+				conn := &fakeNotificationConn{wait: func(context.Context, int32) (*pgconn.Notification, error) {
+					return nil, errors.New("notification session lost")
+				}}
+				switch operation {
+				case "listen":
+					conn.exec = stall
+				case "close_after_listen_failure":
+					conn.exec = func(context.Context) error { return errors.New("LISTEN failed") }
+					conn.close = stall
+				case "close_after_session_failure":
+					conn.close = stall
+				}
+				return conn, nil
+			}
+			go func() {
+				defer close(done)
+				(&Store{}).watchWithConnector(ctx, 10*time.Millisecond, "llmgw_config_changed", func(context.Context) error {
+					if reloads.Add(1) == 4 {
+						cancel()
+					}
+					return nil
+				}, connect, WatchHooks{})
+			}()
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("runtime polling stalled in notification %s: reloads=%d", operation, reloads.Load())
+			}
+			if got := reloads.Load(); got < 4 {
+				t.Fatalf("runtime polling stopped after %d reloads", got)
+			}
+		})
+	}
 }
 
 func TestWatchPollsWhileNotificationConnectionIsUnavailable(t *testing.T) {

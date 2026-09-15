@@ -41,6 +41,18 @@ func TestCircuitContract(t *testing.T) {
 	})
 }
 
+func TestLargeTokenCompletion(t *testing.T) {
+	coordinator := local.NewAdmissionCoordinator(time.Now)
+	contracttest.LargeTokenCompletion(t, coordinator, func() coordination.AdmissionRequest {
+		return coordination.AdmissionRequest{
+			LeaseID: uuid.New(), OperationStartedAt: time.Now().UTC(), RequestID: uuid.NewString(), ReplicaID: uuid.New(),
+			ConfigurationRevision: 1, APIKeyID: 1, ClientID: 1, PoolID: 1, ClientPolicyRevision: 1,
+			EffectiveClientLimit: 1, ConfiguredClientLimit: 1, PoolGatewayInflightLimit: 1,
+			TokensPerMinute: 1, LeaseTTL: time.Minute,
+		}
+	})
+}
+
 func TestCircuitBackendNeutralContract(t *testing.T) {
 	contracttest.CircuitBaseline(t, func(t *testing.T) (coordination.CircuitCoordinator, coordination.BackendIdentity) {
 		coordinator, err := local.NewCircuitCoordinator(circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Hour, OpenCooldown: time.Minute, HalfOpenMaxProbes: 1}, time.Now)

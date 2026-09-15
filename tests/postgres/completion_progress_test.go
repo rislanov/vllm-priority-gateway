@@ -95,9 +95,15 @@ func TestPostgresCompletionBatchReturnsCommittedPrefixForRetryProgress(t *testin
 
 	remaining := items
 	sawPartialProgress := false
-	for attempt := 1; attempt <= 16 && len(remaining) > 0; attempt++ {
+	// Keep each batch short enough to time out with a committed prefix, while
+	// allowing slower CI hosts time to finish all retries through the proxy.
+	retryCtx, cancelRetries := context.WithTimeout(ctx, 15*time.Second)
+	defer cancelRetries()
+	attempt := 0
+	for len(remaining) > 0 && retryCtx.Err() == nil {
+		attempt++
 		attemptSize := len(remaining)
-		results, completionErr := coordinator.Complete(ctx, remaining)
+		results, completionErr := coordinator.Complete(retryCtx, remaining)
 		if len(results) > len(remaining) {
 			t.Fatalf("attempt %d returned %d results for %d completions", attempt, len(results), len(remaining))
 		}
@@ -118,7 +124,7 @@ func TestPostgresCompletionBatchReturnsCommittedPrefixForRetryProgress(t *testin
 		t.Fatal("latency-controlled completion never returned a committed prefix with its timeout")
 	}
 	if len(remaining) != 0 {
-		t.Fatalf("completion retries made no durable progress; %d of %d items remain", len(remaining), len(items))
+		t.Fatalf("completion retry budget expired after %d attempts; %d of %d items remain: %v", attempt, len(remaining), len(items), retryCtx.Err())
 	}
 	var completedReceipts, activeLeases int
 	if err := store.ConfigPool().QueryRow(ctx, "SELECT count(*) FROM admission_operations WHERE completed_at IS NOT NULL").Scan(&completedReceipts); err != nil {

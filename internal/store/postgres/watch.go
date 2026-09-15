@@ -66,20 +66,32 @@ func (s *Store) watchWithConnector(ctx context.Context, interval time.Duration, 
 	connectedOnce := false
 	for ctx.Err() == nil {
 		reloadObserved()
-		conn, err := connect(ctx, s.migrationURL)
+		if ctx.Err() != nil {
+			return
+		}
+		// Connection establishment and LISTEN share the next polling deadline.
+		// A slow direct endpoint must not add another full interval to polling
+		// through the independently available runtime pool.
+		jitter := time.Duration(rand.Int64N(int64(interval/5 + 1)))
+		pollAt := time.Now().Add(interval + jitter)
+		setupCtx, cancelSetup := context.WithDeadline(ctx, pollAt)
+		conn, err := connect(setupCtx, s.migrationURL)
 		if err != nil {
-			s.pollWait(ctx, interval)
+			cancelSetup()
+			s.pollWait(ctx, pollAt)
 			continue
 		}
 		listen := "LISTEN llmgw_config_changed"
 		if channel == "llmgw_circuit_changed" {
 			listen = "LISTEN llmgw_circuit_changed"
 		}
-		if _, err = conn.Exec(ctx, listen); err != nil {
-			_ = conn.Close(ctx)
-			s.pollWait(ctx, interval)
+		if _, err = conn.Exec(setupCtx, listen); err != nil {
+			closeNotificationConnection(ctx, conn, pollAt)
+			cancelSetup()
+			s.pollWait(ctx, pollAt)
 			continue
 		}
+		cancelSetup()
 		if connectedOnce && hooks.NotificationReconnect != nil {
 			hooks.NotificationReconnect()
 		}
@@ -98,14 +110,23 @@ func (s *Store) watchWithConnector(ctx context.Context, interval time.Duration, 
 				break
 			}
 		}
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-		_ = conn.Close(closeCtx)
-		cancel()
+		closeNotificationConnection(ctx, conn, time.Now().Add(interval))
 	}
 }
-func (s *Store) pollWait(ctx context.Context, interval time.Duration) {
-	jitter := time.Duration(rand.Int64N(int64(interval/5 + 1)))
-	timer := time.NewTimer(interval + jitter)
+
+func closeNotificationConnection(ctx context.Context, conn notificationConn, deadline time.Time) {
+	// pgx always closes the underlying socket, even when the graceful-close
+	// deadline has already elapsed. Cleanup must not delay the next poll.
+	if latest := time.Now().Add(time.Second); deadline.After(latest) {
+		deadline = latest
+	}
+	closeCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancel()
+	_ = conn.Close(closeCtx)
+}
+
+func (s *Store) pollWait(ctx context.Context, deadline time.Time) {
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

@@ -56,6 +56,8 @@ Configuration writes commit with `synchronous_commit=on`, increment one global r
 
 Back up configuration and analytics with ordinary PostgreSQL physical or logical tooling appropriate to the selected recovery objectives. Test restoration, migration status, key revocations, and coordination-table cleanup in an isolated environment.
 
+Coordination retention runs in a separate maintenance worker once per second. Each pass drains batches of 256 candidates per category within a 250 ms total budget, alternating admission and circuit cleanup; a full batch triggers another round. This avoids a fixed one-batch-per-minute throughput ceiling while keeping transactions and maintenance time bounded. Expiry and replay safety do not depend on physical deletion. Monitor coordination-table growth and database capacity under the intended request rate; cleanup can lag when the database is overloaded.
+
 ## Distributed semantics
 
 Admission locks pool scopes before client scopes and uses one post-lock server timestamp. A request UUID is a durable, fingerprinted receipt: retrying an ambiguous result with identical inputs cannot debit RPM twice or allocate a second lease. Active leases enforce client and pool concurrency globally. A central scheduler renews long streams and durably retries bounded completion batches. RPM is a continuously refilled one-minute client bucket debited at admission. TPM is a soft client bucket checked at admission and debited from upstream-reported input plus output usage at completion; natural overshoot is allowed, and missing usage is observable but uncharged.
@@ -64,13 +66,15 @@ Circuit state, rolling failure receipts, generations, and half-open probe permit
 
 Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, and circuit policy. Every row carries the expiry calculated from that replica's own TTL. Registration and heartbeat serialize through the same compatibility transaction, so an incompatible live replica prevents both startup and reactivation. Coordination-critical setting changes therefore require a full stop/start without overlap.
 
+PostgreSQL retains terminal coordination receipts for the strict 24-hour replay window. SQLite/local history is process-local and bounded to 65,536 admission receipts and 65,536 circuit attempts; capacity pressure can evict terminal records early, and an evicted UUID can be evaluated again. Choose PostgreSQL when that durable replay guarantee is required.
+
 ## Outage and recovery
 
 An admitted response or stream continues during a PostgreSQL outage. The last-known-good configuration remains readable, but Admin writes fail. Normal and Background requests receive retryable `503 gateway_unavailable`. Critical and High may use only their process-local emergency caps, additionally bounded by client effective concurrency. A zero cap disables that class. With `N` replicas, the worst-case outage admission is `N × class_cap`.
 
 Last-known open and half-open circuits admit no local work. A last-known closed circuit may be opened by the local conservative breaker but never healed locally. Failure completions retain their original attempt ID, outcome, and timestamp for replay; events older than the fixed 24-hour receipt window are discarded.
 
-Recovery is complete only after database ping, replica compatibility check, fresh configuration load, lease reconciliation, failure replay, and circuit refresh. Coordination operation failures latch degraded state at occurrence; a later successful worker operation cannot clear it, and a recovery barrier waits for any active failure replay. A confirmed writable-primary revision lower than the highest revision previously observed is a permanent consistency fault: keep coordination unavailable and reject emergency work until an operator resolves the history.
+Recovery is complete only after database ping, replica compatibility check, fresh configuration load, lease reconciliation, failure replay, and circuit refresh. Database failures and the coordinator's own timeout latch degraded state at occurrence, including failures while reading query results. Cancellation of an individual caller does not change shared database health. A later successful worker operation cannot clear the latch, and a recovery barrier waits for any active failure replay. A confirmed writable-primary revision lower than the highest revision previously observed is a permanent consistency fault: keep coordination unavailable and reject emergency work until an operator resolves the history.
 
 `synchronous_commit=on` guarantees local WAL durability only unless synchronous standbys are configured. HA operators own synchronous replication, quorum availability, promotion policy, and fencing of the former primary. Validate that losing synchronous durability blocks commits instead of silently weakening them.
 

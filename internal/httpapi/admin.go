@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -426,7 +427,7 @@ func (s *AdminService) setDegraded(err error) {
 	if err == nil {
 		s.degraded = ""
 	} else {
-		s.degraded = err.Error()
+		s.degraded = "Configuration update could not be published"
 	}
 	s.stateMu.Unlock()
 }
@@ -646,12 +647,15 @@ func writeAdminError(writer http.ResponseWriter, err error) {
 	message := err.Error()
 	status, code := http.StatusBadRequest, "validation_error"
 	var pgErr *pgconn.PgError
+	var connectErr *pgconn.ConnectError
+	var networkErr net.Error
 	switch {
 	case errors.Is(err, errAdminMutationsUnavailable):
 		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
 		message = "Configuration mutations are temporarily unavailable"
 	case errors.Is(err, sql.ErrNoRows), errors.Is(err, pgx.ErrNoRows):
 		status, code = http.StatusNotFound, "not_found"
+		message = "Resource not found"
 	case errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23505"):
 		status, code = http.StatusConflict, "conflict"
 		message = "Configuration conflicts with an existing or referenced resource"
@@ -661,8 +665,13 @@ func writeAdminError(writer http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "conflict"
 	case strings.Contains(message, "publish configuration"), strings.Contains(message, "reconcile backend monitors"):
 		status, code = http.StatusServiceUnavailable, "configuration_degraded"
-	case strings.Contains(message, "PostgreSQL"):
+		message = "Configuration update could not be published"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
+		errors.As(err, &pgErr), errors.As(err, &connectErr), errors.As(err, &networkErr),
+		strings.Contains(message, "PostgreSQL"):
 		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
+		message = "Configuration mutations are temporarily unavailable"
 	}
 	writeAdminJSONError(writer, status, code, message)
 }

@@ -133,6 +133,8 @@ type CircuitCoordinator interface {
 
 The public contracts use typed reasons rather than backend error strings. The required reasons are `concurrency_exhausted`, `rpm_exhausted`, `tpm_exhausted`, `stale_configuration`, `stale_backend`, `circuit_open`, `probe_capacity_exhausted`, `coordination_unavailable`, `lease_lost`, `stale_operation`, and `idempotency_conflict`.
 
+The SQLite/local profile has an explicit bounded-retention exception to shared idempotency semantics. Each process retains at most 65,536 admission receipts and 65,536 circuit attempts, nominally for 24 hours. At capacity, it evicts the oldest terminal record before admitting new work; it never evicts an active owner. Replaying an evicted UUID within the nominal window may therefore be evaluated as a new operation. Retention is best-effort under memory pressure and does not survive process restart. The local backend shares lease, rate, circuit, and retained-receipt semantics, but does not promise the PostgreSQL backend's durable, strict 24-hour replay guarantee. Local tests must cover this exception explicitly; strict receipt-retention guarantees in sections 11–14 apply to PostgreSQL.
+
 ### 5.3 Runtime ownership
 
 `gateway.Service` stops depending on concrete `*admission.Limiter`. It asks the admission coordinator for one atomic request lease after the pool runtime state and effective client limit are known.
@@ -571,7 +573,7 @@ Replica heartbeat and lease renewal share the coordination lifecycle but not an 
 
 ## 16. PostgreSQL Failure Policy
 
-PostgreSQL coordination errors are classified as timeout, unavailable, stale state, serialization/deadlock retry, constraint/corruption, and permanent incompatibility. At most one bounded retry is allowed inside the original coordination timeout, shared between retryable transaction conflicts and ambiguous acquisition results. Admission and circuit acquisition retries preserve their original UUIDs, timestamps, and immutable inputs; they never start another upstream attempt to resolve database uncertainty.
+PostgreSQL coordination errors are classified as timeout, unavailable, stale state, serialization/deadlock retry, constraint/corruption, and permanent incompatibility. Cancellation or deadline expiry of an individual caller is returned to that caller and is not, by itself, evidence that PostgreSQL is unavailable. The coordinator's own timeout and database failures, including failures while consuming query result rows, latch degraded state until the complete recovery barrier succeeds. At most one bounded retry is allowed inside the original coordination timeout, shared between retryable transaction conflicts and ambiguous acquisition results. Admission and circuit acquisition retries preserve their original UUIDs, timestamps, and immutable inputs; they never start another upstream attempt to resolve database uncertainty.
 
 After successful startup, loss of PostgreSQL enters degraded mode:
 
@@ -640,7 +642,7 @@ The default suite requires no PostgreSQL process and includes:
 
 - every existing SQLite unit, integration, race, vet, and build check;
 - SQLite migration tests for rate-policy and revision additions, including pre-existing `MaxConcurrency=10_001` and `MaxGatewayInflight=100_001` rows that remain loadable and unchanged while new/increased above-maximum values are rejected and lowering succeeds;
-- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion, future-skewed receipt retention/cleanup boundaries, completion idempotency, and refill-before-debit TPM completion;
+- local coordinator contract tests for effective/admin limit reduction, unlimited-pool accounting, `0 -> positive` pool transitions, post-lock expiry without resurrection, acquire response loss after commit, duplicate acquire before/after expiry and completion while the receipt is retained, future-skewed nominal retention/cleanup boundaries, bounded terminal-record eviction, completion idempotency, and refill-before-debit TPM completion;
 - deterministic circuit-coordinator tests for `success + crashed probe`, `success + expired probe + late failure`, cooldown after expiry, stale-generation no-ops, and `commit -> lost response -> rolling prune -> duplicate completion` with the original event timestamp;
 - circuit-acquire contract tests for a lost response with probe capacity one, concurrent identical retries, fingerprint conflicts, retry after completion/expiry/invalidation, and future-skewed acquire timestamps at terminal permit cleanup boundaries;
 - circuit permit cleanup tests for `failure + crashed peer`, backend revision replacement, disabling/draining with unfinished probes, stale completion, and eventual removal of superseded permits;

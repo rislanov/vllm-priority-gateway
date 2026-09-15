@@ -348,6 +348,9 @@ func run(ctx context.Context, getenv config.LookupFunc, listener net.Listener, s
 	}
 	go updateBackendMetrics(ctx, metrics, registryValue, manager, cfg.MetricsInterval)
 	go updateCoordinationMetrics(ctx, metrics, database, registryValue, revisionGuard, leaseManager, manager, admissionCoordinator, circuitCoordinator, replicaManager, recoveryManager, cfg.MetricsInterval)
+	if _, postgresMode := database.(*pgstore.Store); postgresMode {
+		go runCoordinationCleanup(ctx, admissionCoordinator.(coordination.CleanupBatcher), circuitCoordinator.(coordination.CleanupBatcher))
+	}
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.Serve(listener) }()
 	fmt.Fprintf(stdout, "vLLM Priority Gateway listening on %s\n", listener.Addr())
@@ -535,7 +538,6 @@ func updateCoordinationMetrics(ctx context.Context, metrics *observability.Metri
 	if interval <= 0 {
 		interval = time.Second
 	}
-	lastCleanup := time.Time{}
 	publish := func(now time.Time) {
 		guard.ObservePublished(registryValue.Snapshot().Revision)
 		if store, ok := database.(*pgstore.Store); ok && !guard.Faulted() {
@@ -580,19 +582,6 @@ func updateCoordinationMetrics(ctx context.Context, metrics *observability.Metri
 			for workload, stats := range store.PoolStats() {
 				metrics.SetPostgresPool(workload, stats.Acquired, stats.Idle, stats.Total, stats.Canceled)
 			}
-		}
-		if lastCleanup.IsZero() || now.Sub(lastCleanup) >= time.Minute {
-			if cleaner, ok := any(admissionCoordinator).(interface {
-				Cleanup(context.Context, int) error
-			}); ok {
-				_ = cleaner.Cleanup(ctx, 256)
-			}
-			if cleaner, ok := any(circuit).(interface {
-				Cleanup(context.Context, int) error
-			}); ok {
-				_ = cleaner.Cleanup(ctx, 256)
-			}
-			lastCleanup = now
 		}
 	}
 	publish(time.Now().UTC())
