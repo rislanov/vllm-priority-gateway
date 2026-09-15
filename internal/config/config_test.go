@@ -35,6 +35,9 @@ func TestLoadUsesMVPDefaults(t *testing.T) {
 	if cfg.DatabasePath != "./data/llmgw.db" {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath)
 	}
+	if cfg.DatabaseDriver != "sqlite" || cfg.LeaseTTL != 90*time.Second || cfg.LeaseRenewInterval != 30*time.Second {
+		t.Fatalf("coordination defaults = %+v", cfg)
+	}
 	if cfg.HealthInterval != 2*time.Second || cfg.MetricsInterval != time.Second {
 		t.Fatalf("poll intervals = %s/%s", cfg.HealthInterval, cfg.MetricsInterval)
 	}
@@ -55,6 +58,67 @@ func TestLoadUsesMVPDefaults(t *testing.T) {
 	}
 	if cfg.CircuitFailureThreshold != 5 || cfg.CircuitFailureWindow != 30*time.Second || cfg.CircuitOpenCooldown != 15*time.Second || cfg.CircuitHalfOpenMaxProbes != 1 {
 		t.Fatalf("circuit defaults = %+v", cfg)
+	}
+}
+
+func TestLoadAcceptsCompletePostgresProfile(t *testing.T) {
+	env := validEnvironment()
+	env["LLMGW_DATABASE_DRIVER"] = "postgres"
+	env["LLMGW_DATABASE_URL"] = "postgres://gateway:secret@db.example/llmgw?sslmode=verify-full"
+	env["LLMGW_DATABASE_MIGRATION_URL"] = "postgres://migrator:secret@primary.example/llmgw?sslmode=verify-full"
+	cfg, err := config.Load(lookup(env))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DatabaseDriver != "postgres" || cfg.PostgresConfigMaxConns != 4 || cfg.PostgresAnalyticsMaxConns != 4 || cfg.PostgresCoordinationMaxConns != 16 {
+		t.Fatalf("PostgreSQL profile = %+v", cfg)
+	}
+}
+
+func TestLoadAllowsMigrationURLToUseSessionQueryMode(t *testing.T) {
+	env := validEnvironment()
+	env["LLMGW_DATABASE_DRIVER"] = "postgres"
+	env["LLMGW_DATABASE_URL"] = "postgres://gateway:secret@db.example/llmgw?default_query_exec_mode=exec"
+	env["LLMGW_DATABASE_MIGRATION_URL"] = "postgres://migrator:secret@primary.example/llmgw?default_query_exec_mode=cache_statement"
+	if _, err := config.Load(lookup(env)); err != nil {
+		t.Fatalf("Load() rejected direct migration query mode: %v", err)
+	}
+}
+
+func TestLoadRejectsIncompleteOrMixedDatabaseProfiles(t *testing.T) {
+	tests := []map[string]string{
+		{"LLMGW_DATABASE_DRIVER": "postgres"},
+		{"LLMGW_DATABASE_DRIVER": "sqlite", "LLMGW_DATABASE_URL": "postgres://db/llmgw"},
+		{"LLMGW_DATABASE_DRIVER": "sqlite", "LLMGW_POSTGRES_CONFIG_MAX_CONNS": "8"},
+		{"LLMGW_DATABASE_DRIVER": "mysql"},
+		{"LLMGW_DATABASE_DRIVER": "postgres", "LLMGW_DATABASE_URL": "postgres://db/llmgw?default_query_exec_mode=cache_statement"},
+	}
+	for _, additions := range tests {
+		env := validEnvironment()
+		for key, value := range additions {
+			env[key] = value
+		}
+		if _, err := config.Load(lookup(env)); err == nil {
+			t.Fatalf("Load() accepted profile environment %+v", additions)
+		}
+	}
+}
+
+func TestLoadRejectsUnsafeCoordinationTiming(t *testing.T) {
+	for name, values := range map[string]map[string]string{
+		"renew exceeds third":   {"LLMGW_LEASE_TTL": "90s", "LLMGW_LEASE_RENEW_INTERVAL": "31s"},
+		"failure retention gap": {"LLMGW_CIRCUIT_FAILURE_WINDOW": "23h56m"},
+		"zero timeout":          {"LLMGW_COORDINATION_TIMEOUT": "0s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := validEnvironment()
+			for key, value := range values {
+				env[key] = value
+			}
+			if _, err := config.Load(lookup(env)); err == nil {
+				t.Fatal("Load() unexpectedly succeeded")
+			}
+		})
 	}
 }
 

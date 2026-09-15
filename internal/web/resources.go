@@ -239,11 +239,19 @@ func clientInput(request *http.Request) (httpapi.ClientInput, error) {
 	if err != nil {
 		return httpapi.ClientInput{}, fmt.Errorf("max concurrency must be an integer")
 	}
-	input := httpapi.ClientInput{Name: request.Form.Get("name"), Enabled: request.Form.Get("enabled") == "on", PriorityClass: domain.PriorityClass(request.Form.Get("priority_class")), VLLMPriority: priority, MaxConcurrency: maxConcurrency}
+	requestsPerMinute, err := strconv.ParseInt(request.Form.Get("requests_per_minute"), 10, 64)
+	if err != nil {
+		return httpapi.ClientInput{}, fmt.Errorf("requests per minute must be an integer")
+	}
+	tokensPerMinute, err := strconv.ParseInt(request.Form.Get("tokens_per_minute"), 10, 64)
+	if err != nil {
+		return httpapi.ClientInput{}, fmt.Errorf("tokens per minute must be an integer")
+	}
+	input := httpapi.ClientInput{Name: request.Form.Get("name"), Enabled: request.Form.Get("enabled") == "on", PriorityClass: domain.PriorityClass(request.Form.Get("priority_class")), VLLMPriority: priority, MaxConcurrency: maxConcurrency, RequestsPerMinute: requestsPerMinute, TokensPerMinute: tokensPerMinute}
 	for _, raw := range request.Form["model_pool_id"] {
-		id, err := positiveID(raw)
-		if err != nil {
-			return httpapi.ClientInput{}, err
+		id, parseErr := positiveID(raw)
+		if parseErr != nil {
+			return httpapi.ClientInput{}, parseErr
 		}
 		input.ModelPoolIDs = append(input.ModelPoolIDs, id)
 	}

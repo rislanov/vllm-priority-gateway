@@ -599,6 +599,21 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 	if readyResponse.StatusCode != http.StatusOK || readiness.Status != "ready" || readiness.Revision != 0 || readiness.BackendAvailability != 0 {
 		t.Fatalf("readiness = %d %+v", readyResponse.StatusCode, readiness)
 	}
+	coordinationResponse, err := client.Get("http://" + listener.Addr().String() + "/coordination-readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var coordinationReadiness struct {
+		Status   string `json:"status"`
+		Revision int64  `json:"revision"`
+	}
+	if err := json.NewDecoder(coordinationResponse.Body).Decode(&coordinationReadiness); err != nil {
+		t.Fatal(err)
+	}
+	coordinationResponse.Body.Close()
+	if coordinationResponse.StatusCode != http.StatusOK || coordinationReadiness.Status != "ready" || coordinationReadiness.Revision != 0 {
+		t.Fatalf("coordination readiness = %d %+v", coordinationResponse.StatusCode, coordinationReadiness)
+	}
 	inferenceResponse, err := client.Get("http://" + listener.Addr().String() + "/inference-readyz")
 	if err != nil {
 		t.Fatal(err)
@@ -626,6 +641,33 @@ func TestRunServesHealthAndShutsDownGracefully(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("gateway did not shut down within deadline")
+	}
+}
+
+type analyticsPingerStub struct{ err error }
+
+func (s analyticsPingerStub) PingAnalytics(context.Context) error { return s.err }
+
+type analyticsHealthStub bool
+
+func (s analyticsHealthStub) Healthy() bool { return bool(s) }
+
+func TestAnalyticsReadinessIsIndependentFromCoordination(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		pinger   any
+		recorder analyticsHealthStub
+		want     string
+	}{
+		{name: "ready", pinger: analyticsPingerStub{}, recorder: true, want: "ready"},
+		{name: "analytics pool unavailable", pinger: analyticsPingerStub{err: errors.New("analytics unavailable")}, recorder: true, want: "degraded"},
+		{name: "recorder unhealthy", pinger: analyticsPingerStub{}, recorder: false, want: "degraded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := analyticsReadiness(context.Background(), test.pinger, test.recorder, time.Second); got != test.want {
+				t.Fatalf("analyticsReadiness() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

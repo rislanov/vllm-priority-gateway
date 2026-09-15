@@ -11,6 +11,8 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 RUN mkdir -p /out/data && chown 65532:65532 /out/data
 
 FROM scratch
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=build /src/LICENSE /LICENSE
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/gateway /gateway
 COPY --from=build --chown=65532:65532 /out/data /data

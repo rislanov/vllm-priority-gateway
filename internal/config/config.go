@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -12,43 +13,57 @@ import (
 type LookupFunc func(string) (string, bool)
 
 type Config struct {
-	ListenAddress              string
-	DatabasePath               string
-	AdminUsername              string
-	AdminPassword              string
-	APIKeyHMACSecret           []byte
-	HealthInterval             time.Duration
-	HealthTimeout              time.Duration
-	MetricsInterval            time.Duration
-	MetricsTimeout             time.Duration
-	MetricsStaleAfter          time.Duration
-	UnhealthyAfter             int
-	RecoveryAfter              int
-	CircuitFailureThreshold    int
-	CircuitFailureWindow       time.Duration
-	CircuitOpenCooldown        time.Duration
-	CircuitHalfOpenMaxProbes   int
-	QueueSoftLimit             float64
-	KVSoftLimit                float64
-	KVHardLimit                float64
-	EWMAWindow                 time.Duration
-	BusyThreshold              float64
-	SaturatedThreshold         float64
-	EmergencyThreshold         float64
-	BusyRecoveryThreshold      float64
-	SaturatedRecoveryThreshold float64
-	EmergencyRecoveryThreshold float64
-	OverloadEnterWindow        time.Duration
-	OverloadRecoveryWindow     time.Duration
-	RequestBodyLimit           int64
-	RetryAfter                 time.Duration
-	RoutingPressureEpsilon     float64
-	SessionAffinityMaxPressure float64
-	DialTimeout                time.Duration
-	TLSHandshakeTimeout        time.Duration
-	ResponseHeaderTimeout      time.Duration
-	ShutdownGracePeriod        time.Duration
-	AnalyticsRetention         time.Duration
+	postgresSettingsExplicit      bool
+	ListenAddress                 string
+	DatabaseDriver                string
+	DatabasePath                  string
+	DatabaseURL                   string
+	DatabaseMigrationURL          string
+	PostgresConfigMaxConns        int
+	PostgresAnalyticsMaxConns     int
+	PostgresCoordinationMaxConns  int
+	ConfigPollInterval            time.Duration
+	CoordinationTimeout           time.Duration
+	LeaseTTL                      time.Duration
+	LeaseRenewInterval            time.Duration
+	CoordinationCompletionBacklog int
+	EmergencyCriticalMaxInflight  int
+	EmergencyHighMaxInflight      int
+	AdminUsername                 string
+	AdminPassword                 string
+	APIKeyHMACSecret              []byte
+	HealthInterval                time.Duration
+	HealthTimeout                 time.Duration
+	MetricsInterval               time.Duration
+	MetricsTimeout                time.Duration
+	MetricsStaleAfter             time.Duration
+	UnhealthyAfter                int
+	RecoveryAfter                 int
+	CircuitFailureThreshold       int
+	CircuitFailureWindow          time.Duration
+	CircuitOpenCooldown           time.Duration
+	CircuitHalfOpenMaxProbes      int
+	QueueSoftLimit                float64
+	KVSoftLimit                   float64
+	KVHardLimit                   float64
+	EWMAWindow                    time.Duration
+	BusyThreshold                 float64
+	SaturatedThreshold            float64
+	EmergencyThreshold            float64
+	BusyRecoveryThreshold         float64
+	SaturatedRecoveryThreshold    float64
+	EmergencyRecoveryThreshold    float64
+	OverloadEnterWindow           time.Duration
+	OverloadRecoveryWindow        time.Duration
+	RequestBodyLimit              int64
+	RetryAfter                    time.Duration
+	RoutingPressureEpsilon        float64
+	SessionAffinityMaxPressure    float64
+	DialTimeout                   time.Duration
+	TLSHandshakeTimeout           time.Duration
+	ResponseHeaderTimeout         time.Duration
+	ShutdownGracePeriod           time.Duration
+	AnalyticsRetention            time.Duration
 }
 
 func Load(lookup LookupFunc) (Config, error) {
@@ -60,6 +75,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	cfg.AdminPassword = stringValue(lookup, "LLMGW_ADMIN_PASSWORD", "")
 	cfg.APIKeyHMACSecret = []byte(stringValue(lookup, "LLMGW_API_KEY_HMAC_SECRET", ""))
 
+	if err := cfg.loadCoordination(lookup); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.loadHealth(lookup); err != nil {
 		return Config{}, err
 	}
@@ -79,45 +97,59 @@ func Load(lookup LookupFunc) (Config, error) {
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
+	if cfg.DatabaseDriver == "postgres" && cfg.DatabaseMigrationURL == "" {
+		cfg.DatabaseMigrationURL = cfg.DatabaseURL
+	}
 	return cfg, nil
 }
 
 func defaultConfig() Config {
 	return Config{
-		ListenAddress:              ":8080",
-		DatabasePath:               "./data/llmgw.db",
-		HealthInterval:             2 * time.Second,
-		HealthTimeout:              time.Second,
-		MetricsInterval:            time.Second,
-		MetricsTimeout:             time.Second,
-		MetricsStaleAfter:          5 * time.Second,
-		UnhealthyAfter:             3,
-		RecoveryAfter:              2,
-		CircuitFailureThreshold:    5,
-		CircuitFailureWindow:       30 * time.Second,
-		CircuitOpenCooldown:        15 * time.Second,
-		CircuitHalfOpenMaxProbes:   1,
-		QueueSoftLimit:             2,
-		KVSoftLimit:                .80,
-		KVHardLimit:                .95,
-		EWMAWindow:                 4 * time.Second,
-		BusyThreshold:              .70,
-		SaturatedThreshold:         1.00,
-		EmergencyThreshold:         1.40,
-		BusyRecoveryThreshold:      .55,
-		SaturatedRecoveryThreshold: .85,
-		EmergencyRecoveryThreshold: 1.20,
-		OverloadEnterWindow:        3 * time.Second,
-		OverloadRecoveryWindow:     10 * time.Second,
-		RequestBodyLimit:           16 << 20,
-		RetryAfter:                 2 * time.Second,
-		RoutingPressureEpsilon:     .02,
-		SessionAffinityMaxPressure: 1.00,
-		DialTimeout:                3 * time.Second,
-		TLSHandshakeTimeout:        3 * time.Second,
-		ResponseHeaderTimeout:      30 * time.Second,
-		ShutdownGracePeriod:        30 * time.Second,
-		AnalyticsRetention:         2160 * time.Hour,
+		ListenAddress:                 ":8080",
+		DatabaseDriver:                "sqlite",
+		DatabasePath:                  "./data/llmgw.db",
+		PostgresConfigMaxConns:        4,
+		PostgresAnalyticsMaxConns:     4,
+		PostgresCoordinationMaxConns:  16,
+		ConfigPollInterval:            5 * time.Second,
+		CoordinationTimeout:           500 * time.Millisecond,
+		LeaseTTL:                      90 * time.Second,
+		LeaseRenewInterval:            30 * time.Second,
+		CoordinationCompletionBacklog: 4096,
+		EmergencyCriticalMaxInflight:  4,
+		EmergencyHighMaxInflight:      2,
+		HealthInterval:                2 * time.Second,
+		HealthTimeout:                 time.Second,
+		MetricsInterval:               time.Second,
+		MetricsTimeout:                time.Second,
+		MetricsStaleAfter:             5 * time.Second,
+		UnhealthyAfter:                3,
+		RecoveryAfter:                 2,
+		CircuitFailureThreshold:       5,
+		CircuitFailureWindow:          30 * time.Second,
+		CircuitOpenCooldown:           15 * time.Second,
+		CircuitHalfOpenMaxProbes:      1,
+		QueueSoftLimit:                2,
+		KVSoftLimit:                   .80,
+		KVHardLimit:                   .95,
+		EWMAWindow:                    4 * time.Second,
+		BusyThreshold:                 .70,
+		SaturatedThreshold:            1.00,
+		EmergencyThreshold:            1.40,
+		BusyRecoveryThreshold:         .55,
+		SaturatedRecoveryThreshold:    .85,
+		EmergencyRecoveryThreshold:    1.20,
+		OverloadEnterWindow:           3 * time.Second,
+		OverloadRecoveryWindow:        10 * time.Second,
+		RequestBodyLimit:              16 << 20,
+		RetryAfter:                    2 * time.Second,
+		RoutingPressureEpsilon:        .02,
+		SessionAffinityMaxPressure:    1.00,
+		DialTimeout:                   3 * time.Second,
+		TLSHandshakeTimeout:           3 * time.Second,
+		ResponseHeaderTimeout:         30 * time.Second,
+		ShutdownGracePeriod:           30 * time.Second,
+		AnalyticsRetention:            2160 * time.Hour,
 	}
 }
 
@@ -252,8 +284,11 @@ func (c Config) validate() error {
 	if len(c.APIKeyHMACSecret) < 32 {
 		return errors.New("LLMGW_API_KEY_HMAC_SECRET must contain at least 32 bytes")
 	}
-	if strings.TrimSpace(c.ListenAddress) == "" || strings.TrimSpace(c.DatabasePath) == "" {
-		return errors.New("listen address and database path are required")
+	if strings.TrimSpace(c.ListenAddress) == "" {
+		return errors.New("listen address is required")
+	}
+	if err := c.validateDatabaseProfile(); err != nil {
+		return err
 	}
 	for name, value := range map[string]time.Duration{
 		"health interval": c.HealthInterval, "health timeout": c.HealthTimeout,
@@ -264,6 +299,8 @@ func (c Config) validate() error {
 		"retry after": c.RetryAfter, "dial timeout": c.DialTimeout,
 		"TLS handshake timeout": c.TLSHandshakeTimeout, "response header timeout": c.ResponseHeaderTimeout,
 		"shutdown grace period": c.ShutdownGracePeriod,
+		"config poll interval":  c.ConfigPollInterval, "coordination timeout": c.CoordinationTimeout,
+		"lease TTL": c.LeaseTTL, "lease renewal interval": c.LeaseRenewInterval,
 	} {
 		if value <= 0 {
 			return fmt.Errorf("%s must be positive", name)
@@ -277,6 +314,18 @@ func (c Config) validate() error {
 	}
 	if c.CircuitFailureThreshold <= 0 || c.CircuitHalfOpenMaxProbes <= 0 {
 		return errors.New("circuit breaker counts must be positive")
+	}
+	if c.CircuitFailureWindow > 24*time.Hour-5*time.Minute {
+		return errors.New("circuit failure window must not exceed 23h55m")
+	}
+	if c.LeaseRenewInterval > c.LeaseTTL/3 {
+		return errors.New("lease renewal interval must not exceed one third of lease TTL")
+	}
+	if c.PostgresConfigMaxConns <= 0 || c.PostgresAnalyticsMaxConns <= 0 || c.PostgresCoordinationMaxConns <= 0 {
+		return errors.New("PostgreSQL pool limits must be positive")
+	}
+	if c.CoordinationCompletionBacklog <= 0 || c.EmergencyCriticalMaxInflight < 0 || c.EmergencyHighMaxInflight < 0 {
+		return errors.New("coordination backlog must be positive and emergency limits non-negative")
 	}
 	if !finitePositive(c.QueueSoftLimit) {
 		return errors.New("queue soft limit must be positive")
@@ -370,4 +419,85 @@ func floatValue(lookup LookupFunc, key string, fallback float64) (float64, error
 
 func finitePositive(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func (c *Config) loadCoordination(lookup LookupFunc) error {
+	for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL", "LLMGW_POSTGRES_CONFIG_MAX_CONNS", "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", "LLMGW_CONFIG_POLL_INTERVAL", "LLMGW_COORDINATION_TIMEOUT"} {
+		if _, exists := lookup(key); exists {
+			c.postgresSettingsExplicit = true
+		}
+	}
+	c.DatabaseDriver = strings.ToLower(strings.TrimSpace(stringValue(lookup, "LLMGW_DATABASE_DRIVER", c.DatabaseDriver)))
+	c.DatabaseURL = stringValue(lookup, "LLMGW_DATABASE_URL", "")
+	c.DatabaseMigrationURL = stringValue(lookup, "LLMGW_DATABASE_MIGRATION_URL", "")
+
+	var err error
+	if c.PostgresConfigMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_CONFIG_MAX_CONNS", c.PostgresConfigMaxConns); err != nil {
+		return err
+	}
+	if c.PostgresAnalyticsMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", c.PostgresAnalyticsMaxConns); err != nil {
+		return err
+	}
+	if c.PostgresCoordinationMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", c.PostgresCoordinationMaxConns); err != nil {
+		return err
+	}
+	if c.ConfigPollInterval, err = durationValue(lookup, "LLMGW_CONFIG_POLL_INTERVAL", c.ConfigPollInterval); err != nil {
+		return err
+	}
+	if c.CoordinationTimeout, err = durationValue(lookup, "LLMGW_COORDINATION_TIMEOUT", c.CoordinationTimeout); err != nil {
+		return err
+	}
+	if c.LeaseTTL, err = durationValue(lookup, "LLMGW_LEASE_TTL", c.LeaseTTL); err != nil {
+		return err
+	}
+	if c.LeaseRenewInterval, err = durationValue(lookup, "LLMGW_LEASE_RENEW_INTERVAL", c.LeaseRenewInterval); err != nil {
+		return err
+	}
+	if c.CoordinationCompletionBacklog, err = intValue(lookup, "LLMGW_COORDINATION_COMPLETION_BACKLOG", c.CoordinationCompletionBacklog); err != nil {
+		return err
+	}
+	if c.EmergencyCriticalMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_CRITICAL_MAX_INFLIGHT", c.EmergencyCriticalMaxInflight); err != nil {
+		return err
+	}
+	if c.EmergencyHighMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT", c.EmergencyHighMaxInflight); err != nil {
+		return err
+	}
+	return nil
+}
+func (c Config) validateDatabaseProfile() error {
+	switch c.DatabaseDriver {
+	case "sqlite":
+		if strings.TrimSpace(c.DatabasePath) == "" {
+			return errors.New("LLMGW_DATABASE_PATH is required for sqlite")
+		}
+		if c.postgresSettingsExplicit {
+			return errors.New("PostgreSQL-only settings require LLMGW_DATABASE_DRIVER=postgres")
+		}
+		for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL"} {
+			value := map[string]string{"LLMGW_DATABASE_URL": c.DatabaseURL, "LLMGW_DATABASE_MIGRATION_URL": c.DatabaseMigrationURL}[key]
+			if strings.TrimSpace(value) != "" {
+				return fmt.Errorf("%s is valid only for postgres", key)
+			}
+		}
+	case "postgres":
+		if strings.TrimSpace(c.DatabaseURL) == "" {
+			return errors.New("LLMGW_DATABASE_URL is required for postgres")
+		}
+		for _, raw := range []string{c.DatabaseURL, c.DatabaseMigrationURL} {
+			if raw == "" {
+				continue
+			}
+			parsed, err := url.Parse(raw)
+			if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
+				return errors.New("invalid PostgreSQL connection URL")
+			}
+		}
+		runtimeURL, _ := url.Parse(c.DatabaseURL)
+		if mode := runtimeURL.Query().Get("default_query_exec_mode"); mode != "" && mode != "exec" {
+			return errors.New("PostgreSQL runtime URL requires default_query_exec_mode=exec")
+		}
+	default:
+		return fmt.Errorf("unsupported LLMGW_DATABASE_DRIVER %q", c.DatabaseDriver)
+	}
+	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -172,14 +173,17 @@ func TestAdminCRUDPublishesEveryRevisionAndDisclosesKeyOnce(t *testing.T) {
 
 	clientResponse := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients", map[string]any{
 		"name": "payments", "enabled": true, "priorityClass": "critical", "vllmPriority": -100,
-		"maxConcurrency": 24, "modelPoolIds": []int64{poolID},
+		"maxConcurrency": 24, "requestsPerMinute": 600, "tokensPerMinute": 60000, "modelPoolIds": []int64{poolID},
 	}, http.StatusCreated)
+	if clientResponse["requestsPerMinute"] != float64(600) || clientResponse["tokensPerMinute"] != float64(60000) {
+		t.Fatalf("rate policy response=%#v", clientResponse)
+	}
 	clientID := jsonInt64(t, clientResponse, "id")
 	assertRevision(t, registryValue, &revision)
 
 	adminJSON(t, handler, csrf, http.MethodPut, "/admin/api/clients/"+strconv.FormatInt(clientID, 10), map[string]any{
 		"name": "payments", "enabled": false, "priorityClass": "high", "vllmPriority": -50,
-		"maxConcurrency": 12, "modelPoolIds": []int64{poolID},
+		"maxConcurrency": 12, "requestsPerMinute": 300, "tokensPerMinute": 30000, "modelPoolIds": []int64{poolID},
 	}, http.StatusOK)
 	assertRevision(t, registryValue, &revision)
 
@@ -404,6 +408,18 @@ func TestAdminPoolSafetyJSONRoundTripAndValidation(t *testing.T) {
 		"maxGatewayInflight": 0, "maxWaiting": -1,
 	}, http.StatusBadRequest)
 	assertAdminValidationError(t, updateError, "max waiting cannot be negative")
+
+	boundary := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "boundary", "upstreamModelName": "boundary", "enabled": true,
+		"maxGatewayInflight": domain.MaxPoolGatewayInflight, "maxWaiting": 0,
+	}, http.StatusCreated)
+	assertJSONNumber(t, boundary, "maxGatewayInflight", domain.MaxPoolGatewayInflight)
+
+	overMaximum := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{
+		"publicModelName": "over-maximum", "upstreamModelName": "over-maximum", "enabled": true,
+		"maxGatewayInflight": domain.MaxPoolGatewayInflight + 1, "maxWaiting": 0,
+	}, http.StatusBadRequest)
+	assertAdminValidationError(t, overMaximum, "max gateway inflight must not exceed 100000")
 }
 
 func TestRevocationPublishesAfterRequestCancellation(t *testing.T) {
@@ -975,4 +991,62 @@ func (r *adminRuntimeStub) ReconcileCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.reconciles
+}
+
+func TestAdminClientPolicyBoundaries(t *testing.T) {
+	handler, _, _ := newAdminFixture(t)
+	csrf := fetchCSRF(t, handler)
+	pool := adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/pools", map[string]any{"publicModelName": "limits", "upstreamModelName": "limits", "enabled": true}, http.StatusCreated)
+	poolID := jsonInt64(t, pool, "id")
+	base := map[string]any{"name": "bounded", "enabled": true, "priorityClass": "high", "vllmPriority": -10, "maxConcurrency": domain.MaxClientConcurrency, "requestsPerMinute": domain.MaxRequestsPerMinute, "tokensPerMinute": domain.MaxTokensPerMinute, "modelPoolIds": []int64{poolID}}
+	adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients", base, http.StatusCreated)
+	for name, value := range map[string]any{"maxConcurrency": domain.MaxClientConcurrency + 1, "requestsPerMinute": domain.MaxRequestsPerMinute + 1, "tokensPerMinute": domain.MaxTokensPerMinute + 1} {
+		invalid := maps.Clone(base)
+		invalid["name"] = "invalid-" + name
+		invalid[name] = value
+		adminJSON(t, handler, csrf, http.MethodPost, "/admin/api/clients", invalid, http.StatusBadRequest)
+	}
+}
+
+func TestAdminMutationGateReturnsSafeRetryableUnavailableError(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	registryValue := registry.New(database)
+	if err := registryValue.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service, err := httpapi.NewAdminService(httpapi.AdminDependencies{
+		Store: database, Analytics: database, Registry: registryValue,
+		Runtime:    &adminRuntimeStub{values: make(map[int64]domain.BackendRuntime)},
+		HMACSecret: []byte(strings.Repeat("h", 32)), MutationsAllowed: func() bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := httpapi.NewAdminAPI(service)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/clients", strings.NewReader(`{"name":"blocked","enabled":true,"priorityClass":"normal","maxConcurrency":1}`))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"code":"configuration_unavailable"`) || strings.Contains(response.Body.String(), "postgres://") {
+		t.Fatalf("unsafe or incorrect response: %s", response.Body.String())
+	}
+	if clients, err := database.ListClients(context.Background()); err != nil || len(clients) != 0 {
+		t.Fatalf("mutation reached store: clients=%v err=%v", clients, err)
+	}
+	drain := httptest.NewRecorder()
+	drainRequest := httptest.NewRequest(http.MethodPost, "/admin/api/backends/1/drain", nil)
+	handler.ServeHTTP(drain, drainRequest)
+	if drain.Code != http.StatusServiceUnavailable || !strings.Contains(drain.Body.String(), `"code":"configuration_unavailable"`) {
+		t.Fatalf("drain gate status=%d body=%s", drain.Code, drain.Body.String())
+	}
 }

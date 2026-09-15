@@ -813,6 +813,13 @@ func analyticsCSVTemporaryFileCount(t *testing.T, directory string) int {
 	return len(matches)
 }
 
+func setTemporaryDirectory(t *testing.T, directory string) {
+	t.Helper()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, directory)
+	}
+}
+
 func awaitAnalyticsSignal(t *testing.T, signal <-chan struct{}, label string) {
 	t.Helper()
 	select {

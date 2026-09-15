@@ -2,6 +2,7 @@ package monitor_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -9,10 +10,160 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/monitor"
 )
+
+type circuitCoordinatorStub struct {
+	mu            sync.Mutex
+	reconciled    []coordination.BackendIdentity
+	acquisitions  []coordination.CircuitAcquireRequest
+	completions   []coordination.CircuitCompletion
+	snapshot      coordination.CircuitSnapshot
+	completeErr   error
+	completePanic bool
+}
+
+func (f *circuitCoordinatorStub) Reconcile(_ context.Context, v []coordination.BackendIdentity) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reconciled = append([]coordination.BackendIdentity(nil), v...)
+	return nil
+}
+func (f *circuitCoordinatorStub) Snapshot(int64, time.Time) coordination.CircuitSnapshot {
+	return f.snapshot
+}
+func (f *circuitCoordinatorStub) Acquire(_ context.Context, v coordination.CircuitAcquireRequest) (coordination.CircuitDecision, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acquisitions = append(f.acquisitions, v)
+	return coordination.CircuitDecision{Snapshot: f.snapshot}, nil
+}
+func (f *circuitCoordinatorStub) Complete(_ context.Context, v coordination.CircuitCompletion) (coordination.CircuitSnapshot, error) {
+	if f.completePanic {
+		panic("circuit completion")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completions = append(f.completions, v)
+	return f.snapshot, f.completeErr
+}
+
+func TestManagerBuffersOnlyReplayableCircuitFailures(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		err         error
+		wantBacklog int
+	}{
+		{name: "semantic stale result", err: coordination.ReasonError{Reason: coordination.ReasonStaleOperation}, wantBacklog: 0},
+		{name: "coordination outage", err: errors.New("database unavailable"), wantBacklog: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := fakevllm.New()
+			server := httptest.NewServer(fake.Handler())
+			defer server.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			circuit := &circuitCoordinatorStub{snapshot: coordination.CircuitSnapshot{State: domain.CircuitClosed, Generation: 7, Available: true}, completeErr: test.err}
+			options := monitorOptions(server.Client())
+			options.CircuitCoordinator = circuit
+			options.ReplicaID = uuid.New()
+			options.ProbeTTL = time.Minute
+			manager := monitor.NewManager(ctx, options)
+			defer manager.Shutdown()
+			backend := testBackend(server.URL, 1, 9)
+			if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+				t.Fatal(err)
+			}
+			complete, ok := manager.AcquireBackend(backend, time.Now())
+			if !ok {
+				t.Fatal("acquire rejected")
+			}
+			complete(domain.InferenceFailure)
+			if got := manager.CircuitReplayBacklog(); got != test.wantBacklog {
+				t.Fatalf("backlog=%d want=%d", got, test.wantBacklog)
+			}
+		})
+	}
+}
+func (f *circuitCoordinatorStub) RenewProbes(context.Context, []coordination.ProbeIdentity) ([]coordination.RenewResult, error) {
+	return nil, nil
+}
+func (f *circuitCoordinatorStub) Refresh(context.Context) error { return nil }
+func (f *circuitCoordinatorStub) Status() coordination.Status {
+	return coordination.Status{Available: true}
+}
+
+func TestManagerCoordinatedCompletionPanicReleasesInflight(t *testing.T) {
+	circuit := &circuitCoordinatorStub{
+		snapshot:      coordination.CircuitSnapshot{State: domain.CircuitClosed, Available: true},
+		completePanic: true,
+	}
+	options := monitorOptions(nil)
+	options.CircuitCoordinator = circuit
+	options.ReplicaID = uuid.New()
+	options.ProbeTTL = time.Minute
+	manager := monitor.NewManager(context.Background(), options)
+	defer manager.Shutdown()
+	backend := testBackend("http://127.0.0.1:1", 1, 9)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	complete, ok := manager.AcquireBackend(backend, time.Now())
+	if !ok {
+		t.Fatal("acquire rejected")
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("completion did not propagate panic")
+			}
+		}()
+		complete(domain.InferenceNeutral)
+	}()
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("inflight after panic=%d, want 0", got)
+	}
+}
+
+func TestManagerDelegatesCircuitAcquireAndCompletion(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	circuit := &circuitCoordinatorStub{snapshot: coordination.CircuitSnapshot{State: domain.CircuitClosed, Generation: 7, Available: true}}
+	options := monitorOptions(server.Client())
+	options.CircuitCoordinator = circuit
+	options.ReplicaID = uuid.New()
+	options.ProbeTTL = time.Minute
+	manager := monitor.NewManager(ctx, options)
+	defer manager.Shutdown()
+	backend := testBackend(server.URL, 1, 9)
+	backend.Revision = 3
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	complete, ok := manager.AcquireBackend(backend, time.Now())
+	if !ok {
+		t.Fatal("distributed circuit rejected acquisition")
+	}
+	complete(domain.InferenceFailure)
+	circuit.mu.Lock()
+	defer circuit.mu.Unlock()
+	if len(circuit.reconciled) != 1 || circuit.reconciled[0].Revision != 3 {
+		t.Fatalf("reconcile=%+v", circuit.reconciled)
+	}
+	if len(circuit.acquisitions) != 1 || len(circuit.completions) != 1 {
+		t.Fatalf("acquires=%d completes=%d", len(circuit.acquisitions), len(circuit.completions))
+	}
+	if circuit.completions[0].AttemptID != circuit.acquisitions[0].AttemptID || circuit.completions[0].Generation != 7 {
+		t.Fatalf("completion=%+v acquisition=%+v", circuit.completions[0], circuit.acquisitions[0])
+	}
+}
 
 func TestManagerAcquirePoolEnforcesPositiveLimitAndTracksUnlimited(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

@@ -353,7 +353,7 @@ MaxGatewayInflight
 MaxWaiting
 ```
 
-The persisted safety fields are non-negative integers. `0` means disabled/unlimited. SQLite schema migration version 2 adds both columns with `NOT NULL DEFAULT 0` checks while preserving version-1 rows; version 3 adds the metadata-only usage analytics table and indexes. Each missing migration runs transactionally and records its version only after success. A binary with the forward-version guard rejects `PRAGMA user_version` above its latest embedded migration (currently version 3) before running migrations or changing the logical version, schema, or data. Opening SQLite has already applied file permission and WAL connection pragmas, so the guarantee is not byte-for-byte file or metadata immutability.
+The persisted safety fields are non-negative integers. `0` means disabled/unlimited. SQLite schema migration version 2 adds both columns with `NOT NULL DEFAULT 0` checks while preserving version-1 rows; version 3 adds the metadata-only usage analytics table and indexes; version 4 adds client RPM/TPM fields, per-row revisions, and change-aware compatibility triggers for legacy concurrency values. Each missing migration runs transactionally and records its version only after success. A binary with the forward-version guard rejects `PRAGMA user_version` above its latest embedded migration (currently version 4) before running migrations or changing the logical version, schema, or data. Opening SQLite has already applied file permission and WAL connection pragmas, so the guarantee is not byte-for-byte file or metadata immutability.
 
 There is no automatic down migration. The immediate pre-versioning `d6787d2` binary does not inspect `user_version`; it re-runs idempotent `001_initial.sql` and uses explicit-column pool selects, inserts, and updates. It therefore accepts the additive version-2 columns, preserves them and their stored values through its CRUD, but silently ignores and does not enforce `MaxGatewayInflight` or `MaxWaiting`. Only later version-aware binaries with the forward-version guard reject a database newer than their embedded migration set. This compatibility is specific to `d6787d2` and the additive version-2 schema, not a general rollback guarantee; other downgrades require a compatible quiesced backup rather than manual `user_version` edits.
 
@@ -1552,9 +1552,10 @@ The infrastructure implementation changes.
                │                           │
                └─────────────┬─────────────┘
                              │
-                  ┌──────────┴──────────┐
-                  ▼                     ▼
-              PostgreSQL             Valkey/Redis
+                             │
+                             ▼
+              PostgreSQL configuration, analytics,
+                   and distributed coordination
                   │
                   │
          ┌────────┴─────────────────────────┐
@@ -1586,8 +1587,10 @@ PostgreSQL
 Distributed limits:
 
 ```text
-Valkey/Redis
+PostgreSQL leases, rate buckets, circuit state, and probe permits
 ```
+
+This section is implemented by the PostgreSQL production profile in §69. Redis/Valkey remains a possible future coordinator implementation and is not a Production V1 dependency.
 
 ---
 
@@ -1612,10 +1615,10 @@ actual = 20
 
 Therefore, concurrency leases must be stored centrally.
 
-Recommended implementation:
+Production V1 implementation:
 
 ```text
-Redis/Valkey atomic operation
+PostgreSQL atomic transactions over durable lease and idempotency receipts
 ```
 
 with a TTL.
@@ -1623,8 +1626,11 @@ with a TTL.
 Each active request creates a lease:
 
 ```text
+leaseId
 clientId
+modelPoolId
 requestId
+replicaId
 expiresAt
 ```
 
@@ -1853,7 +1859,7 @@ Retry-After
 
 It is better to reject a background request than to keep 10,000 HTTP connections waiting for a GPU.
 
-This protection is implemented for one gateway process. Pool fields are exposed through SQLite, Admin JSON/forms, immutable registry snapshots, and runtime dashboards. Distributed enforcement across gateway replicas remains out of scope.
+This protection is process-local in the SQLite profile and globally enforced through PostgreSQL leases in the PostgreSQL profile. Pool fields are exposed through both stores, Admin JSON/forms, immutable registry snapshots, and runtime dashboards.
 
 Inference capacity has its own unauthenticated `GET /inference-readyz`: HTTP `200`/`status: ready` when at least one enabled pool has a healthy, metrics-fresh, secret-ready, non-draining backend whose circuit has capacity; otherwise HTTP `503`/`status: unavailable`. The body includes configuration `revision`, `poolAvailability`, and `backendAvailability`. Pool congestion does not make inference readiness flap. `GET /readyz` remains separate management-plane readiness and stays HTTP `200` during an inference outage.
 
@@ -2092,15 +2098,18 @@ High429Rate
 HighTTFT
 HighBackend5xx
 MetricsStale
-RedisUnavailable
+CoordinationUnavailable
+AnalyticsUnavailable
 DatabaseUnavailable
 ```
 
+These alerts follow coordination availability (including configuration freshness and consistency) plus the independently evaluated analytics readiness signal. Redis/Valkey is not required.
+
 ---
 
-# 55. Behaviour when Redis fails
+# 55. Behaviour when distributed coordination fails
 
-The Production gateway must use a fail-safe strategy.
+Production V1 coordination is stored in PostgreSQL. The Gateway must use a fail-safe strategy when its coordination pool is unavailable.
 
 For Critical/High:
 
@@ -2118,11 +2127,13 @@ fail-closed
 
 or significantly reduced local concurrency.
 
-The specific mode is configurable.
+Critical/High use only explicitly configured per-process emergency caps. Normal/Background fail closed. Last-known open or half-open circuits admit no emergency work, and a locally opened circuit is never healed without PostgreSQL recovery.
 
 Goal:
 
-> losing Redis must not allow background load to bring down the GPU cluster.
+> losing distributed coordination must not allow background load to bring down the GPU cluster.
+
+Redis/Valkey failure handling is reserved for a future coordinator implementation that passes the same contract suite.
 
 ---
 
@@ -2130,14 +2141,15 @@ Goal:
 
 The Gateway must cache the last known configuration locally.
 
-If PostgreSQL is temporarily unavailable:
+If the PostgreSQL configuration or analytics pool is temporarily unavailable:
 
 ```text
 existing client policies continue working
 new configuration changes unavailable
+analytics persistence/readiness reports degraded independently
 ```
 
-The Admin UI shows a degraded state.
+New inference is still governed by §55: only bounded Critical/High emergency admission is possible while coordination is unavailable. The Admin UI and `/readyz` expose configuration, coordination, and analytics component fields; configuration reflects the coordination/config-freshness result, while analytics is evaluated independently.
 
 ---
 
@@ -2311,8 +2323,9 @@ src/
       repositories
 
   Gateway.RateLimiting/
-      local MVP implementation
-      Redis production implementation
+      local SQLite-profile implementation
+      PostgreSQL production coordinator
+      Redis/Valkey future option
 
   Gateway.Web/
       admin UI
@@ -2399,13 +2412,13 @@ This will allow:
 LocalConcurrencyLimiter
 ```
 
-to be replaced with:
+to be replaced in the production profile with:
 
 ```text
-RedisConcurrencyLimiter
+PostgresAdmissionCoordinator
 ```
 
-without rewriting the proxy.
+without rewriting the proxy. The same interface keeps Redis/Valkey available as a future alternative rather than a Production V1 dependency.
 
 ---
 
@@ -2500,7 +2513,7 @@ Replace:
 SQLite → PostgreSQL
 
 local concurrency
-→ Redis/Valkey leases
+→ PostgreSQL leases, rate buckets, circuit state, and probe permits
 ```
 
 Add:
@@ -2576,7 +2589,7 @@ It must be possible to develop and test it entirely at home on an RTX 4070 Ti.
 2+ Gateway replicas
 
 PostgreSQL
-Redis/Valkey
+PostgreSQL distributed coordination
 
 OIDC
 RBAC
@@ -2601,6 +2614,8 @@ Grafana-ready metrics
 production network isolation
 secret management
 ```
+
+Redis/Valkey is an optional future backend-neutral coordinator, not a Production V1 prerequisite. The detailed current contract is defined by §69 and the PostgreSQL production profile.
 
 ---
 
@@ -2673,3 +2688,11 @@ This is a fundamental architectural boundary.
 ```
 
 **The Gateway's primary product function is not conventional round-robin load balancing, but serving as a QoS layer for scarce GPU resources.**
+
+---
+
+# 69. Persistence and distributed coordination profiles
+
+Production implements two explicit profiles. SQLite remains the default single-replica configuration/analytics store with local coordination. PostgreSQL 16+ stores configuration and analytics and coordinates multi-replica admission leases, continuously refilled client RPM, soft completion-debited TPM, circuit generations, durable failure receipts, and global half-open permits. Backend-neutral store and coordinator interfaces preserve Redis/Valkey as a future option without making it a Production V1 dependency.
+
+PostgreSQL operations use three independently bounded pgx pools, `exec` query mode for transaction-pooler compatibility, direct forward-only migrations, deterministic scope locks, post-lock server timestamps, synchronous commits, fingerprinted 24-hour idempotency receipts, compatible-replica registration, notification-plus-poll config/circuit caches, conservative emergency admission, and distinct management/inference/coordination readiness. The normative operational contract is [PostgreSQL production profile](postgresql-production.md); the detailed implementation design is [PostgreSQL Production Persistence and Distributed Coordination Design](superpowers/specs/2026-09-14-postgresql-production-coordination-design.md).

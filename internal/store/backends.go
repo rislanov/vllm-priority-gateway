@@ -14,6 +14,7 @@ func (s *SQLite) CreateBackend(ctx context.Context, params CreateBackendParams) 
 		return domain.Backend{}, err
 	}
 	now := s.now().UTC()
+	backend.Revision = 1
 	backend.CreatedAt, backend.UpdatedAt = now, now
 	tx, err := s.begin(ctx)
 	if err != nil {
@@ -23,11 +24,11 @@ func (s *SQLite) CreateBackend(ctx context.Context, params CreateBackendParams) 
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO backends (
 			model_pool_id, name, base_url, enabled, draining, capacity_hint,
-			running_soft_limit, upstream_api_key_env, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			running_soft_limit, upstream_api_key_env, revision, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		backend.ModelPoolID, backend.Name, backend.BaseURL, boolInt(backend.Enabled),
 		boolInt(backend.Draining), backend.CapacityHint, backend.RunningSoftLimit,
-		backend.UpstreamAPIKeyEnv, timestamp(now), timestamp(now),
+		backend.UpstreamAPIKeyEnv, backend.Revision, timestamp(now), timestamp(now),
 	)
 	if err != nil {
 		return domain.Backend{}, fmt.Errorf("insert backend: %w", err)
@@ -59,11 +60,12 @@ func (s *SQLite) UpdateBackend(ctx context.Context, id int64, params UpdateBacke
 	var created string
 	err = tx.QueryRowContext(ctx, `
 		UPDATE backends SET model_pool_id = ?, name = ?, base_url = ?, enabled = ?, draining = ?,
-		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, updated_at = ? WHERE id = ? RETURNING created_at`,
+		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, revision = revision + 1, updated_at = ?
+		WHERE id = ? RETURNING revision, created_at`,
 		backend.ModelPoolID, backend.Name, backend.BaseURL, boolInt(backend.Enabled),
 		boolInt(backend.Draining), backend.CapacityHint, backend.RunningSoftLimit,
 		backend.UpstreamAPIKeyEnv, timestamp(backend.UpdatedAt), id,
-	).Scan(&created)
+	).Scan(&backend.Revision, &created)
 	if err != nil {
 		return domain.Backend{}, fmt.Errorf("update backend: %w", err)
 	}
@@ -105,7 +107,7 @@ func (s *SQLite) SetBackendDraining(ctx context.Context, id int64, draining bool
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE backends SET draining = ?, updated_at = ? WHERE id = ?`, boolInt(draining), timestamp(s.now()), id)
+	result, err := tx.ExecContext(ctx, `UPDATE backends SET draining = ?, revision = revision + 1, updated_at = ? WHERE id = ?`, boolInt(draining), timestamp(s.now()), id)
 	if err != nil {
 		return fmt.Errorf("set backend draining: %w", err)
 	}
@@ -120,7 +122,7 @@ func (s *SQLite) SetBackendDraining(ctx context.Context, id int64, draining bool
 
 func (s *SQLite) ListBackends(ctx context.Context) ([]domain.Backend, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, model_pool_id, name, base_url, enabled, draining, capacity_hint,
+		SELECT id, revision, model_pool_id, name, base_url, enabled, draining, capacity_hint,
 		running_soft_limit, upstream_api_key_env, created_at, updated_at
 		FROM backends ORDER BY name`)
 	if err != nil {
@@ -154,7 +156,7 @@ func scanBackend(row scanner) (domain.Backend, error) {
 	var enabled, draining int
 	var created, updated string
 	if err := row.Scan(
-		&backend.ID, &backend.ModelPoolID, &backend.Name, &backend.BaseURL, &enabled,
+		&backend.ID, &backend.Revision, &backend.ModelPoolID, &backend.Name, &backend.BaseURL, &enabled,
 		&draining, &backend.CapacityHint, &backend.RunningSoftLimit,
 		&backend.UpstreamAPIKeyEnv, &created, &updated,
 	); err != nil {

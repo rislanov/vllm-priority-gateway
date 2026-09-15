@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
@@ -58,6 +59,11 @@ type harness struct {
 	csrf         string
 	fakes        []*fakevllm.Server
 	upstreams    []*httptest.Server
+	keyUsage     *apikey.UsageRecorder
+}
+
+type harnessOptions struct {
+	AsyncKeyUsage bool
 }
 
 type harnessUsage struct {
@@ -75,12 +81,18 @@ func TestHarnessCreatePoolWithSafetyLimits(t *testing.T) {
 }
 
 func (u harnessUsage) Record(keyID int64, usedAt time.Time) {
-	if u.database.TouchKeyLastUsed(context.Background(), keyID, usedAt) == nil {
-		u.registry.MarkKeyUsed(keyID, usedAt)
-	}
+	_ = u.TouchKeyLastUsed(context.Background(), keyID, usedAt)
 }
 
-func newHarness(t *testing.T) *harness {
+func (u harnessUsage) TouchKeyLastUsed(ctx context.Context, keyID int64, usedAt time.Time) error {
+	if err := u.database.TouchKeyLastUsed(ctx, keyID, usedAt); err != nil {
+		return err
+	}
+	u.registry.MarkKeyUsed(keyID, usedAt)
+	return nil
+}
+
+func newHarness(t *testing.T, settings ...harnessOptions) *harness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	databasePath := filepath.Join(t.TempDir(), "acceptance.db")
@@ -106,10 +118,16 @@ func newHarness(t *testing.T) *harness {
 		},
 	})
 	metrics := observability.NewMetrics()
+	var usage gateway.UsageRecorder = harnessUsage{database: database, registry: registryValue}
+	var keyUsage *apikey.UsageRecorder
+	if len(settings) > 0 && settings[0].AsyncKeyUsage {
+		keyUsage = apikey.NewUsageRecorder(ctx, harnessUsage{database: database, registry: registryValue})
+		usage = keyUsage
+	}
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: hmacSecret, Limiter: admission.NewLimiter(), Runtime: manager,
 		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: proxy.New(client), Observer: metrics,
-		Usage: harnessUsage{database: database, registry: registryValue}, LookupEnv: os.LookupEnv,
+		Usage: usage, LookupEnv: os.LookupEnv,
 	})
 	publicHandler := httpapi.NewPublicHandler(service, 1<<20, nil)
 	adminService, err := httpapi.NewAdminService(httpapi.AdminDependencies{
@@ -146,7 +164,7 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{
 		t: t, ctx: ctx, cancel: cancel, database: database, databasePath: databasePath,
 		registry: registryValue, manager: manager, metrics: metrics, server: server,
-		client: &http.Client{Transport: client.Transport, Jar: jar, Timeout: 3 * time.Second},
+		client: &http.Client{Transport: client.Transport, Jar: jar, Timeout: 3 * time.Second}, keyUsage: keyUsage,
 	}
 	h.bootstrapCSRF()
 	t.Cleanup(h.close)
@@ -155,6 +173,9 @@ func newHarness(t *testing.T) *harness {
 
 func (h *harness) close() {
 	h.server.Close()
+	if h.keyUsage != nil {
+		h.keyUsage.Close()
+	}
 	h.cancel()
 	h.manager.Shutdown()
 	for _, upstream := range h.upstreams {

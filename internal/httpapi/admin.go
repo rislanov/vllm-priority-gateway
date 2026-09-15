@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -23,20 +26,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
 
-type AdminStore interface {
-	CreateClient(context.Context, store.CreateClientParams) (domain.Client, error)
-	UpdateClient(context.Context, int64, store.UpdateClientParams) (domain.Client, error)
-	DeleteClient(context.Context, int64) ([]int64, error)
-	CreateAPIKey(context.Context, store.CreateAPIKeyParams) (domain.APIKey, error)
-	RevokeAPIKey(context.Context, int64) error
-	CreatePool(context.Context, store.CreatePoolParams) (domain.ModelPool, error)
-	UpdatePool(context.Context, int64, store.UpdatePoolParams) (domain.ModelPool, error)
-	DeletePool(context.Context, int64) error
-	CreateBackend(context.Context, store.CreateBackendParams) (domain.Backend, error)
-	UpdateBackend(context.Context, int64, store.UpdateBackendParams) (domain.Backend, error)
-	DeleteBackend(context.Context, int64) error
-	SetBackendDraining(context.Context, int64, bool) error
-}
+type AdminStore = store.AdminStore
 
 type AdminRegistry interface {
 	Reload(context.Context) error
@@ -52,23 +42,25 @@ type AdminRuntime interface {
 }
 
 type AdminDependencies struct {
-	Store      AdminStore
-	Analytics  analytics.QueryStore
-	Registry   AdminRegistry
-	Runtime    AdminRuntime
-	HMACSecret []byte
-	Random     io.Reader
-	Now        func() time.Time
+	Store            AdminStore
+	Analytics        analytics.QueryStore
+	Registry         AdminRegistry
+	Runtime          AdminRuntime
+	HMACSecret       []byte
+	Random           io.Reader
+	Now              func() time.Time
+	MutationsAllowed func() bool
 }
 
 type AdminService struct {
-	store      AdminStore
-	analytics  analytics.QueryStore
-	registry   AdminRegistry
-	runtime    AdminRuntime
-	hmacSecret []byte
-	random     io.Reader
-	now        func() time.Time
+	store            AdminStore
+	analytics        analytics.QueryStore
+	registry         AdminRegistry
+	runtime          AdminRuntime
+	hmacSecret       []byte
+	random           io.Reader
+	now              func() time.Time
+	mutationsAllowed func() bool
 
 	randomMu  sync.Mutex
 	publishMu sync.Mutex
@@ -94,16 +86,28 @@ func NewAdminService(dependencies AdminDependencies) (*AdminService, error) {
 	return &AdminService{
 		store: dependencies.Store, analytics: dependencies.Analytics, registry: dependencies.Registry, runtime: dependencies.Runtime,
 		hmacSecret: append([]byte(nil), dependencies.HMACSecret...), random: randomSource, now: now,
+		mutationsAllowed: dependencies.MutationsAllowed,
 	}, nil
 }
 
+var errAdminMutationsUnavailable = errors.New("configuration mutations are temporarily unavailable")
+
+func (s *AdminService) requireMutationAvailability() error {
+	if s.mutationsAllowed != nil && !s.mutationsAllowed() {
+		return errAdminMutationsUnavailable
+	}
+	return nil
+}
+
 type ClientInput struct {
-	Name           string               `json:"name"`
-	Enabled        bool                 `json:"enabled"`
-	PriorityClass  domain.PriorityClass `json:"priorityClass"`
-	VLLMPriority   int                  `json:"vllmPriority"`
-	MaxConcurrency int                  `json:"maxConcurrency"`
-	ModelPoolIDs   []int64              `json:"modelPoolIds"`
+	Name              string               `json:"name"`
+	Enabled           bool                 `json:"enabled"`
+	PriorityClass     domain.PriorityClass `json:"priorityClass"`
+	VLLMPriority      int                  `json:"vllmPriority"`
+	MaxConcurrency    int                  `json:"maxConcurrency"`
+	RequestsPerMinute int64                `json:"requestsPerMinute"`
+	TokensPerMinute   int64                `json:"tokensPerMinute"`
+	ModelPoolIDs      []int64              `json:"modelPoolIds"`
 }
 
 type PoolInput struct {
@@ -130,14 +134,17 @@ type KeyInput struct {
 }
 
 type AdminClient struct {
-	ID             int64                `json:"id"`
-	Name           string               `json:"name"`
-	Enabled        bool                 `json:"enabled"`
-	PriorityClass  domain.PriorityClass `json:"priorityClass"`
-	VLLMPriority   int                  `json:"vllmPriority"`
-	MaxConcurrency int                  `json:"maxConcurrency"`
-	ModelPoolIDs   []int64              `json:"modelPoolIds"`
-	Models         []string             `json:"models"`
+	ID                int64                `json:"id"`
+	Revision          int64                `json:"revision"`
+	Name              string               `json:"name"`
+	Enabled           bool                 `json:"enabled"`
+	PriorityClass     domain.PriorityClass `json:"priorityClass"`
+	VLLMPriority      int                  `json:"vllmPriority"`
+	MaxConcurrency    int                  `json:"maxConcurrency"`
+	RequestsPerMinute int64                `json:"requestsPerMinute"`
+	TokensPerMinute   int64                `json:"tokensPerMinute"`
+	ModelPoolIDs      []int64              `json:"modelPoolIds"`
+	Models            []string             `json:"models"`
 }
 
 type AdminKey struct {
@@ -154,6 +161,7 @@ type AdminKey struct {
 
 type AdminPool struct {
 	ID                 int64              `json:"id"`
+	Revision           int64              `json:"revision"`
 	PublicModelName    string             `json:"publicModelName"`
 	UpstreamModelName  string             `json:"upstreamModelName"`
 	Enabled            bool               `json:"enabled"`
@@ -164,6 +172,7 @@ type AdminPool struct {
 
 type AdminBackend struct {
 	ID                int64                 `json:"id"`
+	Revision          int64                 `json:"revision"`
 	ModelPoolID       int64                 `json:"modelPoolId"`
 	ModelPool         string                `json:"modelPool"`
 	Name              string                `json:"name"`
@@ -200,8 +209,9 @@ func (s *AdminService) View() AdminView {
 
 	for _, client := range snapshot.Clients {
 		item := AdminClient{
-			ID: client.ID, Name: client.Name, Enabled: client.Enabled, PriorityClass: client.PriorityClass,
+			ID: client.ID, Revision: client.Revision, Name: client.Name, Enabled: client.Enabled, PriorityClass: client.PriorityClass,
 			VLLMPriority: client.VLLMPriority, MaxConcurrency: client.MaxConcurrency,
+			RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute,
 		}
 		for poolID, allowed := range snapshot.Access[client.ID] {
 			if !allowed {
@@ -234,7 +244,7 @@ func (s *AdminService) View() AdminView {
 	}
 	for _, pool := range snapshot.PoolsByID {
 		view.Pools = append(view.Pools, AdminPool{
-			ID: pool.ID, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
+			ID: pool.ID, Revision: pool.Revision, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
 			Enabled: pool.Enabled, MaxGatewayInflight: pool.MaxGatewayInflight, MaxWaiting: pool.MaxWaiting,
 			Runtime: s.runtime.PoolSnapshot(pool.ID, at),
 		})
@@ -242,7 +252,7 @@ func (s *AdminService) View() AdminView {
 	for _, backend := range snapshot.BackendsByID {
 		pool := snapshot.PoolsByID[backend.ModelPoolID]
 		view.Backends = append(view.Backends, AdminBackend{
-			ID: backend.ID, ModelPoolID: backend.ModelPoolID, ModelPool: pool.PublicModelName,
+			ID: backend.ID, Revision: backend.Revision, ModelPoolID: backend.ModelPoolID, ModelPool: pool.PublicModelName,
 			Name: backend.Name, BaseURL: backend.BaseURL, Enabled: backend.Enabled, Draining: backend.Draining,
 			CapacityHint: backend.CapacityHint, RunningSoftLimit: backend.RunningSoftLimit,
 			UpstreamAPIKeyEnv: backend.UpstreamAPIKeyEnv, Runtime: s.runtime.Snapshot(backend.ID, at),
@@ -256,6 +266,9 @@ func (s *AdminService) View() AdminView {
 }
 
 func (s *AdminService) CreateClient(ctx context.Context, input ClientInput) (AdminClient, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminClient{}, err
+	}
 	created, err := s.store.CreateClient(ctx, store.CreateClientParams(input))
 	if err != nil {
 		return AdminClient{}, err
@@ -267,6 +280,9 @@ func (s *AdminService) CreateClient(ctx context.Context, input ClientInput) (Adm
 }
 
 func (s *AdminService) UpdateClient(ctx context.Context, id int64, input ClientInput) (AdminClient, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminClient{}, err
+	}
 	updated, err := s.store.UpdateClient(ctx, id, store.UpdateClientParams(input))
 	if err != nil {
 		return AdminClient{}, err
@@ -278,6 +294,9 @@ func (s *AdminService) UpdateClient(ctx context.Context, id int64, input ClientI
 }
 
 func (s *AdminService) DeleteClient(ctx context.Context, id int64) error {
+	if err := s.requireMutationAvailability(); err != nil {
+		return err
+	}
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
@@ -298,6 +317,9 @@ func (s *AdminService) DeleteClient(ctx context.Context, id int64) error {
 }
 
 func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyInput) (CreatedKey, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return CreatedKey{}, err
+	}
 	s.randomMu.Lock()
 	plain, err := apikey.Generate(s.random)
 	s.randomMu.Unlock()
@@ -323,6 +345,9 @@ func (s *AdminService) CreateKey(ctx context.Context, clientID int64, input KeyI
 }
 
 func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
+	if err := s.requireMutationAvailability(); err != nil {
+		return err
+	}
 	if err := s.store.RevokeAPIKey(ctx, id); err != nil {
 		return err
 	}
@@ -333,6 +358,9 @@ func (s *AdminService) RevokeKey(ctx context.Context, id int64) error {
 }
 
 func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPool, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminPool{}, err
+	}
 	pool, err := s.store.CreatePool(ctx, store.CreatePoolParams(input))
 	if err != nil {
 		return AdminPool{}, err
@@ -344,6 +372,9 @@ func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPo
 }
 
 func (s *AdminService) UpdatePool(ctx context.Context, id int64, input PoolInput) (AdminPool, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminPool{}, err
+	}
 	pool, err := s.store.UpdatePool(ctx, id, store.UpdatePoolParams(input))
 	if err != nil {
 		return AdminPool{}, err
@@ -355,6 +386,9 @@ func (s *AdminService) UpdatePool(ctx context.Context, id int64, input PoolInput
 }
 
 func (s *AdminService) DeletePool(ctx context.Context, id int64) error {
+	if err := s.requireMutationAvailability(); err != nil {
+		return err
+	}
 	if err := s.store.DeletePool(ctx, id); err != nil {
 		return err
 	}
@@ -362,6 +396,9 @@ func (s *AdminService) DeletePool(ctx context.Context, id int64) error {
 }
 
 func (s *AdminService) CreateBackend(ctx context.Context, input BackendInput) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	backend, err := s.store.CreateBackend(ctx, store.CreateBackendParams(input))
 	if err != nil {
 		return AdminBackend{}, err
@@ -373,6 +410,9 @@ func (s *AdminService) CreateBackend(ctx context.Context, input BackendInput) (A
 }
 
 func (s *AdminService) UpdateBackend(ctx context.Context, id int64, input BackendInput) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	backend, err := s.store.UpdateBackend(ctx, id, store.UpdateBackendParams(input))
 	if err != nil {
 		return AdminBackend{}, err
@@ -384,6 +424,9 @@ func (s *AdminService) UpdateBackend(ctx context.Context, id int64, input Backen
 }
 
 func (s *AdminService) DeleteBackend(ctx context.Context, id int64) error {
+	if err := s.requireMutationAvailability(); err != nil {
+		return err
+	}
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
@@ -403,6 +446,9 @@ func (s *AdminService) DeleteBackend(ctx context.Context, id int64) error {
 }
 
 func (s *AdminService) SetBackendDraining(ctx context.Context, id int64, draining bool) (AdminBackend, error) {
+	if err := s.requireMutationAvailability(); err != nil {
+		return AdminBackend{}, err
+	}
 	if err := s.store.SetBackendDraining(ctx, id, draining); err != nil {
 		return AdminBackend{}, err
 	}
@@ -447,7 +493,7 @@ func (s *AdminService) setDegraded(err error) {
 	if err == nil {
 		s.degraded = ""
 	} else {
-		s.degraded = err.Error()
+		s.degraded = "Configuration update could not be published"
 	}
 	s.stateMu.Unlock()
 }
@@ -684,17 +730,37 @@ func writeAdminResult(writer http.ResponseWriter, status int, value any, err err
 func writeAdminError(writer http.ResponseWriter, err error) {
 	message := err.Error()
 	status, code := http.StatusBadRequest, "validation_error"
+	var pgErr *pgconn.PgError
+	var connectErr *pgconn.ConnectError
+	var networkErr net.Error
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, errAdminMutationsUnavailable):
+		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
+		message = "Configuration mutations are temporarily unavailable"
+	case errors.Is(err, sql.ErrNoRows), errors.Is(err, pgx.ErrNoRows):
 		status, code = http.StatusNotFound, "not_found"
+		message = "Resource not found"
+	case errors.As(err, &pgErr) && (pgErr.Code == "23503" || pgErr.Code == "23505"):
+		status, code = http.StatusConflict, "conflict"
+		message = "Configuration conflicts with an existing or referenced resource"
+	case errors.As(err, &pgErr) && pgErr.Code == "23514":
+		message = "Configuration value is outside the supported range"
 	case errors.Is(err, store.ErrPoolHasBackends):
 		status, code = http.StatusConflict, "conflict"
 	case store.IsTemporary(err):
 		status, code = http.StatusServiceUnavailable, "storage_unavailable"
+		message = "Storage is temporarily unavailable"
 	case strings.Contains(message, "UNIQUE constraint failed"), strings.Contains(message, "FOREIGN KEY constraint failed"):
 		status, code = http.StatusConflict, "conflict"
 	case strings.Contains(message, "publish configuration"), strings.Contains(message, "reconcile backend monitors"):
 		status, code = http.StatusServiceUnavailable, "configuration_degraded"
+		message = "Configuration update could not be published"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
+		errors.As(err, &pgErr), errors.As(err, &connectErr), errors.As(err, &networkErr),
+		strings.Contains(message, "PostgreSQL"):
+		status, code = http.StatusServiceUnavailable, "configuration_unavailable"
+		message = "Configuration mutations are temporarily unavailable"
 	}
 	writeAdminJSONError(writer, status, code, message)
 }

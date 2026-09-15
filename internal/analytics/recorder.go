@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
@@ -13,7 +14,9 @@ const (
 	recorderQueueCapacity  = 1024
 	recorderBatchSize      = 64
 	recorderFlushInterval  = 250 * time.Millisecond
+	recorderWriteTimeout   = 5 * time.Second
 	retentionCheckInterval = time.Hour
+	retentionCleanupBudget = 5 * time.Second
 )
 
 // RecordStore is the recorder's narrow durable-storage dependency.
@@ -38,13 +41,15 @@ type Recorder struct {
 	intakeClosed chan struct{}
 	done         chan struct{}
 
-	mu         sync.Mutex
-	accepting  bool
-	pending    map[*completionReservation]RequestRecord
-	reserved   map[string]*completionReservation
-	lifecycles sync.WaitGroup
-	closeOnce  sync.Once
-	lastErr    error
+	mu             sync.Mutex
+	accepting      bool
+	pending        map[*completionReservation]RequestRecord
+	reserved       map[string]*completionReservation
+	lifecycles     sync.WaitGroup
+	closeOnce      sync.Once
+	lastErr        error
+	writerHealthy  atomic.Bool
+	cleanupHealthy atomic.Bool
 }
 
 type recorderSettings struct {
@@ -68,7 +73,7 @@ type completionReservation struct {
 	requestID string
 }
 
-// NewRecorder starts one writer for request metadata and retention cleanup.
+// NewRecorder starts independent writer and retention-cleanup workers.
 func NewRecorder(store RecordStore, retention time.Duration, onFailure func(), logger *slog.Logger) *Recorder {
 	flushTicker := time.NewTicker(recorderFlushInterval)
 	var cleanupTicker *time.Ticker
@@ -114,6 +119,8 @@ func newRecorder(store RecordStore, retention time.Duration, onFailure func(), s
 		permits: make(chan struct{}, settings.queueCapacity), intakeClosed: make(chan struct{}), done: make(chan struct{}),
 		accepting: true, pending: make(map[*completionReservation]RequestRecord), reserved: make(map[string]*completionReservation),
 	}
+	recorder.writerHealthy.Store(true)
+	recorder.cleanupHealthy.Store(true)
 	go recorder.run()
 	return recorder
 }
@@ -262,17 +269,23 @@ func (r *Recorder) Done() <-chan struct{} {
 	return r.done
 }
 
+// Healthy reports whether the recorder's most recent storage operation
+// succeeded. Readiness also pings the analytics pool, so this captures worker
+// failures that a connection-only check cannot see.
+func (r *Recorder) Healthy() bool {
+	return r.writerHealthy.Load() && r.cleanupHealthy.Load()
+}
+
 func (r *Recorder) run() {
-	defer close(r.done)
-	defer r.cancel()
+	cleanupDone := make(chan struct{})
+	go r.runCleanup(cleanupDone)
+	defer func() {
+		r.cancel()
+		<-cleanupDone
+		close(r.done)
+	}()
 	if r.settings.stopTimers != nil {
 		defer r.settings.stopTimers()
-	}
-
-	lastCleanup := time.Time{}
-	if r.retention > 0 {
-		lastCleanup = r.settings.now()
-		r.cleanup(lastCleanup)
 	}
 	if r.settings.onStart != nil {
 		r.settings.onStart()
@@ -300,6 +313,21 @@ func (r *Recorder) run() {
 				r.flush(batch)
 				batch = batch[:0]
 			}
+		}
+	}
+}
+
+func (r *Recorder) runCleanup(done chan<- struct{}) {
+	defer close(done)
+	lastCleanup := time.Time{}
+	if r.retention > 0 {
+		lastCleanup = r.settings.now()
+		r.cleanup(lastCleanup)
+	}
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
 		case <-r.settings.cleanup:
 			at := r.settings.now()
 			if r.retention > 0 && (lastCleanup.IsZero() || at.Sub(lastCleanup) >= retentionCheckInterval) {
@@ -318,7 +346,13 @@ func (r *Recorder) flush(records []RequestRecord) {
 		return
 	}
 	batch := append([]RequestRecord(nil), records...)
-	if err := r.store.InsertUsageBatch(r.ctx, batch); err != nil {
+	// Storage may wait on a remote connection or a database lock indefinitely.
+	// Bound that wait so the writer keeps draining the inference reservation
+	// queue even while PostgreSQL is unavailable.
+	ctx, cancel := context.WithTimeout(r.ctx, recorderWriteTimeout)
+	defer cancel()
+	if err := r.store.InsertUsageBatch(ctx, batch); err != nil {
+		r.writerHealthy.Store(false)
 		r.lastErr = err
 		if r.onFailure != nil {
 			for range batch {
@@ -331,13 +365,36 @@ func (r *Recorder) flush(records []RequestRecord) {
 			"lastRequestId", batch[len(batch)-1].RequestID,
 			"error", err,
 		)
+		return
 	}
+	r.writerHealthy.Store(true)
 }
 
 func (r *Recorder) cleanup(at time.Time) {
 	cutoff := at.Add(-r.retention).UTC()
-	if _, err := r.store.DeleteUsageBefore(r.ctx, cutoff); err != nil {
-		r.logger.Error("usage retention cleanup failed", "cutoff", cutoff, "error", err)
+	ctx, cancel := context.WithTimeout(r.ctx, retentionCleanupBudget)
+	defer cancel()
+	for {
+		deleted, err := r.store.DeleteUsageBefore(ctx, cutoff)
+		if err != nil {
+			r.cleanupHealthy.Store(false)
+			if r.ctx.Err() == nil {
+				r.logger.Error("usage retention cleanup failed", "cutoff", cutoff, "error", err)
+			}
+			return
+		}
+		r.cleanupHealthy.Store(true)
+		if deleted == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			if r.ctx.Err() == nil {
+				r.logger.Warn("usage retention cleanup time budget exhausted", "cutoff", cutoff, "budget", retentionCleanupBudget)
+			}
+			return
+		default:
+		}
 	}
 }
 

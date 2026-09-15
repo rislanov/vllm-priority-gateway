@@ -66,6 +66,7 @@ type RequestEvent struct {
 	RetryCount        int
 	Usage             *domain.TokenUsage
 	UsageParseFailure string
+	SoftTPMExpected   bool
 	UpstreamFailure   string
 }
 
@@ -75,6 +76,11 @@ type Observer interface {
 	ClientInflight(InflightEvent, int)
 	BackendInflight(InflightEvent, int)
 	Complete(RequestEvent)
+}
+
+// CoordinationEmergencyObserver receives bounded emergency-admission outcomes.
+type CoordinationEmergencyObserver interface {
+	CoordinationEmergency(domain.PriorityClass, bool)
 }
 
 // ResponseCompleteReservation is an opaque, in-memory lifecycle handle. The

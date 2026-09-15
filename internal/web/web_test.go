@@ -3,6 +3,7 @@ package web_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -378,7 +379,7 @@ func TestAdminPagesHaveSemanticNavigationFormsAndTables(t *testing.T) {
 		text    string
 	}{
 		{path: "/admin", headers: []string{"Pool", "State", "Pressure", "Backend", "Running", "Waiting", "KV cache"}, text: "Gateway overview"},
-		{path: "/admin/clients", headers: []string{"Name", "Class", "vLLM priority", "Max concurrency", "Models", "Status", "Actions"}, text: "Create client"},
+		{path: "/admin/clients", headers: []string{"Name", "Class", "vLLM priority", "Max concurrency", "RPM / TPM", "Models", "Status", "Actions"}, text: "Create client"},
 		{path: "/admin/keys", headers: []string{"Prefix", "Client", "Created", "Expires", "Last used", "Status", "Actions"}, text: "Generate API key"},
 		{path: "/admin/backends", headers: []string{"Name", "Model pool", "URL", "State", "Pressure", "Enabled", "Draining", "Actions"}, text: "Create backend"},
 	}
@@ -485,9 +486,20 @@ func TestClientEditPagePrefillsExistingPolicy(t *testing.T) {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
 	body := response.Body.String()
-	for _, expected := range []string{"Edit client: payments", `value="payments"`, `value="-100"`, `value="24"`, `value="1" checked`} {
+	for _, expected := range []string{"Edit client: payments", `value="payments"`, `value="-100"`, `value="24"`, `value="600"`, `value="60000"`, `value="1" checked`} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("edit page missing %q: %s", expected, body)
+		}
+	}
+	document, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, maximum := range map[string]string{
+		"max_concurrency": "10000", "requests_per_minute": "10000000", "tokens_per_minute": "10000000000000",
+	} {
+		if !hasInputWithAttr(document, name, "max", maximum) {
+			t.Fatalf("client edit input %q is missing max=%s: %s", name, maximum, body)
 		}
 	}
 }
@@ -609,6 +621,9 @@ func TestPoolSafetyFormsRenderAndPrefillExistingLimits(t *testing.T) {
 			t.Fatalf("create form is missing min=0 number input %q: %s", name, response.Body.String())
 		}
 	}
+	if !hasInputWithAttr(document, "max_gateway_inflight", "max", "100000") {
+		t.Fatalf("create form is missing max=100000: %s", response.Body.String())
+	}
 
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit_pool=1", nil))
@@ -622,11 +637,36 @@ func TestPoolSafetyFormsRenderAndPrefillExistingLimits(t *testing.T) {
 	if !hasInput(document, "max_gateway_inflight", "number", "0", "17") || !hasInput(document, "max_waiting", "number", "0", "9") {
 		t.Fatalf("pool edit form did not prefill 17/9: %s", response.Body.String())
 	}
+	if !hasInputWithAttr(document, "max_gateway_inflight", "max", "100000") {
+		t.Fatalf("pool edit form is missing max=100000: %s", response.Body.String())
+	}
 
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin", nil))
 	if !strings.Contains(response.Body.String(), "Max gateway inflight") || !strings.Contains(response.Body.String(), "Max waiting") || !strings.Contains(response.Body.String(), ">17<") || !strings.Contains(response.Body.String(), ">9<") {
 		t.Fatalf("dashboard does not expose configured pool limits: %s", response.Body.String())
+	}
+}
+
+func TestPoolEditFormPreservesGrandfatheredInflightLimit(t *testing.T) {
+	handler := newLegacyPoolWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/backends?edit_pool=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasInput(document, "max_gateway_inflight", "number", "0", "100001") {
+		t.Fatalf("legacy limit was not prefilled: %s", response.Body.String())
+	}
+	if inputWithValueHasAttr(document, "max_gateway_inflight", "100001", "max", "100000") {
+		t.Fatalf("legacy input must remain submittable unchanged: %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "Legacy value exceeds 100,000; leave unchanged or lower it.") {
+		t.Fatalf("legacy-value warning is missing: %s", response.Body.String())
 	}
 }
 
@@ -737,8 +777,17 @@ func newWebFixtureWithUsage(t *testing.T, records []analytics.RequestRecord) htt
 }
 
 func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord, queryStore analytics.QueryStore) http.Handler {
+	return newWebFixtureWithPoolLimit(t, records, queryStore, 17)
+}
+
+func newLegacyPoolWebFixture(t *testing.T) http.Handler {
+	return newWebFixtureWithPoolLimit(t, nil, nil, domain.MaxPoolGatewayInflight+1)
+}
+
+func newWebFixtureWithPoolLimit(t *testing.T, records []analytics.RequestRecord, queryStore analytics.QueryStore, poolLimit int) http.Handler {
 	t.Helper()
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "gateway.db"))
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	database, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +805,7 @@ func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := database.CreateClient(context.Background(), store.CreateClientParams{Name: "payments", Enabled: true, PriorityClass: domain.PriorityCritical, VLLMPriority: -100, MaxConcurrency: 24, ModelPoolIDs: []int64{pool.ID}})
+	client, err := database.CreateClient(context.Background(), store.CreateClientParams{Name: "payments", Enabled: true, PriorityClass: domain.PriorityCritical, VLLMPriority: -100, MaxConcurrency: 24, RequestsPerMinute: 600, TokensPerMinute: 60000, ModelPoolIDs: []int64{pool.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -766,6 +815,23 @@ func newWebFixtureWithQueryStore(t *testing.T, records []analytics.RequestRecord
 	_, err = database.CreateBackend(context.Background(), store.CreateBackendParams{ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://127.0.0.1:9001", Enabled: true, CapacityHint: 1, RunningSoftLimit: 16})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if poolLimit > domain.MaxPoolGatewayInflight {
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(`
+			DROP TRIGGER pools_max_inflight_update;
+			UPDATE model_pools SET max_gateway_inflight = ? WHERE id = ?;
+			CREATE TRIGGER pools_max_inflight_update
+			BEFORE UPDATE OF max_gateway_inflight ON model_pools
+			WHEN NEW.max_gateway_inflight > 100000 AND NEW.max_gateway_inflight <> OLD.max_gateway_inflight
+			BEGIN SELECT RAISE(ABORT, 'max gateway inflight exceeds 100000'); END;
+		`, poolLimit, pool.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	registryValue := registry.New(database)
 	if err := registryValue.Reload(context.Background()); err != nil {
@@ -1028,6 +1094,30 @@ func hasInput(node *html.Node, name, inputType, min, value string) bool {
 	}
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		if hasInput(child, name, inputType, min, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInputWithAttr(node *html.Node, inputName, attributeName, attributeValue string) bool {
+	if node.Type == html.ElementNode && node.Data == "input" && nodeAttr(node, "name") == inputName && nodeAttr(node, attributeName) == attributeValue {
+		return true
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if hasInputWithAttr(child, inputName, attributeName, attributeValue) {
+			return true
+		}
+	}
+	return false
+}
+
+func inputWithValueHasAttr(node *html.Node, inputName, value, attributeName, attributeValue string) bool {
+	if node.Type == html.ElementNode && node.Data == "input" && nodeAttr(node, "name") == inputName && nodeAttr(node, "value") == value && nodeAttr(node, attributeName) == attributeValue {
+		return true
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if inputWithValueHasAttr(child, inputName, value, attributeName, attributeValue) {
 			return true
 		}
 	}

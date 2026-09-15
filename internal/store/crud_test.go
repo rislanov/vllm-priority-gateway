@@ -82,7 +82,7 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	}
 	client, err := db.CreateClient(ctx, store.CreateClientParams{
 		Name: "old-client", Enabled: true, PriorityClass: domain.PriorityNormal,
-		MaxConcurrency: 1, ModelPoolIDs: []int64{firstPool.ID},
+		MaxConcurrency: 1, RequestsPerMinute: 60, TokensPerMinute: 6000, ModelPoolIDs: []int64{firstPool.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,13 +102,16 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 
 	updatedClient, err := db.UpdateClient(ctx, client.ID, store.UpdateClientParams{
 		Name: "new-client", Enabled: false, PriorityClass: domain.PriorityHigh,
-		VLLMPriority: -10, MaxConcurrency: 5, ModelPoolIDs: []int64{secondPool.ID},
+		VLLMPriority: -10, MaxConcurrency: 5, RequestsPerMinute: 120, TokensPerMinute: 12000, ModelPoolIDs: []int64{secondPool.ID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updatedClient.Name != "new-client" || updatedClient.Enabled || updatedClient.CreatedAt.IsZero() || !updatedClient.UpdatedAt.Equal(updatedClient.CreatedAt) && updatedClient.UpdatedAt.Before(updatedClient.CreatedAt) {
 		t.Fatalf("updated client = %+v", updatedClient)
+	}
+	if updatedClient.Revision != 2 || updatedClient.RequestsPerMinute != 120 || updatedClient.TokensPerMinute != 12000 {
+		t.Fatalf("updated client policy = %+v", updatedClient)
 	}
 	updatedPool, err := db.UpdatePool(ctx, firstPool.ID, store.UpdatePoolParams{
 		PublicModelName: "c-model", UpstreamModelName: "c-upstream", Enabled: false,
@@ -120,6 +123,9 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	if updatedPool.PublicModelName != "c-model" || updatedPool.Enabled || updatedPool.MaxGatewayInflight != 17 || updatedPool.MaxWaiting != 9 {
 		t.Fatalf("updated pool = %+v", updatedPool)
 	}
+	if updatedPool.Revision != 2 {
+		t.Fatalf("updated pool revision = %d, want 2", updatedPool.Revision)
+	}
 	updatedBackend, err := db.UpdateBackend(ctx, backend.ID, store.UpdateBackendParams{
 		ModelPoolID: secondPool.ID, Name: "new-backend", BaseURL: "https://gpu.internal/vllm/",
 		Enabled: false, Draining: true, CapacityHint: 2, RunningSoftLimit: 12,
@@ -130,6 +136,9 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	}
 	if updatedBackend.BaseURL != "https://gpu.internal/vllm" || updatedBackend.ModelPoolID != secondPool.ID || !updatedBackend.Draining {
 		t.Fatalf("updated backend = %+v", updatedBackend)
+	}
+	if updatedBackend.Revision != 2 {
+		t.Fatalf("updated backend revision = %d, want 2", updatedBackend.Revision)
 	}
 
 	clients, err := db.ListClients(ctx)

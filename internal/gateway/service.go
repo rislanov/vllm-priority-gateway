@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
@@ -24,6 +26,11 @@ const (
 
 type SnapshotProvider interface {
 	Snapshot() *registry.Snapshot
+}
+
+type SnapshotReloader interface {
+	SnapshotProvider
+	Reload(context.Context) error
 }
 
 type Runtime interface {
@@ -42,31 +49,45 @@ type UsageRecorder interface {
 }
 
 type Dependencies struct {
-	Registry   SnapshotProvider
-	HMACSecret []byte
-	Limiter    *admission.Limiter
-	Runtime    Runtime
-	Router     *routing.Router
-	Forwarder  Forwarder
-	Usage      UsageRecorder
-	Observer   Observer
-	Now        func() time.Time
-	LookupEnv  func(string) (string, bool)
-	RetryAfter time.Duration
+	Registry            SnapshotProvider
+	HMACSecret          []byte
+	Limiter             *admission.Limiter
+	Admission           coordination.AdmissionCoordinator
+	Leases              *coordination.LeaseManager
+	ReplicaID           uuid.UUID
+	LeaseTTL            time.Duration
+	Emergency           *coordination.EmergencyAdmission
+	CoordinationAllowed func() bool
+	CoordinationReady   func() bool
+	Runtime             Runtime
+	Router              *routing.Router
+	Forwarder           Forwarder
+	Usage               UsageRecorder
+	Observer            Observer
+	Now                 func() time.Time
+	LookupEnv           func(string) (string, bool)
+	RetryAfter          time.Duration
 }
 
 type Service struct {
-	registry   SnapshotProvider
-	hmacSecret []byte
-	limiter    *admission.Limiter
-	runtime    Runtime
-	router     *routing.Router
-	forwarder  Forwarder
-	usage      UsageRecorder
-	observer   Observer
-	now        func() time.Time
-	lookupEnv  func(string) (string, bool)
-	retryAfter time.Duration
+	registry            SnapshotProvider
+	hmacSecret          []byte
+	limiter             *admission.Limiter
+	admission           coordination.AdmissionCoordinator
+	leases              *coordination.LeaseManager
+	replicaID           uuid.UUID
+	leaseTTL            time.Duration
+	emergency           *coordination.EmergencyAdmission
+	coordinationAllowed func() bool
+	coordinationReady   func() bool
+	runtime             Runtime
+	router              *routing.Router
+	forwarder           Forwarder
+	usage               UsageRecorder
+	observer            Observer
+	now                 func() time.Time
+	lookupEnv           func(string) (string, bool)
+	retryAfter          time.Duration
 }
 
 func New(dependencies Dependencies) *Service {
@@ -86,9 +107,31 @@ func New(dependencies Dependencies) *Service {
 	if retryAfter <= 0 {
 		retryAfter = 2 * time.Second
 	}
+	replicaID := dependencies.ReplicaID
+	if replicaID == uuid.Nil {
+		replicaID = uuid.New()
+	}
+	leaseTTL := dependencies.LeaseTTL
+	if leaseTTL <= 0 {
+		leaseTTL = 90 * time.Second
+	}
+	coordinationAllowed := dependencies.CoordinationAllowed
+	if coordinationAllowed == nil {
+		coordinationAllowed = func() bool { return true }
+	}
+	coordinationReady := dependencies.CoordinationReady
+	if coordinationReady == nil {
+		coordinationReady = func() bool {
+			return dependencies.Admission == nil || dependencies.Admission.Status().Available
+		}
+	}
+	emergency := dependencies.Emergency
+	if emergency == nil {
+		emergency = coordination.NewEmergencyAdmission(0, 0)
+	}
 	return &Service{
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
-		limiter: limiter, runtime: dependencies.Runtime, router: dependencies.Router,
+		limiter: limiter, admission: dependencies.Admission, leases: dependencies.Leases, replicaID: replicaID, leaseTTL: leaseTTL, emergency: emergency, coordinationAllowed: coordinationAllowed, coordinationReady: coordinationReady, runtime: dependencies.Runtime, router: dependencies.Router,
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
 		now: now, lookupEnv: lookupEnv, retryAfter: retryAfter,
 	}
@@ -134,9 +177,30 @@ type LoadStatus struct {
 func (s *Service) InferenceReadiness() InferenceReadiness {
 	snapshot := s.registry.Snapshot()
 	readiness := InferenceReadiness{Status: "unavailable", Revision: snapshot.Revision}
+	if !s.coordinationAllowed() {
+		return readiness
+	}
+	degraded := s.admission != nil && !s.coordinationReady()
 	at := s.now().UTC()
 	for _, pool := range snapshot.PoolsByID {
 		if !pool.Enabled {
+			continue
+		}
+		policyAvailable := !degraded
+		if degraded {
+			for clientID, access := range snapshot.Access {
+				client, exists := snapshot.Clients[clientID]
+				if !exists || !client.Enabled || !access[pool.ID] {
+					continue
+				}
+				limit := admission.EffectiveLimit(client.PriorityClass, s.runtime.PoolSnapshot(pool.ID, at).State, client.MaxConcurrency)
+				if s.emergency.CanServe(client.PriorityClass, client.ID, limit) {
+					policyAvailable = true
+					break
+				}
+			}
+		}
+		if !policyAvailable {
 			continue
 		}
 		available := s.availableBackends(snapshot, pool.ID, at)
@@ -269,6 +333,13 @@ func (s *Service) acquirePool(ctx context.Context, clientID int64, original doma
 		}
 		if pool.MaxWaiting > 0 && runtime.TotalWaiting >= float64(pool.MaxWaiting) {
 			return runtime, nil, overloaded(s.retryAfter, DecisionPoolWaitingLimit)
+		}
+		if s.admission != nil {
+			after := s.registry.Snapshot()
+			if _, stillValid := currentAdmissionPool(after, clientID, original); !stillValid {
+				return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
+			}
+			return runtime, func() {}, nil
 		}
 		release, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
 		if !ok {
@@ -450,4 +521,26 @@ func gatewayUnavailable(retryAfter time.Duration) *APIError {
 
 func upstreamError() *APIError {
 	return &APIError{HTTPStatus: http.StatusBadGateway, Message: "The inference backend could not complete the request", Type: "server_error", Code: "upstream_error", DecisionReason: DecisionUpstreamFailure}
+}
+
+func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, retryAt *time.Time, now time.Time) *APIError {
+	if retryAt != nil {
+		if d := retryAt.Sub(now); d > 0 {
+			retryAfter = d
+		}
+	}
+	switch reason {
+	case coordination.ReasonRPMExhausted, coordination.ReasonTPMExhausted:
+		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Rate limit exceeded", Type: "rate_limit_exceeded", Code: string(reason), RetryAfter: retryAfter}
+	case coordination.ReasonConcurrencyExhausted:
+		return overloaded(retryAfter, DecisionPriorityConcurrencyLimit)
+	default:
+		return gatewayUnavailable(retryAfter)
+	}
+}
+
+func (s *Service) observeEmergency(class domain.PriorityClass, admitted bool) {
+	if observer, ok := s.observer.(CoordinationEmergencyObserver); ok {
+		observer.CoordinationEmergency(class, admitted)
+	}
 }

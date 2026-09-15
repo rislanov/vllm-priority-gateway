@@ -5,7 +5,7 @@
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Защищает высокоприоритетные inference-нагрузки в общих GPU-кластерах vLLM.**
 
@@ -65,7 +65,7 @@ production traffic ──► остаётся admitted
 
 Gateway **не** развёртывает модели, не планирует GPU и не заменяет Kubernetes, Slurm или существующие lifecycle-инструменты vLLM. Он решает, **кто получает общую inference capacity и на какой экземпляр vLLM направить запрос**.
 
-Для развёртывания нужны один статический Go-бинарник и каталог SQLite. Текущая версия намеренно рассчитана на один gateway и небольшой пул backend-серверов под управлением оператора.
+Для развёртывания нужны один статический Go-бинарник и выбранное хранилище: SQLite для одного gateway по умолчанию или PostgreSQL 16+ для нескольких реплик с общей координацией. См. [руководство PostgreSQL production](docs/postgresql-production.md).
 
 ## Инженерные особенности
 
@@ -166,8 +166,9 @@ POST /v1/responses
 | Endpoint | Назначение |
 |---|---|
 | `/healthz` | Liveness процесса |
-| `/readyz` | Готовность SQLite и registry |
+| `/readyz` | Готовность конфигурации, координации и аналитики |
 | `/inference-readyz` | Доступная inference capacity; HTTP `503`, если её нет |
+| `/coordination-readyz` | Строгая готовность PostgreSQL-координации |
 | `/v1/load?model=...` | Авторизованный сигнал нагрузки для конкретной модели |
 | `/metrics` | Prometheus telemetry |
 | `/admin` | Интерфейс оператора |
@@ -205,6 +206,7 @@ make test-race
 make vet
 make build
 make container-smoke  # нужен Docker
+LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 ```
 
 ## CI и релизы
@@ -215,9 +217,9 @@ Release workflow запускается вручную, проверяет вы�
 
 ## Текущие ограничения
 
-- Только один экземпляр gateway; admission leases и runtime state backend-серверов находятся в памяти процесса.
+- SQLite поддерживает один gateway; PostgreSQL 16+ поддерживает несколько реплик с общими durable admission leases и circuit state.
 - Статическая регистрация backend-серверов оператором; нет service discovery и autoscaling.
-- Нет распределённых rate limits, token budgets, billing и GPU/NVML scheduling.
+- PostgreSQL поддерживает распределённые RPM и soft-TPM лимиты. Billing и GPU/NVML scheduling остаются за рамками текущей версии.
 - Priority admission отклоняет новую низкоприоритетную работу, но не прерывает уже допущенную генерацию.
 - Мягкая session affinity улучшает locality, не анализируя KV blocks и содержимое prefix.
 - Для управления используется Basic auth. TLS, OIDC/RBAC, audit trail и secret manager должны предоставляться окружением.
@@ -249,4 +251,6 @@ make build-e2e-linux-amd64
 
 ## Лицензия
 
-[The Unlicense](LICENSE).
+Проект распространяется под [лицензией Apache, версия 2.0](LICENSE) (SPDX: `Apache-2.0`).
+
+Профиль PostgreSQL 16+ поддерживает несколько реплик gateway с общими leases, RPM/soft-TPM, circuit generations и probe permits. SQLite остаётся профилем по умолчанию для одного экземпляра. См. [руководство PostgreSQL production](docs/postgresql-production.md).

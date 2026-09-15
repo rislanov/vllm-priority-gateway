@@ -8,7 +8,7 @@
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="update_pool"><input type="hidden" name="id" value="{{$pool.ID}}">
   <div><label for="edit-public-model">Public model name</label><input id="edit-public-model" name="public_model_name" value="{{$pool.PublicModelName}}" required></div>
   <div><label for="edit-upstream-model">Upstream model name</label><input id="edit-upstream-model" name="upstream_model_name" value="{{$pool.UpstreamModelName}}" required></div>
-  <div><label for="edit-max-gateway-inflight">Max gateway inflight</label><input id="edit-max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" step="1" value="{{$pool.MaxGatewayInflight}}" required></div>
+  <div><label for="edit-max-gateway-inflight">Max gateway inflight</label>{{if gt $pool.MaxGatewayInflight 100000}}<p class="warning">Legacy value exceeds 100,000; leave unchanged or lower it.</p>{{end}}<input id="edit-max-gateway-inflight" name="max_gateway_inflight" type="number" min="0"{{if le $pool.MaxGatewayInflight 100000}} max="100000"{{end}} step="1" value="{{$pool.MaxGatewayInflight}}" required></div>
   <div><label for="edit-max-waiting">Max waiting</label><input id="edit-max-waiting" name="max_waiting" type="number" min="0" step="1" value="{{$pool.MaxWaiting}}" required></div>
   <label class="check" for="edit-pool-enabled"><input id="edit-pool-enabled" name="enabled" type="checkbox"{{if $pool.Enabled}} checked{{end}}>Enabled</label>
   <div class="form-actions"><a class="button secondary" href="/admin/backends">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
@@ -39,7 +39,7 @@
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create_pool">
   <div><label for="public-model">Public model name</label><input id="public-model" name="public_model_name" required></div>
   <div><label for="upstream-model">Upstream model name</label><input id="upstream-model" name="upstream_model_name" required></div>
-  <div><label for="max-gateway-inflight">Max gateway inflight</label><input id="max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" step="1" value="0" required></div>
+  <div><label for="max-gateway-inflight">Max gateway inflight</label><input id="max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" max="100000" step="1" value="0" required></div>
   <div><label for="max-waiting">Max waiting</label><input id="max-waiting" name="max_waiting" type="number" min="0" step="1" value="0" required></div>
   <label class="check" for="pool-enabled"><input id="pool-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create pool</button></div>

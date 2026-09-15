@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/pressure"
 )
@@ -19,20 +21,30 @@ import (
 const maxMetricsPayloadBytes int64 = 4 << 20
 
 type Options struct {
-	HTTPClient         *http.Client
-	HealthInterval     time.Duration
-	HealthTimeout      time.Duration
-	MetricsInterval    time.Duration
-	MetricsTimeout     time.Duration
-	StaleAfter         time.Duration
-	UnhealthyAfter     int
-	RecoveryAfter      int
-	Circuit            circuitbreaker.Options
-	Limits             pressure.Limits
-	EWMAWindow         time.Duration
-	BusyThreshold      float64
-	SaturatedThreshold float64
-	PoolThresholds     pressure.Thresholds
+	HTTPClient             *http.Client
+	HealthInterval         time.Duration
+	HealthTimeout          time.Duration
+	MetricsInterval        time.Duration
+	MetricsTimeout         time.Duration
+	StaleAfter             time.Duration
+	UnhealthyAfter         int
+	RecoveryAfter          int
+	Circuit                circuitbreaker.Options
+	CircuitCoordinator     coordination.CircuitCoordinator
+	AdmissionRuntime       coordination.AdmissionRuntime
+	CoordinationReady      func() bool
+	RecoveryStatus         func() coordination.RecoveryStatus
+	CircuitFailureBuffered func()
+	Observer               coordination.LeaseManagerObserver
+	ReplicaID              uuid.UUID
+	ProbeTTL               time.Duration
+	ProbeRenewInterval     time.Duration
+	ProbeRenewTicks        <-chan time.Time
+	Limits                 pressure.Limits
+	EWMAWindow             time.Duration
+	BusyThreshold          float64
+	SaturatedThreshold     float64
+	PoolThresholds         pressure.Thresholds
 }
 
 func (o Options) validate() error {
@@ -42,8 +54,12 @@ func (o Options) validate() error {
 	if o.UnhealthyAfter <= 0 || o.RecoveryAfter <= 0 {
 		return errors.New("monitor transition counts must be positive")
 	}
-	if _, err := circuitbreaker.New(o.Circuit); err != nil {
-		return fmt.Errorf("circuit breaker options: %w", err)
+	if o.CircuitCoordinator == nil {
+		if _, err := circuitbreaker.New(o.Circuit); err != nil {
+			return fmt.Errorf("circuit breaker options: %w", err)
+		}
+	} else if o.ProbeTTL <= 0 || o.ReplicaID == uuid.Nil {
+		return errors.New("distributed circuit requires a positive probe TTL and replica ID")
 	}
 	if err := o.Limits.Validate(); err != nil {
 		return err
@@ -186,7 +202,13 @@ func (w *Worker) Snapshot(at time.Time) domain.BackendRuntime {
 	snapshot := w.runtime
 	w.mu.Unlock()
 	age := at.Sub(snapshot.LastMetricsAt)
-	snapshot.MetricsFresh = !snapshot.LastMetricsAt.IsZero() && age >= 0 && age <= w.options.StaleAfter
+	// Health, metrics, and pool observers use independent tickers. A metrics
+	// sample can therefore be stamped just after the pool observer's tick even
+	// though it is the newest sample available to that observer.
+	if age < 0 {
+		age = 0
+	}
+	snapshot.MetricsFresh = !snapshot.LastMetricsAt.IsZero() && age <= w.options.StaleAfter
 	snapshot.State = w.state(snapshot)
 	return snapshot
 }

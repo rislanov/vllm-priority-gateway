@@ -12,7 +12,9 @@ import (
 )
 
 func TestPerformanceSmoke(t *testing.T) {
-	h := newHarness(t)
+	// Use the application's bounded asynchronous key-activity recorder. The
+	// CRUD harness writes synchronously so its assertions can inspect storage.
+	h := newHarness(t, harnessOptions{AsyncKeyUsage: true})
 	poolID := h.createPool("qwen")
 	_, backendID := h.addFake(poolID, "gpu-a", fakevllm.State{})
 	h.waitBackend(backendID, eligible)

@@ -5,9 +5,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 )
@@ -43,9 +46,32 @@ type Metrics struct {
 	cacheReadTokens        *prometheus.CounterVec
 	usageParseFails        *prometheus.CounterVec
 	usagePersistFail       prometheus.Counter
+	coordinationOperations *prometheus.CounterVec
+	coordinationDecisions  *prometheus.CounterVec
+	coordinationLatency    *prometheus.HistogramVec
+	postgresPool           *prometheus.GaugeVec
+	postgresPoolFailures   *prometheus.CounterVec
+	configReconnects       prometheus.Counter
+	configPollAge          prometheus.GaugeFunc
+	lastConfigPoll         atomic.Int64
+	activeLeases           prometheus.Gauge
+	localLeaseHandles      prometheus.Gauge
+	renewFailures          prometheus.Counter
+	lostLeases             prometheus.Counter
+	pendingCompletions     prometheus.Gauge
+	droppedCompletions     prometheus.Counter
+	emergency              *prometheus.CounterVec
+	rateRejections         *prometheus.CounterVec
+	missingUsage           prometheus.Counter
+	circuitCacheAge        prometheus.Gauge
+	circuitRefreshFailures prometheus.Counter
+	circuitReplayBacklog   prometheus.Gauge
+	circuitReplayDropped   *prometheus.CounterVec
+	compatibleReplicas     prometheus.Gauge
 	runtimeMu              sync.Mutex
 	runtimeTopologyKnown   bool
 	knownPoolLabels        map[string]struct{}
+	postgresPoolCanceled   map[string]int64
 	knownBackendLabels     map[backendMetricLabels]struct{}
 	knownRequestLabels     map[requestMetricLabels]struct{}
 	knownClientLabels      map[clientMetricLabels]struct{}
@@ -104,6 +130,7 @@ func NewMetrics() *Metrics {
 	m := &Metrics{
 		registry:              prometheus.NewRegistry(),
 		knownPoolLabels:       make(map[string]struct{}),
+		postgresPoolCanceled:  make(map[string]int64),
 		knownBackendLabels:    make(map[backendMetricLabels]struct{}),
 		knownRequestLabels:    make(map[requestMetricLabels]struct{}),
 		knownClientLabels:     make(map[clientMetricLabels]struct{}),
@@ -142,14 +169,130 @@ func NewMetrics() *Metrics {
 	m.cacheReadTokens = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_cache_read_tokens_total", Help: "Cache-read tokens reported by upstream inference responses."}, []string{"client", "model"})
 	m.usageParseFails = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_usage_parse_failures_total", Help: "Upstream usage metadata parse failures."}, []string{"format"})
 	m.usagePersistFail = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_usage_persistence_failures_total", Help: "Usage records that failed to persist."})
+	m.coordinationOperations = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_operations_total", Help: "Bounded coordination operation outcomes."}, []string{"backend", "operation", "outcome"})
+	m.coordinationDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_decisions_total", Help: "Typed coordination decisions by bounded reason."}, []string{"backend", "reason"})
+	m.coordinationLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "llmgw_coordination_operation_duration_seconds", Help: "Coordination operation latency.", Buckets: prometheus.DefBuckets}, []string{"backend", "operation", "outcome"})
+	m.postgresPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "llmgw_postgres_pool_connections", Help: "PostgreSQL connections by workload and state."}, []string{"workload", "state"})
+	m.postgresPoolFailures = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_postgres_pool_acquisition_failures_total", Help: "Canceled or timed-out PostgreSQL pool acquisitions."}, []string{"workload"})
+	m.configReconnects = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_config_notification_reconnects_total", Help: "Configuration LISTEN reconnects."})
+	m.configPollAge = prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "llmgw_config_revision_poll_age_seconds", Help: "Age of the last successful configuration revision poll."}, func() float64 {
+		last := m.lastConfigPoll.Load()
+		if last == 0 {
+			return 0
+		}
+		return time.Since(time.Unix(0, last)).Seconds()
+	})
+	m.activeLeases = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_active_leases", Help: "Active distributed admission leases."})
+	m.localLeaseHandles = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_local_lease_handles", Help: "Locally tracked admission lease handles."})
+	m.renewFailures = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_renew_failures_total", Help: "Admission or probe renewal failures."})
+	m.lostLeases = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_lost_leases_total", Help: "Leases reported lost during renewal or completion."})
+	m.pendingCompletions = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_pending_completions", Help: "Locally queued durable completions."})
+	m.droppedCompletions = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_dropped_completions_total", Help: "Admission completions dropped because the local durable-completion backlog was full."})
+	m.emergency = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_emergency_total", Help: "Emergency admission decisions."}, []string{"priority_class", "outcome"})
+	m.rateRejections = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_rate_rejections_total", Help: "Distributed rate-limit rejections."}, []string{"kind"})
+	m.missingUsage = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_missing_usage_total", Help: "Completed requests without token usage for soft TPM accounting."})
+	m.circuitCacheAge = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_circuit_cache_age_seconds", Help: "Age of the last successful distributed circuit refresh."})
+	m.circuitRefreshFailures = prometheus.NewCounter(prometheus.CounterOpts{Name: "llmgw_coordination_circuit_refresh_failures_total", Help: "Distributed circuit refresh failures."})
+	m.circuitReplayBacklog = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_circuit_replay_backlog", Help: "Buffered circuit failures awaiting replay."})
+	m.circuitReplayDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "llmgw_coordination_circuit_replay_dropped_total", Help: "Circuit replay events dropped because they expired or overflowed the bounded backlog."}, []string{"reason"})
+	m.compatibleReplicas = prometheus.NewGauge(prometheus.GaugeOpts{Name: "llmgw_coordination_compatible_replicas", Help: "Active compatible PostgreSQL gateway replicas."})
 	m.registry.MustRegister(
 		m.requests, m.requestsInflight, m.rejected, m.clientInflight, m.backendInflight, m.backendSelected,
 		m.backendPressure, m.backendRunning, m.backendWaiting, m.backendKV, m.duration,
 		m.backendCircuitState, m.backendCircuitFailures, m.poolGatewayInflight, m.poolWaiting,
 		m.poolAvailableBackends, m.poolPressure, m.poolState, m.queueWait, m.ttft, m.disconnects, m.backendFailures, m.retries,
 		m.inputTokens, m.outputTokens, m.cacheReadTokens, m.usageParseFails, m.usagePersistFail,
+		m.coordinationOperations, m.coordinationDecisions, m.coordinationLatency, m.postgresPool, m.postgresPoolFailures, m.configReconnects, m.configPollAge,
+		m.activeLeases, m.localLeaseHandles, m.renewFailures, m.lostLeases, m.pendingCompletions, m.droppedCompletions,
+		m.emergency, m.rateRejections, m.missingUsage, m.circuitCacheAge, m.circuitRefreshFailures,
+		m.circuitReplayBacklog, m.circuitReplayDropped, m.compatibleReplicas,
 	)
 	return m
+}
+
+func (m *Metrics) ObserveCoordination(backend, operation, outcome string, duration time.Duration) {
+	backend = bounded(backend, "local", "postgres")
+	operation = bounded(operation, "acquire", "renew", "complete", "refresh", "reconcile", "heartbeat")
+	outcome = bounded(outcome, "success", "rejected", "timeout", "unavailable", "stale", "conflict")
+	m.coordinationOperations.WithLabelValues(backend, operation, outcome).Inc()
+	m.coordinationLatency.WithLabelValues(backend, operation, outcome).Observe(duration.Seconds())
+}
+
+// CoordinationOperation implements coordination.OperationObserver.
+func (m *Metrics) CoordinationOperation(backend, operation, outcome string, duration time.Duration, reason coordination.Reason) {
+	m.ObserveCoordination(backend, operation, outcome, duration)
+	if reason != "" {
+		m.coordinationDecisions.WithLabelValues(bounded(backend, "local", "postgres"), bounded(string(reason),
+			"concurrency_exhausted", "rpm_exhausted", "tpm_exhausted", "stale_configuration", "stale_backend",
+			"circuit_open", "probe_capacity_exhausted", "coordination_unavailable", "lease_lost", "stale_operation", "idempotency_conflict",
+		)).Inc()
+	}
+	switch reason {
+	case coordination.ReasonRPMExhausted:
+		m.CoordinationRateRejected("rpm")
+	case coordination.ReasonTPMExhausted:
+		m.CoordinationRateRejected("tpm")
+	}
+}
+
+func (m *Metrics) SetPostgresPool(workload string, acquired, idle, total int32, canceled int64) {
+	workload = bounded(workload, "configuration", "analytics", "coordination")
+	m.postgresPool.WithLabelValues(workload, "acquired").Set(float64(acquired))
+	m.postgresPool.WithLabelValues(workload, "idle").Set(float64(idle))
+	m.postgresPool.WithLabelValues(workload, "total").Set(float64(total))
+	m.runtimeMu.Lock()
+	previous := m.postgresPoolCanceled[workload]
+	if canceled > previous {
+		m.postgresPoolFailures.WithLabelValues(workload).Add(float64(canceled - previous))
+	}
+	m.postgresPoolCanceled[workload] = canceled
+	m.runtimeMu.Unlock()
+}
+
+type CoordinationGauges struct {
+	ActiveLeases, LocalLeaseHandles, PendingCompletions, CircuitReplayBacklog, CompatibleReplicas int
+	CircuitCacheAge                                                                               time.Duration
+}
+
+func (m *Metrics) SetCoordinationGauges(v CoordinationGauges) {
+	m.activeLeases.Set(float64(v.ActiveLeases))
+	m.localLeaseHandles.Set(float64(v.LocalLeaseHandles))
+	m.pendingCompletions.Set(float64(v.PendingCompletions))
+	m.circuitReplayBacklog.Set(float64(v.CircuitReplayBacklog))
+	m.compatibleReplicas.Set(float64(v.CompatibleReplicas))
+	m.circuitCacheAge.Set(v.CircuitCacheAge.Seconds())
+}
+
+func (m *Metrics) CoordinationEmergency(class domain.PriorityClass, admitted bool) {
+	outcome := "rejected"
+	if admitted {
+		outcome = "admitted"
+	}
+	m.emergency.WithLabelValues(bounded(string(class), "critical", "high", "normal", "background"), outcome).Inc()
+}
+func (m *Metrics) CoordinationRateRejected(kind string) {
+	m.rateRejections.WithLabelValues(bounded(kind, "rpm", "tpm")).Inc()
+}
+func (m *Metrics) CoordinationRenewFailure()      { m.renewFailures.Inc() }
+func (m *Metrics) CoordinationLeaseLost()         { m.lostLeases.Inc() }
+func (m *Metrics) CoordinationCompletionDropped() { m.droppedCompletions.Inc() }
+func (m *Metrics) CoordinationMissingUsage()      { m.missingUsage.Inc() }
+func (m *Metrics) ConfigNotificationReconnect()   { m.configReconnects.Inc() }
+func (m *Metrics) ConfigPollSuccess(at time.Time) { m.lastConfigPoll.Store(at.UnixNano()) }
+func (m *Metrics) CircuitRefreshFailure()         { m.circuitRefreshFailures.Inc() }
+func (m *Metrics) CoordinationCircuitReplayDropped(reason string, count int) {
+	if count > 0 {
+		m.circuitReplayDropped.WithLabelValues(bounded(reason, "expired", "overflow")).Add(float64(count))
+	}
+}
+
+func bounded(value string, allowed ...string) string {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value
+		}
+	}
+	return "unknown"
 }
 
 func (m *Metrics) Handler() http.Handler {
@@ -214,6 +357,9 @@ func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
 }
 
 func (m *Metrics) Complete(event gateway.RequestEvent) {
+	if event.SoftTPMExpected && event.Usage == nil {
+		m.CoordinationMissingUsage()
+	}
 	client, model := value(event.Client), value(event.Model)
 	priority, status := value(string(event.PriorityClass)), statusClass(event.Status)
 	backend := value(event.Backend)

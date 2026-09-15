@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/observability"
@@ -60,6 +61,19 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 	})
 	metrics.UsagePersistenceFailure()
 	metrics.UsagePersistenceFailure()
+	metrics.ObserveCoordination("postgres", "acquire", "success", time.Millisecond)
+	metrics.CoordinationOperation("postgres", "acquire", "stale", time.Millisecond, coordination.ReasonStaleConfiguration)
+	metrics.SetPostgresPool("coordination", 1, 2, 3, 1)
+	metrics.SetCoordinationGauges(observability.CoordinationGauges{ActiveLeases: 2, LocalLeaseHandles: 1, PendingCompletions: 3, CircuitReplayBacklog: 4, CompatibleReplicas: 2})
+	metrics.CoordinationEmergency(domain.PriorityCritical, true)
+	metrics.CoordinationRateRejected("rpm")
+	metrics.CoordinationMissingUsage()
+	metrics.ConfigNotificationReconnect()
+	metrics.ConfigPollSuccess(time.Now())
+	metrics.CoordinationRenewFailure()
+	metrics.CoordinationLeaseLost()
+	metrics.CircuitRefreshFailure()
+	metrics.CoordinationCircuitReplayDropped("expired", 1)
 	metrics.SetBackend("qwen", "gpu-1", domain.BackendRuntime{
 		Pressure: .4, Running: 3, Waiting: 1, KVCacheUsage: .7,
 		CircuitState: domain.CircuitClosed, CircuitFailures: 4,
@@ -87,7 +101,21 @@ func TestMetricsExposeRequiredFamiliesWithoutHighCardinalityLabels(t *testing.T)
 		"llmgw_request_duration_seconds", "llmgw_ttft_seconds", "llmgw_stream_disconnects_total",
 		"llmgw_backend_failures_total", "llmgw_retries_total", "llmgw_backend_circuit_state",
 		"llmgw_backend_circuit_failures", "llmgw_pool_gateway_inflight",
-		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends", "llmgw_pool_pressure",
+		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends",
+		"llmgw_coordination_operations_total", "llmgw_coordination_operation_duration_seconds",
+		"llmgw_coordination_decisions_total",
+		"llmgw_postgres_pool_connections", "llmgw_coordination_active_leases",
+		"llmgw_postgres_pool_acquisition_failures_total",
+		"llmgw_coordination_local_lease_handles", "llmgw_coordination_pending_completions",
+		"llmgw_coordination_dropped_completions_total",
+		"llmgw_coordination_emergency_total", "llmgw_coordination_rate_rejections_total",
+		"llmgw_coordination_missing_usage_total", "llmgw_coordination_circuit_replay_backlog",
+		"llmgw_coordination_circuit_replay_dropped_total",
+		"llmgw_coordination_compatible_replicas", "llmgw_config_notification_reconnects_total",
+		"llmgw_config_revision_poll_age_seconds", "llmgw_coordination_renew_failures_total",
+		"llmgw_coordination_lost_leases_total", "llmgw_coordination_circuit_cache_age_seconds",
+		"llmgw_coordination_circuit_refresh_failures_total",
+		"llmgw_pool_pressure",
 		"llmgw_pool_state", "llmgw_backend_selected_total", "llmgw_queue_wait_seconds",
 	} {
 		if !strings.Contains(text, family) {

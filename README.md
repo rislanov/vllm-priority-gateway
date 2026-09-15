@@ -5,7 +5,7 @@
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Protect high-priority inference workloads on shared vLLM GPU clusters.**
 
@@ -66,12 +66,13 @@ production traffic ──► remains admitted
 
 The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Slurm, or existing vLLM lifecycle tooling. It controls **who receives shared inference capacity and which vLLM instance receives each request**.
 
-The deployment footprint is one static Go binary and one SQLite state directory. The current release intentionally targets one gateway replica and a small operator-managed backend pool.
+The deployment footprint is one static Go binary and an explicitly selected persistence profile: SQLite for one replica (the default), or PostgreSQL 16+ for coordinated multi-replica production. See the [PostgreSQL production profile](docs/postgresql-production.md).
 
 ## Engineering highlights
 
 - Server-side priority: inbound priority headers and JSON fields are removed and replaced with stored client policy.
-- Explicit model ACLs and per-client concurrency limits.
+- Explicit model ACLs and per-client concurrency, RPM and soft-TPM limits.
+- PostgreSQL production coordination shares leases, rate accounting, circuit generations and probe permits across replicas.
 - Independent backend health and metrics polling with EWMA pressure and hysteretic pool states.
 - Least-pressure routing, soft session affinity, backend drain, and one conservative pre-first-byte retry.
 - Pool-wide inflight/waiting safety limits and per-backend circuit breakers.
@@ -167,8 +168,9 @@ Session headers from OpenCode, Pi (PiCode), Codex, and Claude Code are also reco
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | Process liveness |
-| `/readyz` | SQLite and registry readiness |
+| `/readyz` | Configuration, coordination and analytics readiness |
 | `/inference-readyz` | Usable inference capacity; HTTP `503` when unavailable |
+| `/coordination-readyz` | Strict PostgreSQL coordination readiness |
 | `/v1/load?model=...` | Authenticated, model-specific client load signal |
 | `/metrics` | Prometheus telemetry |
 | `/admin` | Operator UI |
@@ -206,6 +208,7 @@ make test-race
 make vet
 make build
 make container-smoke  # requires Docker
+LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 ```
 
 ## CI and releases
@@ -216,9 +219,9 @@ Releases are manual. The Release workflow validates the selected stable SemVer t
 
 ## Current scope and limitations
 
-- Exactly one gateway replica; admission leases and backend runtime state are process-local.
+- SQLite supports one gateway replica; PostgreSQL 16+ supports coordinated replicas with durable admission and circuit state.
 - Static operator-managed backend registration; no service discovery or autoscaling.
-- No distributed rate limits, token budgets, billing, or GPU/NVML scheduling.
+- PostgreSQL provides distributed RPM and soft TPM limits. Billing and GPU/NVML scheduling are outside the current scope.
 - Priority admission rejects new lower-priority work but does not preempt an admitted generation.
 - Soft session affinity improves locality without inspecting KV blocks or prefix contents.
 - Basic auth is the current management credential. TLS, OIDC/RBAC, audit trails, and a secret manager are external responsibilities.
@@ -250,4 +253,4 @@ make build-e2e-linux-amd64
 
 ## License
 
-[The Unlicense](LICENSE).
+This project is licensed under the [Apache License, Version 2.0](LICENSE) (SPDX: `Apache-2.0`).

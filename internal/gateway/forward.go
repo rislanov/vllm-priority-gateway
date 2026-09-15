@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
@@ -300,12 +299,11 @@ func (s *Service) Forward(
 		return proxy.Result{}, reservation, poolErr
 	}
 	defer releasePool()
-	limit := admission.EffectiveLimit(resolved.client.PriorityClass, poolRuntime.State, resolved.client.MaxConcurrency)
-	lease, ok := s.limiter.Acquire(resolved.client.ID, limit)
-	if !ok {
-		return proxy.Result{}, reservation, overloaded(s.retryAfter, DecisionPriorityConcurrencyLimit)
+	releaseAdmission, admissionErr := s.acquireForwardAdmission(ctx, request, &resolved, &lifecycle, poolRuntime)
+	if admissionErr != nil {
+		return proxy.Result{}, reservation, admissionErr
 	}
-	defer lease.Release()
+	defer func() { releaseAdmission(coordinationTokenUsage(result.Usage)) }()
 	inflight := InflightEvent{
 		Client: resolved.client.Name, Model: resolved.publicModel, PriorityClass: resolved.client.PriorityClass,
 	}

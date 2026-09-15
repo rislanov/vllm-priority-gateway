@@ -1109,6 +1109,49 @@ func (h *remoteHarness) waitForPool(predicate func(adminPool) bool, timeout time
 	return adminPool{}
 }
 
+func (h *remoteHarness) waitForIdleBackends(ctx context.Context, poolID int64, minimum int) error {
+	// A completed baseline can leave a sampled request in metrics and EWMA.
+	// Pool pressure is the minimum, so a normal pool alone cannot establish
+	// equal idle starting conditions for a finite saturation burst.
+	const idlePressureLimit = .001
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var last adminStatus
+	for {
+		var err error
+		last, err = h.fetchAdminStatus(ctx)
+		if err != nil {
+			return err
+		}
+		poolIdle := false
+		for _, pool := range last.Pools {
+			if pool.ID == poolID {
+				poolIdle = pool.Runtime.GatewayInflight == 0 && pool.Runtime.TotalWaiting == 0
+			}
+		}
+		available, busy := 0, false
+		for _, backend := range last.Backends {
+			if backend.ModelPoolID != poolID || !backend.Enabled || backend.Draining ||
+				!backend.Runtime.Healthy || !backend.Runtime.MetricsFresh || !backend.Runtime.CircuitAvailable {
+				continue
+			}
+			available++
+			if backend.Runtime.Running > 0 || backend.Runtime.Waiting > 0 ||
+				backend.Runtime.GatewayInflight > 0 || backend.Runtime.Pressure > idlePressureLimit {
+				busy = true
+			}
+		}
+		if poolIdle && available >= minimum && !busy {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for idle backends: %w; last=%+v", ctx.Err(), last.Backends)
+		case <-ticker.C:
+		}
+	}
+}
+
 func (h *remoteHarness) waitForBackend(id int64, predicate func(adminBackend) bool, timeout time.Duration) adminBackend {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)

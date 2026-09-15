@@ -1,7 +1,7 @@
 GO ?= go
 DIST ?= dist
 
-.PHONY: test test-race test-real-vllm vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean
+.PHONY: test test-race test-real-vllm test-postgres test-postgres-docker test-postgres-pooler vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean
 
 test:
 	$(GO) test ./...
@@ -12,6 +12,20 @@ test-race:
 test-real-vllm:
 	@case "$(LLMGW_E2E_MODE)" in smoke|priority|resilience) ;; *) printf '%s\n' 'LLMGW_E2E_MODE must be smoke, priority, or resilience' >&2; exit 2 ;; esac
 	$(GO) test -count=1 -v -timeout 10m ./tests/e2e
+
+test-postgres:
+	@test -n "$(LLMGW_POSTGRES_TEST_DSN)" || { printf '%s\n' 'LLMGW_POSTGRES_TEST_DSN is required' >&2; exit 2; }
+	$(GO) test -count=1 -v -timeout 1m ./internal/coordination/postgres
+	$(GO) test -count=1 -v -timeout 1m ./cmd/gateway -run 'Test(TransientCoordinationFailureLatchesRecovery|CircuitRefreshResultTimeoutLatchesRecovery)'
+	$(GO) test -count=1 -v -timeout 10m ./tests/postgres
+
+test-postgres-docker:
+	./scripts/test-postgres-docker.sh
+
+test-postgres-pooler:
+	@test -n "$(LLMGW_POSTGRES_TEST_DSN)" || { printf '%s\n' 'LLMGW_POSTGRES_TEST_DSN is required' >&2; exit 2; }
+	@test -n "$(LLMGW_POSTGRES_POOLER_TEST_DSN)" || { printf '%s\n' 'LLMGW_POSTGRES_POOLER_TEST_DSN is required' >&2; exit 2; }
+	$(GO) test -count=1 -v -timeout 10m ./tests/postgres -run 'TestPostgresTransactionPooler'
 
 vet:
 	$(GO) vet ./...

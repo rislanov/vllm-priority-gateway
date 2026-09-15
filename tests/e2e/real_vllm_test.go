@@ -100,6 +100,12 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 		Key: cfg.highKey, Prompt: "High-priority latency baseline.", MaxTokens: 4, Stream: true,
 	})
 	baselineHigh.requireCompleteStream(t)
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), cfg.saturationTimeout)
+	err = h.waitForIdleBackends(idleCtx, originalPool.ID, cfg.expectedBackends)
+	cancelIdle()
+	if err != nil {
+		t.Fatalf("wait for idle backends after priority baseline: %v", err)
+	}
 	beforeMetrics := h.metrics()
 
 	loadCtx, cancelLoad := context.WithCancel(context.Background())
@@ -333,6 +339,11 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 	probe.requireCompleteStream(t)
 	closed := h.waitForBackend(target.ID, func(backend adminBackend) bool {
 		return backend.Runtime.CircuitState == "closed" && backend.Runtime.CircuitAvailable && backend.Runtime.CircuitFailures == 0
+	}, cfg.recoveryTimeout)
+	// Circuit availability and the observation-based pool projection publish
+	// independently. Recovery must include both within the existing deadline.
+	h.waitForPool(func(pool adminPool) bool {
+		return pool.Runtime.AvailableBackends >= 1 && pool.Runtime.State != "unavailable"
 	}, cfg.recoveryTimeout)
 	recovered, recoveredStatus := h.inferenceReadiness()
 	if recoveredStatus != http.StatusOK || recovered.Status != "ready" || recovered.PoolAvailability < 1 || recovered.BackendAvailability < 1 {

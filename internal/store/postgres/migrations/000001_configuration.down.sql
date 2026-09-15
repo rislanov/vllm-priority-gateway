@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS backends; DROP TABLE IF EXISTS client_model_access; DROP TABLE IF EXISTS api_keys; DROP TABLE IF EXISTS model_pools; DROP TABLE IF EXISTS clients; DROP TABLE IF EXISTS config_meta;

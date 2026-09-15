@@ -4,15 +4,16 @@ This guide contains the detailed deployment and post-deployment procedures for v
 
 ## Supported topology
 
-The current release is a single-replica service:
+The current release supports a single-replica SQLite profile and a multi-replica PostgreSQL profile:
 
 ```text
-client network -> TLS reverse proxy -> one gateway process -> private vLLM endpoints
+client network -> TLS reverse proxy -> gateway replica(s) -> private vLLM endpoints
                                          |
-                                         +-> local SQLite state directory
+                                         +-> SQLite state directory (one replica)
+                                         +-> PostgreSQL 16+ (multiple replicas)
 ```
 
-Run exactly one gateway process against one SQLite state directory. Admission leases, circuit state, backend pressure, and in-flight counters are process-local and are not coordinated between replicas.
+Run exactly one gateway process against one SQLite state directory. For multiple replicas, select the PostgreSQL profile described below. Backend pressure and upstream inflight remain local in both profiles; admission and circuit state are coordinated only in PostgreSQL mode.
 
 The reverse proxy must:
 
@@ -22,7 +23,7 @@ The reverse proxy must:
 - propagate client disconnects;
 - never retry inference `POST` requests;
 - expose `/v1/*` to client networks;
-- restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, and `/inference-readyz` to operator, monitoring, and load-balancer networks.
+- restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, `/inference-readyz`, and `/coordination-readyz` to operator, monitoring, and load-balancer networks.
 
 ## Docker deployment
 
@@ -257,3 +258,7 @@ sudo systemctl start llmgw
 For Docker, stop the container before snapshotting or restoring the complete `llmgw-data` volume, then restart it and repeat the post-deployment verification.
 
 Escrow the exact `LLMGW_API_KEY_HMAC_SECRET` with the state backup. The current release has no dual-secret migration path; rotating this secret requires regenerating and redistributing every client key. Test restores in an isolated instance before relying on a backup.
+
+## Multi-replica PostgreSQL deployment
+
+Use the `postgres` profile for two or more gateway replicas. PostgreSQL 16+, separate direct migration and runtime-pooler URLs, least-privilege roles, TLS verification, synchronous durability/failover fencing, rollout order, backup/restore, and acknowledged-data-loss disaster recovery are specified in [PostgreSQL production profile](postgresql-production.md). Do not mix a SQLite configuration store with PostgreSQL coordination. Start one replica, configure and validate it, then add only replicas with the same coordination fingerprint. Gate rollout on `/coordination-readyz` and client traffic on `/inference-readyz`.
