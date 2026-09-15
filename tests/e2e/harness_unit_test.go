@@ -61,6 +61,70 @@ func TestFetchMetricsHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestWaitForIdleBackendsWaitsForEveryAvailableBackend(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests++
+		step := requests
+		mu.Unlock()
+		// The pool minimum stays zero throughout, even when the other backend
+		// has baseline pressure, stale metrics or an unfinished request.
+		status := adminStatus{
+			Pools: []adminPool{{ID: 1, Runtime: poolRuntime{State: "normal", AvailableBackends: 2}}},
+			Backends: []adminBackend{
+				{ID: 1, ModelPoolID: 1, Enabled: true, Runtime: backendRuntime{Healthy: true, MetricsFresh: true, CircuitAvailable: true}},
+				{ID: 2, ModelPoolID: 1, Enabled: true, Runtime: backendRuntime{Healthy: true, MetricsFresh: true, CircuitAvailable: true}},
+			},
+		}
+		switch step {
+		case 1:
+			status.Backends[1].Runtime.Pressure = .08
+		case 2:
+			status.Backends[1].Runtime.Waiting = 1
+		case 3:
+			status.Backends[1].Runtime.GatewayInflight = 1
+		case 4:
+			status.Backends[1].Runtime.MetricsFresh = false
+		}
+		_ = json.NewEncoder(writer).Encode(status)
+	}))
+	t.Cleanup(server.Close)
+	baseURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &remoteHarness{t: t, cfg: e2eConfig{baseURL: baseURL}, client: server.Client()}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.waitForIdleBackends(ctx, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 5 {
+		t.Fatalf("returned after %d snapshots, want the fifth fully idle snapshot", requests)
+	}
+}
+
+func TestWaitForIdleBackendsHonorsContextDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	baseURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &remoteHarness{t: t, cfg: e2eConfig{baseURL: baseURL}, client: server.Client()}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := h.waitForIdleBackends(ctx, 1, 2); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("idle wait error=%v, want deadline exceeded", err)
+	}
+}
+
 func TestRequestResultValidatesExactInjectedFailure(t *testing.T) {
 	valid := requestResult{Status: http.StatusServiceUnavailable, Body: []byte(faultResponseBody)}
 	if err := valid.validateInjectedFailure(); err != nil {

@@ -100,6 +100,12 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 		Key: cfg.highKey, Prompt: "High-priority latency baseline.", MaxTokens: 4, Stream: true,
 	})
 	baselineHigh.requireCompleteStream(t)
+	idleCtx, cancelIdle := context.WithTimeout(context.Background(), cfg.saturationTimeout)
+	err = h.waitForIdleBackends(idleCtx, originalPool.ID, cfg.expectedBackends)
+	cancelIdle()
+	if err != nil {
+		t.Fatalf("wait for idle backends after priority baseline: %v", err)
+	}
 	beforeMetrics := h.metrics()
 
 	loadCtx, cancelLoad := context.WithCancel(context.Background())

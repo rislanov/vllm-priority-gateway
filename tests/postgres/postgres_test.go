@@ -1307,7 +1307,7 @@ func TestPostgresClosedCircuitAcquireAndNeutralCompletionDoNotTakeStateLock(t *t
 func TestPostgresClosedCircuitFailureCountExpiresWithWindow(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createFixture(t, store, 0)
-	options := circuitbreaker.Options{FailureThreshold: 3, FailureWindow: 40 * time.Millisecond, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
+	options := circuitbreaker.Options{FailureThreshold: 3, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
 	coordinator, err := coordpostgres.NewCircuitCoordinator(store, time.Second, options)
 	if err != nil {
 		t.Fatal(err)
@@ -1333,7 +1333,22 @@ func TestPostgresClosedCircuitFailureCountExpiresWithWindow(t *testing.T) {
 	if err = store.ConfigPool().QueryRow(context.Background(), "SELECT event_at FROM backend_circuit_failure_receipts WHERE attempt_id=$1::uuid", completion.AttemptID).Scan(&originalReceiptEvent); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(options.FailureWindow + 20*time.Millisecond)
+	// Advance only the expiring event projections. Durable receipt timestamps
+	// remain immutable; SQL and replay need not finish within a 40 ms window.
+	expireFailure := func(attemptID uuid.UUID) {
+		t.Helper()
+		var expiredAt time.Time
+		if err := store.ConfigPool().QueryRow(context.Background(), "SELECT clock_timestamp()-interval '2 minutes'").Scan(&expiredAt); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"backend_circuit_failures", "backend_circuit_active_failures"} {
+			tag, err := store.ConfigPool().Exec(context.Background(), "UPDATE "+table+" SET event_at=$2::timestamptz WHERE attempt_id=$1::uuid", attemptID, expiredAt)
+			if err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("expire %s event: rows=%d err=%v", table, tag.RowsAffected(), err)
+			}
+		}
+	}
+	expireFailure(completion.AttemptID)
 	nextRequest := coordination.CircuitAcquireRequest{AttemptID: uuid.New(), AcquisitionStartedAt: time.Now().UTC(), ReplicaID: uuid.New(), Backend: identity, ProbeTTL: time.Minute}
 	nextDecision, err := coordinator.Acquire(context.Background(), nextRequest)
 	if err != nil || nextDecision.Reason != "" {
@@ -1363,6 +1378,13 @@ func TestPostgresClosedCircuitFailureCountExpiresWithWindow(t *testing.T) {
 	replayed, err := coordinator.Complete(context.Background(), completion)
 	if err != nil || replayed.State != domain.CircuitClosed || replayed.FailureCount != 1 {
 		t.Fatalf("failure replay after rolling prune=%+v err=%v", replayed, err)
+	}
+	// Replay returns current state, not the historical completion snapshot.
+	// Once the newer event expires, the same old receipt must not restore it.
+	expireFailure(nextRequest.AttemptID)
+	expiredReplay, err := coordinator.Complete(context.Background(), completion)
+	if err != nil || expiredReplay.State != domain.CircuitClosed || expiredReplay.FailureCount != 0 {
+		t.Fatalf("failure replay after all events expire=%+v err=%v", expiredReplay, err)
 	}
 	var replayEvents, replayActiveEvents int
 	var replayReceiptEvent time.Time
