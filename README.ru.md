@@ -5,7 +5,7 @@
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Защищает высокоприоритетные inference-нагрузки в общих GPU-кластерах vLLM.**
 
@@ -251,6 +251,6 @@ make build-e2e-linux-amd64
 
 ## Лицензия
 
-[The Unlicense](LICENSE).
+Проект распространяется под [лицензией Apache, версия 2.0](LICENSE) (SPDX: `Apache-2.0`).
 
 Профиль PostgreSQL 16+ поддерживает несколько реплик gateway с общими leases, RPM/soft-TPM, circuit generations и probe permits. SQLite остаётся профилем по умолчанию для одного экземпляра. См. [руководство PostgreSQL production](docs/postgresql-production.md).

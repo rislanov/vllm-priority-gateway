@@ -5,7 +5,7 @@
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
-[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **Protect high-priority inference workloads on shared vLLM GPU clusters.**
 
@@ -253,4 +253,4 @@ make build-e2e-linux-amd64
 
 ## License
 
-[The Unlicense](LICENSE).
+This project is licensed under the [Apache License, Version 2.0](LICENSE) (SPDX: `Apache-2.0`).
