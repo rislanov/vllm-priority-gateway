@@ -116,6 +116,11 @@ func (c *CircuitCoordinator) Reconcile(parent context.Context, values []coordina
 			return err
 		}
 		authoritative, err := lockBackendIdentity(ctx, tx, value.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Deletion already superseded permits and retained the tombstone.
+			// A stale topology snapshot must not recreate circuit state.
+			continue
+		}
 		if err != nil {
 			return err
 		}

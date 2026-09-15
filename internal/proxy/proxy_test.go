@@ -32,7 +32,7 @@ func TestForwardFlushesStreamingBytesWithoutFullBuffering(t *testing.T) {
 		})
 	}()
 	select {
-	case <-writer.firstWrite:
+	case <-writer.firstFlush:
 		if !strings.Contains(writer.String(), "one") {
 			t.Fatalf("first bytes = %q", writer.String())
 		}
@@ -82,7 +82,7 @@ func TestForwardInspectsUsageWithoutChangingStreamingBehavior(t *testing.T) {
 	}()
 
 	select {
-	case <-downstream.firstWrite:
+	case <-downstream.firstFlush:
 	case <-time.After(time.Second):
 		t.Fatal("first response chunk was not forwarded")
 	}
@@ -194,6 +194,39 @@ func TestForwardRetriesOneAlternateBeforeFirstByte(t *testing.T) {
 	}
 	if writer.String() != `{"backend":"second"}` {
 		t.Fatalf("body = %q", writer.String())
+	}
+}
+
+func TestForwardDoesNotRetryAfterEmptyFirstRead(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &emptyThenFailBody{},
+		}, nil
+	})}
+	var selections atomic.Int64
+	var outcomes []domain.InferenceOutcome
+	result := proxy.New(client).Forward(context.Background(), newObservingWriter(), proxy.Request{
+		Method: http.MethodPost, Path: "/v1/responses", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://upstream.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, errors.New("unexpected alternate selection")
+		},
+	})
+
+	if !errors.Is(result.Err, errUpstreamRead) || result.RetryCount != 0 || result.ResponseStarted || result.BytesSent != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 {
+		t.Fatalf("alternate selections = %d, want 0", selections.Load())
+	}
+	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("outcomes = %v, want [failure]", outcomes)
 	}
 }
 
@@ -353,7 +386,7 @@ func TestForwardClassifiesBodyReadFailureBeforeDownstreamWriteFailureAsFailure(t
 			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
 		},
 	})
-	if !errors.Is(result.Err, errDownstreamWrite) || !result.ResponseStarted || result.RetryCount != 0 {
+	if !errors.Is(result.Err, errDownstreamWrite) || result.UpstreamFailure != "upstream_body_read_error" || !result.ResponseStarted || result.RetryCount != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
@@ -384,10 +417,68 @@ func TestForwardPreservesProvenBodyReadFailureWhenWriteCancelsContext(t *testing
 			return proxy.Target{}, nil
 		},
 	})
-	if !errors.Is(result.Err, errDownstreamWrite) || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != 0 || result.RetryCount != 0 {
+	if !errors.Is(result.Err, errDownstreamWrite) || result.UpstreamFailure != "upstream_body_read_error" || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != 0 || result.RetryCount != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
+	}
+}
+
+func TestForwardPreservesProvenBodyReadFailureWhenSuccessfulWriteCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       partialReadFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	result := proxy.New(client).Forward(ctx, &cancelWriteWriter{header: make(http.Header), cancel: cancel}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+	})
+	if !errors.Is(result.Err, errUpstreamRead) || result.UpstreamFailure != "upstream_body_read_error" || !result.Cancelled ||
+		result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != int64(len("partial")) || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
+		t.Fatalf("outcomes = %v, want [failure]", outcomes)
+	}
+}
+
+func TestForwardPreservesLateReadFailureWhenSuccessfulWriteCancelsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       &chunkThenFailBody{},
+		}, nil
+	})}
+	var outcomes []domain.InferenceOutcome
+	var selections atomic.Int64
+	result := proxy.New(client).Forward(ctx, &cancelWriteWriter{header: make(http.Header), cancel: cancel}, proxy.Request{
+		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+		Target: proxy.Target{
+			Backend:  backend(1, "http://backend.invalid"),
+			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
+		},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections.Add(1)
+			return proxy.Target{}, nil
+		},
+	})
+	if !errors.Is(result.Err, errUpstreamRead) || !result.Cancelled || result.Status != http.StatusOK || !result.ResponseStarted || result.BytesSent != int64(len("partial")) || result.RetryCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if selections.Load() != 0 || len(outcomes) != 1 || outcomes[0] != domain.InferenceNeutral {
 		t.Fatalf("selections=%d outcomes=%v", selections.Load(), outcomes)
 	}
 }
@@ -430,7 +521,7 @@ func TestForwardClassifiesUpstreamBodyReadFailureAsFailure(t *testing.T) {
 			Complete: func(outcome domain.InferenceOutcome) { outcomes = append(outcomes, outcome) },
 		},
 	})
-	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted {
+	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted || result.UpstreamFailure != "upstream_body_read_error" {
 		t.Fatalf("result = %+v", result)
 	}
 	if len(outcomes) != 1 || outcomes[0] != domain.InferenceFailure {
@@ -514,6 +605,38 @@ func TestForwardCompletesEverySelectedTargetExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestForwardCompletesTargetWhenAttemptPanics(t *testing.T) {
+	panicValue := &struct{ message string }{message: "transport panic"}
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		panic(panicValue)
+	})}
+	var completions atomic.Int64
+	var outcome domain.InferenceOutcome
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		proxy.New(client).Forward(context.Background(), newObservingWriter(), proxy.Request{
+			Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
+			Target: proxy.Target{
+				Backend: backend(1, "http://backend.invalid"),
+				Complete: func(value domain.InferenceOutcome) {
+					completions.Add(1)
+					outcome = value
+					panic("completion panic")
+				},
+			},
+		})
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	if completions.Load() != 1 || outcome != domain.InferenceNeutral {
+		t.Fatalf("panic completion = count %d outcome %q, want one neutral completion", completions.Load(), outcome)
+	}
+}
+
 func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 	failing := fakevllm.New()
 	failing.SetState(fakevllm.State{Tokens: []string{"one", "two"}, ResetMode: fakevllm.ResetAfterChunks, ResetAfterChunks: 1})
@@ -529,7 +652,7 @@ func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 			return proxy.Target{}, errors.New("must not be called")
 		},
 	})
-	if result.Err == nil || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
+	if result.Err == nil || result.UpstreamFailure != "upstream_body_read_error" || result.RetryCount != 0 || selections.Load() != 0 || !strings.Contains(writer.String(), "one") {
 		t.Fatalf("result=%+v selections=%d body=%q", result, selections.Load(), writer.String())
 	}
 }
@@ -608,8 +731,8 @@ type observingWriter struct {
 	status     int
 	body       bytes.Buffer
 	flushes    int
-	firstWrite chan struct{}
-	once       sync.Once
+	firstFlush chan struct{}
+	flushOnce  sync.Once
 }
 
 var errDownstreamWrite = errors.New("downstream write failed")
@@ -628,6 +751,20 @@ func (readFailBody) Read([]byte) (int, error) { return 0, errUpstreamRead }
 
 func (readFailBody) Close() error { return nil }
 
+type emptyThenFailBody struct {
+	emptyReadDone bool
+}
+
+func (b *emptyThenFailBody) Read([]byte) (int, error) {
+	if !b.emptyReadDone {
+		b.emptyReadDone = true
+		return 0, nil
+	}
+	return 0, errUpstreamRead
+}
+
+func (*emptyThenFailBody) Close() error { return nil }
+
 type partialReadFailBody struct{}
 
 func (partialReadFailBody) Read(destination []byte) (int, error) {
@@ -635,6 +772,20 @@ func (partialReadFailBody) Read(destination []byte) (int, error) {
 }
 
 func (partialReadFailBody) Close() error { return nil }
+
+type chunkThenFailBody struct {
+	chunkRead bool
+}
+
+func (b *chunkThenFailBody) Read(destination []byte) (int, error) {
+	if !b.chunkRead {
+		b.chunkRead = true
+		return copy(destination, "partial"), nil
+	}
+	return 0, errUpstreamRead
+}
+
+func (*chunkThenFailBody) Close() error { return nil }
 
 type contextReadBody struct {
 	ctx context.Context
@@ -693,8 +844,23 @@ func (w *cancelWriteFailWriter) Write([]byte) (int, error) {
 	return 0, errDownstreamWrite
 }
 
+type cancelWriteWriter struct {
+	header http.Header
+	status int
+	cancel context.CancelFunc
+}
+
+func (w *cancelWriteWriter) Header() http.Header { return w.header }
+
+func (w *cancelWriteWriter) WriteHeader(status int) { w.status = status }
+
+func (w *cancelWriteWriter) Write(data []byte) (int, error) {
+	w.cancel()
+	return len(data), nil
+}
+
 func newObservingWriter() *observingWriter {
-	return &observingWriter{header: make(http.Header), firstWrite: make(chan struct{})}
+	return &observingWriter{header: make(http.Header), firstFlush: make(chan struct{})}
 }
 
 func (w *observingWriter) Header() http.Header { return w.header }
@@ -713,14 +879,14 @@ func (w *observingWriter) Write(data []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	w.once.Do(func() { close(w.firstWrite) })
 	return w.body.Write(data)
 }
 
 func (w *observingWriter) Flush() {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.flushes++
-	w.mu.Unlock()
+	w.flushOnce.Do(func() { close(w.firstFlush) })
 }
 
 func (w *observingWriter) String() string {

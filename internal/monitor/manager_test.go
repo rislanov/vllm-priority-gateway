@@ -18,12 +18,13 @@ import (
 )
 
 type circuitCoordinatorStub struct {
-	mu           sync.Mutex
-	reconciled   []coordination.BackendIdentity
-	acquisitions []coordination.CircuitAcquireRequest
-	completions  []coordination.CircuitCompletion
-	snapshot     coordination.CircuitSnapshot
-	completeErr  error
+	mu            sync.Mutex
+	reconciled    []coordination.BackendIdentity
+	acquisitions  []coordination.CircuitAcquireRequest
+	completions   []coordination.CircuitCompletion
+	snapshot      coordination.CircuitSnapshot
+	completeErr   error
+	completePanic bool
 }
 
 func (f *circuitCoordinatorStub) Reconcile(_ context.Context, v []coordination.BackendIdentity) error {
@@ -42,6 +43,9 @@ func (f *circuitCoordinatorStub) Acquire(_ context.Context, v coordination.Circu
 	return coordination.CircuitDecision{Snapshot: f.snapshot}, nil
 }
 func (f *circuitCoordinatorStub) Complete(_ context.Context, v coordination.CircuitCompletion) (coordination.CircuitSnapshot, error) {
+	if f.completePanic {
+		panic("circuit completion")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completions = append(f.completions, v)
@@ -91,6 +95,38 @@ func (f *circuitCoordinatorStub) RenewProbes(context.Context, []coordination.Pro
 func (f *circuitCoordinatorStub) Refresh(context.Context) error { return nil }
 func (f *circuitCoordinatorStub) Status() coordination.Status {
 	return coordination.Status{Available: true}
+}
+
+func TestManagerCoordinatedCompletionPanicReleasesInflight(t *testing.T) {
+	circuit := &circuitCoordinatorStub{
+		snapshot:      coordination.CircuitSnapshot{State: domain.CircuitClosed, Available: true},
+		completePanic: true,
+	}
+	options := monitorOptions(nil)
+	options.CircuitCoordinator = circuit
+	options.ReplicaID = uuid.New()
+	options.ProbeTTL = time.Minute
+	manager := monitor.NewManager(context.Background(), options)
+	defer manager.Shutdown()
+	backend := testBackend("http://127.0.0.1:1", 1, 9)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	complete, ok := manager.AcquireBackend(backend, time.Now())
+	if !ok {
+		t.Fatal("acquire rejected")
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("completion did not propagate panic")
+			}
+		}()
+		complete(domain.InferenceNeutral)
+	}()
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("inflight after panic=%d, want 0", got)
+	}
 }
 
 func TestManagerDelegatesCircuitAcquireAndCompletion(t *testing.T) {
@@ -481,10 +517,10 @@ func TestManagerAcquireBackendRequiresExactIdentityAndKeepsOldCompletionBalanced
 		oldComplete(domain.InferenceNeutral)
 		t.Fatal("AcquireBackend() rejected the exact reconciled identity")
 	}
-	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
+	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 2 {
 		oldComplete(domain.InferenceNeutral)
 		newComplete(domain.InferenceNeutral)
-		t.Fatalf("new worker inflight = %d, want 1", got)
+		t.Fatalf("backend inflight across worker generations = %d, want 2", got)
 	}
 	oldComplete(domain.InferenceSuccess)
 	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 1 {
@@ -494,6 +530,54 @@ func TestManagerAcquireBackendRequiresExactIdentityAndKeepsOldCompletionBalanced
 	newComplete(domain.InferenceSuccess)
 	if got := manager.Snapshot(newBackend.ID, time.Now()).GatewayInflight; got != 0 {
 		t.Fatalf("new worker inflight after completion = %d, want 0", got)
+	}
+}
+
+func TestManagerDrainAndResumePreserveActiveBackendLeaseCount(t *testing.T) {
+	fake := fakevllm.New()
+	server := httptest.NewServer(fake.Handler())
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := monitor.NewManager(ctx, monitorOptions(server.Client()))
+	defer manager.Shutdown()
+	backend := testBackend(server.URL, 1, 1)
+	if err := manager.Reconcile([]domain.Backend{backend}); err != nil {
+		t.Fatal(err)
+	}
+	complete, ok := manager.AcquireBackend(backend, time.Now())
+	if !ok {
+		t.Fatal("AcquireBackend() rejected known backend")
+	}
+	draining := backend
+	draining.Draining = true
+	draining.UpdatedAt = time.Now().UTC()
+	if err := manager.Reconcile([]domain.Backend{draining}); err != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal(err)
+	}
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 1 {
+		complete(domain.InferenceNeutral)
+		t.Fatalf("inflight after drain = %d, want 1", got)
+	}
+	if retry, acquired := manager.AcquireBackend(backend, time.Now()); acquired || retry != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal("draining backend accepted a new lease with stale identity")
+	}
+	resumed := draining
+	resumed.Draining = false
+	resumed.UpdatedAt = time.Now().UTC()
+	if err := manager.Reconcile([]domain.Backend{resumed}); err != nil {
+		complete(domain.InferenceNeutral)
+		t.Fatal(err)
+	}
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 1 {
+		complete(domain.InferenceNeutral)
+		t.Fatalf("inflight after resume = %d, want 1", got)
+	}
+	complete(domain.InferenceSuccess)
+	if got := manager.Snapshot(backend.ID, time.Now()).GatewayInflight; got != 0 {
+		t.Fatalf("inflight after old lease completion = %d, want 0", got)
 	}
 }
 

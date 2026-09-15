@@ -41,6 +41,8 @@ func TestProductionSmoke(t *testing.T) {
 	}
 	status.requireHealthyFreshBackends(t, pool.ID, cfg.expectedBackends)
 	t.Logf("management_ready revision=%d inference_ready revision=%d pools=%d backends=%d pool_state=%s", ready.Revision, inferenceReady.Revision, inferenceReady.PoolAvailability, inferenceReady.BackendAvailability, pool.Runtime.State)
+	load := h.loadStatus(cfg.highKey)
+	requireLoadMatchesPool(t, load, pool)
 
 	models := h.models(cfg.highKey)
 	if !models.contains(cfg.model) {
@@ -56,11 +58,12 @@ func TestProductionSmoke(t *testing.T) {
 	}
 	t.Logf("streaming inference status=%d first_byte=%s duration=%s", result.Status, result.FirstByte, result.Duration)
 
-	metrics := h.metrics()
+	load, metrics := h.waitForLoadMetrics(cfg.highKey, "", cfg.probeTimeout)
 	for _, family := range []string{
 		"llmgw_requests_total", "llmgw_backend_pressure", "llmgw_backend_running_requests",
 		"llmgw_backend_circuit_state", "llmgw_backend_circuit_failures", "llmgw_pool_gateway_inflight",
-		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends",
+		"llmgw_pool_waiting_requests", "llmgw_pool_available_backends", "llmgw_pool_pressure",
+		"llmgw_pool_state", "llmgw_backend_selected_total", "llmgw_queue_wait_seconds",
 	} {
 		if !metrics.containsFamily(family) {
 			t.Fatalf("/metrics does not expose %s", family)
@@ -73,7 +76,7 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	h := newRemoteHarness(t, cfg)
 	originalStatus := h.adminStatus()
 	originalPool := originalStatus.requirePool(t, cfg.model)
-	mutationCleanup, err := newAdminMutationCleanup(h, originalStatus, originalPool.ID)
+	mutationCleanup, err := newAdminMutationCleanup(h, priorityCleanupStatus(originalStatus, cfg.drainBackendID), originalPool.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,6 +87,20 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 			t.Errorf("restore priority E2E Admin mutations: %v", err)
 		}
 	})
+	priorityLoadPool := preparePoolForPriorityLoad(originalPool)
+	if !samePoolConfiguration(priorityLoadPool, originalPool) {
+		if _, err := h.updatePool(context.Background(), priorityLoadPool); err != nil {
+			t.Fatalf("disable global waiting limit for priority isolation: %v", err)
+		}
+		h.waitForPool(func(pool adminPool) bool {
+			return samePoolConfiguration(pool, priorityLoadPool)
+		}, cfg.saturationTimeout)
+	}
+	baselineHigh := h.completion(context.Background(), completionRequest{
+		Key: cfg.highKey, Prompt: "High-priority latency baseline.", MaxTokens: 4, Stream: true,
+	})
+	baselineHigh.requireCompleteStream(t)
+	beforeMetrics := h.metrics()
 
 	loadCtx, cancelLoad := context.WithCancel(context.Background())
 	load := h.startHighLoad(loadCtx)
@@ -100,6 +117,10 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 		t.Fatalf("pool reached %s without all backends waiting: %+v", saturated.Runtime.State, saturated.Runtime)
 	}
 	t.Logf("saturation state=%s pressure=%.4f gateway_inflight=%d total_waiting=%.0f available_backends=%d all_waiting=%t", saturated.Runtime.State, saturated.Runtime.BestBackendPressure, saturated.Runtime.GatewayInflight, saturated.Runtime.TotalWaiting, saturated.Runtime.AvailableBackends, saturated.Runtime.AllBackendsWaiting)
+	loadedStatus, _ := h.waitForLoadMetrics(cfg.highKey, "loaded", cfg.saturationTimeout)
+	if loadedStatus.Level != "loaded" || (loadedStatus.PoolState != "saturated" && loadedStatus.PoolState != "emergency") {
+		t.Fatalf("saturated load status = %+v, want loaded with saturated or emergency pool state", loadedStatus)
+	}
 
 	for _, probe := range []completionRequest{
 		{Key: cfg.lowKeys[0], Prompt: "Ordinary low-priority probe.", MaxTokens: 2},
@@ -117,9 +138,24 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 		Key: cfg.criticalKey, Prompt: "Critical-priority continuity probe.", MaxTokens: 4, Stream: true,
 	})
 	critical.requireCompleteStream(t)
-	t.Logf("continuity high_first_byte=%s critical_first_byte=%s", high.FirstByte, critical.FirstByte)
+	loadedStatus, loadedMetrics := h.waitForLoadMetrics(cfg.highKey, "loaded", cfg.saturationTimeout)
+	requireMetricIncrease(t, beforeMetrics, loadedMetrics, "llmgw_requests_rejected_total", map[string]string{
+		"model": cfg.model, "priority_class": "background", "reason": "priority_concurrency_limit",
+	}, 3)
+	requireMetricIncrease(t, beforeMetrics, loadedMetrics, "llmgw_backend_selected_total", map[string]string{"model": cfg.model}, 1)
+	requireHistogramIncrease(t, beforeMetrics, loadedMetrics, "llmgw_request_duration_seconds", map[string]string{
+		"model": cfg.model, "priority_class": "high", "status_class": "2xx",
+	}, 1)
+	requireHistogramIncrease(t, beforeMetrics, loadedMetrics, "llmgw_queue_wait_seconds", map[string]string{
+		"model": cfg.model, "priority_class": "high", "outcome": "selected",
+	}, 1)
+	if pressure, ok := loadedMetrics.value("llmgw_pool_pressure", map[string]string{"model": cfg.model}); !ok || pressure <= 0 {
+		t.Fatalf("loaded pool pressure = %.4f, present=%t; want positive sample", pressure, ok)
+	}
+	t.Logf("continuity baseline_high_first_byte=%s loaded_high_first_byte=%s ratio=%.3f critical_first_byte=%s",
+		baselineHigh.FirstByte, high.FirstByte, float64(high.FirstByte)/float64(baselineHigh.FirstByte), critical.FirstByte)
 
-	limitedPool := isolatePoolGatewayInflight(originalPool, 1)
+	limitedPool := isolatePoolGatewayInflight(priorityLoadPool, 1)
 	if _, err := h.updatePool(context.Background(), limitedPool); err != nil {
 		t.Fatalf("set priority E2E pool limit: %v", err)
 	}
@@ -129,11 +165,11 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical probe bounded by pool safety.", MaxTokens: 2,
 	}).requireOverloaded(t)
-	if _, err := h.updatePool(context.Background(), originalPool); err != nil {
+	if _, err := h.updatePool(context.Background(), priorityLoadPool); err != nil {
 		t.Fatalf("restore pool limit before continuity probe: %v", err)
 	}
 	h.waitForPool(func(pool adminPool) bool {
-		return samePoolConfiguration(pool, originalPool)
+		return samePoolConfiguration(pool, priorityLoadPool)
 	}, cfg.saturationTimeout)
 	postLimitCritical := h.completion(context.Background(), completionRequest{
 		Key: cfg.criticalKey, Prompt: "Critical continuity after pool limit restoration.", MaxTokens: 4, Stream: true,
@@ -172,13 +208,23 @@ func TestPriorityIsolationWithRealVLLM(t *testing.T) {
 	load.wait(10 * time.Second)
 	load.requireNoHTTPFailures(t)
 
-	h.waitForPool(func(pool adminPool) bool { return pool.Runtime.State == "busy" }, cfg.recoveryTimeout)
+	busy := h.waitForPool(func(pool adminPool) bool { return pool.Runtime.State == "busy" }, cfg.recoveryTimeout)
+	busyLoad := h.loadStatus(cfg.highKey)
+	requireLoadMatchesPool(t, busyLoad, busy)
+	if busyLoad.Level != "medium" {
+		t.Fatalf("busy load level = %q, want medium", busyLoad.Level)
+	}
 	t.Logf("recovery reached busy after %s", time.Since(recoveryStarted))
 	h.completion(context.Background(), completionRequest{
 		Key: cfg.lowKeys[0], Prompt: "Busy-state recovery probe.", MaxTokens: 2,
 	}).requireStatus(t, http.StatusOK)
 
-	h.waitForPool(func(pool adminPool) bool { return pool.Runtime.State == "normal" }, cfg.recoveryTimeout)
+	normal := h.waitForPool(func(pool adminPool) bool { return pool.Runtime.State == "normal" }, cfg.recoveryTimeout)
+	normalLoad := h.loadStatus(cfg.highKey)
+	requireLoadMatchesPool(t, normalLoad, normal)
+	if normalLoad.Level != "free" {
+		t.Fatalf("normal load level = %q, want free", normalLoad.Level)
+	}
 	t.Logf("recovery reached normal after %s", time.Since(recoveryStarted))
 	h.completion(context.Background(), completionRequest{
 		Key: cfg.lowKeys[0], Prompt: "Normal-state recovery probe.", MaxTokens: 2,
@@ -267,6 +313,13 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 	if unavailableStatus != http.StatusServiceUnavailable || unavailable.Status != "unavailable" || unavailable.PoolAvailability != 0 || unavailable.BackendAvailability != 0 {
 		t.Fatalf("open-circuit inference readiness = HTTP %d %+v, want HTTP 503 unavailable", unavailableStatus, unavailable)
 	}
+	unavailableLoad, unavailableMetrics := h.waitForLoadMetrics(cfg.highKey, "unavailable", cfg.saturationTimeout)
+	if unavailableLoad.Level != "unavailable" || unavailableLoad.PoolState != "unavailable" || unavailableLoad.AvailableBackends != 0 {
+		t.Fatalf("open-circuit load status = %+v, want unavailable with zero available backends", unavailableLoad)
+	}
+	if stateMetric, ok := unavailableMetrics.value("llmgw_pool_state", map[string]string{"model": cfg.model, "state": "unavailable"}); !ok || stateMetric != 1 {
+		t.Fatalf("unavailable pool-state metric = %v, present=%t; want 1", stateMetric, ok)
+	}
 
 	proxy.SetFaulting(false)
 	halfOpen := h.waitForBackend(target.ID, func(backend adminBackend) bool {
@@ -284,6 +337,10 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 	recovered, recoveredStatus := h.inferenceReadiness()
 	if recoveredStatus != http.StatusOK || recovered.Status != "ready" || recovered.PoolAvailability < 1 || recovered.BackendAvailability < 1 {
 		t.Fatalf("recovered inference readiness = HTTP %d %+v, want HTTP 200 ready", recoveredStatus, recovered)
+	}
+	recoveredLoad := h.loadStatus(cfg.highKey)
+	if recoveredLoad.Level == "unavailable" || recoveredLoad.AvailableBackends < 1 {
+		t.Fatalf("recovered load status = %+v, want an available load level and backend", recoveredLoad)
 	}
 	t.Logf("circuit backend=%d opened_failures=%d retry_at=%s half_open_probes=%d closed_failures=%d recovery_first_byte=%s", target.ID, opened.Runtime.CircuitFailures, opened.Runtime.CircuitRetryAt, halfOpen.Runtime.CircuitProbesInFlight, closed.Runtime.CircuitFailures, probe.FirstByte)
 }

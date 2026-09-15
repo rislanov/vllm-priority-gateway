@@ -2,12 +2,72 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 	"github.com/rislanov/vllm-priority-gateway/internal/store"
 )
+
+func TestConfigurationUpdatesDoNotLoseSQLiteWriteUpgradeRace(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := db.CreateClient(ctx, store.CreateClientParams{
+		Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal, MaxConcurrency: 2,
+		ModelPoolIDs: []int64{pool.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const iterations = 250
+	start := make(chan struct{})
+	errorsFound := make(chan error, iterations*2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			_, updateErr := db.UpdateClient(ctx, client.ID, store.UpdateClientParams{
+				Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal,
+				MaxConcurrency: 2, ModelPoolIDs: []int64{pool.ID},
+			})
+			if updateErr != nil {
+				errorsFound <- fmt.Errorf("update %d: %w", index, updateErr)
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			insertErr := db.InsertUsageBatch(ctx, []analytics.RequestRecord{{
+				OccurredAt: time.Now().UTC(), RequestID: fmt.Sprintf("request-%d", index),
+				ClientID: client.ID, ClientName: client.Name, ModelPoolID: pool.ID,
+				ModelName: pool.PublicModelName, HTTPStatus: 200,
+			}})
+			if insertErr != nil {
+				errorsFound <- fmt.Errorf("analytics %d: %w", index, insertErr)
+			}
+		}
+	}()
+	close(start)
+	workers.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Error(err)
+	}
+}
 
 func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	ctx := context.Background()
@@ -120,6 +180,102 @@ func TestSQLiteUpdateAndListConfiguration(t *testing.T) {
 	}
 }
 
+func TestSQLiteDeletesConfigurationAndCascadesDependents(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := db.CreateClient(ctx, store.CreateClientParams{
+		Name: "client", Enabled: true, PriorityClass: domain.PriorityNormal, MaxConcurrency: 2,
+		ModelPoolIDs: []int64{pool.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := db.CreateAPIKey(ctx, store.CreateAPIKeyParams{
+		ClientID: client.ID, Prefix: "llmgw_123456", SecretHash: [32]byte{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := db.CreateBackend(ctx, store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "backend", BaseURL: "http://127.0.0.1:8000",
+		Enabled: true, CapacityHint: 1, RunningSoftLimit: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteBackend(ctx, backend.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeletePool(ctx, pool.ID); err != nil {
+		t.Fatal(err)
+	}
+	deletedKeyIDs, err := db.DeleteClient(ctx, client.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletedKeyIDs) != 1 || deletedKeyIDs[0] != key.ID {
+		t.Fatalf("DeleteClient() key IDs = %v, want [%d]", deletedKeyIDs, key.ID)
+	}
+
+	snapshot, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Revision != 7 || len(snapshot.Clients) != 0 || len(snapshot.Keys) != 0 || len(snapshot.Pools) != 0 || len(snapshot.Backends) != 0 || len(snapshot.Access) != 0 {
+		t.Fatalf("snapshot after deletes = %+v", snapshot)
+	}
+}
+
+func TestSQLiteDeleteRejectsReferencedPoolAndMissingTargetsWithoutRevisionChange(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	pool, err := db.CreatePool(ctx, store.CreatePoolParams{PublicModelName: "model", UpstreamModelName: "upstream", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.CreateBackend(ctx, store.CreateBackendParams{
+		ModelPoolID: pool.ID, Name: "backend", BaseURL: "http://127.0.0.1:8000",
+		Enabled: true, CapacityHint: 1, RunningSoftLimit: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeletePool(ctx, pool.ID); !errors.Is(err, store.ErrPoolHasBackends) {
+		t.Fatalf("DeletePool() error = %v, want ErrPoolHasBackends", err)
+	}
+	deleteMissingClient := func(ctx context.Context, id int64) error {
+		_, err := db.DeleteClient(ctx, id)
+		return err
+	}
+	for name, deleteValue := range map[string]func(context.Context, int64) error{
+		"client":  deleteMissingClient,
+		"pool":    db.DeletePool,
+		"backend": db.DeleteBackend,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := deleteValue(ctx, 999); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("delete missing %s error = %v, want sql.ErrNoRows", name, err)
+			}
+		})
+	}
+	after, err := db.LoadSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != before.Revision {
+		t.Fatalf("revision changed from %d to %d after rejected deletes", before.Revision, after.Revision)
+	}
+}
+
 func TestSetClientModelAccessReplacesAndDeduplicates(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -136,5 +292,39 @@ func TestSetClientModelAccessReplacesAndDeduplicates(t *testing.T) {
 	}
 	if len(snapshot.Access) != 1 || snapshot.Access[0].ModelPoolID != second.ID {
 		t.Fatalf("model access = %+v", snapshot.Access)
+	}
+}
+
+func TestSetClientModelAccessRejectsMissingClientWithoutRevisionChange(t *testing.T) {
+	tests := []struct {
+		name    string
+		poolIDs []int64
+	}{
+		{name: "nil access", poolIDs: nil},
+		{name: "empty access", poolIDs: []int64{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			before, err := db.LoadSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("LoadSnapshot() before update error = %v", err)
+			}
+
+			err = db.SetClientModelAccess(ctx, 999, tt.poolIDs)
+			if !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("SetClientModelAccess() error = %v, want sql.ErrNoRows", err)
+			}
+
+			after, err := db.LoadSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("LoadSnapshot() after update error = %v", err)
+			}
+			if after.Revision != before.Revision {
+				t.Fatalf("revision changed from %d to %d after rejected update", before.Revision, after.Revision)
+			}
+		})
 	}
 }

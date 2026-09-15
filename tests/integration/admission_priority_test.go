@@ -31,6 +31,7 @@ func TestAdmissionPriorityAndHysteresisAcceptance(t *testing.T) {
 		t.Fatalf("sub-enter-window spike changed state to %s", state)
 	}
 	h.waitPool(poolID, domain.PoolEmergency)
+	_, beforeMetrics := h.public(http.MethodGet, "/metrics", "", "")
 
 	for _, check := range []struct {
 		name       string
@@ -63,6 +64,13 @@ func TestAdmissionPriorityAndHysteresisAcceptance(t *testing.T) {
 	records := fake.Snapshot().Requests
 	if len(records) != 2 || records[0].Priority != "-100" || records[1].Priority != "-10" {
 		t.Fatalf("upstream priorities = %+v", records)
+	}
+	_, afterMetrics := h.public(http.MethodGet, "/metrics", "", "")
+	if got := metricCounterDelta(beforeMetrics, afterMetrics, "llmgw_requests_rejected_total", map[string]string{"reason": "priority_concurrency_limit"}); got != 2 {
+		t.Fatalf("priority rejection delta = %v, want 2", got)
+	}
+	if got := metricCounterDelta(beforeMetrics, afterMetrics, "llmgw_backend_selected_total", map[string]string{"backend": "gpu-a"}); got != 2 {
+		t.Fatalf("backend selection delta = %v, want 2", got)
 	}
 
 	fake.SetState(fakevllm.State{})

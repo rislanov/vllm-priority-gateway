@@ -2,13 +2,25 @@
 
 This procedure validates behavior that the deterministic fake backend cannot prove: current OpenAI API compatibility, upstream cancellation on a real engine, queue metrics under GPU contention, vLLM priority scheduling, gateway hysteretic recovery, and circuit recovery against a live inference endpoint.
 
-The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
+The smoke, priority/pool-safety, and circuit-recovery core is automated by [`tests/e2e`](../tests/e2e) and documented in [real-vllm-priority-e2e.md](real-vllm-priority-e2e.md). The suite also verifies the authenticated `/v1/load` signal against Admin runtime and Prometheus during idle, sustained load, hysteretic recovery, circuit unavailability, and recovery. Run all three modes first in the appropriate safety window; use this broader procedure for endpoint compatibility, cancellation evidence, affinity observations, threshold calibration, and retained production sign-off artifacts.
 
-## Recorded non-target development evidence
+## Recorded RTX 4070 Ti local-build evidence
 
-On 2026-08-27 all three automated modes passed locally at gateway commit `6b7a29b` on a MacBook Air `Mac16,13` (Apple M4, 24 GB) using vLLM `0.28.0+cpu`, vLLM-Metal `0.3.0.dev20260827104907`, and two loopback `Qwen/Qwen3-0.6B` nodes with `max-num-seqs=1`. Smoke observed two healthy/fresh backends and `360.398334ms` first byte. The four-client × four-request, 768-token priority profile observed `GatewayInflight=16`, `TotalWaiting=14`, every backend waiting, Critical rejection at temporary `MaxGatewayInflight=1`, exact pool restoration, and recovery to `busy` in `4.290394292s` and `normal` in `6.727045209s`. With circuit threshold/count `3` and cooldown `3s`, resilience opened at exactly three injected failures, made inference readiness HTTP 503, recovered through a `156.983875ms` half-open streaming probe to closed/readiness HTTP 200, and restored the exact captured pool/backend state.
+On 2026-08-28 the repository's local-build Docker topology and all three automated real-vLLM modes passed on an NVIDIA GeForce RTX 4070 Ti with 12,282 MiB VRAM and driver `610.47`. The Linux-container daemon was Docker `29.1.2` with Compose `2.40.3`; the repository base commit was `a138ab8`. Compose ran two pinned `vllm/vllm-openai:v0.28.0` services with `Qwen/Qwen3-0.6B`, `max-num-seqs=1`, priority scheduling, and no published vLLM ports.
 
-The representative non-secret commands and full durable summary are in [acceptance-evidence.md](acceptance-evidence.md). Raw gateway, vLLM, and terminal process logs were ephemeral and were not retained. Docker container smoke was not run because the daemon was unavailable. This Apple Silicon/vLLM-Metal result does not replace any step below: all three modes, the broader checks, and threshold/TTFT calibration remain pending on the selected CUDA host and production model.
+The exact documented `docker compose config`, container GPU probe, `up --build --wait`, health/readiness, model listing, and checked-in streaming request all passed. The gateway image healthcheck used its own static binary and reached healthy before Compose returned. Smoke observed one available pool and two healthy, metrics-fresh backends; complete-stream first byte was `240.6163ms` before restart and `242.46ms` after restart. The four-client × four-request, 768-token priority profile reached `GatewayInflight=16`, `TotalWaiting=14`, and `AllBackendsWaiting=true`; Low traffic was rejected while High/Critical continued, the pool-safety and one-backend drain checks passed, and recovery reached `busy` in `14.0900556s` and `normal` in `24.9508766s`. Resilience opened the selected circuit after exactly five injected inference failures, made inference readiness HTTP 503, and returned through half-open to closed/readiness HTTP 200 with a `368.449514ms` recovery first byte. Cleanup restored limits `32/8`, both internal backend URLs, both drain flags, and two healthy/fresh closed circuits. Restarting only the gateway preserved revision `63`, Admin state, rotated client keys, and two-backend inference readiness. The complete Go suite and `go vet ./...` also passed in a Linux Go container.
+
+The representative non-secret commands and durable summary are in [acceptance-evidence.md](acceptance-evidence.md). This is a development-sized CUDA/Docker gate, not production-model sizing or latency calibration. The broader endpoint, cancellation, affinity, and retained-artifact procedure below remains available when those claims are required.
+
+## Recorded decision-telemetry evidence
+
+On 2026-08-30 commit `f4cc474` passed the real-vLLM priority scenario with the Prometheus/Grafana overlay on the same RTX 4070 Ti (driver `616.56`). A calibrated four-client Background workload of four 128-token streams per client reached `saturated`; pool pressure peaked at `0.7293`, four exact `priority_concurrency_limit` Low rejections were visible, and backend selections increased by `22`. The protected High probe stayed admitted with first byte `186.9918ms` before load and `560.7569ms` under load; the aligned Grafana window rendered High request/TTFT p95 at `975ms` and gateway queue-wait p95 at `4.75ms`. Recovery reached `busy` after `11.5818242s` and `normal` after `23.610879s`, and cleanup restored the original pool and client configuration. The exact window, measurements, and dashboard checks are recorded in [acceptance-evidence.md](acceptance-evidence.md).
+
+Use a lower-priority saturation workload when the evidence target is the causal dashboard story. A High-class saturation workload is a valid harsher admission test, but it also contributes its own long requests to the High histogram and therefore cannot demonstrate a stable protected-High percentile. Calibrate request length so the pressure EWMA remains saturated long enough to scrape without turning the local small-model run into a production SLO claim.
+
+## Recorded v0.1.0 release-artifact evidence
+
+On 2026-08-30 the [local demo](local-demo.md) was validated independently with both published gateway artifacts against two real `vllm/vllm-openai:v0.28.0` services serving `Qwen/Qwen3-0.6B` on the same RTX 4070 Ti. The Docker path pulled `ghcr.io/rislanov/vllm-priority-gateway:0.1.0` without a source build. The native path downloaded the GitHub Release Linux `amd64` archive inside a clean Ubuntu 24.04 container and verified it with the published `SHA256SUMS` before extraction. Each path used separate SQLite state, reached two healthy and metrics-fresh backends, completed a streaming chat request through the gateway with `data: [DONE]`, and retained its configuration and inference readiness after restarting only the gateway.
 
 ## 1. Prerequisites
 
@@ -29,7 +41,20 @@ export ADMIN_USER='operator'
 export ADMIN_PASSWORD='replace-with-your-password'
 ```
 
-Start vLLM A (and B on another GPU/host when available):
+For the canonical local Compose topology, enable live decision telemetry from the same checkout:
+
+```bash
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
+curl -fsS http://127.0.0.1:9090/-/ready
+```
+
+Confirm the `vllm-priority-gateway` target at `http://127.0.0.1:9090/targets`, then open `http://127.0.0.1:3000/d/llmgw-gateway-decisions`. The first row must be captured over one aligned interval: GPU pool pressure, Low 429 decisions by exact reason, High p95 duration/TTFT, and High selected queue-wait p95. Use lower-priority traffic to create pressure when this row is the evidence target, otherwise the saturation workload itself contaminates the High percentile. The Grafana `admin` / `admin` default is for loopback development only; override both Grafana credential variables anywhere else.
+
+Run the health, model, and metrics probes below from the gateway host. `VLLM_A` and `VLLM_B` may point to remote serving groups, provided the network policy allows only the intended gateway hosts to reach them.
+
+The native commands below are a two-GPU example. On a single GPU, prefer the canonical Docker Compose topology; if manually sharing the device between native processes, set and calibrate an explicit `--gpu-memory-utilization` for each process rather than referencing a nonexistent second device.
+
+Start vLLM A and B on separate GPUs or serving hosts when available:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" --host 127.0.0.1 --port 8001 \
@@ -38,6 +63,21 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" --host 127.0.0.1 --port 8001 \
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL" --host 127.0.0.1 --port 8002 \
   --scheduling-policy priority --enable-request-id-headers
 ```
+
+These commands bind loopback for a same-host deployment. On a separate serving host, bind the intended private interface instead and restrict its ingress to the gateway hosts.
+
+Confirm the exact upstream URLs from the gateway host before registering them:
+
+```bash
+for upstream in "$VLLM_A" "$VLLM_B"; do
+  curl -fsS "$upstream/health" >/dev/null
+  curl -fsS "$upstream/v1/models" | jq -e '.data | length > 0'
+  curl -fsS "$upstream/metrics" \
+    | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc)' >/dev/null
+done
+```
+
+Add the configured upstream authorization header to these probes when vLLM API-key authentication is enabled.
 
 Register the pool/backends and clients in the Admin UI. Wait for Dashboard to show healthy, fresh metrics. Capture baseline evidence:
 
@@ -159,10 +199,10 @@ kill -0 "$LOAD_PID"
   -class-keys "critical=$CRITICAL_KEY,high=$HIGH_KEY,normal=$NORMAL_KEY,background=$BACKGROUND_KEY" \
   -mix critical=10,high=20,normal=30,background=40 -json | tee /tmp/mixed-priority.json
 
-curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds)'
+curl -sS "$GATEWAY/metrics" | grep -E '^llmgw_(requests_total|requests_rejected_total|request_duration_seconds|ttft_seconds|pool_pressure|pool_state|backend_selected_total|queue_wait_seconds)'
 ```
 
-Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; accepted high-priority requests retain materially better TTFT than queued background traffic.
+Inspect the `byClass` outcome and successful-response latency summaries, then submit one request per class with unique prompts and inspect the vLLM access/request logs. Pass criteria: vLLM sees the configured values (for example critical `-100`, high `-10`, normal `0`, background `100`); client-supplied header/body escalation is overwritten; under saturation, lower classes receive admission `429` before critical/high classes; `priority_concurrency_limit` increases for Low while backend selections and both High histograms increase; accepted high-priority requests retain materially better TTFT than queued background traffic. Record the pre-load and loaded High first-byte values and ratio rather than applying an uncalibrated universal threshold.
 
 ## 6. Hysteresis, recovery, and health transitions
 
@@ -247,10 +287,10 @@ Run the isolated resilience scenario from the same host as the gateway:
 LLMGW_E2E_MODE=resilience make test-real-vllm
 ```
 
-Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires a loopback gateway URL, captures the target URL, all sibling drain states, all backend update fields, and both pool limits, and attempts to restore every captured value. Cleanup reports all failed updates and continues trying later resources; a resource whose update fails may remain mutated and must be restored manually. The loopback fault proxy faults only supported inference routes. Do not run this mode against production traffic.
+Set `LLMGW_E2E_CIRCUIT_BACKEND_ID` to one backend in the selected pool and keep `LLMGW_E2E_CIRCUIT_FAILURE_COUNT` aligned with the gateway threshold (default `5`). This mode requires the test process and gateway on the same host with a loopback gateway URL; the selected vLLM backend itself may be remote. The test captures the target URL, all sibling drain states, all backend update fields, and both pool limits, and attempts to restore every captured value. Cleanup reports all failed updates and continues trying later resources; a resource whose update fails may remain mutated and must be restored manually. The loopback fault proxy faults only supported inference routes. Do not run this mode against production traffic.
 
 Retain Admin snapshots showing healthy/fresh metrics alongside `closed → open → half_open → closed`, `/readyz` remaining HTTP 200, `/inference-readyz` changing `200 → 503 → 200`, and the five Prometheus families `llmgw_backend_circuit_state`, `llmgw_backend_circuit_failures`, `llmgw_pool_gateway_inflight`, `llmgw_pool_waiting_requests`, and `llmgw_pool_available_backends`. Also retain the complete recovery stream timing and the cleanup status. Do not claim a target-host gate until its real-vLLM command has actually run and its required artifacts have been retained.
 
 ## 8. Evidence to retain
 
-Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.
+Keep the vLLM version/command line, GPU model and count, gateway commit, Admin status captures, gateway metrics before/after, structured request logs, vLLM metrics/logs, loadgen JSON, and timestamps. Also retain the Prometheus target state and one Grafana time-window capture that shows pressure rising, Low `priority_concurrency_limit` 429s, and High duration/TTFT plus queue-wait on the same time axis. Record the baseline/loaded High first-byte measurements and ratio. Record deviations caused by model length, GPU memory, or vLLM-version metric names. Do not use real API keys or prompts containing sensitive data in retained artifacts.

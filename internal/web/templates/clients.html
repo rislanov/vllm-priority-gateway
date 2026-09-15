@@ -5,7 +5,8 @@
   <form method="post" action="/admin/clients" class="row-actions">
     <input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="update"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="name" value="{{.Name}}"><input type="hidden" name="priority_class" value="{{.PriorityClass}}"><input type="hidden" name="vllm_priority" value="{{.VLLMPriority}}"><input type="hidden" name="max_concurrency" value="{{.MaxConcurrency}}"><input type="hidden" name="requests_per_minute" value="{{.RequestsPerMinute}}"><input type="hidden" name="tokens_per_minute" value="{{.TokensPerMinute}}">{{range .ModelPoolIDs}}<input type="hidden" name="model_pool_id" value="{{.}}">{{end}}{{if not .Enabled}}<input type="hidden" name="enabled" value="on">{{end}}
     <button class="button secondary small" type="submit" data-confirm="Change enabled state for this client?">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
-  </form></div>
+  </form>
+  <form method="post" action="/admin/clients" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{.ID}}"><button class="button danger small" type="submit" data-confirm="Delete this client and all of its API keys?">Delete</button></form></div>
 </td></tr>{{else}}<tr><td colspan="7" class="empty">No clients configured.</td></tr>{{end}}
 </tbody></table></div>
 {{if .EditClient}}

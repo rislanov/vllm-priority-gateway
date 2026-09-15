@@ -313,6 +313,43 @@ func TestLeaseManagerShutdownReportsPermanentlyUndeliveredCompletions(t *testing
 	}
 }
 
+type shutdownContextCoordinator struct {
+	managerCoordinator
+	started  chan struct{}
+	draining chan context.Context
+	calls    atomic.Int32
+}
+
+func (c *shutdownContextCoordinator) Complete(ctx context.Context, _ []coordination.LeaseCompletion) ([]coordination.CompleteResult, error) {
+	if c.calls.Add(1) == 1 {
+		close(c.started)
+	} else {
+		c.draining <- ctx
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestLeaseManagerShutdownUsesRemainingCallerBudget(t *testing.T) {
+	coordinator := &shutdownContextCoordinator{started: make(chan struct{}), draining: make(chan context.Context, 1)}
+	manager := coordination.NewLeaseManager(context.Background(), coordinator, coordination.LeaseManagerOptions{
+		ShutdownTimeout: time.Minute,
+	})
+	manager.Track(coordination.LeaseIdentity{LeaseID: uuid.New()}).Complete(nil)
+	<-coordinator.started
+	shutdownCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := manager.CloseContext(shutdownCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext() = %v, want expired caller budget", err)
+	}
+	if got := <-coordinator.draining; got != shutdownCtx {
+		t.Fatal("shutdown replaced the caller's shared context")
+	}
+	if manager.DroppedCompletions() != 1 || manager.ActiveCount() != 0 {
+		t.Fatalf("dropped=%d active=%d", manager.DroppedCompletions(), manager.ActiveCount())
+	}
+}
+
 type blockingCoordinator struct{ started chan struct{} }
 
 func (b *blockingCoordinator) Acquire(context.Context, coordination.AdmissionRequest) (coordination.AdmissionDecision, error) {

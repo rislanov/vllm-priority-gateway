@@ -67,7 +67,44 @@ type Config struct {
 }
 
 func Load(lookup LookupFunc) (Config, error) {
-	cfg := Config{
+	cfg := defaultConfig()
+
+	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
+	cfg.DatabasePath = stringValue(lookup, "LLMGW_DATABASE_PATH", cfg.DatabasePath)
+	cfg.AdminUsername = stringValue(lookup, "LLMGW_ADMIN_USERNAME", "")
+	cfg.AdminPassword = stringValue(lookup, "LLMGW_ADMIN_PASSWORD", "")
+	cfg.APIKeyHMACSecret = []byte(stringValue(lookup, "LLMGW_API_KEY_HMAC_SECRET", ""))
+
+	if err := cfg.loadCoordination(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadHealth(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadCircuit(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadPressure(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadRequestPolicy(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadTransport(lookup); err != nil {
+		return Config{}, err
+	}
+
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
+	if cfg.DatabaseDriver == "postgres" && cfg.DatabaseMigrationURL == "" {
+		cfg.DatabaseMigrationURL = cfg.DatabaseURL
+	}
+	return cfg, nil
+}
+
+func defaultConfig() Config {
+	return Config{
 		ListenAddress:                 ":8080",
 		DatabaseDriver:                "sqlite",
 		DatabasePath:                  "./data/llmgw.db",
@@ -114,156 +151,127 @@ func Load(lookup LookupFunc) (Config, error) {
 		ShutdownGracePeriod:           30 * time.Second,
 		AnalyticsRetention:            2160 * time.Hour,
 	}
+}
 
-	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
-	for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL", "LLMGW_POSTGRES_CONFIG_MAX_CONNS", "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", "LLMGW_CONFIG_POLL_INTERVAL", "LLMGW_COORDINATION_TIMEOUT"} {
-		if _, exists := lookup(key); exists {
-			cfg.postgresSettingsExplicit = true
-		}
-	}
-	cfg.DatabaseDriver = strings.ToLower(strings.TrimSpace(stringValue(lookup, "LLMGW_DATABASE_DRIVER", cfg.DatabaseDriver)))
-	cfg.DatabasePath = stringValue(lookup, "LLMGW_DATABASE_PATH", cfg.DatabasePath)
-	cfg.DatabaseURL = stringValue(lookup, "LLMGW_DATABASE_URL", "")
-	cfg.DatabaseMigrationURL = stringValue(lookup, "LLMGW_DATABASE_MIGRATION_URL", "")
-	cfg.AdminUsername = stringValue(lookup, "LLMGW_ADMIN_USERNAME", "")
-	cfg.AdminPassword = stringValue(lookup, "LLMGW_ADMIN_PASSWORD", "")
-	cfg.APIKeyHMACSecret = []byte(stringValue(lookup, "LLMGW_API_KEY_HMAC_SECRET", ""))
-
+func (c *Config) loadHealth(lookup LookupFunc) error {
 	var err error
-	if cfg.PostgresConfigMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_CONFIG_MAX_CONNS", cfg.PostgresConfigMaxConns); err != nil {
-		return Config{}, err
+	if c.HealthInterval, err = durationValue(lookup, "LLMGW_HEALTH_INTERVAL", c.HealthInterval); err != nil {
+		return err
 	}
-	if cfg.PostgresAnalyticsMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", cfg.PostgresAnalyticsMaxConns); err != nil {
-		return Config{}, err
+	if c.HealthTimeout, err = durationValue(lookup, "LLMGW_HEALTH_TIMEOUT", c.HealthTimeout); err != nil {
+		return err
 	}
-	if cfg.PostgresCoordinationMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", cfg.PostgresCoordinationMaxConns); err != nil {
-		return Config{}, err
+	if c.MetricsInterval, err = durationValue(lookup, "LLMGW_METRICS_INTERVAL", c.MetricsInterval); err != nil {
+		return err
 	}
-	if cfg.ConfigPollInterval, err = durationValue(lookup, "LLMGW_CONFIG_POLL_INTERVAL", cfg.ConfigPollInterval); err != nil {
-		return Config{}, err
+	if c.MetricsTimeout, err = durationValue(lookup, "LLMGW_METRICS_TIMEOUT", c.MetricsTimeout); err != nil {
+		return err
 	}
-	if cfg.CoordinationTimeout, err = durationValue(lookup, "LLMGW_COORDINATION_TIMEOUT", cfg.CoordinationTimeout); err != nil {
-		return Config{}, err
+	if c.MetricsStaleAfter, err = durationValue(lookup, "LLMGW_METRICS_STALE_AFTER", c.MetricsStaleAfter); err != nil {
+		return err
 	}
-	if cfg.LeaseTTL, err = durationValue(lookup, "LLMGW_LEASE_TTL", cfg.LeaseTTL); err != nil {
-		return Config{}, err
+	if c.UnhealthyAfter, err = intValue(lookup, "LLMGW_UNHEALTHY_AFTER", c.UnhealthyAfter); err != nil {
+		return err
 	}
-	if cfg.LeaseRenewInterval, err = durationValue(lookup, "LLMGW_LEASE_RENEW_INTERVAL", cfg.LeaseRenewInterval); err != nil {
-		return Config{}, err
+	if c.RecoveryAfter, err = intValue(lookup, "LLMGW_RECOVERY_AFTER", c.RecoveryAfter); err != nil {
+		return err
 	}
-	if cfg.CoordinationCompletionBacklog, err = intValue(lookup, "LLMGW_COORDINATION_COMPLETION_BACKLOG", cfg.CoordinationCompletionBacklog); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyCriticalMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_CRITICAL_MAX_INFLIGHT", cfg.EmergencyCriticalMaxInflight); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyHighMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT", cfg.EmergencyHighMaxInflight); err != nil {
-		return Config{}, err
-	}
-	if cfg.HealthInterval, err = durationValue(lookup, "LLMGW_HEALTH_INTERVAL", cfg.HealthInterval); err != nil {
-		return Config{}, err
-	}
-	if cfg.HealthTimeout, err = durationValue(lookup, "LLMGW_HEALTH_TIMEOUT", cfg.HealthTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.MetricsInterval, err = durationValue(lookup, "LLMGW_METRICS_INTERVAL", cfg.MetricsInterval); err != nil {
-		return Config{}, err
-	}
-	if cfg.MetricsTimeout, err = durationValue(lookup, "LLMGW_METRICS_TIMEOUT", cfg.MetricsTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.MetricsStaleAfter, err = durationValue(lookup, "LLMGW_METRICS_STALE_AFTER", cfg.MetricsStaleAfter); err != nil {
-		return Config{}, err
-	}
-	if cfg.UnhealthyAfter, err = intValue(lookup, "LLMGW_UNHEALTHY_AFTER", cfg.UnhealthyAfter); err != nil {
-		return Config{}, err
-	}
-	if cfg.RecoveryAfter, err = intValue(lookup, "LLMGW_RECOVERY_AFTER", cfg.RecoveryAfter); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitFailureThreshold, err = intValue(lookup, "LLMGW_CIRCUIT_FAILURE_THRESHOLD", cfg.CircuitFailureThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitFailureWindow, err = durationValue(lookup, "LLMGW_CIRCUIT_FAILURE_WINDOW", cfg.CircuitFailureWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitOpenCooldown, err = durationValue(lookup, "LLMGW_CIRCUIT_OPEN_COOLDOWN", cfg.CircuitOpenCooldown); err != nil {
-		return Config{}, err
-	}
-	if cfg.CircuitHalfOpenMaxProbes, err = intValue(lookup, "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", cfg.CircuitHalfOpenMaxProbes); err != nil {
-		return Config{}, err
-	}
-	if cfg.QueueSoftLimit, err = floatValue(lookup, "LLMGW_QUEUE_SOFT_LIMIT", cfg.QueueSoftLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.KVSoftLimit, err = floatValue(lookup, "LLMGW_KV_SOFT_LIMIT", cfg.KVSoftLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.KVHardLimit, err = floatValue(lookup, "LLMGW_KV_HARD_LIMIT", cfg.KVHardLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.EWMAWindow, err = durationValue(lookup, "LLMGW_EWMA_WINDOW", cfg.EWMAWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.BusyThreshold, err = floatValue(lookup, "LLMGW_BUSY_THRESHOLD", cfg.BusyThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.SaturatedThreshold, err = floatValue(lookup, "LLMGW_SATURATED_THRESHOLD", cfg.SaturatedThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_THRESHOLD", cfg.EmergencyThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.BusyRecoveryThreshold, err = floatValue(lookup, "LLMGW_BUSY_RECOVERY_THRESHOLD", cfg.BusyRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.SaturatedRecoveryThreshold, err = floatValue(lookup, "LLMGW_SATURATED_RECOVERY_THRESHOLD", cfg.SaturatedRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.EmergencyRecoveryThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_RECOVERY_THRESHOLD", cfg.EmergencyRecoveryThreshold); err != nil {
-		return Config{}, err
-	}
-	if cfg.OverloadEnterWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_ENTER_WINDOW", cfg.OverloadEnterWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.OverloadRecoveryWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_RECOVERY_WINDOW", cfg.OverloadRecoveryWindow); err != nil {
-		return Config{}, err
-	}
-	if cfg.RequestBodyLimit, err = int64Value(lookup, "LLMGW_REQUEST_BODY_LIMIT", cfg.RequestBodyLimit); err != nil {
-		return Config{}, err
-	}
-	if cfg.RetryAfter, err = durationValue(lookup, "LLMGW_RETRY_AFTER", cfg.RetryAfter); err != nil {
-		return Config{}, err
-	}
-	if cfg.RoutingPressureEpsilon, err = floatValue(lookup, "LLMGW_ROUTING_PRESSURE_EPSILON", cfg.RoutingPressureEpsilon); err != nil {
-		return Config{}, err
-	}
-	if cfg.SessionAffinityMaxPressure, err = floatValue(lookup, "LLMGW_SESSION_AFFINITY_MAX_PRESSURE", cfg.SessionAffinityMaxPressure); err != nil {
-		return Config{}, err
-	}
-	if cfg.DialTimeout, err = durationValue(lookup, "LLMGW_DIAL_TIMEOUT", cfg.DialTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.TLSHandshakeTimeout, err = durationValue(lookup, "LLMGW_TLS_HANDSHAKE_TIMEOUT", cfg.TLSHandshakeTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.ResponseHeaderTimeout, err = durationValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT", cfg.ResponseHeaderTimeout); err != nil {
-		return Config{}, err
-	}
-	if cfg.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", cfg.ShutdownGracePeriod); err != nil {
-		return Config{}, err
-	}
-	if cfg.AnalyticsRetention, err = durationValue(lookup, "LLMGW_ANALYTICS_RETENTION", cfg.AnalyticsRetention); err != nil {
-		return Config{}, err
-	}
+	return nil
+}
 
-	if err := cfg.validate(); err != nil {
-		return Config{}, err
+func (c *Config) loadCircuit(lookup LookupFunc) error {
+	var err error
+	if c.CircuitFailureThreshold, err = intValue(lookup, "LLMGW_CIRCUIT_FAILURE_THRESHOLD", c.CircuitFailureThreshold); err != nil {
+		return err
 	}
-	if cfg.DatabaseDriver == "postgres" && cfg.DatabaseMigrationURL == "" {
-		cfg.DatabaseMigrationURL = cfg.DatabaseURL
+	if c.CircuitFailureWindow, err = durationValue(lookup, "LLMGW_CIRCUIT_FAILURE_WINDOW", c.CircuitFailureWindow); err != nil {
+		return err
 	}
-	return cfg, nil
+	if c.CircuitOpenCooldown, err = durationValue(lookup, "LLMGW_CIRCUIT_OPEN_COOLDOWN", c.CircuitOpenCooldown); err != nil {
+		return err
+	}
+	if c.CircuitHalfOpenMaxProbes, err = intValue(lookup, "LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES", c.CircuitHalfOpenMaxProbes); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadPressure(lookup LookupFunc) error {
+	var err error
+	if c.QueueSoftLimit, err = floatValue(lookup, "LLMGW_QUEUE_SOFT_LIMIT", c.QueueSoftLimit); err != nil {
+		return err
+	}
+	if c.KVSoftLimit, err = floatValue(lookup, "LLMGW_KV_SOFT_LIMIT", c.KVSoftLimit); err != nil {
+		return err
+	}
+	if c.KVHardLimit, err = floatValue(lookup, "LLMGW_KV_HARD_LIMIT", c.KVHardLimit); err != nil {
+		return err
+	}
+	if c.EWMAWindow, err = durationValue(lookup, "LLMGW_EWMA_WINDOW", c.EWMAWindow); err != nil {
+		return err
+	}
+	if c.BusyThreshold, err = floatValue(lookup, "LLMGW_BUSY_THRESHOLD", c.BusyThreshold); err != nil {
+		return err
+	}
+	if c.SaturatedThreshold, err = floatValue(lookup, "LLMGW_SATURATED_THRESHOLD", c.SaturatedThreshold); err != nil {
+		return err
+	}
+	if c.EmergencyThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_THRESHOLD", c.EmergencyThreshold); err != nil {
+		return err
+	}
+	if c.BusyRecoveryThreshold, err = floatValue(lookup, "LLMGW_BUSY_RECOVERY_THRESHOLD", c.BusyRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.SaturatedRecoveryThreshold, err = floatValue(lookup, "LLMGW_SATURATED_RECOVERY_THRESHOLD", c.SaturatedRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.EmergencyRecoveryThreshold, err = floatValue(lookup, "LLMGW_EMERGENCY_RECOVERY_THRESHOLD", c.EmergencyRecoveryThreshold); err != nil {
+		return err
+	}
+	if c.OverloadEnterWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_ENTER_WINDOW", c.OverloadEnterWindow); err != nil {
+		return err
+	}
+	if c.OverloadRecoveryWindow, err = durationValue(lookup, "LLMGW_OVERLOAD_RECOVERY_WINDOW", c.OverloadRecoveryWindow); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadRequestPolicy(lookup LookupFunc) error {
+	var err error
+	if c.RequestBodyLimit, err = int64Value(lookup, "LLMGW_REQUEST_BODY_LIMIT", c.RequestBodyLimit); err != nil {
+		return err
+	}
+	if c.RetryAfter, err = durationValue(lookup, "LLMGW_RETRY_AFTER", c.RetryAfter); err != nil {
+		return err
+	}
+	if c.RoutingPressureEpsilon, err = floatValue(lookup, "LLMGW_ROUTING_PRESSURE_EPSILON", c.RoutingPressureEpsilon); err != nil {
+		return err
+	}
+	if c.SessionAffinityMaxPressure, err = floatValue(lookup, "LLMGW_SESSION_AFFINITY_MAX_PRESSURE", c.SessionAffinityMaxPressure); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) loadTransport(lookup LookupFunc) error {
+	var err error
+	if c.DialTimeout, err = durationValue(lookup, "LLMGW_DIAL_TIMEOUT", c.DialTimeout); err != nil {
+		return err
+	}
+	if c.TLSHandshakeTimeout, err = durationValue(lookup, "LLMGW_TLS_HANDSHAKE_TIMEOUT", c.TLSHandshakeTimeout); err != nil {
+		return err
+	}
+	if c.ResponseHeaderTimeout, err = durationValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT", c.ResponseHeaderTimeout); err != nil {
+		return err
+	}
+	if c.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", c.ShutdownGracePeriod); err != nil {
+		return err
+	}
+	if c.AnalyticsRetention, err = durationValue(lookup, "LLMGW_ANALYTICS_RETENTION", c.AnalyticsRetention); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c Config) validate() error {
@@ -327,6 +335,18 @@ func (c Config) validate() error {
 		c.KVSoftLimit < 0 || c.KVHardLimit > 1 || c.KVSoftLimit >= c.KVHardLimit {
 		return errors.New("KV limits must satisfy 0 <= soft < hard <= 1")
 	}
+	for _, threshold := range []float64{
+		c.BusyRecoveryThreshold,
+		c.BusyThreshold,
+		c.SaturatedRecoveryThreshold,
+		c.SaturatedThreshold,
+		c.EmergencyRecoveryThreshold,
+		c.EmergencyThreshold,
+	} {
+		if !finitePositive(threshold) {
+			return errors.New("pool thresholds and recovery thresholds must be finite and positive")
+		}
+	}
 	if !(c.BusyRecoveryThreshold < c.BusyThreshold && c.BusyThreshold < c.SaturatedRecoveryThreshold && c.SaturatedRecoveryThreshold < c.SaturatedThreshold && c.SaturatedThreshold < c.EmergencyRecoveryThreshold && c.EmergencyRecoveryThreshold < c.EmergencyThreshold) {
 		return errors.New("pool thresholds and recovery thresholds are out of order")
 	}
@@ -338,44 +358,6 @@ func (c Config) validate() error {
 	}
 	if !finitePositive(c.SessionAffinityMaxPressure) {
 		return errors.New("session affinity max pressure must be finite and positive")
-	}
-	return nil
-}
-
-func (c Config) validateDatabaseProfile() error {
-	switch c.DatabaseDriver {
-	case "sqlite":
-		if strings.TrimSpace(c.DatabasePath) == "" {
-			return errors.New("LLMGW_DATABASE_PATH is required for sqlite")
-		}
-		if c.postgresSettingsExplicit {
-			return errors.New("PostgreSQL-only settings require LLMGW_DATABASE_DRIVER=postgres")
-		}
-		for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL"} {
-			value := map[string]string{"LLMGW_DATABASE_URL": c.DatabaseURL, "LLMGW_DATABASE_MIGRATION_URL": c.DatabaseMigrationURL}[key]
-			if strings.TrimSpace(value) != "" {
-				return fmt.Errorf("%s is valid only for postgres", key)
-			}
-		}
-	case "postgres":
-		if strings.TrimSpace(c.DatabaseURL) == "" {
-			return errors.New("LLMGW_DATABASE_URL is required for postgres")
-		}
-		for _, raw := range []string{c.DatabaseURL, c.DatabaseMigrationURL} {
-			if raw == "" {
-				continue
-			}
-			parsed, err := url.Parse(raw)
-			if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
-				return errors.New("invalid PostgreSQL connection URL")
-			}
-		}
-		runtimeURL, _ := url.Parse(c.DatabaseURL)
-		if mode := runtimeURL.Query().Get("default_query_exec_mode"); mode != "" && mode != "exec" {
-			return errors.New("PostgreSQL runtime URL requires default_query_exec_mode=exec")
-		}
-	default:
-		return fmt.Errorf("unsupported LLMGW_DATABASE_DRIVER %q", c.DatabaseDriver)
 	}
 	return nil
 }
@@ -437,4 +419,85 @@ func floatValue(lookup LookupFunc, key string, fallback float64) (float64, error
 
 func finitePositive(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func (c *Config) loadCoordination(lookup LookupFunc) error {
+	for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL", "LLMGW_POSTGRES_CONFIG_MAX_CONNS", "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", "LLMGW_CONFIG_POLL_INTERVAL", "LLMGW_COORDINATION_TIMEOUT"} {
+		if _, exists := lookup(key); exists {
+			c.postgresSettingsExplicit = true
+		}
+	}
+	c.DatabaseDriver = strings.ToLower(strings.TrimSpace(stringValue(lookup, "LLMGW_DATABASE_DRIVER", c.DatabaseDriver)))
+	c.DatabaseURL = stringValue(lookup, "LLMGW_DATABASE_URL", "")
+	c.DatabaseMigrationURL = stringValue(lookup, "LLMGW_DATABASE_MIGRATION_URL", "")
+
+	var err error
+	if c.PostgresConfigMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_CONFIG_MAX_CONNS", c.PostgresConfigMaxConns); err != nil {
+		return err
+	}
+	if c.PostgresAnalyticsMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", c.PostgresAnalyticsMaxConns); err != nil {
+		return err
+	}
+	if c.PostgresCoordinationMaxConns, err = intValue(lookup, "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", c.PostgresCoordinationMaxConns); err != nil {
+		return err
+	}
+	if c.ConfigPollInterval, err = durationValue(lookup, "LLMGW_CONFIG_POLL_INTERVAL", c.ConfigPollInterval); err != nil {
+		return err
+	}
+	if c.CoordinationTimeout, err = durationValue(lookup, "LLMGW_COORDINATION_TIMEOUT", c.CoordinationTimeout); err != nil {
+		return err
+	}
+	if c.LeaseTTL, err = durationValue(lookup, "LLMGW_LEASE_TTL", c.LeaseTTL); err != nil {
+		return err
+	}
+	if c.LeaseRenewInterval, err = durationValue(lookup, "LLMGW_LEASE_RENEW_INTERVAL", c.LeaseRenewInterval); err != nil {
+		return err
+	}
+	if c.CoordinationCompletionBacklog, err = intValue(lookup, "LLMGW_COORDINATION_COMPLETION_BACKLOG", c.CoordinationCompletionBacklog); err != nil {
+		return err
+	}
+	if c.EmergencyCriticalMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_CRITICAL_MAX_INFLIGHT", c.EmergencyCriticalMaxInflight); err != nil {
+		return err
+	}
+	if c.EmergencyHighMaxInflight, err = intValue(lookup, "LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT", c.EmergencyHighMaxInflight); err != nil {
+		return err
+	}
+	return nil
+}
+func (c Config) validateDatabaseProfile() error {
+	switch c.DatabaseDriver {
+	case "sqlite":
+		if strings.TrimSpace(c.DatabasePath) == "" {
+			return errors.New("LLMGW_DATABASE_PATH is required for sqlite")
+		}
+		if c.postgresSettingsExplicit {
+			return errors.New("PostgreSQL-only settings require LLMGW_DATABASE_DRIVER=postgres")
+		}
+		for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL"} {
+			value := map[string]string{"LLMGW_DATABASE_URL": c.DatabaseURL, "LLMGW_DATABASE_MIGRATION_URL": c.DatabaseMigrationURL}[key]
+			if strings.TrimSpace(value) != "" {
+				return fmt.Errorf("%s is valid only for postgres", key)
+			}
+		}
+	case "postgres":
+		if strings.TrimSpace(c.DatabaseURL) == "" {
+			return errors.New("LLMGW_DATABASE_URL is required for postgres")
+		}
+		for _, raw := range []string{c.DatabaseURL, c.DatabaseMigrationURL} {
+			if raw == "" {
+				continue
+			}
+			parsed, err := url.Parse(raw)
+			if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
+				return errors.New("invalid PostgreSQL connection URL")
+			}
+		}
+		runtimeURL, _ := url.Parse(c.DatabaseURL)
+		if mode := runtimeURL.Query().Get("default_query_exec_mode"); mode != "" && mode != "exec" {
+			return errors.New("PostgreSQL runtime URL requires default_query_exec_mode=exec")
+		}
+	default:
+		return fmt.Errorf("unsupported LLMGW_DATABASE_DRIVER %q", c.DatabaseDriver)
+	}
+	return nil
 }

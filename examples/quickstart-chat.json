@@ -1,0 +1,14 @@
+{
+  "model": "qwen",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain priority scheduling in one sentence."
+    }
+  ],
+  "max_tokens": 64,
+  "stream": true,
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  }
+}

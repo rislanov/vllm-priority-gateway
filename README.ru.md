@@ -1,283 +1,233 @@
 [English](README.md) | [Русский](README.ru.md)
 
-# Lightweight vLLM Priority Gateway
+# vLLM Priority Gateway
 
-## Содержание
+[![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
+[![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](LICENSE)
 
-- [Что это за продукт](#что-это-за-продукт)
-- [Основные возможности](#основные-возможности)
-- [Быстрый запуск в production](#быстрый-запуск-в-production)
-- [Админка](#админка)
-- [Поведение клиентского API](#поведение-клиентского-api)
-- [Эксплуатация и развёртывание](#эксплуатация-и-развёртывание)
-- [Admin API](#admin-api)
-- [Разработка и тестирование](#разработка-и-тестирование)
-- [Текущие ограничения](#текущие-ограничения)
-- [Документация](#документация)
+**Защищает высокоприоритетные inference-нагрузки в общих GPU-кластерах vLLM.**
 
-## Что это за продукт
+vLLM Priority Gateway — лёгкий слой policy, admission и routing перед **существующими серверами [vLLM](https://docs.vllm.ai/)**. Приложения продолжают использовать стандартный OpenAI API: достаточно изменить base URL, использовать выданный gateway ключ и оставить развёртывание моделей и GPU scheduling существующей инфраструктуре.
 
-Lightweight vLLM Priority Gateway — это компактный слой управления и маршрутизации перед статическим пулом OpenAI-совместимых серверов [vLLM](https://docs.vllm.ai/). Приложения продолжают использовать обычные OpenAI-клиенты, а операторы централизованно задают приоритет, конкурентность, доступ к моделям, правила маршрутизации и поведение при перегрузке.
+**Проверено на реальном vLLM с GPU NVIDIA**, включая saturation, изоляцию приоритетов, отказ и восстановление backend-серверов, streaming и сохранность состояния после перезапуска. [Результаты проверки](docs/acceptance-evidence.md).
 
-Без gateway каждый клиент обращается к vLLM напрямую и потенциально может назначить себе приоритет. С gateway клиент получает API-ключ с ограниченными правами, запрашивает публичное имя модели и не может повысить собственный приоритет. Gateway заменяет модель и приоритет, применяет admission policy, выбирает здоровый backend по текущей нагрузке GPU и сразу начинает передавать потоковый ответ клиенту.
+## Какую проблему решает
+
+Обычный HTTP load balancer распределяет запросы, но обычно не знает:
+
+- какой клиент может потреблять общую GPU capacity;
+- какой запрос относится к production, а какой — к background;
+- сколько запросов выполняется и ожидает внутри scheduler каждого vLLM;
+- насколько занят KV cache;
+- когда нужно первым отклонить низкоприоритетный трафик;
+- какой backend лучше сохраняет prefix-cache locality.
+
+Gateway объединяет server-side policy клиента с live health и Prometheus-метриками vLLM:
 
 ```text
-OpenAI-клиент
-    │ Bearer-ключ llmgw_*
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│ Lightweight vLLM Priority Gateway                       │
-│ auth → доступ к модели → admission → affinity/routing   │
-│ streaming proxy │ health/pressure │ Admin UI/API        │
-│ analytics       │ Prometheus      │ SQLite/PostgreSQL   │
-└───────────────────────────┬──────────────────────────────┘
-                            │ управляемый X-Vllm-Priority
-                   ┌────────┴────────┐
-                   ▼                 ▼
-              vLLM backend A    vLLM backend B
+production requests  ── high ────────┐
+interactive agents   ── normal ──────┼──► общая vLLM capacity
+nightly / eval jobs  ── background ──┘
+
+                         GPU pressure растёт
+
+background traffic ──► throttled / 429
+production traffic ──► остаётся admitted
 ```
 
-Для развёртывания нужен один статический Go-бинарник и явно выбранный профиль: SQLite по умолчанию для одного экземпляра либо PostgreSQL 16+ для согласованной работы нескольких реплик. Redis, message broker, Kubernetes controller и отдельная сборка frontend не требуются. Подробности — в [руководстве PostgreSQL production](docs/postgresql-production.md).
+## Место в кластере
 
-## Основные возможности
+```text
+                    Существующая inference-инфраструктура
 
-- OpenAI-совместимые `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions` и `POST /v1/responses`.
-- Криптографически стойкие клиентские ключи, которые хранятся только как HMAC-SHA-256 digest, а не в открытом виде.
-- Для каждого клиента: включение/отключение, класс приоритета, целочисленный приоритет vLLM, лимит конкурентности и явный доступ к моделям.
-- Отдельные публичные и upstream-имена моделей, статические пулы из нескольких backend-серверов.
-- Независимые health- и Prometheus-проверки backend-серверов, EWMA pressure и устойчивые к дребезгу состояния пула.
-- Priority-aware admission, ограниченные ответы `429`, маршрутизация на наименее загруженный backend, мягкая session affinity, drain и одна консервативная повторная попытка до получения заголовков.
-- Circuit breaker для каждого backend и лимиты gateway-inflight/waiting для каждого пула.
-- Немедленный streaming и передача отмены запроса upstream-серверу.
-- Аналитика запросов и токенов без сохранения контента: графики, фильтры, детализация запросов и CSV.
-- Встроенные Admin UI и JSON Admin API с Basic auth и CSRF-защитой.
-- Метрики Prometheus и структурированные JSON-логи завершённых запросов.
-
-## Быстрый запуск в production
-
-Этот сценарий подключает gateway к реальному vLLM и доводит настройку до первого авторизованного inference-запроса. Для gateway используется Docker. Нативная установка с systemd, требования к reverse proxy, production-проверки и backup/restore описаны в [подробном руководстве](docs/deployment.md).
-
-### Требования
-
-- Linux-хост с Docker для gateway.
-- Production endpoint vLLM, доступный по приватной сети.
-- Доверенный TLS reverse proxy перед публикацией gateway в клиентскую сеть.
-- `curl`; для проверок также удобен `jq`.
-
-В примерах используются:
-
-- upstream-модель: `Qwen/Qwen2.5-7B-Instruct`;
-- публичная модель для клиентов: `qwen`;
-- приватный URL vLLM, доступный из контейнера gateway: `http://vllm.internal:8000`;
-- адрес gateway на Docker-хосте: `http://127.0.0.1:8080`.
-
-Замените все четыре значения под своё окружение. Важно: `127.0.0.1` внутри контейнера gateway указывает на сам контейнер, а не на процесс vLLM на Docker-хосте.
-
-### 1. Запустите vLLM с priority scheduling
-
-Если vLLM уже управляется вашей inference-платформой, проверьте эквивалентность параметров и переходите к следующему шагу.
-
-```bash
-vllm serve Qwen/Qwen2.5-7B-Instruct \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --scheduling-policy priority \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details \
-  --enable-request-id-headers
+ Production API ────────┐
+                        │  llmgw_prod_*     priority: high
+ Coding agents ─────────┼──────────────────────────────────┐
+                        │  llmgw_agents_*   priority: normal
+ Batch / eval jobs ─────┘  llmgw_batch_*    priority: background
+                                                            │
+                                                            ▼
+                                              ┌───────────────────────┐
+                                              │ vLLM Priority Gateway │
+                                              │ auth / policy         │
+                                              │ admission control     │
+                                              │ pressure-aware route  │
+                                              │ session affinity      │
+                                              │ circuit breakers      │
+                                              └───────────┬───────────┘
+                                                          │
+                                      ┌───────────────────┼───────────────────┐
+                                      ▼                   ▼                   ▼
+                               vLLM GPU node A     vLLM GPU node B     vLLM GPU node C
 ```
 
-В vLLM меньшие целочисленные значения priority обслуживаются раньше. Флаг `--enable-prompt-tokens-details` позволяет строить аналитику cache-read, когда модель и backend возвращают эти данные. При фиксации или обновлении версии сверяйтесь с актуальными страницами [vLLM serve CLI](https://docs.vllm.ai/en/latest/cli/serve/) и [OpenAI-compatible server](https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/).
+Gateway **не** развёртывает модели, не планирует GPU и не заменяет Kubernetes, Slurm или существующие lifecycle-инструменты vLLM. Он решает, **кто получает общую inference capacity и на какой экземпляр vLLM направить запрос**.
 
-Порт vLLM должен оставаться в приватной сети. Клиенты должны обращаться только к gateway.
+Для развёртывания нужны один статический Go-бинарник и выбранное хранилище: SQLite для одного gateway по умолчанию или PostgreSQL 16+ для нескольких реплик с общей координацией. См. [руководство PostgreSQL production](docs/postgresql-production.md).
 
-### 2. Соберите и запустите gateway
+## Инженерные особенности
 
-```bash
-git clone https://github.com/rislanov/vllm-priority-gateway.git
-cd vllm-priority-gateway
+- Server-side priority: входящие priority headers и JSON-поля удаляются и заменяются сохранённой policy клиента.
+- Явные model ACL и per-client concurrency limits.
+- Независимый health/metrics polling backend-серверов, EWMA pressure и hysteretic pool states.
+- Least-pressure routing, мягкая session affinity, drain и один консервативный retry до первого байта.
+- Pool-wide safety limits и per-backend circuit breakers.
+- Немедленный streaming и propagation отмены downstream-клиента.
+- Metadata-only аналитика запросов и токенов без сохранения prompts и сгенерированного текста.
+- Встроенные Basic-authenticated, CSRF-protected Admin UI и JSON Admin API.
+- Prometheus, структурированные completion logs и готовый causal Grafana dashboard.
 
-umask 077
-export LLMGW_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-export LLMGW_API_KEY_HMAC_SECRET="$(openssl rand -base64 48)"
-# Сразу сохраните оба значения в утверждённом хранилище секретов.
+## Быстрый старт за 5 минут
 
-docker build --platform linux/amd64 -t vllm-priority-gateway:local .
-docker volume create llmgw-data
-docker run -d --name llmgw --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v llmgw-data:/data \
-  -e LLMGW_ADMIN_USERNAME=operator \
-  -e LLMGW_ADMIN_PASSWORD \
-  -e LLMGW_API_KEY_HMAC_SECRET \
-  vllm-priority-gateway:local
-```
+Этот путь подключает опубликованный gateway к уже работающим vLLM. Gateway должен обращаться к `/health`, `/metrics` и `/v1/*` каждого зарегистрированного сервера.
 
-Проверьте, что процесс запущен, а SQLite и registry готовы:
+1. Создайте `.env` с независимо сгенерированными секретами:
 
-```bash
-curl -fsS http://127.0.0.1:8080/healthz | jq
-curl -fsS http://127.0.0.1:8080/readyz | jq
-```
+   ```dotenv
+   LLMGW_ADMIN_USERNAME=operator
+   LLMGW_ADMIN_PASSWORD=replace-with-at-least-16-random-bytes
+   LLMGW_API_KEY_HMAC_SECRET=replace-with-at-least-32-random-bytes
+   ```
 
-`/readyz` проверяет management plane и намеренно остаётся доступным при нулевой inference capacity. `/inference-readyz` станет готов после настройки пула и успешных проверок backend.
+2. Запустите опубликованный образ с постоянным SQLite volume:
 
-### 3. Настройте gateway в админке
+   ```console
+   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.4.0
+   docker volume create llmgw-data
+   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.4.0
+   ```
 
-Откройте `http://127.0.0.1:8080/admin` через доступный только операторам маршрут и войдите как `operator`, используя `LLMGW_ADMIN_PASSWORD`.
+3. Откройте `http://127.0.0.1:8080/admin` и создайте:
 
-Создайте сущности в следующем порядке:
+   - model pool с публичным и upstream именем модели;
+   - каждый экземпляр vLLM как отдельный backend;
+   - клиента с priority, concurrency и model access;
+   - API-ключ клиента. Скопируйте его сразу: полный секрет показывается один раз.
 
-1. Откройте **Backends → Create model pool**:
-   - **Public model name:** `qwen`
-   - **Upstream model name:** `Qwen/Qwen2.5-7B-Instruct`
-   - **Max gateway inflight:** `32`
-   - **Max waiting:** `8`
-   - **Enabled:** включено
-2. На той же странице создайте backend:
-   - **Name:** `gpu-a`
-   - **Model pool:** `qwen`
-   - **URL:** `http://vllm.internal:8000`
-   - **Capacity hint:** `1`
-   - **Running soft limit:** `16`
-   - **Enabled:** включено
-3. Откройте **Clients → Create client**:
-   - **Name:** `production-app`
-   - **Priority class:** `normal`
-   - **vLLM priority:** `0`
-   - **Max concurrency:** `8`
-   - **Model access:** отметьте `qwen`
-   - **Enabled:** включено
-4. Откройте **API Keys**, выберите `production-app`, при необходимости задайте срок действия и нажмите **Generate API key**. Сразу скопируйте полное значение `llmgw_*`: оно показывается только один раз.
+4. Переключите OpenAI-клиент на gateway:
 
-Числовые лимиты выше — стартовый пример для проверки сценария, а не универсальный production sizing. Перед включением клиентского трафика откалибруйте их под модель, GPU, значение vLLM `--max-num-seqs`, требования к задержке и результаты saturation-тестов. Ноль отключает соответствующий лимит пула.
+   ```python
+   from openai import OpenAI
 
-Если vLLM запущен с `--api-key`, в поле **Upstream API key environment variable** укажите только имя переменной gateway, например `VLLM_GPU_A_KEY`, и передайте эту переменную контейнеру. Не вставляйте сам upstream-секрет в Admin UI.
+   client = OpenAI(
+       base_url="http://127.0.0.1:8080/v1",
+       api_key="llmgw_...",
+   )
 
-### 4. Проверьте capacity и отправьте реальные запросы
+   response = client.chat.completions.create(
+       model="your-public-model",
+       messages=[{"role": "user", "content": "Review this function."}],
+   )
+   ```
 
-Дождитесь health- и metrics-проверок backend, затем проверьте inference readiness:
+Для автономной GPU-среды с двумя реальными vLLM, проверки checksum релиза, точных Admin-значений, inference probes и cleanup используйте [полный локальный real-vLLM demo](docs/local-demo.ru.md).
 
-```bash
-curl -fsS http://127.0.0.1:8080/inference-readyz \
-  | jq -e '.status == "ready" and .backendAvailability > 0'
-```
+## Admin UI
 
-Экспортируйте одноразово показанный клиентский ключ:
-
-```bash
-export LLMGW_URL='http://127.0.0.1:8080'
-export LLMGW_CLIENT_KEY='llmgw_copy-the-one-time-value-here'
-```
-
-Получите список доступных клиенту моделей:
-
-```bash
-curl -fsS "$LLMGW_URL/v1/models" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" | jq
-```
-
-Отправьте потоковый Chat Completions запрос:
-
-```bash
-curl -fsS -N "$LLMGW_URL/v1/chat/completions" \
-  -H "Authorization: Bearer $LLMGW_CLIENT_KEY" \
-  -H 'X-LLM-Session-Id: production-agent-42' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen",
-    "messages": [{"role": "user", "content": "Explain priority scheduling in one sentence."}],
-    "max_tokens": 64,
-    "stream": true
-  }'
-```
-
-Клиент отправляет публичное имя `qwen`. Gateway проверяет ключ, применяет политику клиента, заменяет модель на `Qwen/Qwen2.5-7B-Instruct`, устанавливает управляемый сервером приоритет vLLM, выбирает подходящий backend и передаёт потоковый ответ.
-
-## Админка
-
-Admin UI встроен в gateway, поэтому отдельное frontend-развёртывание не требуется. На скриншотах ниже используется синтетический трафик без production credentials.
+UI встроен в gateway; отдельное frontend-развёртывание не требуется.
 
 ### Состояние gateway и backend-серверов
 
-Dashboard показывает готовность конфигурации, pressure и защитные лимиты пулов, а также health, circuit, running/waiting и KV-cache каждого backend.
-
-![Dashboard с одним здоровым пулом и backend](docs/images/admin-dashboard.jpg)
+![Dashboard gateway со здоровым пулом и backend](docs/images/admin-dashboard.jpg)
 
 ### Выдача и отзыв API-ключей
 
-Сначала создайте клиента и выдайте ему доступ к модели. Затем откройте **API Keys**, выберите клиента и необязательный срок действия, нажмите **Generate API key**. Полный секрет показывается один раз; в таблице остаются только prefix, status, expiry и время последнего использования. Отзыв применяется немедленно.
-
 ![Список API-ключей и форма выдачи](docs/images/admin-api-keys.jpg)
 
-### Просмотр аналитики
-
-После завершения inference-запросов откройте **Analytics**. Можно выбрать UTC preset или точный диапазон, отфильтровать данные по клиенту, модели и наличию usage, посмотреть графики запросов и токенов, изучить метаданные отдельных запросов или скачать тот же набор данных в CSV.
+### Metadata-only аналитика
 
 ![Графики запросов, токенов и cache usage](docs/images/admin-analytics.jpg)
 
-Аналитика хранит только операционные метаданные и количество токенов. Prompts, messages, сгенерированный текст, тела запросов и ответов, authorization headers и API-ключи не сохраняются.
-
-## Поведение клиентского API
-
-Поддерживаемые клиентские маршруты:
+## Клиентский API
 
 ```text
+GET  /v1/load?model=<public-model>
 GET  /v1/models
 POST /v1/chat/completions
 POST /v1/completions
 POST /v1/responses
 ```
 
-Клиент не может повысить собственный приоритет: gateway удаляет входящие `X-Vllm-Priority` и JSON-поле `priority`, заменяет публичное имя модели и применяет политику из SQLite. Неподдерживаемые `/v1/*` маршруты и ошибки gateway возвращаются в OpenAI-совместимом error envelope.
+Авторизованный клиент может опрашивать `/v1/load` перед отправкой работы. Ручка возвращает для пула модели уровень `free`, `medium`, `loaded` или `unavailable`; контракт ответа и рекомендации по polling описаны в [руководстве по эксплуатации](docs/operations.md#client-side-load-polling).
 
-Для улучшения prefix-cache locality передавайте одинаковый непрозрачный `X-LLM-Session-Id` в последовательных запросах одного агента или диалога. Значение ограничено 256 байтами, не попадает в логи и metric labels и удаляется перед отправкой в vLLM. Health, drain, свежесть метрик, circuit state и текущий pressure всегда важнее affinity.
+Для prefix-cache locality передавайте один непрозрачный `X-LLM-Session-Id` в последовательных запросах агента или диалога. Значение ограничено, не попадает в логи и metric labels и удаляется перед forwarding. Health, drain, свежесть метрик, circuit state и pressure всегда важнее affinity.
 
-## Эксплуатация и развёртывание
+Заголовки сессий OpenCode, Pi (PiCode), Codex и Claude Code также распознаются автоматически. Явный `X-LLM-Session-Id` имеет приоритет над заголовками клиентов. [Список заголовков и порядок выбора](docs/operations.md#backend-monitoring-and-routing).
 
-- [Production deployment](docs/deployment.md): Docker и systemd, требования к reverse proxy, post-deployment verification, backup и restore.
-- [Operations guide](docs/operations.md): readiness, routing, drain/resume, circuit breaker, pool safety, хранение аналитики, метрики, логи и границы безопасности.
-- [Real-vLLM E2E runbook](docs/real-vllm-priority-e2e.md): безопасный для production smoke и изолированные priority, saturation, drain и resilience тесты.
-- [Real-GPU test plan](docs/real-gpu-testing.md): финальная проверка совместимости модели/железа и калибровка порогов.
+## Production и эксплуатация
 
-Основные runtime endpoints:
+- [Production deployment](docs/deployment.md): Docker/systemd, TLS reverse proxy, secrets, backup и restore.
+- [Operations guide](docs/operations.md): readiness, routing, drain/resume, circuits, pool safety, метрики, логи и recovery.
+- [Real-vLLM E2E runbook](docs/real-vllm-priority-e2e.md): smoke, priority, saturation, drain и resilience.
+- [Real-GPU validation](docs/real-gpu-testing.md): compatibility и калибровка порогов на целевом железе.
 
 | Endpoint | Назначение |
 |---|---|
 | `/healthz` | Liveness процесса |
-| `/readyz` | Готовность management plane и состояния компонентов |
+| `/readyz` | Готовность конфигурации, координации и аналитики |
 | `/inference-readyz` | Доступная inference capacity; HTTP `503`, если её нет |
-| `/coordination-readyz` | Строгая готовность распределённой PostgreSQL-координации |
-| `/metrics` | Метрики Prometheus |
+| `/coordination-readyz` | Строгая готовность PostgreSQL-координации |
+| `/v1/load?model=...` | Авторизованный сигнал нагрузки для конкретной модели |
+| `/metrics` | Prometheus telemetry |
 | `/admin` | Интерфейс оператора |
 
-Gateway применяет подтверждённые изменения Admin UI без перезапуска. Перед обслуживанием переведите backend в drain и возобновляйте его только после восстановления health и свежих метрик.
+Observability overlay запускает Prometheus и добавляет dashboard **Gateway Decisions**:
 
-## Admin API
-
-Все Admin-маршруты требуют Basic auth. Каждый запрос, меняющий состояние, дополнительно требует совпадающие double-submit CSRF cookie/header либо cookie/form token.
-
-```text
-GET    /admin/api/status
-GET    /admin/api/clients
-POST   /admin/api/clients
-PUT    /admin/api/clients/{id}
-POST   /admin/api/clients/{id}/keys
-DELETE /admin/api/keys/{id}
-GET    /admin/api/pools
-POST   /admin/api/pools
-PUT    /admin/api/pools/{id}
-GET    /admin/api/backends
-POST   /admin/api/backends
-PUT    /admin/api/backends/{id}
-POST   /admin/api/backends/{id}/drain
-POST   /admin/api/backends/{id}/resume
-GET    /admin/api/analytics
-GET    /admin/api/analytics/requests
-GET    /admin/api/analytics/export.csv
+```console
+docker compose --env-file .env -f compose.yaml -f compose.observability.yaml up -d --build --wait --wait-timeout 900
 ```
 
-## Разработка и тестирование
+Dashboard показывает pressure пула → точные причины Low 429 → остаётся ли High admitted → ожидание High внутри gateway. Он не называет latency перегруженной GPU стабильной.
+
+## Тестирование и проверка на реальном vLLM
+
+Релизные артефакты и поведение при перегрузке проверены на реальной inference-среде:
+
+- NVIDIA RTX 4070 Ti с 12 ГБ VRAM;
+- два `vllm/vllm-openai:v0.28.0` с моделью `Qwen/Qwen3-0.6B`;
+- saturation при `GatewayInflight=16` и `TotalWaiting=14`;
+- низкоприоритетные probes отклонялись, а High/Critical продолжали admission;
+- проверены backend drain, pool safety limits, открытие и восстановление circuit breaker;
+- streaming, restart gateway и сохранность SQLite проверены на реальном vLLM;
+- propagation отмены downstream-клиента покрыта детерминированными integration tests;
+- отдельный Prometheus/Grafana-сценарий воспроизвёл цепочку pressure → shedding → admission.
+
+Под записанной нагрузкой защищённый High-запрос продолжал admission, однако latency первого байта выросла примерно с `187ms` до `561ms`. Evidence доказывает изоляцию admission, а не неизменность GPU latency при saturation.
+
+- [Acceptance evidence](docs/acceptance-evidence.md) связывает claims с automated tests и записанными hardware runs.
+- [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md) содержит opt-in deployed tests.
+- [Real-GPU validation](docs/real-gpu-testing.md) определяет retained evidence и production calibration.
+
+```bash
+make test
+make test-race
+make vet
+make build
+make container-smoke  # нужен Docker
+LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
+```
+
+## CI и релизы
+
+Для pull request и push в `main` параллельно запускаются unit tests, Go race detector, `go vet`, сборка бинарника gateway и Docker-образа. Агрегированный status **Unit tests and builds** становится успешным только после всех пяти jobs и используется как required branch check. CI не публикует артефакты.
+
+Release workflow запускается вручную, проверяет выбранный стабильный SemVer-тег, публикует Linux `amd64`/`arm64` архивы с checksum и multi-platform образ в GHCR. Использование артефактов описано в [Production deployment](docs/deployment.md), точный release-контракт — в [workflow](.github/workflows/release.yml).
+
+## Текущие ограничения
+
+- SQLite поддерживает один gateway; PostgreSQL 16+ поддерживает несколько реплик с общими durable admission leases и circuit state.
+- Статическая регистрация backend-серверов оператором; нет service discovery и autoscaling.
+- PostgreSQL поддерживает распределённые RPM и soft-TPM лимиты. Billing и GPU/NVML scheduling остаются за рамками текущей версии.
+- Priority admission отклоняет новую низкоприоритетную работу, но не прерывает уже допущенную генерацию.
+- Мягкая session affinity улучшает locality, не анализируя KV blocks и содержимое prefix.
+- Для управления используется Basic auth. TLS, OIDC/RBAC, audit trail и secret manager должны предоставляться окружением.
+- Capacity hints сохраняются для будущей совместимости, но пока не влияют на вес маршрутизации.
+
+Более широкий целевой объём Production V1 описан в [технической спецификации](docs/technical-specification.md).
+
+## Разработка
 
 Требования: Go 1.27, macOS или Linux. SQLite-драйвер написан на чистом Go, поэтому CGO не требуется.
 
@@ -288,32 +238,19 @@ make vet
 make build
 make build-linux-amd64
 make build-e2e-linux-amd64
-make container-smoke  # нужен запущенный Docker daemon
-LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 ```
-
-В репозитории также есть детерминированный fake vLLM и генератор нагрузки. Это инструменты разработки и тестирования, а не часть production quick start.
-
-Реализация и детерминированный acceptance suite завершены. Опциональные real-vLLM режимы smoke, priority/pool-safety и circuit-resilience прошли на Apple M4 с vLLM-Metal 27 августа 2026 года. Перед production sign-off повторите compatibility, saturation и threshold calibration на выбранной модели и GPU.
-
-## Текущие ограничения
-
-- Профиль SQLite поддерживает одну реплику; для распределённых admission, rate limit и circuit state используется PostgreSQL 16+.
-- Статическая регистрация backend-серверов оператором; нет service discovery и autoscaling.
-- Нет billing, жёсткого резервирования токенов, Redis backend и GPU/NVML scheduling; PostgreSQL TPM намеренно мягкий и списывает сообщённый upstream usage.
-- Priority admission отклоняет новую низкоприоритетную работу, но не прерывает уже допущенную генерацию.
-- Мягкая session affinity улучшает locality, не анализируя KV blocks и содержимое prefix.
-- Для управления используется Basic auth. TLS, OIDC/RBAC, audit trail и secret manager должны предоставляться окружением.
-- Capacity hints сохраняются для будущей совместимости, но пока не влияют на вес маршрутизации.
-
-Более широкий целевой объём Production V1 описан в [технической спецификации](docs/technical-specification.md).
 
 ## Документация
 
+- [Полный локальный real-vLLM demo](docs/local-demo.ru.md)
 - [Production deployment](docs/deployment.md)
 - [Operations guide](docs/operations.md)
 - [Technical specification](docs/technical-specification.md)
-- [Automated real-vLLM E2E](docs/real-vllm-priority-e2e.md)
-- [Real-GPU test plan](docs/real-gpu-testing.md)
 - [Acceptance evidence](docs/acceptance-evidence.md)
 - [English README](README.md)
+
+## Лицензия
+
+[The Unlicense](LICENSE).
+
+Профиль PostgreSQL 16+ поддерживает несколько реплик gateway с общими leases, RPM/soft-TPM, circuit generations и probe permits. SQLite остаётся профилем по умолчанию для одного экземпляра. См. [руководство PostgreSQL production](docs/postgresql-production.md).

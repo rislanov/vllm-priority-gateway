@@ -56,28 +56,22 @@ func (s *SQLite) UpdateBackend(ctx context.Context, id int64, params UpdateBacke
 		return domain.Backend{}, err
 	}
 	defer tx.Rollback()
-	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT revision, created_at FROM backends WHERE id = ?`, id).Scan(&backend.Revision, &created); err != nil {
-		return domain.Backend{}, fmt.Errorf("find backend %d: %w", id, err)
-	}
-	backend.Revision++
-	backend.CreatedAt, err = parseTimestamp(created)
-	if err != nil {
-		return domain.Backend{}, err
-	}
 	backend.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
+	var created string
+	err = tx.QueryRowContext(ctx, `
 		UPDATE backends SET model_pool_id = ?, name = ?, base_url = ?, enabled = ?, draining = ?,
-		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, revision = ?, updated_at = ? WHERE id = ?`,
+		capacity_hint = ?, running_soft_limit = ?, upstream_api_key_env = ?, revision = revision + 1, updated_at = ?
+		WHERE id = ? RETURNING revision, created_at`,
 		backend.ModelPoolID, backend.Name, backend.BaseURL, boolInt(backend.Enabled),
 		boolInt(backend.Draining), backend.CapacityHint, backend.RunningSoftLimit,
-		backend.UpstreamAPIKeyEnv, backend.Revision, timestamp(backend.UpdatedAt), id,
-	)
+		backend.UpstreamAPIKeyEnv, timestamp(backend.UpdatedAt), id,
+	).Scan(&backend.Revision, &created)
 	if err != nil {
 		return domain.Backend{}, fmt.Errorf("update backend: %w", err)
 	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.Backend{}, sql.ErrNoRows
+	backend.CreatedAt, err = parseTimestamp(created)
+	if err != nil {
+		return domain.Backend{}, err
 	}
 	if err := bumpRevision(ctx, tx); err != nil {
 		return domain.Backend{}, err
@@ -86,6 +80,25 @@ func (s *SQLite) UpdateBackend(ctx context.Context, id int64, params UpdateBacke
 		return domain.Backend{}, err
 	}
 	return backend, nil
+}
+
+func (s *SQLite) DeleteBackend(ctx context.Context, id int64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM backends WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete backend: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	return commit(tx)
 }
 
 func (s *SQLite) SetBackendDraining(ctx context.Context, id int64, draining bool) error {

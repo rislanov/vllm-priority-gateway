@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -62,31 +63,30 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 		return domain.Client{}, err
 	}
 	defer tx.Rollback()
-	var created string
 	var previous domain.Client
-	if err := tx.QueryRowContext(ctx, `SELECT max_concurrency, revision, created_at FROM clients WHERE id = ?`, id).Scan(&previous.MaxConcurrency, &previous.Revision, &created); err != nil {
+	// Reserve the writer before reading the previous limit so concurrent writes
+	// cannot force a deferred transaction to upgrade an obsolete WAL snapshot.
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING max_concurrency`, id).Scan(&previous.MaxConcurrency); err != nil {
 		return domain.Client{}, fmt.Errorf("find client %d: %w", id, err)
 	}
 	if err := client.ValidateUpdate(previous); err != nil {
 		return domain.Client{}, err
 	}
-	client.Revision = previous.Revision + 1
-	client.CreatedAt, err = parseTimestamp(created)
-	if err != nil {
-		return domain.Client{}, err
-	}
 	client.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
+	var created string
+	err = tx.QueryRowContext(ctx, `
 		UPDATE clients SET name = ?, enabled = ?, priority_class = ?, vllm_priority = ?,
-		max_concurrency = ?, requests_per_minute = ?, tokens_per_minute = ?, revision = ?, updated_at = ? WHERE id = ?`,
+		max_concurrency = ?, requests_per_minute = ?, tokens_per_minute = ?, revision = revision + 1, updated_at = ?
+		WHERE id = ? RETURNING revision, created_at`,
 		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
-		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, client.Revision, timestamp(client.UpdatedAt), id,
-	)
+		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, timestamp(client.UpdatedAt), id,
+	).Scan(&client.Revision, &created)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("update client: %w", err)
 	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.Client{}, sql.ErrNoRows
+	client.CreatedAt, err = parseTimestamp(created)
+	if err != nil {
+		return domain.Client{}, err
 	}
 	if err := replaceClientAccess(ctx, tx, id, params.ModelPoolIDs); err != nil {
 		return domain.Client{}, err
@@ -98,6 +98,54 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 		return domain.Client{}, err
 	}
 	return client, nil
+}
+
+func (s *SQLite) DeleteClient(ctx context.Context, id int64) ([]int64, error) {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING 1`, id).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, sql.ErrNoRows
+		}
+		return nil, fmt.Errorf("reserve client deletion: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM api_keys WHERE client_id = ? ORDER BY id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("list client API keys before deletion: %w", err)
+	}
+	var keyIDs []int64
+	for rows.Next() {
+		var keyID int64
+		if err := rows.Scan(&keyID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan client API key before deletion: %w", err)
+		}
+		keyIDs = append(keyIDs, keyID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close client API key rows: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate client API keys before deletion: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM clients WHERE id = ?`, id)
+	if err != nil {
+		return nil, fmt.Errorf("delete client: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return nil, sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err := commit(tx); err != nil {
+		return nil, err
+	}
+	return keyIDs, nil
 }
 
 func (s *SQLite) ListClients(ctx context.Context) ([]domain.Client, error) {
@@ -128,6 +176,10 @@ func (s *SQLite) SetClientModelAccess(ctx context.Context, clientID int64, model
 		return err
 	}
 	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING 1`, clientID).Scan(&exists); err != nil {
+		return fmt.Errorf("find client %d: %w", clientID, err)
+	}
 	if err := replaceClientAccess(ctx, tx, clientID, modelPoolIDs); err != nil {
 		return err
 	}

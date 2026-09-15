@@ -97,6 +97,50 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 	return v, err
 }
 
+func (s *Store) DeleteClient(ctx context.Context, id int64) ([]int64, error) {
+	var keyIDs []int64
+	err := s.mutation(ctx, func(tx pgx.Tx) error {
+		// Keep the pool-before-client lock order used by admission and access
+		// updates. Scope rows survive deletion so retained leases can complete.
+		if _, err := tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes ORDER BY pool_id FOR UPDATE"); err != nil {
+			return configurationOperationError("lock pool admission scopes", err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", id); err != nil {
+			return configurationOperationError("lock client admission scope", err)
+		}
+		var clientID int64
+		if err := tx.QueryRow(ctx, "SELECT id FROM clients WHERE id=$1::bigint FOR UPDATE", id).Scan(&clientID); err != nil {
+			return configurationOperationError("read client before deletion", err)
+		}
+		rows, err := tx.Query(ctx, "SELECT id FROM api_keys WHERE client_id=$1::bigint ORDER BY id", id)
+		if err != nil {
+			return configurationOperationError("list client API keys before deletion", err)
+		}
+		keyIDs, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return configurationOperationError("read client API keys before deletion", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM client_model_access WHERE client_id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete client access", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM api_keys WHERE client_id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete client API keys", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM coordination_rate_state WHERE client_id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete client rate state", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM clients WHERE id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete client", err)
+		}
+		_, err = tx.Exec(ctx, "UPDATE client_admission_scopes SET tombstoned=true,updated_at=clock_timestamp() WHERE client_id=$1::bigint", id)
+		return configurationOperationError("tombstone client admission scope", err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keyIDs, nil
+}
+
 func replaceAccess(ctx context.Context, tx pgx.Tx, clientID int64, poolIDs []int64) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM client_model_access WHERE client_id=$1::bigint", clientID); err != nil {
 		return fmt.Errorf("clear PostgreSQL client access: %w", err)
@@ -161,6 +205,35 @@ func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePool
 	return v, err
 }
 
+func (s *Store) DeletePool(ctx context.Context, id int64) error {
+	return s.mutation(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", id); err != nil {
+			return configurationOperationError("lock pool admission scope", err)
+		}
+		var poolID int64
+		// A parent-row lock also prevents a concurrent backend insert from
+		// appearing after the reference check through its foreign key.
+		if err := tx.QueryRow(ctx, "SELECT id FROM model_pools WHERE id=$1::bigint FOR UPDATE", id).Scan(&poolID); err != nil {
+			return configurationOperationError("read model pool before deletion", err)
+		}
+		var backendCount int64
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM backends WHERE model_pool_id=$1::bigint", id).Scan(&backendCount); err != nil {
+			return configurationOperationError("count model pool backends", err)
+		}
+		if backendCount != 0 {
+			return basestore.ErrPoolHasBackends
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM client_model_access WHERE model_pool_id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete model pool access", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM model_pools WHERE id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete model pool", err)
+		}
+		_, err := tx.Exec(ctx, "UPDATE pool_admission_scopes SET tombstoned=true,updated_at=clock_timestamp() WHERE pool_id=$1::bigint", id)
+		return configurationOperationError("tombstone pool admission scope", err)
+	})
+}
+
 func (s *Store) CreateBackend(ctx context.Context, p basestore.CreateBackendParams) (domain.Backend, error) {
 	v := domain.Backend{ModelPoolID: p.ModelPoolID, Name: p.Name, BaseURL: p.BaseURL, Enabled: p.Enabled, Draining: p.Draining, CapacityHint: p.CapacityHint, RunningSoftLimit: p.RunningSoftLimit, UpstreamAPIKeyEnv: p.UpstreamAPIKeyEnv, Revision: 1}
 	if err := v.Validate(); err != nil {
@@ -214,6 +287,35 @@ func (s *Store) UpdateBackend(ctx context.Context, id int64, p basestore.UpdateB
 		return configurationOperationError("update backend circuit", err)
 	})
 	return v, err
+}
+
+func (s *Store) DeleteBackend(ctx context.Context, id int64) error {
+	return s.mutation(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT backend_id FROM backend_circuit_state WHERE backend_id=$1::bigint FOR UPDATE", id); err != nil {
+			return configurationOperationError("lock backend circuit", err)
+		}
+		var revision int64
+		if err := tx.QueryRow(ctx, "SELECT revision FROM backends WHERE id=$1::bigint FOR UPDATE", id).Scan(&revision); err != nil {
+			return configurationOperationError("read backend before deletion", err)
+		}
+		now, err := supersedeProbes(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM backend_circuit_active_failures WHERE backend_id=$1::bigint", id); err != nil {
+			return configurationOperationError("clear deleted backend failures", err)
+		}
+		// Retain the state identity and terminal receipts so old permits can be
+		// renewed or completed safely without recreating a deleted backend.
+		if _, err := tx.Exec(ctx, "UPDATE backend_circuit_state SET backend_revision=$2::bigint,state='closed',generation=generation+1,opened_at=NULL,half_open_succeeded=false,updated_at=$3::timestamptz WHERE backend_id=$1::bigint", id, revision+1, now); err != nil {
+			return configurationOperationError("tombstone backend circuit", err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM backends WHERE id=$1::bigint", id); err != nil {
+			return configurationOperationError("delete backend", err)
+		}
+		_, err = tx.Exec(ctx, "SELECT pg_notify('llmgw_circuit_changed',$1::text)", fmt.Sprint(id))
+		return configurationOperationError("notify backend circuit deletion", err)
+	})
 }
 
 func (s *Store) SetBackendDraining(ctx context.Context, id int64, draining bool) error {

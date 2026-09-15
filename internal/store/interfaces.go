@@ -12,12 +12,15 @@ import (
 type AdminStore interface {
 	CreateClient(context.Context, CreateClientParams) (domain.Client, error)
 	UpdateClient(context.Context, int64, UpdateClientParams) (domain.Client, error)
+	DeleteClient(context.Context, int64) ([]int64, error)
 	CreateAPIKey(context.Context, CreateAPIKeyParams) (domain.APIKey, error)
 	RevokeAPIKey(context.Context, int64) error
 	CreatePool(context.Context, CreatePoolParams) (domain.ModelPool, error)
 	UpdatePool(context.Context, int64, UpdatePoolParams) (domain.ModelPool, error)
+	DeletePool(context.Context, int64) error
 	CreateBackend(context.Context, CreateBackendParams) (domain.Backend, error)
 	UpdateBackend(context.Context, int64, UpdateBackendParams) (domain.Backend, error)
+	DeleteBackend(context.Context, int64) error
 	SetBackendDraining(context.Context, int64, bool) error
 }
 

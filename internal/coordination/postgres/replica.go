@@ -84,10 +84,16 @@ func binaryVersion() string {
 }
 
 func (m *ReplicaManager) Start(parent context.Context) error {
-	if err := m.heartbeat(parent, true); err != nil {
+	return m.StartRuntime(parent, parent)
+}
+
+// StartRuntime keeps startup registration cancellable independently of the
+// heartbeat lifetime, which must cover the HTTP shutdown drain.
+func (m *ReplicaManager) StartRuntime(startup, runtime context.Context) error {
+	if err := m.heartbeat(startup, true); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(runtime)
 	m.cancel = cancel
 	go m.run(ctx)
 	return nil

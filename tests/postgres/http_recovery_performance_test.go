@@ -187,11 +187,22 @@ func waitPostgresGatewayBackend(t *testing.T, value *postgresHTTPGateway, backen
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		snapshot := value.manager.Snapshot(backendID, time.Now())
-		if snapshot.Healthy && snapshot.MetricsFresh && snapshot.CircuitAvailable {
+		backend := value.registry.Snapshot().BackendsByID[backendID]
+		pool := value.manager.PoolSnapshot(backend.ModelPoolID, time.Now())
+		// Backend polls and the pool observer run independently. HTTP admission
+		// needs the observer's eligible pool snapshot as well as a fresh backend.
+		if snapshot.Healthy && snapshot.MetricsFresh && snapshot.CircuitAvailable && pool.State != domain.PoolUnavailable {
 			return
 		}
+		if snapshot.Healthy && snapshot.MetricsFresh && snapshot.CircuitAvailable && pool.State == domain.PoolUnavailable {
+			// Outage fixtures deliberately stop periodic pool observation for an
+			// hour. Publish the initial healthy topology before injecting faults.
+			if err := value.manager.Reconcile(backendsFromSnapshot(value.registry.Snapshot())); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("gateway backend did not become eligible: %+v", snapshot)
+			t.Fatalf("gateway did not become eligible: backend=%+v pool=%+v", snapshot, pool)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

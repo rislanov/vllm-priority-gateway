@@ -110,11 +110,18 @@ func (m *LeaseManager) PendingCompletions() int {
 	return count
 }
 func (m *LeaseManager) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
+	defer cancel()
+	return m.CloseContext(ctx)
+}
+
+// CloseContext drains completions within the application's remaining shutdown budget.
+func (m *LeaseManager) CloseContext(ctx context.Context) error {
 	m.close.Do(func() {
 		m.cancel()
 		m.stopTicker()
 		<-m.done
-		m.closeErr = m.drainShutdown()
+		m.closeErr = m.drainShutdown(ctx)
 	})
 	return m.closeErr
 }
@@ -125,7 +132,7 @@ func (m *LeaseManager) Reconcile(ctx context.Context) error {
 	return m.renewContext(ctx)
 }
 
-func (m *LeaseManager) drainShutdown() error {
+func (m *LeaseManager) drainShutdown(ctx context.Context) error {
 	items := make([]LeaseCompletion, 0, len(m.completions))
 	for {
 		select {
@@ -145,8 +152,6 @@ pending:
 	if len(items) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), m.shutdownTimeout)
-	defer cancel()
 	backoff := 10 * time.Millisecond
 	var lastErr error
 	for {
@@ -156,6 +161,9 @@ pending:
 			return nil
 		}
 		lastErr = err
+		if lastErr == nil {
+			lastErr = ctx.Err()
+		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():

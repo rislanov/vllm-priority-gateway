@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -20,6 +21,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 )
 
 type e2eMode string
@@ -390,6 +395,18 @@ type inferenceReadyResponse struct {
 	BackendAvailability int    `json:"backendAvailability"`
 }
 
+type loadStatusResponse struct {
+	Model               string    `json:"model"`
+	Level               string    `json:"level"`
+	PoolState           string    `json:"poolState"`
+	BestBackendPressure float64   `json:"bestBackendPressure"`
+	AvailableBackends   int       `json:"availableBackends"`
+	WaitingRequests     float64   `json:"waitingRequests"`
+	GatewayInflight     int       `json:"gatewayInflight"`
+	ConfigRevision      int64     `json:"configRevision"`
+	EvaluatedAt         time.Time `json:"evaluatedAt"`
+}
+
 type adminStatus struct {
 	Revision int64          `json:"revision"`
 	Pools    []adminPool    `json:"pools"`
@@ -496,6 +513,21 @@ func (models modelsResponse) contains(model string) bool {
 
 type metricsResponse string
 
+func TestMetricsResponseLookup(t *testing.T) {
+	fixture := metricsResponse("# TYPE llmgw_pool_pressure gauge\n" +
+		"llmgw_pool_pressure{model=\"qwen\"} 1.4\n" +
+		"# TYPE llmgw_queue_wait_seconds histogram\n" +
+		"llmgw_queue_wait_seconds_count{model=\"qwen\",priority_class=\"high\",outcome=\"selected\"} 3\n")
+	if got, ok := fixture.value("llmgw_pool_pressure", map[string]string{"model": "qwen"}); !ok || got != 1.4 {
+		t.Fatalf("pool pressure = %v, %t", got, ok)
+	}
+	if got := fixture.histogramCount("llmgw_queue_wait_seconds", map[string]string{
+		"model": "qwen", "priority_class": "high", "outcome": "selected",
+	}); got != 3 {
+		t.Fatalf("queue wait count = %d, want 3", got)
+	}
+}
+
 func (metrics metricsResponse) containsFamily(family string) bool {
 	for _, line := range strings.Split(string(metrics), "\n") {
 		if strings.HasPrefix(line, "# HELP "+family+" ") || strings.HasPrefix(line, family+"{") || strings.HasPrefix(line, family+" ") {
@@ -503,6 +535,179 @@ func (metrics metricsResponse) containsFamily(family string) bool {
 		}
 	}
 	return false
+}
+
+func (metrics metricsResponse) value(name string, labels map[string]string) (float64, bool) {
+	families, ok := metrics.metricFamilies()
+	if !ok {
+		return 0, false
+	}
+	family := families[name]
+	if family == nil {
+		return 0, false
+	}
+	var total float64
+	found := false
+	for _, metric := range family.Metric {
+		if !metricMatches(metric, labels) {
+			continue
+		}
+		switch {
+		case metric.Counter != nil:
+			total += metric.Counter.GetValue()
+		case metric.Gauge != nil:
+			total += metric.Gauge.GetValue()
+		case metric.Untyped != nil:
+			total += metric.Untyped.GetValue()
+		default:
+			continue
+		}
+		found = true
+	}
+	return total, found
+}
+
+func (metrics metricsResponse) histogramCount(name string, labels map[string]string) uint64 {
+	families, ok := metrics.metricFamilies()
+	if ok {
+		if family := families[name]; family != nil {
+			var total uint64
+			for _, metric := range family.Metric {
+				if metricMatches(metric, labels) && metric.Histogram != nil {
+					total += metric.Histogram.GetSampleCount()
+				}
+			}
+			if total > 0 {
+				return total
+			}
+		}
+	}
+	value, found := metrics.value(name+"_count", labels)
+	if !found || value < 0 {
+		return 0
+	}
+	return uint64(value)
+}
+
+func (metrics metricsResponse) metricFamilies() (map[string]*dto.MetricFamily, bool) {
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(string(metrics)))
+	return families, err == nil
+}
+
+func requireLoadMatchesPool(t *testing.T, load loadStatusResponse, pool adminPool) {
+	t.Helper()
+	wantLevel := map[string]string{
+		"normal": "free", "busy": "medium", "saturated": "loaded", "emergency": "loaded", "unavailable": "unavailable",
+	}[pool.Runtime.State]
+	if wantLevel == "" {
+		t.Fatalf("pool has unsupported runtime state %q", pool.Runtime.State)
+	}
+	if load.Model != pool.PublicModelName || load.PoolState != pool.Runtime.State || load.Level != wantLevel {
+		t.Fatalf("load status = model %q level %q pool state %q, want model %q level %q pool state %q",
+			load.Model, load.Level, load.PoolState, pool.PublicModelName, wantLevel, pool.Runtime.State)
+	}
+	if load.AvailableBackends != pool.Runtime.AvailableBackends {
+		t.Fatalf("load available backends = %d, admin pool = %d", load.AvailableBackends, pool.Runtime.AvailableBackends)
+	}
+	if load.ConfigRevision <= 0 || load.EvaluatedAt.IsZero() {
+		t.Fatalf("load status has invalid revision or timestamp: %+v", load)
+	}
+}
+
+func (h *remoteHarness) waitForLoadMetrics(key, level string, timeout time.Duration) (loadStatusResponse, metricsResponse) {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var lastLoad loadStatusResponse
+	var lastMetrics metricsResponse
+	var lastErr error
+	for {
+		lastLoad, lastErr = h.fetchLoadStatus(ctx, key)
+		if lastErr == nil {
+			lastMetrics, lastErr = h.fetchMetrics(ctx)
+		}
+		if lastErr == nil && (level == "" || lastLoad.Level == level) && loadMetricsAligned(lastLoad, lastMetrics) {
+			return lastLoad, lastMetrics
+		}
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("load status and metrics did not align before %s: level=%q load=%+v err=%v", timeout, level, lastLoad, lastErr)
+			return loadStatusResponse{}, ""
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func loadMetricsAligned(load loadStatusResponse, metrics metricsResponse) bool {
+	state, stateOK := metrics.value("llmgw_pool_state", map[string]string{"model": load.Model, "state": load.PoolState})
+	pressure, pressureOK := metrics.value("llmgw_pool_pressure", map[string]string{"model": load.Model})
+	available, availableOK := metrics.value("llmgw_pool_available_backends", map[string]string{"model": load.Model})
+	if !stateOK || state != 1 || !pressureOK || math.IsNaN(pressure) || math.IsInf(pressure, 0) || !availableOK || available != float64(load.AvailableBackends) {
+		return false
+	}
+	if load.Level == "loaded" && (load.BestBackendPressure <= 0 || pressure <= 0) {
+		return false
+	}
+	if load.WaitingRequests > 0 {
+		waiting, ok := metrics.value("llmgw_pool_waiting_requests", map[string]string{"model": load.Model})
+		if !ok || waiting <= 0 {
+			return false
+		}
+	}
+	if load.GatewayInflight > 0 {
+		inflight, ok := metrics.value("llmgw_pool_gateway_inflight", map[string]string{"model": load.Model})
+		if !ok || inflight <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func metricMatches(metric *dto.Metric, want map[string]string) bool {
+	matched := 0
+	for _, pair := range metric.Label {
+		if value, exists := want[pair.GetName()]; exists && value == pair.GetValue() {
+			matched++
+		}
+	}
+	return matched == len(want)
+}
+
+func requireMetricIncrease(
+	t *testing.T,
+	before, after metricsResponse,
+	name string,
+	labels map[string]string,
+	minimum float64,
+) {
+	t.Helper()
+	beforeValue, _ := before.value(name, labels)
+	afterValue, found := after.value(name, labels)
+	if delta := afterValue - beforeValue; !found || delta < minimum {
+		t.Fatalf("%s%v delta = %v (before=%v after=%v present=%t), want at least %v",
+			name, labels, delta, beforeValue, afterValue, found, minimum)
+	}
+}
+
+func requireHistogramIncrease(
+	t *testing.T,
+	before, after metricsResponse,
+	name string,
+	labels map[string]string,
+	minimum uint64,
+) {
+	t.Helper()
+	beforeCount := before.histogramCount(name, labels)
+	afterCount := after.histogramCount(name, labels)
+	var delta uint64
+	if afterCount >= beforeCount {
+		delta = afterCount - beforeCount
+	}
+	if afterCount < beforeCount || delta < minimum {
+		t.Fatalf("%s_count%v delta = %d (before=%d after=%d), want at least %d",
+			name, labels, delta, beforeCount, afterCount, minimum)
+	}
 }
 
 type remoteHarness struct {
@@ -549,6 +754,48 @@ func (h *remoteHarness) inferenceReadiness() (inferenceReadyResponse, int) {
 		h.t.Fatal(err)
 	}
 	return readiness, status
+}
+
+func (h *remoteHarness) loadStatus(key string) loadStatusResponse {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), h.cfg.probeTimeout)
+	defer cancel()
+	status, err := h.fetchLoadStatus(ctx, key)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return status
+}
+
+func (h *remoteHarness) fetchLoadStatus(ctx context.Context, key string) (loadStatusResponse, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.endpoint("/v1/load")+"?model="+url.QueryEscape(h.cfg.model), nil)
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("create GET /v1/load: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	response, err := h.client.Do(request)
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return loadStatusResponse{}, fmt.Errorf("read /v1/load: %w", err)
+	}
+	if response.StatusCode != http.StatusOK {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load = %d: %s", response.StatusCode, bodyExcerpt(body))
+	}
+	if response.Header.Get("Cache-Control") != "no-store" {
+		return loadStatusResponse{}, fmt.Errorf("GET /v1/load Cache-Control = %q, want no-store", response.Header.Get("Cache-Control"))
+	}
+	if response.Header.Get("X-Request-Id") == "" {
+		return loadStatusResponse{}, errors.New("GET /v1/load did not return X-Request-Id")
+	}
+	var status loadStatusResponse
+	if err := json.Unmarshal(body, &status); err != nil {
+		return loadStatusResponse{}, fmt.Errorf("decode /v1/load: %w", err)
+	}
+	return status, nil
 }
 
 func (h *remoteHarness) fetchInferenceReadiness(ctx context.Context) (inferenceReadyResponse, int, error) {
@@ -800,6 +1047,11 @@ func isolatePoolGatewayInflight(pool adminPool, maximum int) adminPool {
 	return pool
 }
 
+func preparePoolForPriorityLoad(pool adminPool) adminPool {
+	pool.MaxWaiting = 0
+	return pool
+}
+
 func samePoolConfiguration(left, right adminPool) bool {
 	return left.ID == right.ID && left.PublicModelName == right.PublicModelName &&
 		left.UpstreamModelName == right.UpstreamModelName && left.Enabled == right.Enabled &&
@@ -1029,6 +1281,21 @@ type adminMutationCleanup struct {
 	backends []adminBackend
 	once     sync.Once
 	err      error
+}
+
+func priorityCleanupStatus(status adminStatus, drainBackendID int64) adminStatus {
+	filtered := status
+	filtered.Backends = nil
+	if drainBackendID <= 0 {
+		return filtered
+	}
+	for _, backend := range status.Backends {
+		if backend.ID == drainBackendID {
+			filtered.Backends = append(filtered.Backends, backend)
+			break
+		}
+	}
+	return filtered
 }
 
 func newAdminMutationCleanup(updater adminStateUpdater, status adminStatus, poolID int64) (*adminMutationCleanup, error) {

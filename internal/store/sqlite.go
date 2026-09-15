@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 //go:embed migrations/*.sql
@@ -28,10 +29,39 @@ var migrations = []struct {
 	{version: 4, path: "migrations/004_postgresql_compatibility.sql"},
 }
 
+const sqlitePragmas = "?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"
+
+func sqliteDSN(path string) (string, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve SQLite path: %w", err)
+	}
+	urlPath := filepath.ToSlash(absolutePath)
+	if filepath.VolumeName(absolutePath) != "" && !strings.HasPrefix(urlPath, "/") {
+		urlPath = "/" + urlPath
+	}
+	return (&url.URL{Scheme: "file", Path: urlPath}).String() + sqlitePragmas, nil
+}
+
 type SQLite struct {
 	db   *sql.DB
 	path string
 	now  func() time.Time
+}
+
+// IsTemporary reports SQLite contention that callers may safely surface as a
+// transient server failure instead of blaming otherwise valid input.
+func IsTemporary(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	switch sqliteErr.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	default:
+		return false
+	}
 }
 
 func Open(ctx context.Context, path string) (*SQLite, error) {
@@ -52,16 +82,10 @@ func Open(ctx context.Context, path string) (*SQLite, error) {
 		return nil, fmt.Errorf("secure SQLite file permissions: %w", err)
 	}
 
-	absolutePath, err := filepath.Abs(path)
+	dsn, err := sqliteDSN(path)
 	if err != nil {
-		return nil, fmt.Errorf("resolve SQLite path: %w", err)
+		return nil, err
 	}
-	urlPath := filepath.ToSlash(absolutePath)
-	if filepath.VolumeName(absolutePath) != "" && !strings.HasPrefix(urlPath, "/") {
-		urlPath = "/" + urlPath
-	}
-	dsn := (&url.URL{Scheme: "file", Path: urlPath}).String() +
-		"?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite: %w", err)

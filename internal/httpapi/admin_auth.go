@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -12,6 +13,8 @@ import (
 )
 
 const adminCSRFCookie = "llmgw_csrf"
+
+type adminCSRFContextKey struct{}
 
 type AdminSecurityConfig struct {
 	Username     string
@@ -77,6 +80,7 @@ func (s *AdminSecurity) Wrap(next http.Handler) http.Handler {
 			http.Error(writer, "CSRF token mismatch", http.StatusForbidden)
 			return
 		}
+		request = request.WithContext(context.WithValue(request.Context(), adminCSRFContextKey{}, token))
 		next.ServeHTTP(writer, request)
 	})
 }
@@ -136,5 +140,8 @@ func setAdminSecurityHeaders(header http.Header) {
 
 // AdminCSRFToken returns the validated double-submit token for HTML forms.
 func AdminCSRFToken(request *http.Request) string {
+	if token, ok := request.Context().Value(adminCSRFContextKey{}).(string); ok {
+		return token
+	}
 	return csrfToken(request)
 }

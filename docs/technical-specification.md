@@ -953,6 +953,7 @@ Actions:
 Create
 Edit
 Disable
+Delete
 ```
 
 ---
@@ -1000,6 +1001,7 @@ Edit
 Enable
 Disable
 Drain
+Delete
 ```
 
 ---
@@ -1012,6 +1014,7 @@ At minimum:
 GET    /admin/api/clients
 POST   /admin/api/clients
 PUT    /admin/api/clients/{id}
+DELETE /admin/api/clients/{id}
 
 POST   /admin/api/clients/{id}/keys
 DELETE /admin/api/keys/{id}
@@ -1019,16 +1022,20 @@ DELETE /admin/api/keys/{id}
 GET    /admin/api/pools
 POST   /admin/api/pools
 PUT    /admin/api/pools/{id}
+DELETE /admin/api/pools/{id}
 
 GET    /admin/api/backends
 POST   /admin/api/backends
 PUT    /admin/api/backends/{id}
+DELETE /admin/api/backends/{id}
 
 POST   /admin/api/backends/{id}/drain
 POST   /admin/api/backends/{id}/resume
 
 GET    /admin/api/status
 ```
+
+Deletion is destructive and requires an explicit confirmation in the Admin UI. Deleting a client also removes its model access and API keys; captured keys are immediately denied even if the subsequent registry reload fails. A model pool cannot be deleted while any backend still references it, so its backends must be deleted first. Deleting a backend removes it from routing and runtime monitoring immediately after the database commit, including when the full registry reload fails; retrying the delete reconciles any stale published configuration.
 
 ---
 
@@ -1082,6 +1089,7 @@ llmgw_requests_rejected_total
 llmgw_client_inflight
 
 llmgw_backend_requests_inflight
+llmgw_backend_selected_total
 llmgw_backend_pressure
 llmgw_backend_running_requests
 llmgw_backend_waiting_requests
@@ -1100,9 +1108,21 @@ llmgw_backend_circuit_failures
 llmgw_pool_gateway_inflight
 llmgw_pool_waiting_requests
 llmgw_pool_available_backends
+llmgw_pool_pressure
+llmgw_pool_state
+
+llmgw_queue_wait_seconds
 ```
 
 `llmgw_backend_circuit_state` uses the bounded numeric encoding `unmanaged/unknown=-1`, `closed=0`, `open=1`, and `half_open=2`. The negative value distinguishes a configured backend that has no managed runtime worker yet from an explicitly closed managed circuit.
+
+`llmgw_pool_state{model,state}` is one-hot over `normal`, `busy`, `saturated`, `emergency`, and `unavailable`. `llmgw_pool_pressure{model}` is the best eligible backend pressure used by pool admission. Both are current-topology gauges and their stale label sets are deleted on pool removal or rename. Backend/runtime/client in-flight gauges use the same topology cleanup; historical counters and histograms are retained.
+
+`llmgw_backend_selected_total{model,backend}` increments for every successful backend lease. The conservative alternate retry therefore increments the selected backend's counter without changing the request count.
+
+`llmgw_queue_wait_seconds{model,priority_class,outcome}` measures gateway pre-dispatch time, not vLLM's internal queue. It starts after stable client/model identity, access-policy validation, and request rewriting, immediately before pool admission. It ends at the first backend lease (`selected`) or terminal admission/selection rejection (`rejected`). Pre-admission failures emit no queue sample, and an alternate retry does not emit a second sample.
+
+`llmgw_requests_rejected_total` uses a gateway-owned bounded `reason`: `pool_waiting_limit`, `pool_inflight_limit`, `priority_concurrency_limit`, `pool_unavailable`, `no_eligible_backend`, `gateway_backpressure`, `model_not_allowed`, `invalid_request`, `invalid_api_key`, `upstream_failure`, or the pre-lifecycle fallback `internal_error`. This internal classification does not change the public OpenAI-compatible error code. In particular, the three overload reasons still return public `429 gateway_overloaded`; dashboards that previously selected `reason="gateway_overloaded"` must migrate to `reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"`.
 
 Labels:
 
@@ -1111,8 +1131,10 @@ client
 model
 backend
 priority_class
-status
+status_class
 reason
+state
+outcome
 ```
 
 Labels containing request IDs and other high-cardinality values should be avoided.
@@ -1137,6 +1159,9 @@ poolState
 backendPressure
 
 httpStatus
+decisionReason
+queueOutcome
+queueWaitMs
 
 duration
 ttft
@@ -1838,6 +1863,10 @@ This protection is process-local in the SQLite profile and globally enforced thr
 
 Inference capacity has its own unauthenticated `GET /inference-readyz`: HTTP `200`/`status: ready` when at least one enabled pool has a healthy, metrics-fresh, secret-ready, non-draining backend whose circuit has capacity; otherwise HTTP `503`/`status: unavailable`. The body includes configuration `revision`, `poolAvailability`, and `backendAvailability`. Pool congestion does not make inference readiness flap. `GET /readyz` remains separate management-plane readiness and stays HTTP `200` during an inference outage.
 
+Authenticated workload producers have a separate model-scoped `GET /v1/load?model=<public-model>` endpoint. It uses the same Bearer-key and model-access policy as inference requests, returns HTTP `200` for every successfully evaluated state, and exposes a stable `level` vocabulary: `normal` maps to `free`, `busy` to `medium`, `saturated` and `emergency` to `loaded`, and zero eligible backends to `unavailable`. The response also carries the internal pool state, best eligible pressure, eligible backend count, upstream waiting requests, gateway in-flight count, configuration revision, and evaluation timestamp.
+
+The load endpoint is an advisory observation only. It does not acquire admission capacity or a backend lease, and it is excluded from inference analytics. Responses are non-cacheable and carry a request ID. Clients must add jitter/backoff to polling and must still handle admission races and ordinary inference `429`/`503` responses.
+
 ---
 
 # 47. Anti-Starvation
@@ -1998,6 +2027,18 @@ structured logs
 ```
 
 The Grafana dashboard must show:
+
+The repository-provisioned **Gateway Decisions** dashboard leads with four aligned panels so an operator can read the overload sequence without changing filters:
+
+```promql
+max by (model) (llmgw_pool_pressure{model=~"$model"})
+sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~"$model",priority_class="background",reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"}[$__rate_interval]))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_request_duration_seconds_bucket{model=~"$model",priority_class="high",status_class="2xx"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_ttft_seconds_bucket{model=~"$model",priority_class="high"}[$__rate_interval])))
+histogram_quantile(0.95, sum by (model, le) (rate(llmgw_queue_wait_seconds_bucket{model=~"$model",priority_class="high",outcome="selected"}[$__rate_interval])))
+```
+
+The Low panel allowlists only the three gateway overload decisions that map to HTTP 429. Every causal query retains `model`, including with the `All` filter, so pools cannot be visually cross-correlated by aggregation. This makes the intended claim inspectable: GPU pressure rose, Low was shed with an exact gateway decision, and High latency plus gateway queue wait remained controlled. The dashboard also exposes pool state, request/status mix, client/priority in-flight work, backend pressure/running/waiting, backend selection rate, and circuit state, with bounded model/backend/client/priority filters.
 
 ### Cluster
 

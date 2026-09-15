@@ -310,6 +310,9 @@ func TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion(t *testin
 	if second.apiErr == nil || second.apiErr.HTTPStatus != http.StatusTooManyRequests || second.apiErr.Code != "gateway_overloaded" || second.apiErr.RetryAfter <= 0 {
 		t.Fatalf("second request API error = %+v, want bounded 429 with Retry-After", second.apiErr)
 	}
+	if second.apiErr.DecisionReason != gateway.DecisionPoolInflightLimit {
+		t.Fatalf("second request reason = %q, want %q", second.apiErr.DecisionReason, gateway.DecisionPoolInflightLimit)
+	}
 	if got := runtime.PoolInflight(); got != 1 {
 		t.Fatalf("pool inflight while first request blocks = %d, want 1", got)
 	}
@@ -324,18 +327,46 @@ func TestServicePoolMaxInflightRejectsSecondAndReleasesAfterCompletion(t *testin
 	}
 }
 
+func TestServiceCoordinatedPoolLimitPreservesDecisionTelemetry(t *testing.T) {
+	forwarder := newPoolBlockingForwarder()
+	defer forwarder.releaseAll()
+	service, request, _ := newPoolService(t, poolServiceOptions{
+		maximum: 1, priority: domain.PriorityHigh, forwarder: forwarder,
+		coordinator: local.NewAdmissionCoordinator(func() time.Time { return poolTestNow }),
+	})
+	first := forwardPoolAsync(service, context.Background(), request)
+	forwarder.waitStarted(t)
+	second := waitPoolResult(t, forwardPoolAsync(service, context.Background(), request), forwarder.releaseAll)
+	forwarder.releaseAll()
+	<-first
+	if second.apiErr == nil || second.apiErr.Code != "gateway_overloaded" || second.apiErr.DecisionReason != gateway.DecisionPoolInflightLimit {
+		t.Fatalf("coordinated pool rejection = %+v", second.apiErr)
+	}
+}
+
 func TestServicePoolMaxWaitingRejectsBeforePoolAndClientAcquisition(t *testing.T) {
+	observer := &backendRecordingObserver{}
 	service, request, runtime := newPoolService(t, poolServiceOptions{
 		maximum: 2, maxWaiting: 5, totalWaiting: 5, priority: domain.PriorityCritical,
-		forwarder: &poolCompletionForwarder{},
+		forwarder: &poolCompletionForwarder{}, observer: observer,
 	})
 
 	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
 	if apiErr == nil || apiErr.HTTPStatus != http.StatusTooManyRequests || apiErr.Code != "gateway_overloaded" || apiErr.RetryAfter <= 0 {
 		t.Fatalf("waiting rejection API error = %+v, want bounded 429 with Retry-After", apiErr)
 	}
+	if apiErr.DecisionReason != gateway.DecisionPoolWaitingLimit {
+		t.Fatalf("waiting rejection reason = %q, want %q", apiErr.DecisionReason, gateway.DecisionPoolWaitingLimit)
+	}
 	if got := runtime.PoolAcquisitions(); got != 0 {
 		t.Fatalf("pool acquisitions after waiting rejection = %d, want 0", got)
+	}
+	event := observer.Event()
+	if event.QueueOutcome != gateway.QueueRejected || event.QueueWait < 0 {
+		t.Fatalf("waiting rejection queue telemetry = outcome %q wait %s", event.QueueOutcome, event.QueueWait)
+	}
+	if event.DecisionReason != gateway.DecisionPoolWaitingLimit {
+		t.Fatalf("waiting rejection event reason = %q, want %q", event.DecisionReason, gateway.DecisionPoolWaitingLimit)
 	}
 }
 
@@ -572,6 +603,11 @@ func TestServiceReleasesPoolLeaseWhenClientLimiterRejects(t *testing.T) {
 		<-firstDone
 		t.Fatalf("client limiter API error = %+v", apiErr)
 	}
+	if apiErr.DecisionReason != gateway.DecisionPriorityConcurrencyLimit {
+		forwarder.releaseAll()
+		<-firstDone
+		t.Fatalf("client limiter reason = %q, want %q", apiErr.DecisionReason, gateway.DecisionPriorityConcurrencyLimit)
+	}
 	if got := runtime.PoolInflight(); got != 1 {
 		forwarder.releaseAll()
 		<-firstDone
@@ -709,6 +745,68 @@ func TestServiceInferenceReadinessMatrix(t *testing.T) {
 				t.Fatalf("InferenceReadiness() = %+v, want status=%q revision=47 pools=%d backends=%d", readiness, tt.wantStatus, tt.wantPools, tt.wantBackends)
 			}
 		})
+	}
+}
+
+func TestServiceLoadStatusMapsPoolStatesToStablePublicLevels(t *testing.T) {
+	tests := []struct {
+		state domain.PoolState
+		level gateway.LoadLevel
+	}{
+		{state: domain.PoolNormal, level: gateway.LoadFree},
+		{state: domain.PoolBusy, level: gateway.LoadMedium},
+		{state: domain.PoolSaturated, level: gateway.LoadLoaded},
+		{state: domain.PoolEmergency, level: gateway.LoadLoaded},
+		{state: domain.PoolUnavailable, level: gateway.LoadUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.state), func(t *testing.T) {
+			runtime := newPoolRuntime(domain.PoolRuntime{
+				PoolID: 10, State: tt.state, BestBackendPressure: .82,
+				AvailableBackends: 1, TotalWaiting: 3,
+			}, []domain.BackendRuntime{{
+				BackendID: 20, Healthy: true, MetricsFresh: true, CircuitAvailable: true,
+			}})
+			runtime.poolInflight = 11
+			service, request, _ := newPoolService(t, poolServiceOptions{runtime: runtime})
+
+			status, apiErr := service.LoadStatus(request.APIKey, "public-model")
+
+			if apiErr != nil {
+				t.Fatalf("LoadStatus() API error = %+v", apiErr)
+			}
+			if status.Model != "public-model" || status.Level != tt.level || status.PoolState != tt.state {
+				t.Fatalf("LoadStatus() identity/state = %+v, want model=public-model level=%q state=%q", status, tt.level, tt.state)
+			}
+			if status.BestBackendPressure != .82 || status.AvailableBackends != 1 ||
+				status.WaitingRequests != 3 || status.GatewayInflight != 11 {
+				t.Fatalf("LoadStatus() runtime = %+v", status)
+			}
+			if status.ConfigRevision != 1 || !status.EvaluatedAt.Equal(poolTestNow) {
+				t.Fatalf("LoadStatus() metadata = %+v, want revision=1 evaluatedAt=%s", status, poolTestNow)
+			}
+		})
+	}
+}
+
+func TestServiceLoadStatusReportsUnavailableWhenNoBackendCanServeRequests(t *testing.T) {
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	backend.UpstreamAPIKeyEnv = "MISSING_UPSTREAM_KEY"
+	runtime := newPoolRuntime(domain.PoolRuntime{
+		PoolID: 10, State: domain.PoolNormal, BestBackendPressure: .2, AvailableBackends: 1,
+	}, []domain.BackendRuntime{{
+		BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true,
+	}})
+	service, request, _ := newPoolService(t, poolServiceOptions{runtime: runtime, backends: []domain.Backend{backend}})
+
+	status, apiErr := service.LoadStatus(request.APIKey, "public-model")
+
+	if apiErr != nil {
+		t.Fatalf("LoadStatus() API error = %+v", apiErr)
+	}
+	if status.Level != gateway.LoadUnavailable || status.PoolState != domain.PoolUnavailable || status.AvailableBackends != 0 {
+		t.Fatalf("LoadStatus() = %+v, want unavailable with zero serving backends", status)
 	}
 }
 

@@ -44,8 +44,9 @@ type Manager struct {
 	probes         map[uuid.UUID]coordination.ProbeIdentity
 	circuitBacklog []coordination.CircuitCompletion
 
-	replayMu   sync.Mutex
-	replayDone chan struct{}
+	replayMu        sync.Mutex
+	replayDone      chan struct{}
+	backendInflight map[int64]int
 }
 
 func NewManager(ctx context.Context, options Options) *Manager {
@@ -66,7 +67,8 @@ func NewManager(ctx context.Context, options Options) *Manager {
 		ctx: managerCtx, cancel: cancel, observerDone: make(chan struct{}), probeRenewDone: make(chan struct{}), options: options,
 		workers: make(map[int64]*managedWorker), poolMachine: make(map[int64]*pressure.PoolMachine),
 		poolRuntime: make(map[int64]domain.PoolRuntime), poolInflight: make(map[int64]int),
-		probes: make(map[uuid.UUID]coordination.ProbeIdentity),
+		probes:          make(map[uuid.UUID]coordination.ProbeIdentity),
+		backendInflight: make(map[int64]int),
 	}
 	go manager.runPoolObserver()
 	go manager.runProbeRenewer()
@@ -144,11 +146,14 @@ func (m *Manager) Reconcile(backends []domain.Backend) error {
 func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime {
 	m.mu.Lock()
 	managed := m.workers[backendID]
+	inflight := m.backendInflight[backendID]
 	m.mu.Unlock()
 	if managed == nil {
-		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy}
+		return domain.BackendRuntime{BackendID: backendID, State: domain.BackendUnhealthy, GatewayInflight: inflight}
 	}
-	return m.snapshotManaged(managed, at)
+	snapshot := m.snapshotManaged(managed, at)
+	snapshot.GatewayInflight = inflight
+	return snapshot
 }
 
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
@@ -214,8 +219,8 @@ func (m *Manager) runPoolObserver() {
 	defer ticker.Stop()
 	for {
 		select {
-		case at := <-ticker.C:
-			m.observePools(at)
+		case <-ticker.C:
+			m.observePools(time.Now())
 		case <-m.ctx.Done():
 			return
 		}
@@ -352,17 +357,17 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 				m.mu.Unlock()
 				return nil, false
 			}
-			managed.worker.incrementInflight(1)
+			m.backendInflight[expected.ID]++
 			m.mu.Unlock()
 			var once sync.Once
 			return func(outcome domain.InferenceOutcome) {
 				once.Do(func() {
+					defer m.releaseBackendInflight(expected.ID)
 					reported := time.Now().UTC()
 					completeLocal(outcome, reported)
 					if outcome == domain.InferenceFailure {
 						m.bufferCircuitFailure(coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: cached.Generation, Outcome: outcome, ReportedOutcomeAt: reported})
 					}
-					managed.worker.incrementInflight(-1)
 				})
 			}, true
 		}
@@ -375,7 +380,7 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 			m.mu.Unlock()
 			return nil, false
 		}
-		managed.worker.incrementInflight(1)
+		m.backendInflight[expected.ID]++
 		if decision.Permit != nil {
 			m.probes[decision.Permit.PermitID] = *decision.Permit
 		}
@@ -383,15 +388,17 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 		var once sync.Once
 		return func(outcome domain.InferenceOutcome) {
 			once.Do(func() {
+				defer func() {
+					m.mu.Lock()
+					delete(m.probes, attemptID)
+					m.mu.Unlock()
+					m.releaseBackendInflight(expected.ID)
+				}()
 				reported := time.Now().UTC()
 				completion := coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: decision.Snapshot.Generation, Outcome: outcome, ReportedOutcomeAt: reported}
 				if _, err := m.options.CircuitCoordinator.Complete(context.WithoutCancel(m.ctx), completion); err != nil && outcome == domain.InferenceFailure && replayableCircuitError(err) {
 					m.bufferCircuitFailure(completion)
 				}
-				m.mu.Lock()
-				delete(m.probes, attemptID)
-				managed.worker.incrementInflight(-1)
-				m.mu.Unlock()
 			})
 		}, true
 	}
@@ -400,13 +407,21 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 		m.mu.Unlock()
 		return nil, false
 	}
-	managed.worker.incrementInflight(1)
+	m.backendInflight[expected.ID]++
 	m.mu.Unlock()
 	var once sync.Once
 	return func(outcome domain.InferenceOutcome) {
 		once.Do(func() {
+			defer func() {
+				m.mu.Lock()
+				if current := m.backendInflight[expected.ID]; current > 1 {
+					m.backendInflight[expected.ID] = current - 1
+				} else {
+					delete(m.backendInflight, expected.ID)
+				}
+				m.mu.Unlock()
+			}()
 			completeCircuit(outcome, time.Now())
-			managed.worker.incrementInflight(-1)
 		})
 	}, true
 }
@@ -626,5 +641,15 @@ func (m *Manager) Shutdown() {
 func waitWorkers(workers []*managedWorker) {
 	for _, managed := range workers {
 		<-managed.done
+	}
+}
+
+func (m *Manager) releaseBackendInflight(id int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current := m.backendInflight[id]; current > 1 {
+		m.backendInflight[id] = current - 1
+	} else {
+		delete(m.backendInflight, id)
 	}
 }

@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
+
+var ErrPoolHasBackends = errors.New("model pool cannot be deleted while backends reference it")
 
 func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domain.ModelPool, error) {
 	pool := domain.ModelPool{
@@ -55,28 +58,24 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 		return domain.ModelPool{}, err
 	}
 	defer tx.Rollback()
-	var created string
 	var previous domain.ModelPool
-	if err := tx.QueryRowContext(ctx, `SELECT max_gateway_inflight, revision, created_at FROM model_pools WHERE id = ?`, id).Scan(&previous.MaxGatewayInflight, &previous.Revision, &created); err != nil {
+	if err := tx.QueryRowContext(ctx, `UPDATE model_pools SET id = id WHERE id = ? RETURNING max_gateway_inflight`, id).Scan(&previous.MaxGatewayInflight); err != nil {
 		return domain.ModelPool{}, fmt.Errorf("find model pool %d: %w", id, err)
 	}
 	if err := pool.ValidateUpdate(previous); err != nil {
 		return domain.ModelPool{}, err
 	}
-	pool.Revision = previous.Revision + 1
-	pool.CreatedAt, err = parseTimestamp(created)
-	if err != nil {
-		return domain.ModelPool{}, err
-	}
 	pool.UpdatedAt = s.now().UTC()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, revision = ?, updated_at = ?
-		WHERE id = ?`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, pool.Revision, timestamp(pool.UpdatedAt), id)
+	var created string
+	err = tx.QueryRowContext(ctx, `
+		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, revision = revision + 1, updated_at = ?
+		WHERE id = ? RETURNING revision, created_at`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(pool.UpdatedAt), id).Scan(&pool.Revision, &created)
 	if err != nil {
 		return domain.ModelPool{}, fmt.Errorf("update model pool: %w", err)
 	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return domain.ModelPool{}, sql.ErrNoRows
+	pool.CreatedAt, err = parseTimestamp(created)
+	if err != nil {
+		return domain.ModelPool{}, err
 	}
 	if err := bumpRevision(ctx, tx); err != nil {
 		return domain.ModelPool{}, err
@@ -85,6 +84,36 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 		return domain.ModelPool{}, err
 	}
 	return pool, nil
+}
+
+func (s *SQLite) DeletePool(ctx context.Context, id int64) error {
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `UPDATE model_pools SET id = id WHERE id = ? RETURNING 1`, id).Scan(&exists); err != nil {
+		return fmt.Errorf("reserve model pool deletion: %w", err)
+	}
+	var backendCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backends WHERE model_pool_id = ?`, id).Scan(&backendCount); err != nil {
+		return fmt.Errorf("count model pool backends: %w", err)
+	}
+	if backendCount != 0 {
+		return ErrPoolHasBackends
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM model_pools WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete model pool: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return sql.ErrNoRows
+	}
+	if err := bumpRevision(ctx, tx); err != nil {
+		return err
+	}
+	return commit(tx)
 }
 
 func (s *SQLite) ListPools(ctx context.Context) ([]domain.ModelPool, error) {

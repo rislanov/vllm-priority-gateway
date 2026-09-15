@@ -101,8 +101,11 @@ func TestStreamingIsByteExactAndRetryStopsAfterFirstByte(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		truncated, _ := io.ReadAll(stream.Body)
+		truncated, readErr := io.ReadAll(stream.Body)
 		stream.Body.Close()
+		if readErr == nil {
+			t.Fatal("post-byte upstream reset completed as a clean downstream response")
+		}
 		if !strings.Contains(string(truncated), `"content":"one"`) || strings.Contains(string(truncated), "[DONE]") {
 			t.Fatalf("post-byte reset body = %q", truncated)
 		}

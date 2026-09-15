@@ -120,8 +120,14 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	}
 	receipt := &admissionReceipt{fingerprint: fp, request: req}
 	c.receipts[req.LeaseID] = receipt
-	reject := func(reason coordination.Reason, retry *time.Time) (coordination.AdmissionDecision, error) {
+	reject := func(reason coordination.Reason, retry *time.Time, scope ...coordination.AdmissionScope) (coordination.AdmissionDecision, error) {
 		d := coordination.AdmissionDecision{Reason: reason, RetryAt: retry}
+		if reason == coordination.ReasonConcurrencyExhausted {
+			d.ConcurrencyScope = coordination.AdmissionClientScope
+			if len(scope) > 0 {
+				d.ConcurrencyScope = scope[0]
+			}
+		}
 		receipt.decision = d
 		receipt.retainUntil = retentionBoundary(req.OperationStartedAt, now)
 		c.terminalExpiries.add(admissionReceiptExpiry, req.LeaseID, receipt.retainUntil)
@@ -136,7 +142,7 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	}
 	clientCount, poolCount := c.clientInflight[req.ClientID], c.poolInflight[req.PoolID]
 	if req.PoolGatewayInflightLimit > 0 && poolCount >= req.PoolGatewayInflightLimit {
-		return reject(coordination.ReasonConcurrencyExhausted, nil)
+		return reject(coordination.ReasonConcurrencyExhausted, nil, coordination.AdmissionPoolScope)
 	}
 	if clientCount >= req.EffectiveClientLimit {
 		return reject(coordination.ReasonConcurrencyExhausted, nil)

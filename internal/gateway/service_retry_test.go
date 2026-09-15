@@ -72,6 +72,95 @@ func TestRetrySelectionUsesCurrentRegistryAndTime(t *testing.T) {
 	}
 }
 
+func TestForwardRevalidatesKeyAfterResponseReservationWait(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	backend.ModelPoolID = pool.ID
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		backend.ID: {BackendID: backend.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true},
+	}}
+	forwarder := &completionForwarder{}
+	observer := newBlockingReservationObserver()
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+		Observer: observer,
+	})
+	type forwardResult struct {
+		reservation gateway.ResponseCompleteReservation
+		err         *gateway.APIError
+	}
+	returned := make(chan forwardResult, 1)
+	go func() {
+		_, reservation, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+			Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+			Body: []byte(`{"model":"public-model"}`), APIKey: rawKey, RequestID: "waiting-request",
+		})
+		returned <- forwardResult{reservation: reservation, err: apiErr}
+	}()
+	<-observer.entered
+	revokedAt := time.Now().UTC()
+	key.RevokedAt = &revokedAt
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{backend}))
+	close(observer.release)
+	result := <-returned
+	service.ResponseComplete(result.reservation)
+	if result.err == nil || result.err.HTTPStatus != http.StatusUnauthorized || result.err.Code != "invalid_api_key" {
+		t.Fatalf("Forward() error after revocation = %+v", result.err)
+	}
+	if forwarder.Calls() != 0 || runtime.Inflight(backend.ID) != 0 {
+		t.Fatalf("revoked waiting request reached upstream: calls=%d inflight=%d", forwarder.Calls(), runtime.Inflight(backend.ID))
+	}
+	if observer.terminals != 1 {
+		t.Fatalf("reservation terminal callbacks = %d, want 1", observer.terminals)
+	}
+}
+
+func TestRetrySelectionRejectsKeyRevokedAfterFirstAttempt(t *testing.T) {
+	secret := []byte(strings.Repeat("s", 32))
+	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
+	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}
+	pool := domain.ModelPool{ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true}
+	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
+	first := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	second := retryBackend(21, "gpu-21", "http://gpu-21.invalid")
+	first.ModelPoolID, second.ModelPoolID = pool.ID, pool.ID
+	provider := &mutableSnapshotProvider{}
+	provider.Set(testSnapshot(client, key, pool, []domain.Backend{first, second}))
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		first.ID:  {BackendID: first.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true, Pressure: .1},
+		second.ID: {BackendID: second.ID, Healthy: true, MetricsFresh: true, CircuitAvailable: true, Pressure: .2},
+	}}
+	forwarder := &revokingRetryForwarder{beforeAlternate: func() {
+		revokedAt := time.Now().UTC()
+		key.RevokedAt = &revokedAt
+		provider.Set(testSnapshot(client, key, pool, []domain.Backend{first, second}))
+	}}
+	service := gateway.New(gateway.Dependencies{
+		Registry: provider, HMACSecret: secret, Runtime: runtime,
+		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
+	})
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), gateway.ForwardRequest{
+		Method: http.MethodPost, Path: "/v1/completions", Headers: make(http.Header),
+		Body: []byte(`{"model":"public-model"}`), APIKey: rawKey,
+	})
+	if apiErr == nil || apiErr.HTTPStatus != http.StatusUnauthorized || apiErr.Code != "invalid_api_key" {
+		t.Fatalf("retry after revocation error = %+v", apiErr)
+	}
+	if forwarder.alternateSelected {
+		t.Fatal("retry selected an alternate backend after key revocation")
+	}
+	if runtime.Inflight(first.ID) != 0 || runtime.Inflight(second.ID) != 0 {
+		t.Fatalf("inflight after rejected retry: first=%d second=%d", runtime.Inflight(first.ID), runtime.Inflight(second.ID))
+	}
+}
+
 func TestRetrySelectionRejectsPoolModelReconfiguration(t *testing.T) {
 	started := time.Unix(1_700_000_000, 0).UTC()
 	clock := &mutableClock{current: started}
@@ -240,6 +329,97 @@ func TestForwardCompletesFailedBackendBeforeSelectingAlternateAndBalancesObserve
 	}
 }
 
+func TestForwardCompletesAcquiredTargetExactlyOnce(t *testing.T) {
+	backend := retryBackend(20, "gpu-20", "http://gpu-20.invalid")
+	runtime := &duplicateCompletionRuntime{value: domain.BackendRuntime{
+		BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true,
+	}}
+	observer := &backendRecordingObserver{}
+	service, request := retryService(
+		[]domain.Backend{backend}, runtime, duplicateCompletionForwarder{}, observer, time.Now,
+	)
+
+	result, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr != nil || result.Status != http.StatusOK {
+		t.Fatalf("Forward() result=%+v API error=%+v", result, apiErr)
+	}
+	if got := runtime.Completions(); len(got) != 1 || got[0] != domain.InferenceFailure {
+		t.Fatalf("runtime completions = %v, want one failure from first callback", got)
+	}
+	if got := runtime.Inflight(); got != 0 {
+		t.Fatalf("runtime inflight = %d, want 0", got)
+	}
+	if got := observer.Deltas(); strings.Join(got, ",") != "gpu-20:+1,gpu-20:-1" {
+		t.Fatalf("backend observer deltas = %v, want one balanced increment/decrement", got)
+	}
+}
+
+func TestForwardPanicCompletesEverySelectedTargetAndPreservesPanicIdentity(t *testing.T) {
+	backends := []domain.Backend{
+		retryBackend(20, "gpu-20", "http://gpu-20.invalid"),
+		retryBackend(21, "gpu-21", "http://gpu-21.invalid"),
+		retryBackend(22, "gpu-22", "http://gpu-22.invalid"),
+	}
+	runtime := newPanicCleanupRuntime(backends, 21)
+	observer := &backendRecordingObserver{}
+	panicValue := &struct{ message string }{message: "forwarding panic"}
+	service, request := retryService(
+		backends, runtime, panicAfterAlternateSelectionsForwarder{value: panicValue}, observer, time.Now,
+	)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _, _ = service.Forward(context.Background(), httptest.NewRecorder(), request)
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("recovered panic = %#v, want original identity %#v", recovered, panicValue)
+	}
+	wantCompletions := []string{"20:failure", "21:neutral", "22:neutral"}
+	if got := runtime.Completions(); strings.Join(got, ",") != strings.Join(wantCompletions, ",") {
+		t.Fatalf("backend completions = %v, want %v", got, wantCompletions)
+	}
+	if inflight, halfOpen := runtime.Ownership(); inflight != 0 || halfOpen != 0 {
+		t.Fatalf("runtime ownership after panic = inflight %d half-open probes %d, want 0/0", inflight, halfOpen)
+	}
+	wantDeltas := "gpu-20:+1,gpu-20:-1,gpu-21:+1,gpu-22:+1,gpu-21:-1,gpu-22:-1"
+	if got := strings.Join(observer.Deltas(), ","); got != wantDeltas {
+		t.Fatalf("backend observer deltas = %q, want %q", got, wantDeltas)
+	}
+}
+
+func TestForwardRecordsAdmissionWaitOnceAcrossRetry(t *testing.T) {
+	backends := []domain.Backend{
+		retryBackend(20, "gpu-20", "http://gpu-20.invalid"),
+		retryBackend(21, "gpu-21", "http://gpu-21.invalid"),
+	}
+	runtime := &recordingRuntime{values: map[int64]domain.BackendRuntime{
+		20: {BackendID: 20, Healthy: true, MetricsFresh: true, Pressure: .1, CircuitAvailable: true},
+		21: {BackendID: 21, Healthy: true, MetricsFresh: true, Pressure: .2, CircuitAvailable: true},
+	}}
+	observer := &backendRecordingObserver{}
+	service, request := retryService(backends, runtime, &retryProbeForwarder{beforeAlternate: func() {}}, observer, time.Now)
+
+	_, _, apiErr := service.Forward(context.Background(), httptest.NewRecorder(), request)
+	if apiErr != nil {
+		t.Fatalf("Forward() API error = %+v", apiErr)
+	}
+	event := observer.Event()
+	if event.QueueOutcome != gateway.QueueSelected || event.QueueWait < 0 {
+		t.Fatalf("selected queue telemetry = outcome %q wait %s", event.QueueOutcome, event.QueueWait)
+	}
+	if event.DecisionReason != "" {
+		t.Fatalf("successful request decision reason = %q, want empty", event.DecisionReason)
+	}
+	if event.Backend != "gpu-21" {
+		t.Fatalf("retry event backend = %q, want gpu-21", event.Backend)
+	}
+	if got := strings.Join(runtime.Events(), ","); got != "acquire-20,complete-20:failure,acquire-21,complete-21:success" {
+		t.Fatalf("retry lifecycle = %q", got)
+	}
+}
+
 func TestForwardRecordsHTTP5xxFailureWithoutRetry(t *testing.T) {
 	fake := fakevllm.New()
 	fake.SetState(fakevllm.State{HTTPStatus: http.StatusServiceUnavailable, HTTPBody: `{"error":"busy"}`})
@@ -312,6 +492,38 @@ type mutableSnapshotProvider struct {
 	snapshot *registry.Snapshot
 }
 
+type noOpReservation struct{}
+
+func (noOpReservation) StageResponseComplete(gateway.RequestEvent) {}
+
+type blockingReservationObserver struct {
+	entered   chan struct{}
+	release   chan struct{}
+	terminals int
+}
+
+func newBlockingReservationObserver() *blockingReservationObserver {
+	return &blockingReservationObserver{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (*blockingReservationObserver) ClientInflight(gateway.InflightEvent, int)  {}
+func (*blockingReservationObserver) BackendInflight(gateway.InflightEvent, int) {}
+func (*blockingReservationObserver) Complete(gateway.RequestEvent)              {}
+
+func (o *blockingReservationObserver) ReserveResponseComplete(ctx context.Context, _ string) (gateway.ResponseCompleteReservation, func(), bool) {
+	close(o.entered)
+	select {
+	case <-o.release:
+		return noOpReservation{}, func() {}, true
+	case <-ctx.Done():
+		return nil, nil, false
+	}
+}
+
+func (o *blockingReservationObserver) ResponseComplete(gateway.ResponseCompleteReservation) {
+	o.terminals++
+}
+
 func (p *mutableSnapshotProvider) Snapshot() *registry.Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -349,6 +561,123 @@ type recordingRuntime struct {
 	rejectAcquisitions map[int64]int
 	events             []string
 	poolInflight       map[int64]int
+}
+
+type duplicateCompletionRuntime struct {
+	mu          sync.Mutex
+	value       domain.BackendRuntime
+	inflight    int
+	completions []domain.InferenceOutcome
+}
+
+type panicCleanupRuntime struct {
+	mu                sync.Mutex
+	values            map[int64]domain.BackendRuntime
+	inflight          int
+	halfOpenProbes    int
+	panicOnCompletion int64
+	completions       []string
+}
+
+func newPanicCleanupRuntime(backends []domain.Backend, panicOnCompletion int64) *panicCleanupRuntime {
+	values := make(map[int64]domain.BackendRuntime, len(backends))
+	for index, backend := range backends {
+		values[backend.ID] = domain.BackendRuntime{
+			BackendID: backend.ID, Healthy: true, MetricsFresh: true, Pressure: float64(index+1) / 10,
+			CircuitState: domain.CircuitHalfOpen, CircuitAvailable: true,
+		}
+	}
+	return &panicCleanupRuntime{values: values, panicOnCompletion: panicOnCompletion}
+}
+
+func (r *panicCleanupRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
+	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal, AvailableBackends: len(r.values)}
+}
+
+func (*panicCleanupRuntime) AcquirePool(int64, int) (func(), bool) {
+	return func() {}, true
+}
+
+func (r *panicCleanupRuntime) Snapshot(backendID int64, _ time.Time) domain.BackendRuntime {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.values[backendID]
+}
+
+func (r *panicCleanupRuntime) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
+	r.mu.Lock()
+	if _, exists := r.values[expected.ID]; !exists {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.inflight++
+	r.halfOpenProbes++
+	r.mu.Unlock()
+	return func(outcome domain.InferenceOutcome) {
+		r.mu.Lock()
+		r.inflight--
+		r.halfOpenProbes--
+		r.completions = append(r.completions, strconv.FormatInt(expected.ID, 10)+":"+string(outcome))
+		shouldPanic := expected.ID == r.panicOnCompletion
+		r.mu.Unlock()
+		if shouldPanic {
+			panic("backend completion panic")
+		}
+	}, true
+}
+
+func (r *panicCleanupRuntime) Completions() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.completions...)
+}
+
+func (r *panicCleanupRuntime) Ownership() (inflight, halfOpenProbes int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inflight, r.halfOpenProbes
+}
+
+func (r *duplicateCompletionRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
+	return domain.PoolRuntime{PoolID: poolID, State: domain.PoolNormal, AvailableBackends: 1}
+}
+
+func (*duplicateCompletionRuntime) AcquirePool(int64, int) (func(), bool) {
+	return func() {}, true
+}
+
+func (r *duplicateCompletionRuntime) Snapshot(int64, time.Time) domain.BackendRuntime {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.value
+}
+
+func (r *duplicateCompletionRuntime) AcquireBackend(expected domain.Backend, _ time.Time) (func(domain.InferenceOutcome), bool) {
+	r.mu.Lock()
+	if expected.ID != r.value.BackendID {
+		r.mu.Unlock()
+		return nil, false
+	}
+	r.inflight++
+	r.mu.Unlock()
+	return func(outcome domain.InferenceOutcome) {
+		r.mu.Lock()
+		r.completions = append(r.completions, outcome)
+		r.inflight--
+		r.mu.Unlock()
+	}, true
+}
+
+func (r *duplicateCompletionRuntime) Completions() []domain.InferenceOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]domain.InferenceOutcome(nil), r.completions...)
+}
+
+func (r *duplicateCompletionRuntime) Inflight() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inflight
 }
 
 func (r *recordingRuntime) PoolSnapshot(poolID int64, _ time.Time) domain.PoolRuntime {
@@ -458,6 +787,23 @@ type retryProbeForwarder struct {
 	result           proxy.Result
 }
 
+type revokingRetryForwarder struct {
+	beforeAlternate   func()
+	alternateSelected bool
+}
+
+func (f *revokingRetryForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
+	f.beforeAlternate()
+	alternate, err := request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
+	if err == nil {
+		f.alternateSelected = true
+		alternate.Complete(domain.InferenceNeutral)
+		return proxy.Result{BackendID: alternate.Backend.ID, Status: http.StatusOK}
+	}
+	return proxy.Result{BackendID: request.Target.Backend.ID, Err: fmt.Errorf("select retry backend: %w", err)}
+}
+
 func (f *retryProbeForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
 	f.initialBackend = request.Target.Backend.ID
 	request.Target.Complete(domain.InferenceFailure)
@@ -486,6 +832,34 @@ type completionForwarder struct {
 	mu        sync.Mutex
 	backendID int64
 	calls     int
+}
+
+type duplicateCompletionForwarder struct{}
+
+type panicAfterAlternateSelectionsForwarder struct {
+	value any
+}
+
+func (f panicAfterAlternateSelectionsForwarder) Forward(_ context.Context, _ http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
+	second, err := request.SelectAlternate(map[int64]struct{}{request.Target.Backend.ID: {}})
+	if err != nil {
+		panic(err)
+	}
+	_, err = request.SelectAlternate(map[int64]struct{}{
+		request.Target.Backend.ID: {}, second.Backend.ID: {},
+	})
+	if err != nil {
+		panic(err)
+	}
+	panic(f.value)
+}
+
+func (duplicateCompletionForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
+	request.Target.Complete(domain.InferenceFailure)
+	request.Target.Complete(domain.InferenceSuccess)
+	writer.WriteHeader(http.StatusOK)
+	return proxy.Result{BackendID: request.Target.Backend.ID, Status: http.StatusOK}
 }
 
 func (f *completionForwarder) Forward(_ context.Context, writer http.ResponseWriter, request proxy.Request) proxy.Result {
@@ -549,7 +923,7 @@ func retryBackend(id int64, name, baseURL string) domain.Backend {
 	}
 }
 
-func retryService(backends []domain.Backend, runtime *recordingRuntime, forwarder gateway.Forwarder, observer gateway.Observer, now func() time.Time) (*gateway.Service, gateway.ForwardRequest) {
+func retryService(backends []domain.Backend, runtime gateway.Runtime, forwarder gateway.Forwarder, observer gateway.Observer, now func() time.Time) (*gateway.Service, gateway.ForwardRequest) {
 	secret := []byte(strings.Repeat("s", 32))
 	rawKey := "llmgw_abcdefghijklmnopqrstuvwxyz012345"
 	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: domain.PriorityHigh, MaxConcurrency: 2}

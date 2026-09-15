@@ -40,6 +40,7 @@ func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGe
 	}
 	handler := &PublicHandler{service: service, bodyLimit: bodyLimit, generateID: generateID}
 	router := chi.NewRouter()
+	router.Get("/v1/load", handler.load)
 	router.Get("/v1/models", handler.models)
 	router.Post("/v1/chat/completions", handler.forward)
 	router.Post("/v1/completions", handler.forward)
@@ -48,6 +49,28 @@ func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGe
 	router.MethodNotAllowed(handler.unsupported)
 	handler.router = router
 	return handler
+}
+
+func (h *PublicHandler) load(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
+	if _, ok := h.begin(writer); !ok {
+		return
+	}
+	rawKey, err := bearerToken(request.Header.Get("Authorization"))
+	if err != nil {
+		writeGatewayError(writer, &gateway.APIError{
+			HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key",
+			Type: "authentication_error", Code: "invalid_api_key", DecisionReason: gateway.DecisionInvalidAPIKey,
+		})
+		return
+	}
+	status, gatewayError := h.service.LoadStatus(rawKey, request.URL.Query().Get("model"))
+	if gatewayError != nil {
+		writeGatewayError(writer, gatewayError)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(status)
 }
 
 func (h *PublicHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -64,16 +87,16 @@ func (h *PublicHandler) models(writer http.ResponseWriter, request *http.Request
 	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
-		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key", DecisionReason: gateway.DecisionInvalidAPIKey}
 		writeGatewayError(writer, apiError)
-		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		event.Status, event.Reason, event.DecisionReason = apiError.HTTPStatus, apiError.Code, apiError.DecisionReason
 		h.completePublic(started, event)
 		return
 	}
 	models, client, gatewayError := h.service.Models(request.Context(), rawKey)
 	if gatewayError != nil {
 		writeGatewayError(writer, gatewayError)
-		event.Status, event.Reason = gatewayError.HTTPStatus, gatewayError.Code
+		event.Status, event.Reason, event.DecisionReason = gatewayError.HTTPStatus, gatewayError.Code, gatewayError.DecisionReason
 		h.completePublic(started, event)
 		return
 	}
@@ -110,16 +133,16 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 	event := gateway.RequestEvent{RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id"))}
 	rawKey, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
-		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+		apiError := &gateway.APIError{HTTPStatus: 401, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key", DecisionReason: gateway.DecisionInvalidAPIKey}
 		writeGatewayError(writer, apiError)
-		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		event.Status, event.Reason, event.DecisionReason = apiError.HTTPStatus, apiError.Code, apiError.DecisionReason
 		h.completePublic(started, event)
 		return
 	}
 	client, authErr := h.service.ValidateAPIKey(rawKey)
 	if authErr != nil {
 		writeGatewayError(writer, authErr)
-		event.Status, event.Reason = authErr.HTTPStatus, authErr.Code
+		event.Status, event.Reason, event.DecisionReason = authErr.HTTPStatus, authErr.Code, authErr.DecisionReason
 		h.completePublic(started, event)
 		return
 	}
@@ -131,16 +154,19 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 	if err != nil {
 		apiError := invalidRequest("Request body is invalid or exceeds the configured limit")
 		writeGatewayError(writer, apiError)
-		event.Status, event.Reason = apiError.HTTPStatus, apiError.Code
+		event.Status, event.Reason, event.DecisionReason = apiError.HTTPStatus, apiError.Code, apiError.DecisionReason
 		h.completePublic(started, event)
 		return
 	}
-	_, reservation, gatewayError = h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
+	result, reservation, gatewayError := h.service.Forward(request.Context(), writer, gateway.ForwardRequest{
 		Method: request.Method, Path: request.URL.Path, Headers: request.Header.Clone(), Body: body,
 		APIKey: rawKey, RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id")),
 	})
 	if gatewayError != nil {
 		writeGatewayError(writer, gatewayError)
+	}
+	if result.Err != nil && result.ResponseStarted && !result.Cancelled {
+		panic(http.ErrAbortHandler)
 	}
 }
 
@@ -155,7 +181,7 @@ func (h *PublicHandler) unsupported(writer http.ResponseWriter, request *http.Re
 	writeGatewayError(writer, apiError)
 	h.completePublic(started, gateway.RequestEvent{
 		RequestID: requestID, ParentRequestID: validParentRequestID(request.Header.Get("X-Request-Id")),
-		Status: apiError.HTTPStatus, Reason: apiError.Code,
+		Status: apiError.HTTPStatus, Reason: apiError.Code, DecisionReason: apiError.DecisionReason,
 	})
 }
 

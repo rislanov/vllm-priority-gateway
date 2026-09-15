@@ -73,10 +73,18 @@ type LeaseIdentity struct {
 
 func (l LeaseIdentity) Identity() LeaseIdentity { return l }
 
+type AdmissionScope string
+
+const (
+	AdmissionClientScope AdmissionScope = "client"
+	AdmissionPoolScope   AdmissionScope = "pool"
+)
+
 type AdmissionDecision struct {
-	Lease   *LeaseIdentity
-	Reason  Reason
-	RetryAt *time.Time
+	Lease            *LeaseIdentity
+	Reason           Reason
+	RetryAt          *time.Time
+	ConcurrencyScope AdmissionScope
 }
 
 func (d AdmissionDecision) Admitted() bool { return d.Lease != nil && d.Reason == "" }

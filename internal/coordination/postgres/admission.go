@@ -203,7 +203,7 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 		return coordination.AdmissionDecision{}, err
 	}
 	if poolLimit > 0 && poolCount >= poolLimit {
-		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now)
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now, coordination.AdmissionPoolScope)
 	}
 	if clientCount >= r.EffectiveClientLimit {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now)
@@ -261,7 +261,8 @@ func (c *AdmissionCoordinator) resolveAcquire(ctx context.Context, tx pgx.Tx, r 
 	var reason *string
 	var retry *time.Time
 	var completed, expired *time.Time
-	if err := tx.QueryRow(ctx, "SELECT input_fingerprint,decision,rejection_reason,retry_at,completed_at,lease_expired_at FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", r.LeaseID).Scan(&stored, &decision, &reason, &retry, &completed, &expired); err != nil {
+	var scope coordination.AdmissionScope
+	if err := tx.QueryRow(ctx, "SELECT input_fingerprint,decision,rejection_reason,retry_at,completed_at,lease_expired_at,concurrency_scope FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", r.LeaseID).Scan(&stored, &decision, &reason, &retry, &completed, &expired, &scope); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
 	if !bytes.Equal(stored, fp[:]) {
@@ -271,7 +272,7 @@ func (c *AdmissionCoordinator) resolveAcquire(ctx context.Context, tx pgx.Tx, r 
 		if reason == nil {
 			return coordination.AdmissionDecision{}, coordination.PermanentError{Err: errors.New("invalid rejected admission receipt")}
 		}
-		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.Reason(*reason), RetryAt: retry})
+		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.Reason(*reason), RetryAt: retry, ConcurrencyScope: scope})
 	}
 	if completed != nil || expired != nil {
 		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.ReasonLeaseLost})
@@ -299,12 +300,19 @@ func markLost(ctx context.Context, tx pgx.Tx, id uuid.UUID, now time.Time) (coor
 	}
 	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.ReasonLeaseLost})
 }
-func rejectAcquire(ctx context.Context, tx pgx.Tx, id uuid.UUID, reason coordination.Reason, retry *time.Time, now time.Time) (coordination.AdmissionDecision, error) {
-	_, err := tx.Exec(ctx, "UPDATE admission_operations SET decision='rejected',rejection_reason=$2::text,retry_at=$3::timestamptz,decided_at=$4::timestamptz,retain_until=GREATEST(operation_started_at,$4::timestamptz)+interval '24 hours' WHERE lease_id=$1::uuid", id, string(reason), retry, now)
+func rejectAcquire(ctx context.Context, tx pgx.Tx, id uuid.UUID, reason coordination.Reason, retry *time.Time, now time.Time, scopes ...coordination.AdmissionScope) (coordination.AdmissionDecision, error) {
+	var scope coordination.AdmissionScope
+	if reason == coordination.ReasonConcurrencyExhausted {
+		scope = coordination.AdmissionClientScope
+		if len(scopes) > 0 {
+			scope = scopes[0]
+		}
+	}
+	_, err := tx.Exec(ctx, "UPDATE admission_operations SET decision='rejected',rejection_reason=$2::text,retry_at=$3::timestamptz,decided_at=$4::timestamptz,retain_until=GREATEST(operation_started_at,$4::timestamptz)+interval '24 hours',concurrency_scope=$5::text WHERE lease_id=$1::uuid", id, string(reason), retry, now, string(scope))
 	if err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
-	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: reason, RetryAt: retry})
+	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: reason, RetryAt: retry, ConcurrencyScope: scope})
 }
 func commitDecision(ctx context.Context, tx pgx.Tx, d coordination.AdmissionDecision) (coordination.AdmissionDecision, error) {
 	if err := tx.Commit(ctx); err != nil {

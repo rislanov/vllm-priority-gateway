@@ -128,6 +128,23 @@ func TestPoolInflightIsolationDisablesWaitingWithoutMutatingOriginal(t *testing.
 	}
 }
 
+func TestPriorityLoadPoolDisablesGlobalWaitingLimitWithoutMutatingOriginal(t *testing.T) {
+	original := adminPool{
+		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
+		MaxGatewayInflight: 17, MaxWaiting: 9,
+	}
+	prepared := preparePoolForPriorityLoad(original)
+	if prepared.MaxGatewayInflight != 17 || prepared.MaxWaiting != 0 {
+		t.Fatalf("prepared pool limits = (%d, %d), want (17, 0)", prepared.MaxGatewayInflight, prepared.MaxWaiting)
+	}
+	if prepared.ID != original.ID || prepared.PublicModelName != original.PublicModelName || prepared.UpstreamModelName != original.UpstreamModelName || prepared.Enabled != original.Enabled {
+		t.Fatalf("prepared pool changed unrelated fields: original=%+v prepared=%+v", original, prepared)
+	}
+	if original.MaxGatewayInflight != 17 || original.MaxWaiting != 9 {
+		t.Fatalf("preparation mutated original pool: %+v", original)
+	}
+}
+
 func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 	const (
 		healthBody          = `{"status":"ok"}`
@@ -469,6 +486,25 @@ func TestInferenceReadinessHonorsContextDeadline(t *testing.T) {
 				t.Fatalf("readiness = statusCode %d body %+v", statusCode, got)
 			}
 		})
+	}
+}
+
+func TestPriorityCleanupStatusIncludesOnlyBackendThatMayBeDrained(t *testing.T) {
+	status := adminStatus{Backends: []adminBackend{
+		{ID: 21, ModelPoolID: 11},
+		{ID: 22, ModelPoolID: 11},
+		{ID: 23, ModelPoolID: 12},
+	}}
+	withoutDrain := priorityCleanupStatus(status, 0)
+	if len(withoutDrain.Backends) != 0 {
+		t.Fatalf("cleanup without drain retained backends: %+v", withoutDrain.Backends)
+	}
+	withDrain := priorityCleanupStatus(status, 22)
+	if len(withDrain.Backends) != 1 || withDrain.Backends[0].ID != 22 {
+		t.Fatalf("cleanup for backend 22 = %+v", withDrain.Backends)
+	}
+	if len(status.Backends) != 3 {
+		t.Fatalf("cleanup filtering mutated original status: %+v", status.Backends)
 	}
 }
 

@@ -6,9 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -140,21 +138,12 @@ func New(dependencies Dependencies) *Service {
 }
 
 type APIError struct {
-	HTTPStatus int
-	Message    string
-	Type       string
-	Code       string
-	RetryAfter time.Duration
-}
-
-type ForwardRequest struct {
-	Method          string
-	Path            string
-	Headers         http.Header
-	Body            []byte
-	APIKey          string
-	RequestID       string
-	ParentRequestID string
+	HTTPStatus     int
+	Message        string
+	Type           string
+	Code           string
+	RetryAfter     time.Duration
+	DecisionReason DecisionReason
 }
 
 type InferenceReadiness struct {
@@ -162,6 +151,27 @@ type InferenceReadiness struct {
 	Revision            int64  `json:"revision"`
 	PoolAvailability    int    `json:"poolAvailability"`
 	BackendAvailability int    `json:"backendAvailability"`
+}
+
+type LoadLevel string
+
+const (
+	LoadFree        LoadLevel = "free"
+	LoadMedium      LoadLevel = "medium"
+	LoadLoaded      LoadLevel = "loaded"
+	LoadUnavailable LoadLevel = "unavailable"
+)
+
+type LoadStatus struct {
+	Model               string           `json:"model"`
+	Level               LoadLevel        `json:"level"`
+	PoolState           domain.PoolState `json:"poolState"`
+	BestBackendPressure float64          `json:"bestBackendPressure"`
+	AvailableBackends   int              `json:"availableBackends"`
+	WaitingRequests     float64          `json:"waitingRequests"`
+	GatewayInflight     int              `json:"gatewayInflight"`
+	ConfigRevision      int64            `json:"configRevision"`
+	EvaluatedAt         time.Time        `json:"evaluatedAt"`
 }
 
 func (s *Service) InferenceReadiness() InferenceReadiness {
@@ -176,7 +186,6 @@ func (s *Service) InferenceReadiness() InferenceReadiness {
 		if !pool.Enabled {
 			continue
 		}
-		poolAvailable := false
 		policyAvailable := !degraded
 		if degraded {
 			for clientID, access := range snapshot.Access {
@@ -194,19 +203,9 @@ func (s *Service) InferenceReadiness() InferenceReadiness {
 		if !policyAvailable {
 			continue
 		}
-		for _, backend := range snapshot.BackendsByPool[pool.ID] {
-			if !backend.Enabled || backend.Draining {
-				continue
-			}
-			runtime := s.runtime.Snapshot(backend.ID, at)
-			_, secretAvailable := s.upstreamSecret(backend)
-			if !runtime.Healthy || !runtime.MetricsFresh || !runtime.CircuitAvailable || !secretAvailable {
-				continue
-			}
-			readiness.BackendAvailability++
-			poolAvailable = true
-		}
-		if poolAvailable {
+		available := s.availableBackends(snapshot, pool.ID, at)
+		readiness.BackendAvailability += available
+		if available > 0 {
 			readiness.PoolAvailability++
 		}
 	}
@@ -214,6 +213,64 @@ func (s *Service) InferenceReadiness() InferenceReadiness {
 		readiness.Status = "ready"
 	}
 	return readiness
+}
+
+func (s *Service) LoadStatus(rawKey, model string) (LoadStatus, *APIError) {
+	snapshot := s.registry.Snapshot()
+	client, _, apiErr := s.validateAPIKeySnapshot(rawKey, snapshot)
+	if apiErr != nil {
+		return LoadStatus{}, apiErr
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return LoadStatus{}, invalidRequest("Model is required")
+	}
+	pool, exists := snapshot.PoolsByName[model]
+	if !exists || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
+		return LoadStatus{}, modelNotAllowed()
+	}
+
+	at := s.now().UTC()
+	runtime := s.runtime.PoolSnapshot(pool.ID, at)
+	available := s.availableBackends(snapshot, pool.ID, at)
+	state := runtime.State
+	if available == 0 {
+		state = domain.PoolUnavailable
+	}
+	return LoadStatus{
+		Model: model, Level: loadLevel(state), PoolState: state,
+		BestBackendPressure: runtime.BestBackendPressure, AvailableBackends: available,
+		WaitingRequests: runtime.TotalWaiting, GatewayInflight: runtime.GatewayInflight,
+		ConfigRevision: snapshot.Revision, EvaluatedAt: at,
+	}, nil
+}
+
+func loadLevel(state domain.PoolState) LoadLevel {
+	switch state {
+	case domain.PoolNormal:
+		return LoadFree
+	case domain.PoolBusy:
+		return LoadMedium
+	case domain.PoolSaturated, domain.PoolEmergency:
+		return LoadLoaded
+	default:
+		return LoadUnavailable
+	}
+}
+
+func (s *Service) availableBackends(snapshot *registry.Snapshot, poolID int64, at time.Time) int {
+	available := 0
+	for _, backend := range snapshot.BackendsByPool[poolID] {
+		if !backend.Enabled || backend.Draining {
+			continue
+		}
+		runtime := s.runtime.Snapshot(backend.ID, at)
+		_, secretAvailable := s.upstreamSecret(backend)
+		if runtime.Healthy && runtime.MetricsFresh && runtime.CircuitAvailable && secretAvailable {
+			available++
+		}
+	}
+	return available
 }
 
 func (s *Service) Models(_ context.Context, rawKey string) ([]domain.ModelPool, domain.Client, *APIError) {
@@ -263,344 +320,42 @@ func (s *Service) ResponseComplete(reservation ResponseCompleteReservation) {
 	}
 }
 
-func (s *Service) Forward(
-	ctx context.Context,
-	writer http.ResponseWriter,
-	request ForwardRequest,
-) (result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
-	started := time.Now()
-	event := RequestEvent{RequestID: request.RequestID, ParentRequestID: request.ParentRequestID}
-	var reservationRollback func()
-	// Register before event finalization so panics from forwarding or deferred
-	// observer delivery both release an acquired lifecycle before propagating.
-	defer func() {
-		if reservationRollback == nil {
-			return
-		}
-		if panicValue := recover(); panicValue != nil {
-			reservationRollback()
-			panic(panicValue)
-		}
-	}()
-	defer func() {
-		event.OccurredAt = s.now().UTC()
-		event.Duration = time.Since(started)
-		event.TTFT = result.FirstByte
-		event.Disconnect = result.Cancelled
-		event.RetryCount = result.RetryCount
-		event.Usage = result.Usage
-		event.UsageParseFailure = result.UsageParseFailure
-		if apiErr != nil {
-			event.Status = apiErr.HTTPStatus
-			event.Reason = apiErr.Code
-		} else {
-			event.Status = result.Status
-		}
-		if reservation != nil {
-			reservation.StageResponseComplete(event)
-		}
-		if s.observer != nil {
-			s.observer.Complete(event)
-		}
-	}()
-
-	client, matchedKey, authErr := s.authenticate(request.APIKey)
-	if authErr != nil {
-		return proxy.Result{}, nil, authErr
-	}
-	event.ClientID = client.ID
-	event.Client = client.Name
-	event.PriorityClass = client.PriorityClass
-	event.VLLMPriority = client.VLLMPriority
-	sessionID := strings.TrimSpace(request.Headers.Get(SessionAffinityHeader))
-	if len(sessionID) > MaxSessionAffinityIDBytes {
-		return proxy.Result{}, nil, invalidRequest("X-LLM-Session-Id must not exceed 256 bytes")
-	}
-	payload, publicModel, parseErr := rewritePayload(request.Body)
-	if parseErr != nil {
-		return proxy.Result{}, nil, invalidRequest(parseErr.Error())
-	}
-	snapshot := s.registry.Snapshot()
-	pool, exists := snapshot.PoolsByName[publicModel]
-	if !exists {
-		return proxy.Result{}, nil, modelNotAllowed()
-	}
-	event.ModelPoolID = pool.ID
-	event.Model = pool.PublicModelName
-	if reserver, ok := s.observer.(ResponseCompleteReserver); ok {
-		reservedLifecycle, rollback, reserved := reserver.ReserveResponseComplete(ctx, request.RequestID)
-		if !reserved || reservedLifecycle == nil {
-			if rollback != nil {
-				rollback()
-			}
-			if reservationErr := ctx.Err(); reservationErr != nil {
-				return proxy.Result{Cancelled: true, Err: reservationErr}, nil, nil
-			}
-			return proxy.Result{}, nil, gatewayUnavailable(s.retryAfter)
-		}
-		reservation = reservedLifecycle
-		reservationRollback = rollback
-	}
-	if !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
-		return proxy.Result{}, reservation, modelNotAllowed()
-	}
-	payload, err := forceStreamingUsage(payload, request.Path)
-	if err != nil {
-		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream request")
-	}
-	basePayload := payload
-	affinityKey := ""
-	rebuildDerived := func() error {
-		if sessionID == "" {
-			affinityKey = ""
-		} else {
-			affinityKey = strconv.FormatInt(client.ID, 10) + "\x00" + strconv.FormatInt(pool.ID, 10) + "\x00" + sessionID
-		}
-		payload, err = replaceModel(basePayload, pool.UpstreamModelName)
-		return err
-	}
-	if err = rebuildDerived(); err != nil {
-		return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
-	}
-	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, client.ID, pool)
-	event.PoolState = poolRuntime.State
-	if poolErr != nil {
-		return proxy.Result{}, reservation, poolErr
-	}
-	defer releasePool()
-	limit := admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
-	if s.admission == nil {
-		lease, ok := s.limiter.Acquire(client.ID, limit)
-		if !ok {
-			return proxy.Result{}, reservation, overloaded(s.retryAfter)
-		}
-		defer lease.Release()
-	} else {
-		if !s.coordinationAllowed() {
-			return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
-		}
-		if !s.coordinationReady() {
-			releaseEmergency, ok := s.emergency.Acquire(client.PriorityClass, client.ID, limit)
-			s.observeEmergency(client.PriorityClass, ok)
-			if !ok {
-				return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
-			}
-			defer releaseEmergency()
-		} else {
-			var decision coordination.AdmissionDecision
-			var coordinationErr error
-			for admissionAttempt := 0; admissionAttempt < 2; admissionAttempt++ {
-				operationStarted := s.now().UTC()
-				decision, coordinationErr = s.admission.Acquire(ctx, coordination.AdmissionRequest{LeaseID: uuid.New(), OperationStartedAt: operationStarted, RequestID: request.RequestID, ReplicaID: s.replicaID, ConfigurationRevision: snapshot.Revision, APIKeyID: matchedKey.ID, ClientID: client.ID, PoolID: pool.ID, ClientPolicyRevision: client.Revision, EffectiveClientLimit: limit, ConfiguredClientLimit: client.MaxConcurrency, PoolGatewayInflightLimit: pool.MaxGatewayInflight, RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute, LeaseTTL: s.leaseTTL})
-				if decision.Reason != coordination.ReasonStaleConfiguration || admissionAttempt > 0 {
-					break
-				}
-				reloader, ok := s.registry.(SnapshotReloader)
-				if !ok || reloader.Reload(ctx) != nil {
-					coordinationErr = errors.New("configuration reload failed")
-					break
-				}
-				var authErr *APIError
-				client, matchedKey, authErr = s.validateAPIKey(request.APIKey)
-				if authErr != nil {
-					return proxy.Result{}, reservation, authErr
-				}
-				snapshot = s.registry.Snapshot()
-				var poolOK bool
-				pool, poolOK = snapshot.PoolsByName[publicModel]
-				if !poolOK || !pool.Enabled || !snapshot.Access[client.ID][pool.ID] {
-					return proxy.Result{}, reservation, modelNotAllowed()
-				}
-				if err = rebuildDerived(); err != nil {
-					return proxy.Result{}, reservation, invalidRequest("Failed to encode the upstream model")
-				}
-				poolRuntime, releasePool, poolErr = s.acquirePool(ctx, client.ID, pool)
-				if poolErr != nil {
-					return proxy.Result{}, reservation, poolErr
-				}
-				defer releasePool()
-				limit = admission.EffectiveLimit(client.PriorityClass, poolRuntime.State, client.MaxConcurrency)
-				event.ClientID, event.Client, event.PriorityClass, event.VLLMPriority = client.ID, client.Name, client.PriorityClass, client.VLLMPriority
-				event.ModelPoolID, event.Model, event.PoolState = pool.ID, pool.PublicModelName, poolRuntime.State
-			}
-			if coordinationErr != nil || decision.Reason == coordination.ReasonCoordinationUnavailable {
-				var permanent coordination.PermanentError
-				if errors.As(coordinationErr, &permanent) {
-					return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
-				}
-				releaseEmergency, ok := s.emergency.Acquire(client.PriorityClass, client.ID, limit)
-				s.observeEmergency(client.PriorityClass, ok)
-				if !ok {
-					return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
-				}
-				defer releaseEmergency()
-			} else if !decision.Admitted() {
-				return proxy.Result{}, reservation, coordinationAPIError(decision.Reason, s.retryAfter, decision.RetryAt, s.now().UTC())
-			} else {
-				event.SoftTPMExpected = client.TokensPerMinute > 0
-				var leaseHandle *coordination.LeaseHandle
-				if s.leases != nil {
-					leaseHandle = s.leases.Track(decision.Lease.Identity())
-				}
-				complete := func(usage *coordination.TokenUsage) {
-					if observer, ok := s.admission.(coordination.AdmissionPolicyObserver); ok {
-						if current, exists := s.registry.Snapshot().Clients[client.ID]; exists {
-							observer.ObserveClientRatePolicy(coordination.ClientRatePolicy{
-								ClientID: current.ID, Revision: current.Revision,
-								RequestsPerMinute: current.RequestsPerMinute, TokensPerMinute: current.TokensPerMinute,
-							})
-						}
-					}
-					if leaseHandle != nil {
-						leaseHandle.Complete(usage)
-						return
-					}
-					_, _ = s.admission.Complete(context.WithoutCancel(ctx), []coordination.LeaseCompletion{{Lease: decision.Lease.Identity(), Usage: usage}})
-				}
-				defer func() {
-					var usage *coordination.TokenUsage
-					if result.Usage != nil {
-						cache := int64(0)
-						if result.Usage.CacheReadTokens != nil {
-							cache = *result.Usage.CacheReadTokens
-						}
-						usage = &coordination.TokenUsage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, CacheReadTokens: cache}
-					}
-					complete(usage)
-				}()
-			}
-		}
-	}
-	inflight := InflightEvent{Client: client.Name, Model: publicModel, PriorityClass: client.PriorityClass}
-	if s.observer != nil {
-		s.observer.ClientInflight(inflight, 1)
-		defer s.observer.ClientInflight(inflight, -1)
-	}
-
-	selectTarget := func(exclude map[int64]struct{}) (proxy.Target, error) {
-		excluded := make(map[int64]struct{}, len(exclude)+1)
-		for backendID := range exclude {
-			excluded[backendID] = struct{}{}
-		}
-		for {
-			currentSnapshot := s.registry.Snapshot()
-			currentPool, poolExists := currentSnapshot.PoolsByID[pool.ID]
-			currentClient, clientExists := currentSnapshot.Clients[client.ID]
-			if !poolExists || !currentPool.Enabled || currentPool.PublicModelName != pool.PublicModelName ||
-				currentPool.UpstreamModelName != pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
-				!currentSnapshot.Access[client.ID][pool.ID] {
-				return proxy.Target{}, routing.ErrNoBackend
-			}
-			selectionTime := s.now().UTC()
-			candidates := make([]routing.Candidate, 0, len(currentSnapshot.BackendsByPool[pool.ID]))
-			for _, backend := range currentSnapshot.BackendsByPool[pool.ID] {
-				runtime := s.runtime.Snapshot(backend.ID, selectionTime)
-				_, secretOK := s.upstreamSecret(backend)
-				candidates = append(candidates, routing.Candidate{
-					Backend: backend, Pressure: runtime.Pressure, GatewayInflight: runtime.GatewayInflight,
-					Eligible: runtime.Healthy && runtime.MetricsFresh && runtime.CircuitAvailable && secretOK,
-				})
-			}
-			candidate, err := s.router.SelectWithSessionAffinity(candidates, excluded, affinityKey)
-			if err != nil {
-				return proxy.Target{}, err
-			}
-			completeBackend, acquired := s.runtime.AcquireBackend(candidate.Backend, selectionTime)
-			if !acquired {
-				excluded[candidate.Backend.ID] = struct{}{}
-				continue
-			}
-			secret, _ := s.upstreamSecret(candidate.Backend)
-			backendInflight := inflight
-			backendInflight.Backend = candidate.Backend.Name
-			event.Backend = candidate.Backend.Name
-			event.BackendPressure = candidate.Pressure
-			if s.observer != nil {
-				s.observer.BackendInflight(backendInflight, 1)
-			}
-			var once sync.Once
-			return proxy.Target{
-				Backend: candidate.Backend, UpstreamAPIKey: secret,
-				Complete: func(outcome domain.InferenceOutcome) {
-					once.Do(func() {
-						completeBackend(outcome)
-						if s.observer != nil {
-							s.observer.BackendInflight(backendInflight, -1)
-						}
-					})
-				},
-			}, nil
-		}
-	}
-
-	target, err := selectTarget(nil)
-	if err != nil {
-		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter)
-	}
-
-	headers := request.Headers.Clone()
-	headers.Del("X-Vllm-Priority")
-	headers.Del(SessionAffinityHeader)
-	headers.Del("Authorization")
-	proxyRequest := proxy.Request{
-		Method: request.Method, Path: request.Path, Headers: headers, Body: payload,
-		RequestID: request.RequestID, Priority: client.VLLMPriority, Target: target,
-	}
-	proxyRequest.SelectAlternate = func(exclude map[int64]struct{}) (proxy.Target, error) {
-		return selectTarget(exclude)
-	}
-	result = s.forwarder.Forward(ctx, writer, proxyRequest)
-	if result.Err != nil && !result.ResponseStarted {
-		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
-			return result, reservation, nil
-		}
-		return result, reservation, upstreamError()
-	}
-	return result, reservation, nil
-}
-
-func (s *Service) observeEmergency(class domain.PriorityClass, admitted bool) {
-	if observer, ok := s.observer.(CoordinationEmergencyObserver); ok {
-		observer.CoordinationEmergency(class, admitted)
-	}
-}
-
 func (s *Service) acquirePool(ctx context.Context, clientID int64, original domain.ModelPool) (domain.PoolRuntime, func(), *APIError) {
 	for {
 		before := s.registry.Snapshot()
 		pool, valid := currentAdmissionPool(before, clientID, original)
 		if !valid {
-			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		runtime := s.runtime.PoolSnapshot(pool.ID, s.now().UTC())
 		if runtime.State == domain.PoolUnavailable {
-			return runtime, nil, backendUnavailable(s.retryAfter)
+			return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		if pool.MaxWaiting > 0 && runtime.TotalWaiting >= float64(pool.MaxWaiting) {
-			return runtime, nil, overloaded(s.retryAfter)
+			return runtime, nil, overloaded(s.retryAfter, DecisionPoolWaitingLimit)
 		}
 		if s.admission != nil {
 			after := s.registry.Snapshot()
 			if _, stillValid := currentAdmissionPool(after, clientID, original); !stillValid {
-				return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+				return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 			}
 			return runtime, func() {}, nil
 		}
 		release, ok := s.runtime.AcquirePool(pool.ID, pool.MaxGatewayInflight)
 		if !ok {
-			return runtime, nil, overloaded(s.retryAfter)
+			return runtime, nil, overloaded(s.retryAfter, DecisionPoolInflightLimit)
 		}
 
 		after := s.registry.Snapshot()
 		validatedPool, stillValid := currentAdmissionPool(after, clientID, original)
 		if !stillValid {
 			release()
-			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter)
+			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
 		if validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
 			release()
 			if ctx.Err() != nil {
-				return runtime, nil, backendUnavailable(s.retryAfter)
+				return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 			}
 			continue
 		}
@@ -629,10 +384,13 @@ func (s *Service) authenticate(raw string) (domain.Client, domain.APIKey, *APIEr
 }
 
 func (s *Service) validateAPIKey(raw string) (domain.Client, domain.APIKey, *APIError) {
+	return s.validateAPIKeySnapshot(raw, s.registry.Snapshot())
+}
+
+func (s *Service) validateAPIKeySnapshot(raw string, snapshot *registry.Snapshot) (domain.Client, domain.APIKey, *APIError) {
 	if len(raw) < 12 || !strings.HasPrefix(raw, "llmgw_") {
 		return domain.Client{}, domain.APIKey{}, invalidAPIKey()
 	}
-	snapshot := s.registry.Snapshot()
 	candidates := snapshot.KeyCandidates[raw[:12]]
 	var matched domain.APIKey
 	found := false
@@ -731,19 +489,38 @@ func forceStreamingUsage(body []byte, path string) ([]byte, error) {
 }
 
 func invalidAPIKey() *APIError {
-	return &APIError{HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key"}
+	return &APIError{HTTPStatus: http.StatusUnauthorized, Message: "Invalid API key", Type: "authentication_error", Code: "invalid_api_key", DecisionReason: DecisionInvalidAPIKey}
 }
 
 func invalidRequest(message string) *APIError {
-	return &APIError{HTTPStatus: http.StatusBadRequest, Message: message, Type: "invalid_request_error", Code: "invalid_request_error"}
+	return &APIError{HTTPStatus: http.StatusBadRequest, Message: message, Type: "invalid_request_error", Code: "invalid_request_error", DecisionReason: DecisionInvalidRequest}
 }
 
 func modelNotAllowed() *APIError {
-	return &APIError{HTTPStatus: http.StatusForbidden, Message: "The requested model is not available to this client", Type: "invalid_request_error", Code: "model_not_allowed"}
+	return &APIError{HTTPStatus: http.StatusForbidden, Message: "The requested model is not available to this client", Type: "invalid_request_error", Code: "model_not_allowed", DecisionReason: DecisionModelNotAllowed}
 }
 
-func overloaded(retryAfter time.Duration) *APIError {
-	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: retryAfter}
+func overloaded(retryAfter time.Duration, reason DecisionReason) *APIError {
+	return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Inference cluster is currently overloaded", Type: "rate_limit_error", Code: "gateway_overloaded", RetryAfter: retryAfter, DecisionReason: reason}
+}
+
+func backendUnavailable(retryAfter time.Duration, reason DecisionReason) *APIError {
+	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter, DecisionReason: reason}
+}
+
+func gatewayUnavailable(retryAfter time.Duration) *APIError {
+	return &APIError{
+		HTTPStatus:     http.StatusServiceUnavailable,
+		Message:        "The gateway is temporarily unable to accept requests",
+		Type:           "server_error",
+		Code:           "gateway_unavailable",
+		RetryAfter:     retryAfter,
+		DecisionReason: DecisionGatewayBackpressure,
+	}
+}
+
+func upstreamError() *APIError {
+	return &APIError{HTTPStatus: http.StatusBadGateway, Message: "The inference backend could not complete the request", Type: "server_error", Code: "upstream_error", DecisionReason: DecisionUpstreamFailure}
 }
 
 func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, retryAt *time.Time, now time.Time) *APIError {
@@ -756,26 +533,14 @@ func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, 
 	case coordination.ReasonRPMExhausted, coordination.ReasonTPMExhausted:
 		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Rate limit exceeded", Type: "rate_limit_exceeded", Code: string(reason), RetryAfter: retryAfter}
 	case coordination.ReasonConcurrencyExhausted:
-		return overloaded(retryAfter)
+		return overloaded(retryAfter, DecisionPriorityConcurrencyLimit)
 	default:
 		return gatewayUnavailable(retryAfter)
 	}
 }
 
-func backendUnavailable(retryAfter time.Duration) *APIError {
-	return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "No healthy inference backend is currently available", Type: "server_error", Code: "backend_unavailable", RetryAfter: retryAfter}
-}
-
-func gatewayUnavailable(retryAfter time.Duration) *APIError {
-	return &APIError{
-		HTTPStatus: http.StatusServiceUnavailable,
-		Message:    "The gateway is temporarily unable to accept requests",
-		Type:       "server_error",
-		Code:       "gateway_unavailable",
-		RetryAfter: retryAfter,
+func (s *Service) observeEmergency(class domain.PriorityClass, admitted bool) {
+	if observer, ok := s.observer.(CoordinationEmergencyObserver); ok {
+		observer.CoordinationEmergency(class, admitted)
 	}
-}
-
-func upstreamError() *APIError {
-	return &APIError{HTTPStatus: http.StatusBadGateway, Message: "The inference backend could not complete the request", Type: "server_error", Code: "upstream_error"}
 }
