@@ -63,7 +63,7 @@ type ReplicaManager struct {
 
 func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy ReplicaPolicy, timeout time.Duration) *ReplicaManager {
 	if timeout <= 0 {
-		timeout = 50 * time.Millisecond
+		timeout = 500 * time.Millisecond
 	}
 	interval := policy.LeaseRenewInterval
 	if interval <= 0 {

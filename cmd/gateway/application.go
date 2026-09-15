@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
+	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/config"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
@@ -439,50 +440,10 @@ func (s projectedKeyUsageStore) TouchKeyLastUsed(ctx context.Context, keyID int6
 	return nil
 }
 
-type apiKeyUsageEvent struct {
-	keyID int64
-	at    time.Time
-}
-
-type apiKeyUsageRecorder struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	events chan apiKeyUsageEvent
-}
+type apiKeyUsageRecorder = apikey.UsageRecorder
 
 func newAPIKeyUsageRecorder(parent context.Context, destination keyUsageStore) *apiKeyUsageRecorder {
-	ctx, cancel := context.WithCancel(parent)
-	recorder := &apiKeyUsageRecorder{cancel: cancel, done: make(chan struct{}), events: make(chan apiKeyUsageEvent, 256)}
-	go func() {
-		defer close(recorder.done)
-		last := make(map[int64]time.Time)
-		for {
-			select {
-			case event := <-recorder.events:
-				if previous := last[event.keyID]; !previous.IsZero() && event.at.Sub(previous) < time.Minute {
-					continue
-				}
-				if destination.TouchKeyLastUsed(ctx, event.keyID, event.at) == nil {
-					last[event.keyID] = event.at
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return recorder
-}
-
-func (r *apiKeyUsageRecorder) Record(keyID int64, usedAt time.Time) {
-	select {
-	case r.events <- apiKeyUsageEvent{keyID: keyID, at: usedAt}:
-	default:
-	}
-}
-
-func (r *apiKeyUsageRecorder) Close() {
-	r.cancel()
-	<-r.done
+	return apikey.NewUsageRecorder(parent, destination)
 }
 
 func coordinationReadiness(admissionCoordinator coordination.AdmissionCoordinator, circuitCoordinator coordination.CircuitCoordinator, replica *coordpostgres.ReplicaManager, guard *registry.RevisionGuard, recovery *coordination.RecoveryManager) string {

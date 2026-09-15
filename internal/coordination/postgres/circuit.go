@@ -38,7 +38,7 @@ func NewCircuitCoordinator(store *pgstore.Store, timeout time.Duration, options 
 		return nil, err
 	}
 	if timeout <= 0 {
-		timeout = 50 * time.Millisecond
+		timeout = 500 * time.Millisecond
 	}
 	return &CircuitCoordinator{
 		pool: store.CoordinationPool(), timeout: timeout, options: options,

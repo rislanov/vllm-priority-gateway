@@ -1432,15 +1432,23 @@ func TestPostgresHalfOpenAcquireReplayAtCapacityOneReturnsSamePermit(t *testing.
 func TestPostgresExpiredProbeReopensCircuitAndCannotBeRevived(t *testing.T) {
 	store := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createFixture(t, store, 0)
-	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Millisecond, HalfOpenMaxProbes: 1}
-	coordinator, _, request, probe := openHalfOpenProbe(t, store, f, options, 15*time.Millisecond)
-	time.Sleep(25 * time.Millisecond)
+	options := circuitbreaker.Options{FailureThreshold: 1, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
+	coordinator, _, request, probe := openHalfOpenProbe(t, store, f, options, time.Minute)
+	// Expire the durable permit explicitly. A 15 ms TTL could expire inside
+	// Acquire's own refresh on a slow host, so the next refresh skipped the
+	// open state that this test needs to inspect.
+	if _, err := store.CoordinationPool().Exec(context.Background(), "UPDATE backend_circuit_probes SET expires_at=clock_timestamp()-interval '1 second' WHERE permit_id=$1::uuid", probe.Permit.PermitID); err != nil {
+		t.Fatal(err)
+	}
 	if err := coordinator.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := coordinator.Snapshot(f.backend.ID, time.Now())
 	if snapshot.State != domain.CircuitOpen || snapshot.Generation <= probe.Snapshot.Generation || snapshot.FailureCount != 2 {
 		t.Fatalf("snapshot after expired probe=%+v", snapshot)
+	}
+	if _, err := store.CoordinationPool().Exec(context.Background(), "UPDATE backend_circuit_state SET opened_at=clock_timestamp()-interval '2 seconds' WHERE backend_id=$1::bigint", f.backend.ID); err != nil {
+		t.Fatal(err)
 	}
 	if err := coordinator.Refresh(context.Background()); err != nil {
 		t.Fatal(err)

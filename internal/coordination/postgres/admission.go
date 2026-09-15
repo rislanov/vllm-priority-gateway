@@ -28,7 +28,7 @@ type AdmissionCoordinator struct {
 
 func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *AdmissionCoordinator {
 	if timeout <= 0 {
-		timeout = 50 * time.Millisecond
+		timeout = 500 * time.Millisecond
 	}
 	return &AdmissionCoordinator{pool: store.CoordinationPool(), timeout: timeout, status: coordination.Status{Backend: "postgres", Available: true}, inflight: make(map[int64]int)}
 }
@@ -132,23 +132,26 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 		return coordination.AdmissionDecision{}, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, "SET LOCAL synchronous_commit=on"); err != nil {
+	fp := admissionFingerprint(r)
+	initial := &pgx.Batch{}
+	initial.Queue("SET LOCAL synchronous_commit=on")
+	initial.Queue(`INSERT INTO admission_operations(lease_id,operation_started_at,input_fingerprint,request_id,replica_id,client_id,pool_id,decision) VALUES($1::uuid,$2::timestamptz,$3::bytea,$4::text,$5::uuid,$6::bigint,$7::bigint,'pending') ON CONFLICT DO NOTHING`, r.LeaseID, r.OperationStartedAt.UTC(), fp[:], r.RequestID, r.ReplicaID, r.ClientID, r.PoolID)
+	initialResults := tx.SendBatch(ctx, initial)
+	if _, err = initialResults.Exec(); err != nil {
+		_ = initialResults.Close()
 		return coordination.AdmissionDecision{}, err
 	}
-	fp := admissionFingerprint(r)
-	tag, err := tx.Exec(ctx, `INSERT INTO admission_operations(lease_id,operation_started_at,input_fingerprint,request_id,replica_id,client_id,pool_id,decision) VALUES($1::uuid,$2::timestamptz,$3::bytea,$4::text,$5::uuid,$6::bigint,$7::bigint,'pending') ON CONFLICT DO NOTHING`, r.LeaseID, r.OperationStartedAt.UTC(), fp[:], r.RequestID, r.ReplicaID, r.ClientID, r.PoolID)
+	tag, err := initialResults.Exec()
+	closeErr := initialResults.Close()
 	if err != nil {
 		return coordination.AdmissionDecision{}, err
+	}
+	if closeErr != nil {
+		return coordination.AdmissionDecision{}, closeErr
 	}
 	created := tag.RowsAffected() == 1
 	if !created {
 		return c.resolveAcquire(ctx, tx, r, fp)
-	}
-	if _, err = tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", r.PoolID); err != nil {
-		return coordination.AdmissionDecision{}, err
-	}
-	if _, err = tx.Exec(ctx, "SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", r.ClientID); err != nil {
-		return coordination.AdmissionDecision{}, err
 	}
 	var revision, clientRevision int64
 	var keyClient int64
@@ -156,35 +159,41 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	var configuredClient, poolLimit int
 	var rpm, tpm int64
 	var keyExpires *time.Time
-	err = tx.QueryRow(ctx, `SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var now time.Time
-		if scanErr := tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); scanErr != nil {
-			return coordination.AdmissionDecision{}, scanErr
-		}
-		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
-	}
-	if err != nil {
-		return coordination.AdmissionDecision{}, err
-	}
-	for _, kind := range []string{"rpm", "tpm"} {
-		limit := rpm
-		if kind == "tpm" {
-			limit = tpm
-		}
-		if limit <= 0 {
-			continue
-		}
-		if _, err = tx.Exec(ctx, `INSERT INTO coordination_rate_state(client_id,rate_kind,policy_revision,balance,last_refill_at) VALUES($1::bigint,$2::text,$3::bigint,$4::double precision,$5::timestamptz) ON CONFLICT DO NOTHING`, r.ClientID, kind, clientRevision, float64(limit), time.Unix(0, 0).UTC()); err != nil {
-			return coordination.AdmissionDecision{}, err
-		}
-		if _, err = tx.Exec(ctx, "SELECT client_id FROM coordination_rate_state WHERE client_id=$1::bigint AND rate_kind=$2::text FOR UPDATE", r.ClientID, kind); err != nil {
-			return coordination.AdmissionDecision{}, err
-		}
-	}
 	var now time.Time
-	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
+	var poolCount, clientCount int
+	var configurationMissing bool
+	// Send ordered statements together to avoid network waits while holding the
+	// shared pool scope. Locks and counts must remain separate SQL statements:
+	// READ COMMITTED needs a fresh snapshot after a contended lock is acquired.
+	checks := &pgx.Batch{}
+	checks.Queue("SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", r.PoolID)
+	checks.Queue("SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", r.ClientID)
+	checks.Queue(`SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).QueryRow(func(row pgx.Row) error {
+		err := row.Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit)
+		configurationMissing = errors.Is(err, pgx.ErrNoRows)
+		if configurationMissing {
+			return nil
+		}
+		return err
+	})
+	// Seed using the locked database policy, never the request's policy. Both
+	// rate kinds share the client scope, including with lease completion.
+	checks.Queue(`INSERT INTO coordination_rate_state(client_id,rate_kind,policy_revision,balance,last_refill_at)
+		SELECT c.id,v.kind,c.revision,v.capacity::double precision,$2::timestamptz
+		FROM clients c CROSS JOIN LATERAL (VALUES ('rpm',c.requests_per_minute),('tpm',c.tokens_per_minute)) v(kind,capacity)
+		WHERE c.id=$1::bigint AND v.capacity>0 ON CONFLICT DO NOTHING`, r.ClientID, time.Unix(0, 0).UTC())
+	checks.Queue("SELECT client_id FROM coordination_rate_state WHERE client_id=$1::bigint ORDER BY rate_kind FOR UPDATE", r.ClientID)
+	checks.Queue(`WITH at AS MATERIALIZED (SELECT clock_timestamp() AS now)
+		SELECT at.now,
+		(SELECT count(*) FROM request_leases WHERE pool_id=$1::bigint AND expires_at>at.now),
+		(SELECT count(*) FROM request_leases WHERE client_id=$2::bigint AND expires_at>at.now) FROM at`, r.PoolID, r.ClientID).QueryRow(func(row pgx.Row) error {
+		return row.Scan(&now, &poolCount, &clientCount)
+	})
+	if err = tx.SendBatch(ctx, checks).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err
+	}
+	if configurationMissing {
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
 	}
 	if revision != r.ConfigurationRevision || keyClient != r.ClientID || !clientEnabled || !poolEnabled || clientRevision != r.ClientPolicyRevision || configuredClient != r.ConfiguredClientLimit || poolLimit != r.PoolGatewayInflightLimit || rpm != r.RequestsPerMinute || tpm != r.TokensPerMinute || (keyExpires != nil && !keyExpires.After(now)) {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
@@ -194,13 +203,6 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	}
 	if r.OperationStartedAt.After(now.Add(5*time.Minute)) || !r.OperationStartedAt.After(now.Add(-24*time.Hour)) {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleOperation, nil, now)
-	}
-	var poolCount, clientCount int
-	if err = tx.QueryRow(ctx, "SELECT count(*) FROM request_leases WHERE pool_id=$1::bigint AND expires_at>$2::timestamptz", r.PoolID, now).Scan(&poolCount); err != nil {
-		return coordination.AdmissionDecision{}, err
-	}
-	if err = tx.QueryRow(ctx, "SELECT count(*) FROM request_leases WHERE client_id=$1::bigint AND expires_at>$2::timestamptz", r.ClientID, now).Scan(&clientCount); err != nil {
-		return coordination.AdmissionDecision{}, err
 	}
 	if poolLimit > 0 && poolCount >= poolLimit {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now, coordination.AdmissionPoolScope)
@@ -227,10 +229,10 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 		}
 	}
 	lease := coordination.LeaseIdentity{LeaseID: r.LeaseID, ClientID: r.ClientID, PoolID: r.PoolID, RequestID: r.RequestID, ReplicaID: r.ReplicaID, ExpiresAt: now.Add(r.LeaseTTL), TTL: r.LeaseTTL}
-	if _, err = tx.Exec(ctx, `INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at) VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz)`, lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt); err != nil {
-		return coordination.AdmissionDecision{}, err
-	}
-	if _, err = tx.Exec(ctx, "UPDATE admission_operations SET decision='admitted',decided_at=$2::timestamptz WHERE lease_id=$1::uuid", r.LeaseID, now); err != nil {
+	writes := &pgx.Batch{}
+	writes.Queue(`INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at) VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz)`, lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt)
+	writes.Queue("UPDATE admission_operations SET decision='admitted',decided_at=$2::timestamptz WHERE lease_id=$1::uuid", r.LeaseID, now)
+	if err = tx.SendBatch(ctx, writes).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {

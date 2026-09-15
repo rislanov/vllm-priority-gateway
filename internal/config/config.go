@@ -112,7 +112,7 @@ func defaultConfig() Config {
 		PostgresAnalyticsMaxConns:     4,
 		PostgresCoordinationMaxConns:  16,
 		ConfigPollInterval:            5 * time.Second,
-		CoordinationTimeout:           50 * time.Millisecond,
+		CoordinationTimeout:           500 * time.Millisecond,
 		LeaseTTL:                      90 * time.Second,
 		LeaseRenewInterval:            30 * time.Second,
 		CoordinationCompletionBacklog: 4096,

@@ -25,13 +25,15 @@ Other coordination settings are:
 
 ```text
 LLMGW_CONFIG_POLL_INTERVAL=5s
-LLMGW_COORDINATION_TIMEOUT=50ms
+LLMGW_COORDINATION_TIMEOUT=500ms
 LLMGW_LEASE_TTL=90s
 LLMGW_LEASE_RENEW_INTERVAL=30s
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
 LLMGW_COORDINATION_EMERGENCY_CRITICAL_MAX_INFLIGHT=4
 LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT=2
 ```
+
+The operation timeout includes connection-pool waits, row-lock waits, queries, and durable commit. The 500 ms default allows parallel admissions to serialize on a shared pool scope; the previous 50 ms default rejected valid High bursts in the local GPU/PostgreSQL test. It is a deadline, not a fixed delay or a latency SLO. Tune it against measured coordination latency and request deadlines in the target topology; explicitly configured shorter values remain supported. Admission pipelines ordered SQL statements to reduce network waits while retaining scope locks, fresh READ COMMITTED snapshots, and synchronous commit.
 
 Lease renewal must not exceed one third of the lease TTL. Circuit failure windows are limited to 23h55m because durable circuit completion receipts are retained for 24 hours and accept at most five minutes of positive clock skew.
 

@@ -334,6 +334,11 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 	closed := h.waitForBackend(target.ID, func(backend adminBackend) bool {
 		return backend.Runtime.CircuitState == "closed" && backend.Runtime.CircuitAvailable && backend.Runtime.CircuitFailures == 0
 	}, cfg.recoveryTimeout)
+	// Circuit availability and the observation-based pool projection publish
+	// independently. Recovery must include both within the existing deadline.
+	h.waitForPool(func(pool adminPool) bool {
+		return pool.Runtime.AvailableBackends >= 1 && pool.Runtime.State != "unavailable"
+	}, cfg.recoveryTimeout)
 	recovered, recoveredStatus := h.inferenceReadiness()
 	if recoveredStatus != http.StatusOK || recovered.Status != "ready" || recovered.PoolAvailability < 1 || recovered.BackendAvailability < 1 {
 		t.Fatalf("recovered inference readiness = HTTP %d %+v, want HTTP 200 ready", recoveredStatus, recovered)
