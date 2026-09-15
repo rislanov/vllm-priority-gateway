@@ -192,10 +192,24 @@ func newGatewayApplication(
 	}
 	application.transport = transport
 	upstreamClient := &http.Client{Transport: transport}
+	adminMutationsAllowed := func() bool {
+		return coordinationReadiness(admissionCoordinator, circuitCoordinator, replicaManager, revisionGuard, recoveryManager) == "ready"
+	}
 	manager = monitor.NewManager(ctx, monitor.Options{
 		HTTPClient: upstreamClient, HealthInterval: cfg.HealthInterval, HealthTimeout: cfg.HealthTimeout,
 		MetricsInterval: cfg.MetricsInterval, MetricsTimeout: cfg.MetricsTimeout, StaleAfter: cfg.MetricsStaleAfter,
 		UnhealthyAfter: cfg.UnhealthyAfter, RecoveryAfter: cfg.RecoveryAfter,
+		CircuitFailureBuffered: func() {
+			if recoveryManager != nil {
+				recoveryManager.MarkDegraded(errors.New("buffered circuit failure awaits replay"))
+			}
+		},
+		CoordinationReady: adminMutationsAllowed, RecoveryStatus: func() coordination.RecoveryStatus {
+			if recoveryManager != nil {
+				return recoveryManager.Status()
+			}
+			return coordination.RecoveryStatus{}
+		},
 		Circuit: circuitOptions, CircuitCoordinator: circuitCoordinator, AdmissionRuntime: admissionCoordinator.(coordination.AdmissionRuntime), Observer: metrics, ReplicaID: replicaID, ProbeTTL: cfg.LeaseTTL, ProbeRenewInterval: cfg.LeaseRenewInterval,
 		Limits:     pressure.Limits{QueueSoft: cfg.QueueSoftLimit, KVSoft: cfg.KVSoftLimit, KVHard: cfg.KVHardLimit},
 		EWMAWindow: cfg.EWMAWindow, BusyThreshold: cfg.BusyThreshold, SaturatedThreshold: cfg.SaturatedThreshold,
@@ -242,9 +256,6 @@ func newGatewayApplication(
 		return !revisionGuard.Faulted() && !admissionCoordinator.Status().Permanent && !circuitCoordinator.Status().Permanent &&
 			(replicaManager == nil || replicaManager.Compatible() && !replicaManager.Status().Permanent) &&
 			(recoveryManager == nil || recoveryManager.Status().State != coordination.RecoveryPermanentFault)
-	}
-	adminMutationsAllowed := func() bool {
-		return coordinationReadiness(admissionCoordinator, circuitCoordinator, replicaManager, revisionGuard, recoveryManager) == "ready"
 	}
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Admission: admissionCoordinator, Leases: leaseManager, ReplicaID: replicaID, LeaseTTL: cfg.LeaseTTL,

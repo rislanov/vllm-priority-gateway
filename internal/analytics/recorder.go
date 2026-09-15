@@ -14,6 +14,7 @@ const (
 	recorderQueueCapacity  = 1024
 	recorderBatchSize      = 64
 	recorderFlushInterval  = 250 * time.Millisecond
+	recorderWriteTimeout   = 5 * time.Second
 	retentionCheckInterval = time.Hour
 	retentionCleanupBudget = 5 * time.Second
 )
@@ -345,7 +346,12 @@ func (r *Recorder) flush(records []RequestRecord) {
 		return
 	}
 	batch := append([]RequestRecord(nil), records...)
-	if err := r.store.InsertUsageBatch(r.ctx, batch); err != nil {
+	// Storage may wait on a remote connection or a database lock indefinitely.
+	// Bound that wait so the writer keeps draining the inference reservation
+	// queue even while PostgreSQL is unavailable.
+	ctx, cancel := context.WithTimeout(r.ctx, recorderWriteTimeout)
+	defer cancel()
+	if err := r.store.InsertUsageBatch(ctx, batch); err != nil {
 		r.writerHealthy.Store(false)
 		r.lastErr = err
 		if r.onFailure != nil {

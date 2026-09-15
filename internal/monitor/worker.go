@@ -21,27 +21,30 @@ import (
 const maxMetricsPayloadBytes int64 = 4 << 20
 
 type Options struct {
-	HTTPClient         *http.Client
-	HealthInterval     time.Duration
-	HealthTimeout      time.Duration
-	MetricsInterval    time.Duration
-	MetricsTimeout     time.Duration
-	StaleAfter         time.Duration
-	UnhealthyAfter     int
-	RecoveryAfter      int
-	Circuit            circuitbreaker.Options
-	CircuitCoordinator coordination.CircuitCoordinator
-	AdmissionRuntime   coordination.AdmissionRuntime
-	Observer           coordination.LeaseManagerObserver
-	ReplicaID          uuid.UUID
-	ProbeTTL           time.Duration
-	ProbeRenewInterval time.Duration
-	ProbeRenewTicks    <-chan time.Time
-	Limits             pressure.Limits
-	EWMAWindow         time.Duration
-	BusyThreshold      float64
-	SaturatedThreshold float64
-	PoolThresholds     pressure.Thresholds
+	HTTPClient             *http.Client
+	HealthInterval         time.Duration
+	HealthTimeout          time.Duration
+	MetricsInterval        time.Duration
+	MetricsTimeout         time.Duration
+	StaleAfter             time.Duration
+	UnhealthyAfter         int
+	RecoveryAfter          int
+	Circuit                circuitbreaker.Options
+	CircuitCoordinator     coordination.CircuitCoordinator
+	AdmissionRuntime       coordination.AdmissionRuntime
+	CoordinationReady      func() bool
+	RecoveryStatus         func() coordination.RecoveryStatus
+	CircuitFailureBuffered func()
+	Observer               coordination.LeaseManagerObserver
+	ReplicaID              uuid.UUID
+	ProbeTTL               time.Duration
+	ProbeRenewInterval     time.Duration
+	ProbeRenewTicks        <-chan time.Time
+	Limits                 pressure.Limits
+	EWMAWindow             time.Duration
+	BusyThreshold          float64
+	SaturatedThreshold     float64
+	PoolThresholds         pressure.Thresholds
 }
 
 func (o Options) validate() error {

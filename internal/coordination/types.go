@@ -125,6 +125,9 @@ type CompleteResult struct {
 
 type AdmissionCoordinator interface {
 	Acquire(context.Context, AdmissionRequest) (AdmissionDecision, error)
+	// Renew returns results in input order. On error, results may contain the
+	// durably renewed input prefix; callers must apply these committed results
+	// before retrying or reconciling the remaining leases.
 	Renew(context.Context, []LeaseIdentity) ([]RenewResult, error)
 	// Complete applies completions in input order. When it returns an error,
 	// results may contain the durably completed input prefix; callers must retry

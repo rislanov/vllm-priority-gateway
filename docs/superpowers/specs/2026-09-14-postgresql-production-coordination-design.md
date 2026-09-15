@@ -746,3 +746,14 @@ This design is executed through three sequential implementation plans in the sam
 3. **Distributed circuit breaker and HA validation** — circuit SQL state machine, local cache, notification/poll refresh, failure replay, readiness, observability, and opt-in multi-replica validation.
 
 Each plan must end in a buildable, testable state and preserve the default SQLite profile. Redis can be added only by implementing the published coordination contracts and passing the same contract suite.
+
+## 23. Integration amendments — 2026-09-15
+
+The following integration decisions supersede the corresponding original design details above:
+
+- Preserve the administrative deletion lifecycle already present on `main`: clients, backends, and unreferenced pools can be deleted. This replaces the deletion non-goal in sections 3 and 14.2. PostgreSQL retains admission scopes, circuit tombstones, and terminal receipts so admitted work and idempotent replay remain valid; backend deletion supersedes unfinished permits atomically. Referenced pools cannot be deleted.
+- The default coordination timeout is 500 ms, replacing the 50 ms value in section 7. It remains a maximum duration, not an added delay or the proxy latency target. Explicit shorter values remain supported. The production guide records the contention evidence and topology-dependent tuning requirement.
+- Admission renewal uses bounded transactions of at most 256 leases, each with a coordination deadline inside the caller's context. `Renew` returns the committed input prefix if a later transaction fails; `LeaseManager` applies that prefix without reviving handles already removed by completion. Recovery requires the entire reconciliation to succeed. Scope and UUID lock ordering and the fresh post-lock database timestamp remain mandatory within each transaction.
+- Circuit cache read/reconciliation/publication is serialized with context cancellation. Due states use bulk SQL, and idle half-open states need no transaction. Expiry, generation, and retention semantics are unchanged.
+- Circuit admission, readiness, and nonfailure completion honor the global recovery barrier. A failure buffered during recovery invalidates that recovery attempt before publishing the event, ensuring readiness cannot overtake replay. Conservative local breaker state is replaced only after a completed recovery; earlier callbacks retain their original breaker.
+- Analytics writes have a five-second deadline. A failed batch updates health/failure telemetry and the writer continues draining, preserving bounded backpressure without an indefinite storage wait.

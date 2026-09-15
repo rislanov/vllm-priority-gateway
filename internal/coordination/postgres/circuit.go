@@ -27,10 +27,12 @@ type CircuitCoordinator struct {
 	timeout time.Duration
 	options circuitbreaker.Options
 
-	mu       sync.RWMutex
-	cache    map[int64]coordination.CircuitSnapshot
-	status   coordination.Status
-	failures failurePublisher
+	mu          sync.RWMutex
+	cache       map[int64]coordination.CircuitSnapshot
+	status      coordination.Status
+	failures    failurePublisher
+	refreshOnce sync.Once
+	refreshGate chan struct{}
 }
 
 func NewCircuitCoordinator(store *pgstore.Store, timeout time.Duration, options circuitbreaker.Options) (*CircuitCoordinator, error) {
@@ -175,14 +177,15 @@ func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 	}()
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
-	ids, err := c.reconcilableBackendIDs(ctx)
-	if err != nil {
-		return err
+	c.refreshOnce.Do(func() { c.refreshGate = make(chan struct{}, 1) })
+	select {
+	case c.refreshGate <- struct{}{}:
+		defer func() { <-c.refreshGate }()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	for _, id := range ids {
-		if err := c.reconcileBackendState(ctx, id); err != nil {
-			return err
-		}
+	if err := c.reconcileRefreshStates(ctx); err != nil {
+		return err
 	}
 	rows, err := c.pool.Query(ctx, `SELECT s.backend_id,s.backend_revision,s.state,s.generation,s.opened_at,s.half_open_succeeded,
 		(SELECT count(*) FROM backend_circuit_active_failures f WHERE f.backend_id=s.backend_id AND f.backend_revision=s.backend_revision AND (s.state<>'closed' OR f.event_at>=clock_timestamp()-$1::interval)),
@@ -230,7 +233,12 @@ func (c *CircuitCoordinator) Refresh(parent context.Context) (resultErr error) {
 }
 
 func (c *CircuitCoordinator) reconcilableBackendIDs(ctx context.Context) ([]int64, error) {
-	rows, err := c.pool.Query(ctx, "SELECT backend_id FROM backend_circuit_state WHERE state='half_open' OR (state='open' AND opened_at IS NOT NULL AND opened_at+$1::interval<=clock_timestamp()) ORDER BY backend_id", c.options.OpenCooldown)
+	rows, err := c.pool.Query(ctx, `SELECT s.backend_id FROM backend_circuit_state s
+		WHERE (s.state='half_open' AND EXISTS (SELECT 1 FROM backend_circuit_probes p
+		WHERE p.backend_id=s.backend_id AND p.backend_revision=s.backend_revision
+		AND p.circuit_generation=s.generation AND p.outcome IS NULL AND p.expires_at<=clock_timestamp()))
+		OR (s.state='open' AND s.opened_at IS NOT NULL AND s.opened_at+$1::interval<=clock_timestamp())
+		ORDER BY s.backend_id`, c.options.OpenCooldown)
 	if err != nil {
 		return nil, err
 	}

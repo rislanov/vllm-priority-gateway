@@ -16,11 +16,13 @@ import (
 )
 
 type managedWorker struct {
-	worker     *Worker
-	cancel     context.CancelFunc
-	done       chan struct{}
-	generation uint64
-	breaker    *circuitbreaker.Breaker
+	worker       *Worker
+	cancel       context.CancelFunc
+	done         chan struct{}
+	generation   uint64
+	breaker      *circuitbreaker.Breaker
+	emergencyMu  sync.Mutex
+	lastRecovery time.Time
 }
 
 type circuitReplayDropObserver interface {
@@ -336,42 +338,18 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 		m.mu.Unlock()
 		attemptID := uuid.New()
 		identity := coordination.BackendIdentity{ID: expected.ID, Revision: expected.Revision, Enabled: expected.Enabled, Draining: expected.Draining}
+		if !m.coordinationReady() {
+			return m.acquireEmergencyBackend(expected, at, attemptID, identity)
+		}
 		decision, err := m.options.CircuitCoordinator.Acquire(m.ctx, coordination.CircuitAcquireRequest{AttemptID: attemptID, AcquisitionStartedAt: at.UTC(), ReplicaID: m.options.ReplicaID, Backend: identity, ProbeTTL: m.options.ProbeTTL})
 		if err != nil {
 			var permanent coordination.PermanentError
 			if errors.As(err, &permanent) {
 				return nil, false
 			}
-			cached := m.options.CircuitCoordinator.Snapshot(expected.ID, at)
-			if cached.State != domain.CircuitClosed {
-				return nil, false
-			}
-			m.mu.Lock()
-			managed = m.workers[expected.ID]
-			if managed == nil || managed.worker.Backend() != expected {
-				m.mu.Unlock()
-				return nil, false
-			}
-			completeLocal, localOK := managed.breaker.Acquire(at)
-			if !localOK || managed.breaker.Snapshot(at).State != domain.CircuitClosed {
-				m.mu.Unlock()
-				return nil, false
-			}
-			m.backendInflight[expected.ID]++
-			m.mu.Unlock()
-			var once sync.Once
-			return func(outcome domain.InferenceOutcome) {
-				once.Do(func() {
-					defer m.releaseBackendInflight(expected.ID)
-					reported := time.Now().UTC()
-					completeLocal(outcome, reported)
-					if outcome == domain.InferenceFailure {
-						m.bufferCircuitFailure(coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: cached.Generation, Outcome: outcome, ReportedOutcomeAt: reported})
-					}
-				})
-			}, true
+			return m.acquireEmergencyBackend(expected, at, attemptID, identity)
 		}
-		if decision.Reason != "" {
+		if decision.Reason != "" || !m.coordinationReady() {
 			return nil, false
 		}
 		m.mu.Lock()
@@ -394,6 +372,11 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 					m.mu.Unlock()
 					m.releaseBackendInflight(expected.ID)
 				}()
+				// Even a neutral probe completion can close a generation after another
+				// probe succeeded. Let terminal permits expire while recovery is gated.
+				if outcome != domain.InferenceFailure && !m.coordinationReady() {
+					return
+				}
 				reported := time.Now().UTC()
 				completion := coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: decision.Snapshot.Generation, Outcome: outcome, ReportedOutcomeAt: reported}
 				if _, err := m.options.CircuitCoordinator.Complete(context.WithoutCancel(m.ctx), completion); err != nil && outcome == domain.InferenceFailure && replayableCircuitError(err) {
@@ -426,6 +409,73 @@ func (m *Manager) AcquireBackend(expected domain.Backend, at time.Time) (func(do
 	}, true
 }
 
+// coordinationReady includes the global recovery barrier, not just the most
+// recent successful operation on the circuit connection pool.
+func (m *Manager) coordinationReady() bool {
+	return m.options.CircuitCoordinator.Status().Available &&
+		(m.options.CoordinationReady == nil || m.options.CoordinationReady())
+}
+
+// emergencyBreaker replaces conservative local state only after a completed
+// recovery, including when no requests arrived between two outages. In-flight
+// completions retain their old breaker and cannot reopen the new local epoch.
+func (m *Manager) emergencyBreaker(managed *managedWorker) *circuitbreaker.Breaker {
+	managed.emergencyMu.Lock()
+	defer managed.emergencyMu.Unlock()
+	if m.options.RecoveryStatus != nil {
+		recovered := m.options.RecoveryStatus().LastSuccess
+		if recovered.After(managed.lastRecovery) {
+			managed.breaker, _ = circuitbreaker.New(m.options.Circuit)
+			managed.lastRecovery = recovered
+		}
+	}
+	return managed.breaker
+}
+
+func (m *Manager) emergencyAllowed() bool {
+	return !m.options.CircuitCoordinator.Status().Permanent &&
+		(m.options.RecoveryStatus == nil || m.options.RecoveryStatus().State != coordination.RecoveryPermanentFault)
+}
+
+func (m *Manager) acquireEmergencyBackend(expected domain.Backend, at time.Time, attemptID uuid.UUID, identity coordination.BackendIdentity) (func(domain.InferenceOutcome), bool) {
+	if !m.emergencyAllowed() {
+		return nil, false
+	}
+	cached := m.options.CircuitCoordinator.Snapshot(expected.ID, at)
+	if cached.State != domain.CircuitClosed {
+		return nil, false
+	}
+	m.mu.Lock()
+	managed := m.workers[expected.ID]
+	if managed == nil || managed.worker.Backend() != expected {
+		m.mu.Unlock()
+		return nil, false
+	}
+	breaker := m.emergencyBreaker(managed)
+	if breaker.Snapshot(at).State != domain.CircuitClosed {
+		m.mu.Unlock()
+		return nil, false
+	}
+	completeLocal, ok := breaker.Acquire(at)
+	if !ok {
+		m.mu.Unlock()
+		return nil, false
+	}
+	m.backendInflight[expected.ID]++
+	m.mu.Unlock()
+	var once sync.Once
+	return func(outcome domain.InferenceOutcome) {
+		once.Do(func() {
+			defer m.releaseBackendInflight(expected.ID)
+			reported := time.Now().UTC()
+			completeLocal(outcome, reported)
+			if outcome == domain.InferenceFailure {
+				m.bufferCircuitFailure(coordination.CircuitCompletion{AttemptID: attemptID, Backend: identity, Generation: cached.Generation, Outcome: outcome, ReportedOutcomeAt: reported})
+			}
+		})
+	}, true
+}
+
 func snapshotManaged(managed *managedWorker, at time.Time) domain.BackendRuntime {
 	snapshot := managed.worker.Snapshot(at)
 	if managed.breaker == nil {
@@ -446,11 +496,9 @@ func (m *Manager) snapshotManaged(managed *managedWorker, at time.Time) domain.B
 	}
 	snapshot := managed.worker.Snapshot(at)
 	circuit := m.options.CircuitCoordinator.Snapshot(managed.worker.Backend().ID, at)
-	if !m.options.CircuitCoordinator.Status().Available && circuit.State == domain.CircuitClosed {
-		local := managed.breaker.Snapshot(at)
-		if local.State != domain.CircuitClosed {
-			circuit.Available = false
-		}
+	if !m.coordinationReady() {
+		local := m.emergencyBreaker(managed).Snapshot(at)
+		circuit.Available = m.emergencyAllowed() && circuit.State == domain.CircuitClosed && local.State == domain.CircuitClosed
 	}
 	snapshot.CircuitState = circuit.State
 	snapshot.CircuitFailures = circuit.FailureCount
@@ -534,6 +582,13 @@ func (m *Manager) endCircuitReplay(done chan struct{}) {
 
 func (m *Manager) bufferCircuitFailure(completion coordination.CircuitCompletion) {
 	m.mu.Lock()
+	// Invalidate an in-progress recovery before publishing a new replay event.
+	// Holding mu also ensures a recovery starting after this notification cannot
+	// drain the backlog before the event is appended. The callback must not call
+	// back into Manager; RecoveryManager only takes its own state mutex here.
+	if m.options.CircuitFailureBuffered != nil {
+		m.options.CircuitFailureBuffered()
+	}
 	m.circuitBacklog = append(m.circuitBacklog, completion)
 	dropped := 0
 	if len(m.circuitBacklog) > 4096 {

@@ -1184,7 +1184,9 @@ func TestPostgresClosedCircuitFastPathsIgnoreOtherBackendLock(t *testing.T) {
 	if err = coordinator.Reconcile(context.Background(), backends); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.ConfigPool().Exec(context.Background(), "UPDATE backend_circuit_state SET state='half_open' WHERE backend_id=$1", fixture.backend.ID); err != nil {
+	// A due open state requires authoritative reconciliation; an idle
+	// half-open state can now be refreshed without acquiring a write lock.
+	if _, err = store.ConfigPool().Exec(context.Background(), "UPDATE backend_circuit_state SET state='open',opened_at=clock_timestamp()-interval '2 minutes' WHERE backend_id=$1", fixture.backend.ID); err != nil {
 		t.Fatal(err)
 	}
 	holder, err := store.ConfigPool().Begin(context.Background())

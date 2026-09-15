@@ -355,33 +355,38 @@ func admissionFingerprint(v coordination.AdmissionRequest) [32]byte {
 	return sha256.Sum256(b)
 }
 
+// Renewal transactions are bounded so a large stream population does not turn
+// one coordination timeout into a rollback of every lease renewal.
+const renewalBatchSize = 256
+
 func (c *AdmissionCoordinator) Renew(parent context.Context, leases []coordination.LeaseIdentity) ([]coordination.RenewResult, error) {
-	ctx, cancel := c.deadline(parent)
-	defer cancel()
-	out, err := c.renew(ctx, leases)
-	if err != nil {
-		err = recordCoordinationError(parent, err, c)
-	} else {
-		c.setStatus(true, "")
-		_ = c.RefreshInflight(parent)
+	out := make([]coordination.RenewResult, 0, len(leases))
+	for start := 0; start < len(leases); start += renewalBatchSize {
+		end := min(start+renewalBatchSize, len(leases))
+		ctx, cancel := c.deadline(parent)
+		results, err := c.renew(ctx, leases[start:end])
+		cancel()
+		if err != nil {
+			// Only committed transactions form the returned prefix. Callers can
+			// apply these results even when a later transaction cannot finish.
+			return out, recordCoordinationError(parent, err, c)
+		}
+		out = append(out, results...)
 	}
-	return out, err
+	c.setStatus(true, "")
+	_ = c.RefreshInflight(parent)
+	return out, nil
 }
+
 func (c *AdmissionCoordinator) renew(ctx context.Context, leases []coordination.LeaseIdentity) ([]coordination.RenewResult, error) {
 	out := make([]coordination.RenewResult, len(leases))
 	if len(leases) == 0 {
 		return out, nil
 	}
-	ordered := append([]coordination.LeaseIdentity(nil), leases...)
-	sort.Slice(ordered, func(i, j int) bool { return bytes.Compare(ordered[i].LeaseID[:], ordered[j].LeaseID[:]) < 0 })
-	pools := make([]int64, 0, len(ordered))
-	clients := make([]int64, 0, len(ordered))
-	for _, lease := range ordered {
-		pools = append(pools, lease.PoolID)
-		clients = append(clients, lease.ClientID)
+	ids := make([]string, len(leases))
+	for i, lease := range leases {
+		ids[i] = lease.LeaseID.String()
 	}
-	pools = sortedUnique(pools)
-	clients = sortedUnique(clients)
 	tx, err := c.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, err
@@ -390,59 +395,98 @@ func (c *AdmissionCoordinator) renew(ctx context.Context, leases []coordination.
 	if _, err = tx.Exec(ctx, "SET LOCAL synchronous_commit=on"); err != nil {
 		return nil, err
 	}
-	for _, id := range pools {
-		if _, err = tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", id); err != nil {
-			return nil, err
-		}
+	// Read immutable ownership from storage rather than trusting a supplied
+	// identity to choose the scopes protecting expiry and concurrency counts.
+	rows, err := tx.Query(ctx, "SELECT pool_id,client_id FROM request_leases WHERE lease_id=ANY($1::uuid[])", ids)
+	if err != nil {
+		return nil, err
 	}
-	for _, id := range clients {
-		if _, err = tx.Exec(ctx, "SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", id); err != nil {
+	var pools, clients []int64
+	for rows.Next() {
+		var pool, client int64
+		if err := rows.Scan(&pool, &client); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		pools = append(pools, pool)
+		clients = append(clients, client)
 	}
-	for _, lease := range ordered {
-		if _, err = tx.Exec(ctx, "SELECT lease_id FROM request_leases WHERE lease_id=$1::uuid FOR UPDATE", lease.LeaseID); err != nil {
-			return nil, err
-		}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
 	}
-	for _, lease := range ordered {
-		if _, err = tx.Exec(ctx, "SELECT lease_id FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", lease.LeaseID); err != nil {
-			return nil, err
-		}
+	// Consume each ordered lock category before acquiring the next one. The
+	// number of round trips is independent of the number of leases in a batch.
+	if _, err = tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=ANY($1::bigint[]) ORDER BY pool_id FOR UPDATE", pools); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, "SELECT client_id FROM client_admission_scopes WHERE client_id=ANY($1::bigint[]) ORDER BY client_id FOR UPDATE", clients); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, "SELECT lease_id FROM request_leases WHERE lease_id=ANY($1::uuid[]) ORDER BY lease_id FOR UPDATE", ids); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, "SELECT lease_id FROM admission_operations WHERE lease_id=ANY($1::uuid[]) ORDER BY lease_id FOR UPDATE", ids); err != nil {
+		return nil, err
 	}
 	var now time.Time
 	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return nil, err
 	}
-	byID := make(map[uuid.UUID]coordination.RenewResult, len(ordered))
-	for _, lease := range ordered {
-		result := coordination.RenewResult{Lease: lease}
-		var current coordination.LeaseIdentity
-		scanErr := tx.QueryRow(ctx, "SELECT lease_id,client_id,pool_id,request_id,replica_id,expires_at FROM request_leases WHERE lease_id=$1::uuid", lease.LeaseID).Scan(&current.LeaseID, &current.ClientID, &current.PoolID, &current.RequestID, &current.ReplicaID, &current.ExpiresAt)
-		if scanErr != nil || current.ClientID != lease.ClientID || current.PoolID != lease.PoolID || current.RequestID != lease.RequestID || current.ReplicaID != lease.ReplicaID || !current.ExpiresAt.After(now) || lease.TTL <= 0 {
-			result.Reason = coordination.ReasonLeaseLost
-			if _, err = tx.Exec(ctx, "DELETE FROM request_leases WHERE lease_id=$1::uuid AND expires_at<=$2::timestamptz", lease.LeaseID, now); err != nil {
-				return nil, err
-			}
-			if _, err = tx.Exec(ctx, "UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours' WHERE lease_id=$1::uuid AND completed_at IS NULL", lease.LeaseID, now); err != nil {
-				return nil, err
-			}
-			byID[lease.LeaseID] = result
+	rows, err = tx.Query(ctx, "SELECT lease_id,client_id,pool_id,request_id,replica_id,expires_at FROM request_leases WHERE lease_id=ANY($1::uuid[])", ids)
+	if err != nil {
+		return nil, err
+	}
+	current, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (v coordination.LeaseIdentity, err error) {
+		err = row.Scan(&v.LeaseID, &v.ClientID, &v.PoolID, &v.RequestID, &v.ReplicaID, &v.ExpiresAt)
+		return
+	})
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[uuid.UUID]coordination.LeaseIdentity, len(current))
+	for _, lease := range current {
+		byID[lease.LeaseID] = lease
+	}
+	updates := make(map[uuid.UUID]time.Time, len(leases))
+	for i, lease := range leases {
+		out[i] = coordination.RenewResult{Lease: lease, Reason: coordination.ReasonLeaseLost}
+		stored, exists := byID[lease.LeaseID]
+		if !exists || stored.ClientID != lease.ClientID || stored.PoolID != lease.PoolID || stored.RequestID != lease.RequestID || stored.ReplicaID != lease.ReplicaID || !stored.ExpiresAt.After(now) || lease.TTL <= 0 {
 			continue
 		}
-		current.TTL = lease.TTL
-		current.ExpiresAt = now.Add(lease.TTL)
-		if _, err = tx.Exec(ctx, "UPDATE request_leases SET expires_at=$2::timestamptz WHERE lease_id=$1::uuid", lease.LeaseID, current.ExpiresAt); err != nil {
+		stored.TTL = lease.TTL
+		stored.ExpiresAt = now.Add(lease.TTL)
+		out[i] = coordination.RenewResult{Lease: stored}
+		if stored.ExpiresAt.After(updates[lease.LeaseID]) {
+			updates[lease.LeaseID] = stored.ExpiresAt
+		}
+	}
+	if len(updates) > 0 {
+		updateIDs := make([]string, 0, len(updates))
+		expires := make([]time.Time, 0, len(updates))
+		for id, at := range updates {
+			updateIDs = append(updateIDs, id.String())
+			expires = append(expires, at)
+		}
+		if _, err = tx.Exec(ctx, `UPDATE request_leases l SET expires_at=v.expires_at
+			FROM unnest($1::uuid[],$2::timestamptz[]) AS v(lease_id,expires_at)
+			WHERE l.lease_id=v.lease_id`, updateIDs, expires); err != nil {
 			return nil, err
 		}
-		result.Lease = current
-		byID[lease.LeaseID] = result
+	}
+	// Only actual expiry changes the receipt; an identity mismatch must not
+	// mark another replica's still-live admission as expired.
+	if _, err = tx.Exec(ctx, `WITH expired AS (
+		DELETE FROM request_leases WHERE lease_id=ANY($1::uuid[]) AND expires_at<=$2::timestamptz RETURNING lease_id
+	) UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),
+		retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours'
+		WHERE lease_id IN (SELECT lease_id FROM expired) AND completed_at IS NULL`, ids, now); err != nil {
+		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
-	}
-	for i, lease := range leases {
-		out[i] = byID[lease.LeaseID]
 	}
 	return out, nil
 }

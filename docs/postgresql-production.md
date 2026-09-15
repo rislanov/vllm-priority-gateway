@@ -35,6 +35,10 @@ LLMGW_COORDINATION_EMERGENCY_HIGH_MAX_INFLIGHT=2
 
 The operation timeout includes connection-pool waits, row-lock waits, queries, and durable commit. The 500 ms default allows parallel admissions to serialize on a shared pool scope; the previous 50 ms default rejected valid High bursts in the local GPU/PostgreSQL test. It is a deadline, not a fixed delay or a latency SLO. Tune it against measured coordination latency and request deadlines in the target topology; explicitly configured shorter values remain supported. Admission pipelines ordered SQL statements to reduce network waits while retaining scope locks, fresh READ COMMITTED snapshots, and synchronous commit.
 
+Lease renewal uses ordered bulk SQL and transactions of at most 256 leases. Each transaction has its own coordination deadline, bounded by the caller's context. A later failure preserves results from committed batches; the recovery barrier remains degraded until every tracked lease is reconciled. Circuit refresh serializes snapshot publication and reconciles due states with bulk SQL, so an older refresh cannot replace a newer cache. Idle half-open states require no reconciliation transaction.
+
+Analytics inserts have a five-second write deadline. A failed batch is reported through recorder health and failure metrics; the writer continues draining its bounded queue. This prevents a database lock or stalled connection from holding new inference reservations indefinitely. Already completed responses are unchanged.
+
 Lease renewal must not exceed one third of the lease TTL. Circuit failure windows are limited to 23h55m because durable circuit completion receipts are retained for 24 hours and accept at most five minutes of positive clock skew.
 
 All newly created or changed policies are bounded before persistence:

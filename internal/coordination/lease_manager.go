@@ -126,7 +126,7 @@ func (m *LeaseManager) CloseContext(ctx context.Context) error {
 	return m.closeErr
 }
 
-// Reconcile renews every locally tracked lease as one batch. It is the lease
+// Reconcile renews every locally tracked lease. It is the lease
 // reconciliation barrier used before PostgreSQL recovery is declared ready.
 func (m *LeaseManager) Reconcile(ctx context.Context) error {
 	return m.renewContext(ctx)
@@ -216,7 +216,6 @@ func (m *LeaseManager) renewContext(ctx context.Context) error {
 		if m.observer != nil {
 			m.observer.CoordinationRenewFailure()
 		}
-		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -227,10 +226,14 @@ func (m *LeaseManager) renewContext(ctx context.Context) error {
 				m.observer.CoordinationLeaseLost()
 			}
 		} else if r.Lease.LeaseID != [16]byte{} {
-			m.active[r.Lease.LeaseID] = r.Lease
+			// A concurrent completion may have removed this lease while the
+			// database renewal was in flight. Do not start tracking it again.
+			if _, active := m.active[r.Lease.LeaseID]; active {
+				m.active[r.Lease.LeaseID] = r.Lease
+			}
 		}
 	}
-	return nil
+	return err
 }
 func (m *LeaseManager) complete(first LeaseCompletion) {
 	batch := []LeaseCompletion{first}
