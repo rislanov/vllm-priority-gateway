@@ -142,6 +142,8 @@ The UI is embedded in the gateway; there is no separate frontend deployment.
 
 ![Request, token, and cache-usage charts](docs/images/admin-analytics.jpg)
 
+The Compose vLLM workers enable `--enable-prompt-tokens-details`, so the gateway can record `usage.prompt_tokens_details.cached_tokens` when vLLM reports it. Enable the same flag on independently managed vLLM nodes to populate cache-read analytics. Time presets on the Analytics page follow the current time when the page is refreshed; a custom From/To range stays fixed.
+
 ## Client API
 
 ```text

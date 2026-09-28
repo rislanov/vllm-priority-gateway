@@ -43,7 +43,8 @@ vllm serve Qwen/Qwen3-0.6B \
   --max-model-len 1024 --max-num-seqs 1 \
   --scheduling-policy priority \
   --served-model-name qwen-test \
-  --generation-config vllm
+  --generation-config vllm \
+  --enable-prompt-tokens-details
 ```
 
 ```bash
@@ -55,7 +56,8 @@ vllm serve Qwen/Qwen3-0.6B \
   --max-model-len 1024 --max-num-seqs 1 \
   --scheduling-policy priority \
   --served-model-name qwen-test \
-  --generation-config vllm
+  --generation-config vllm \
+  --enable-prompt-tokens-details
 ```
 
 ### Linux with NVIDIA GPUs
@@ -68,14 +70,16 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B \
   --max-model-len 1024 --max-num-seqs 1 \
   --scheduling-policy priority \
   --served-model-name qwen-test \
-  --generation-config vllm
+  --generation-config vllm \
+  --enable-prompt-tokens-details
 
 CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B \
   --host 0.0.0.0 --port 8002 \
   --max-model-len 1024 --max-num-seqs 1 \
   --scheduling-policy priority \
   --served-model-name qwen-test \
-  --generation-config vllm
+  --generation-config vllm \
+  --enable-prompt-tokens-details
 ```
 
 For a single NVIDIA GPU, the canonical and tested reference topology is the repository's Docker Compose quick start. It runs two deliberately small `Qwen/Qwen3-0.6B` workers with explicit per-worker GPU memory fractions. If you instead share one GPU between manually managed native vLLM processes, set and calibrate `--gpu-memory-utilization` for every process so their total leaves runtime headroom; do not copy the second `CUDA_VISIBLE_DEVICES=1` command onto a host without a second GPU.

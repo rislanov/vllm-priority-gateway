@@ -497,10 +497,11 @@ func TestAdminDashboardRendersPoolSafetyAndCircuitRuntime(t *testing.T) {
 	runtime := runtimeMetricsStub{
 		pool: domain.PoolRuntime{
 			PoolID: pool.ID, State: domain.PoolBusy, GatewayInflight: 37,
-			TotalWaiting: 41.5, AvailableBackends: 2,
+			TotalWaiting: 42, AvailableBackends: 2,
 		},
 		backend: domain.BackendRuntime{
 			State: domain.BackendHealthy, Healthy: true, MetricsFresh: true,
+			Running: 3, Waiting: 2,
 			CircuitState: domain.CircuitHalfOpen, CircuitAvailable: true,
 		},
 	}
@@ -522,11 +523,14 @@ func TestAdminDashboardRendersPoolSafetyAndCircuitRuntime(t *testing.T) {
 	}
 	text := response.Body.String()
 	for _, fragment := range []string{
-		"Gateway inflight", "Waiting", "Available", ">37<", ">41.50<", ">2<", "Circuit", "half_open",
+		"Gateway inflight", "Waiting", "Available", ">37<", ">42<", ">3<", ">2<", "Circuit", "half_open",
 	} {
 		if !strings.Contains(text, fragment) {
 			t.Fatalf("dashboard missing server-rendered %q:\n%s", fragment, text)
 		}
+	}
+	if strings.Contains(text, ">3.00<") || strings.Contains(text, ">2.00<") || strings.Contains(text, ">42.00<") {
+		t.Fatalf("request counts rendered as fractional values:\n%s", text)
 	}
 }
 

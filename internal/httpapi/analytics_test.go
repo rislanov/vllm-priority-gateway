@@ -76,6 +76,26 @@ func TestAnalyticsDefaultsRangeAndPaginationAndReturnsJSON(t *testing.T) {
 	}
 }
 
+func TestAnalyticsPresetRangeMovesWithClock(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	queryStore := &analyticsQueryStoreStub{dataset: analytics.Dataset{Series: []analytics.SeriesPoint{}}}
+	handler := newAnalyticsHandler(t, queryStore, func() time.Time { return now })
+	path := "/admin/api/analytics?range=1h"
+	if response := analyticsRequest(t, handler, path); response.Code != http.StatusOK {
+		t.Fatalf("first range request = %d body=%s", response.Code, response.Body.String())
+	}
+	now = now.Add(10 * time.Minute)
+	if response := analyticsRequest(t, handler, path); response.Code != http.StatusOK {
+		t.Fatalf("second range request = %d body=%s", response.Code, response.Body.String())
+	}
+	filters := queryStore.analyticsFilters()
+	if len(filters) != 2 || !filters[0].To.Equal(now.Add(-10*time.Minute)) ||
+		!filters[0].From.Equal(now.Add(-70*time.Minute)) ||
+		!filters[1].To.Equal(now) || !filters[1].From.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("preset did not follow clock: %+v", filters)
+	}
+}
+
 func TestAnalyticsParsesActiveFiltersForJSONAndCSV(t *testing.T) {
 	queryStore := &analyticsQueryStoreStub{
 		dataset: analytics.Dataset{Series: []analytics.SeriesPoint{}, Breakdown: []analytics.BreakdownRow{}, Clients: []analytics.Dimension{}, Models: []analytics.Dimension{}},
@@ -152,6 +172,9 @@ func TestAnalyticsRejectsInvalidQueries(t *testing.T) {
 		"negative offset":       "offset=-1",
 		"duplicate parameter":   "client_id=1&client_id=2",
 		"unsupported parameter": "client=1",
+		"invalid preset":        "range=2h",
+		"preset and from":       "range=1h&from=" + url.QueryEscape(validFrom),
+		"preset and to":         "range=1h&to=" + url.QueryEscape(validTo),
 	}
 	for name, query := range tests {
 		t.Run(name, func(t *testing.T) {

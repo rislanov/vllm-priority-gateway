@@ -82,12 +82,13 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 		return nil, fmt.Errorf("admin web service is required")
 	}
 	functions := template.FuncMap{
-		"join":      strings.Join,
-		"timeValue": timeValue,
-		"percent":   func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
-		"decimal":   func(value float64) string { return fmt.Sprintf("%.2f", value) },
-		"integer":   formatInteger,
-		"ratio":     func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
+		"join":         strings.Join,
+		"timeValue":    timeValue,
+		"percent":      func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
+		"decimal":      func(value float64) string { return fmt.Sprintf("%.2f", value) },
+		"requestCount": func(value float64) string { return fmt.Sprintf("%.0f", value) },
+		"integer":      formatInteger,
+		"ratio":        func(value float64) string { return fmt.Sprintf("%.0f%%", value*100) },
 		"optionalInteger": func(value *int64) string {
 			if value == nil {
 				return "—"
@@ -231,6 +232,11 @@ func parseAnalyticsLocalTime(value string) (time.Time, error) {
 func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset, requests analytics.RequestPage) *analyticsPage {
 	filterValues := analyticsFilterValues(query.Filter)
 	pageValues := filterValues.Clone()
+	if query.Range != "" {
+		pageValues.Del("from")
+		pageValues.Del("to")
+		pageValues.Set("range", query.Range)
+	}
 	pageValues.Set("limit", strconv.Itoa(query.Limit))
 	if query.Offset > 0 {
 		pageValues.Set("offset", strconv.Itoa(query.Offset))
@@ -264,10 +270,12 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		width time.Duration
 	}{{"1h", time.Hour}, {"24h", 24 * time.Hour}, {"7d", 7 * 24 * time.Hour}, {"30d", 30 * 24 * time.Hour}, {"90d", 90 * 24 * time.Hour}} {
 		presetValues := filterValues.Clone()
-		presetValues.Set("from", query.Filter.To.Add(-preset.width).Format(time.RFC3339Nano))
+		presetValues.Del("from")
+		presetValues.Del("to")
+		presetValues.Set("range", preset.label)
 		page.Presets = append(page.Presets, analyticsPreset{
 			Label: preset.label, URL: analyticsURL("/admin/analytics", presetValues),
-			Active: query.Filter.To.Sub(query.Filter.From) == preset.width,
+			Active: query.Range == preset.label || (query.Range == "" && query.Filter.To.Sub(query.Filter.From) == preset.width),
 		})
 	}
 	page.HasPrevious = query.Offset > 0
