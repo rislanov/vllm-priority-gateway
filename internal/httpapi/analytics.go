@@ -25,7 +25,12 @@ const (
 
 var analyticsQueryNames = map[string]struct{}{
 	"from": {}, "to": {}, "client_id": {}, "model_pool_id": {},
-	"usage_available": {}, "limit": {}, "offset": {},
+	"usage_available": {}, "limit": {}, "offset": {}, "range": {},
+}
+
+var analyticsRanges = map[string]time.Duration{
+	"1h": time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour,
+	"30d": 30 * 24 * time.Hour, "90d": 90 * 24 * time.Hour,
 }
 
 // AnalyticsQuery is the validated query shared by the admin API and web UI.
@@ -33,6 +38,7 @@ type AnalyticsQuery struct {
 	Filter analytics.Filter
 	Limit  int
 	Offset int
+	Range  string
 }
 
 // ParseAnalyticsQuery applies the admin service's clock and the common analytics
@@ -86,6 +92,14 @@ func parseAnalyticsQuery(values url.Values, now time.Time) (AnalyticsQuery, erro
 	}
 	fromValue, fromPresent := singleAnalyticsValue(values, "from")
 	toValue, toPresent := singleAnalyticsValue(values, "to")
+	if rangeValue, present := singleAnalyticsValue(values, "range"); present {
+		width, valid := analyticsRanges[rangeValue]
+		if !valid || fromPresent || toPresent {
+			return AnalyticsQuery{}, errors.New("range must be a supported preset without from or to")
+		}
+		query.Range = rangeValue
+		query.Filter.From = now.Add(-width)
+	}
 	if fromPresent != toPresent {
 		return AnalyticsQuery{}, errors.New("from and to must be supplied together")
 	}

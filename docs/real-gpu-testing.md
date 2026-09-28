@@ -58,10 +58,10 @@ Start vLLM A and B on separate GPUs or serving hosts when available:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" --host 127.0.0.1 --port 8001 \
-  --scheduling-policy priority --enable-request-id-headers
+  --scheduling-policy priority --enable-request-id-headers --enable-prompt-tokens-details
 
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL" --host 127.0.0.1 --port 8002 \
-  --scheduling-policy priority --enable-request-id-headers
+  --scheduling-policy priority --enable-request-id-headers --enable-prompt-tokens-details
 ```
 
 These commands bind loopback for a same-host deployment. On a separate serving host, bind the intended private interface instead and restrict its ingress to the gateway hosts.

@@ -140,6 +140,8 @@ UI встроен в gateway; отдельное frontend-развёртыван
 
 ![Графики запросов, токенов и cache usage](docs/images/admin-analytics.jpg)
 
+В Compose у обеих нод vLLM включён `--enable-prompt-tokens-details`: gateway сохраняет `usage.prompt_tokens_details.cached_tokens`, когда vLLM его возвращает. Для отдельно запущенных нод включите тот же флаг, чтобы видеть чтения из кеша в аналитике. Пресеты времени на странице Analytics сдвигаются при обновлении страницы; вручную заданный диапазон From/To остаётся фиксированным.
+
 ## Клиентский API
 
 ```text

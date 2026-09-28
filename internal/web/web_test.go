@@ -198,6 +198,78 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 	}
 }
 
+func TestAnalyticsPresetLinksStayLiveAndPreserveDimensions(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/admin/analytics?client_id=1&model_pool_id=1&usage_available=true", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("analytics status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := attrForElementWithText(document, "a", "1h", "href")
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := parsed.Query()
+	if parsed.Path != "/admin/analytics" || values.Get("range") != "1h" ||
+		values.Has("from") || values.Has("to") || values.Get("client_id") != "1" ||
+		values.Get("model_pool_id") != "1" || values.Get("usage_available") != "true" {
+		t.Fatalf("preset link freezes time or drops filters: %s", link)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, link, nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "Request volume data") {
+		t.Fatalf("preset target status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAnalyticsPresetPaginationKeepsMovingRange(t *testing.T) {
+	handler := newAnalyticsWebFixture(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/admin/analytics?range=1h&limit=1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("first page status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err := html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := attrForElementWithText(document, "a", "Next", "href")
+	assertMovingPresetPaginationLink(t, next, "1")
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, next, nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("next page status = %d body=%s", response.Code, response.Body.String())
+	}
+	document, err = html.Parse(strings.NewReader(response.Body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := attrForElementWithText(document, "a", "Previous", "href")
+	assertMovingPresetPaginationLink(t, previous, "")
+}
+
+func assertMovingPresetPaginationLink(t *testing.T, link, offset string) {
+	t.Helper()
+	parsed, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := parsed.Query()
+	if parsed.Path != "/admin/analytics" || values.Get("range") != "1h" ||
+		values.Has("from") || values.Has("to") || values.Get("limit") != "1" ||
+		values.Get("offset") != offset {
+		t.Fatalf("pagination froze preset range: %s", link)
+	}
+}
+
 func TestAnalyticsPageRendersSilentBucketAsZeroChartPoint(t *testing.T) {
 	input, output := int64(10), int64(2)
 	handler := newWebFixtureWithUsage(t, []analytics.RequestRecord{
