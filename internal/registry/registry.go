@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,8 +35,9 @@ type Loader interface {
 }
 
 type Registry struct {
-	loader  Loader
-	current atomic.Pointer[Snapshot]
+	loader      Loader
+	current     atomic.Pointer[Snapshot]
+	publication sync.RWMutex
 }
 
 func New(loader Loader) *Registry {
@@ -55,6 +57,8 @@ func (r *Registry) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.publication.Lock()
+	defer r.publication.Unlock()
 	for {
 		current := r.current.Load()
 		if snapshot.Revision <= current.Revision {
@@ -107,6 +111,8 @@ func (r *Registry) MarkKeyRevoked(id int64, at time.Time) bool {
 // MarkBackendDeleted immediately publishes a fail-closed view after durable
 // deletion, before a complete database snapshot is reloaded.
 func (r *Registry) MarkBackendDeleted(id int64) bool {
+	r.publication.Lock()
+	defer r.publication.Unlock()
 	for {
 		current := r.current.Load()
 		backend, found := current.BackendsByID[id]
@@ -148,6 +154,8 @@ func (r *Registry) MarkKeyUsed(id int64, at time.Time) bool {
 }
 
 func (r *Registry) updateKey(id int64, update func(*domain.APIKey)) bool {
+	r.publication.Lock()
+	defer r.publication.Unlock()
 	for {
 		current := r.current.Load()
 		updated := *current
@@ -174,6 +182,14 @@ func (r *Registry) updateKey(id int64, update func(*domain.APIKey)) bool {
 
 func (r *Registry) Snapshot() *Snapshot {
 	return r.current.Load()
+}
+
+// WithSnapshot orders an admission allocation against configuration publication.
+// The callback must not publish a snapshot or reload the registry.
+func (r *Registry) WithSnapshot(read func(*Snapshot)) {
+	r.publication.RLock()
+	defer r.publication.RUnlock()
+	read(r.current.Load())
 }
 
 func newSnapshot() Snapshot {

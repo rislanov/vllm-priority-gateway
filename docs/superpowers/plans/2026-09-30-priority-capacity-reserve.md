@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.27.0, PostgreSQL 16+, pgx/v5, modernc SQLite, существующие chi Admin API, Go HTML templates, Prometheus и Grafana.
 
-**Spec:** [GitHub issue #22](https://github.com/rislanov/vllm-priority-gateway/issues/22), прочитан 2026-09-30, OPEN, комментариев нет. Ниже сохранены требования и выбранные проектные решения; это план, реализация ещё не выполнена.
+**Spec:** [GitHub issue #22](https://github.com/rislanov/vllm-priority-gateway/issues/22), прочитан 2026-09-30, OPEN, комментариев нет. Ниже сохранены требования и выбранные проектные решения; исходный план и фактические результаты исполнения приведены ниже.
 
 **Base:** `origin/main`, `c48be28` — `chore: prepare v0.5.0 release (#21)`.
 
@@ -208,6 +208,28 @@ Admin API остаётся с существующей полной замено
 - [ ] При R=0 сохранены текущие admission решения и public response contract; schema/contract upgrade всё равно требует описанного rollout.
 - [ ] Плановые проверки отделены от фактически полученных результатов. Только после этого реализация готова к PR.
 
-## Статус подготовки плана
+## История подготовки и исполнения
 
 2026-09-30: создана отдельная локальная ветка от актуального origin/main; прочитаны issue и соответствующие исходники; план проверен по acceptance criteria. В этом изменении присутствует только документ. Тесты реализации не запускались, поскольку код фичи ещё не написан.
+
+
+2026-09-30: задачи 1–6 реализованы в `faebaf5`; первоначальные детальные чек-листы выше сохранены как история планирования (имена отдельных тестов и разбиение коммитов при реализации изменились). Домен, обе миграции/store, локальная и PostgreSQL координация, gateway, Admin API/UI, наблюдаемость, HTTP acceptance и эксплуатационные документы готовы. Результаты и ограничения: [acceptance-evidence.md](../../acceptance-evidence.md#priority-capacity-reserve-issue-22--2026-09-30).
+
+Субагент провёл ревью реализации и нашёл Important-гонку устаревшего SQLite snapshot при обновлении резерва/класса, а также Minor-пропуск reason в документированном PromQL. Оба замечания исправлены; повторная проверка этих исправлений тем же ревьюером не нашла новых проблем. Новые barrier-регрессии прошли RED → GREEN; публикация registry snapshot и admission allocation теперь имеют общий порядок под read/write lock. Общие SQLite/PostgreSQL lifecycle contracts и acceptance сохраняют класс уже принятого lease.
+
+| Задача | Фактический статус |
+|---|---|
+| 1. Модель, validation, миграции и store | Выполнена; roundtrip, ограничения SQL, backfill и guarded downgrade проверены |
+| 2. Local admission | Выполнена; subset/total accounting, concurrent acquisition, TTL, replay, completion и policy-update regression проверены |
+| 3. PostgreSQL admission | Выполнена; общий лимит двух coordinator/HTTP gateway, stale policy/class, expiry и COMMIT-response loss проверены |
+| 4. Gateway и наблюдаемость | Выполнена; overload contract, trusted class, safety guards, metrics/Grafana и stale retry проверены |
+| 5. Admin API/UI | Выполнена; API и HTML rendering/form tests прошли; ручная браузерная проверка layout не выполнялась |
+| 6. Acceptance и эксплуатация | Выполнена; L=20/R=6, R=0, cancellation, crash/expiry, emergency recovery и rollout задокументированы |
+
+- [x] Все критерии issue сопоставлены с тестами/документацией.
+- [x] PostgreSQL acceptance выполнен с реальной БД и двумя gateway.
+- [x] Ревью выполнено субагентом, замечания исправлены и повторно проверены.
+- [x] Итоговые Windows tests с PostgreSQL, Linux full race и последовательные PostgreSQL race suites, vet и command build прошли.
+- [x] Результаты исполнения отделены от исторического плана и ограничений среды.
+
+Решение: для существующих внутренних вызовов coordinator пустой PriorityClass остаётся консервативным lower-классом только при R=0; положительный резерв требует валидный класс. PostgreSQL всегда записывает доверенный класс из БД. Shell-ledger ведётся в PowerShell вместо POSIX helper scripts; это не меняет контракт фичи. Реализация готова к PR после записанной итоговой проверки; push/PR/merge этой задачей не запрашивались.

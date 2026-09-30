@@ -72,6 +72,69 @@ func TestConcurrentReloadNeverPublishesAnOlderRevision(t *testing.T) {
 	}
 }
 
+func TestAdmissionSnapshotGuardOrdersEveryPublication(t *testing.T) {
+	for _, action := range []string{"reload", "revoke key", "delete backend", "mark key used"} {
+		t.Run(action, func(t *testing.T) {
+			data := registry.Data{Revision: 1, Clients: []domain.Client{{ID: 1}}, Pools: []domain.ModelPool{{ID: 2, PublicModelName: "public"}},
+				Keys: []domain.APIKey{{ID: 7, ClientID: 1, Prefix: "llmgw_abcd"}}, Backends: []domain.Backend{{ID: 3, ModelPoolID: 2}}}
+			updated := data
+			updated.Revision = 2
+			reg := registry.New(&sequenceLoader{results: []loadResult{{data: data}, {data: updated}}})
+			if err := reg.Reload(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			entered, release, readDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			go func() {
+				reg.WithSnapshot(func(snapshot *registry.Snapshot) { close(entered); <-release })
+				close(readDone)
+			}()
+			<-entered
+			started, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				close(started)
+				switch action {
+				case "reload":
+					done <- reg.Reload(context.Background())
+					return
+				case "revoke key":
+					reg.MarkKeyRevoked(7, time.Now())
+				case "delete backend":
+					reg.MarkBackendDeleted(3)
+				case "mark key used":
+					reg.MarkKeyUsed(7, time.Now())
+				}
+				done <- nil
+			}()
+			<-started
+			select {
+			case err := <-done:
+				close(release)
+				<-readDone
+				t.Fatalf("publication passed an active admission guard: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(release)
+			<-readDone
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("publication remained blocked after admission")
+			}
+			snapshot := reg.Snapshot()
+			if action == "reload" && snapshot.Revision != 2 || action == "revoke key" && snapshot.KeyCandidates["llmgw_abcd"][0].RevokedAt == nil ||
+				action == "mark key used" && snapshot.KeyCandidates["llmgw_abcd"][0].LastUsedAt == nil {
+				t.Fatal("publication was lost")
+			}
+			if _, exists := snapshot.BackendsByID[3]; action == "delete backend" && exists {
+				t.Fatal("backend deletion was lost")
+			}
+		})
+	}
+}
+
 func TestMarkKeyRevokedPublishesFailClosedOverlay(t *testing.T) {
 	loader := &sequenceLoader{results: []loadResult{{data: registry.Data{
 		Revision: 3,
