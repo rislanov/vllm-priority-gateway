@@ -175,10 +175,10 @@ func TestClosedCircuitBaselineRequiresCleanAvailableCircuit(t *testing.T) {
 func TestPoolInflightIsolationDisablesWaitingWithoutMutatingOriginal(t *testing.T) {
 	original := adminPool{
 		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
-		MaxGatewayInflight: 17, MaxWaiting: 9,
+		MaxGatewayInflight: 17, HighPriorityReserve: 6, MaxWaiting: 9,
 	}
 	isolated := isolatePoolGatewayInflight(original, 1)
-	if isolated.MaxGatewayInflight != 1 || isolated.MaxWaiting != 0 {
+	if isolated.MaxGatewayInflight != 1 || isolated.HighPriorityReserve != 0 || isolated.MaxWaiting != 0 {
 		t.Fatalf("isolated pool limits = (%d, %d), want (1, 0)", isolated.MaxGatewayInflight, isolated.MaxWaiting)
 	}
 	if isolated.ID != original.ID || isolated.PublicModelName != original.PublicModelName || isolated.UpstreamModelName != original.UpstreamModelName || isolated.Enabled != original.Enabled {
@@ -195,10 +195,10 @@ func TestPoolInflightIsolationDisablesWaitingWithoutMutatingOriginal(t *testing.
 func TestPriorityLoadPoolDisablesGlobalWaitingLimitWithoutMutatingOriginal(t *testing.T) {
 	original := adminPool{
 		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
-		MaxGatewayInflight: 17, MaxWaiting: 9,
+		MaxGatewayInflight: 17, HighPriorityReserve: 6, MaxWaiting: 9,
 	}
 	prepared := preparePoolForPriorityLoad(original)
-	if prepared.MaxGatewayInflight != 17 || prepared.MaxWaiting != 0 {
+	if prepared.MaxGatewayInflight != 17 || prepared.HighPriorityReserve != 6 || prepared.MaxWaiting != 0 {
 		t.Fatalf("prepared pool limits = (%d, %d), want (17, 0)", prepared.MaxGatewayInflight, prepared.MaxWaiting)
 	}
 	if prepared.ID != original.ID || prepared.PublicModelName != original.PublicModelName || prepared.UpstreamModelName != original.UpstreamModelName || prepared.Enabled != original.Enabled {
@@ -352,7 +352,7 @@ func TestFaultProxyPassesHealthMetricsAndCanToggleInference5xx(t *testing.T) {
 func TestAdminMutationCleanupRestoresPoolAndBackends(t *testing.T) {
 	pool := adminPool{
 		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
-		MaxGatewayInflight: 17, MaxWaiting: 9,
+		MaxGatewayInflight: 17, HighPriorityReserve: 6, MaxWaiting: 9,
 	}
 	backends := []adminBackend{
 		{ID: 21, ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://127.0.0.1:9001", Enabled: true, Draining: false, CapacityHint: 1.5, RunningSoftLimit: 16, UpstreamAPIKeyEnv: "VLLM_A_KEY"},
@@ -506,6 +506,35 @@ func cloneStringMap(input map[string]string) map[string]string {
 	return output
 }
 
+func TestReserveConfigRejectsMissingOrDuplicateIdentityAndUnsafePeerURL(t *testing.T) {
+	base := map[string]string{"LLMGW_E2E_MODE": "reserve", "LLMGW_E2E_GATEWAY_URL": "http://127.0.0.1:8080", "LLMGW_E2E_ADMIN_USERNAME": "admin", "LLMGW_E2E_ADMIN_PASSWORD": "secret", "LLMGW_E2E_MODEL": "qwen", "LLMGW_E2E_HIGH_KEY": "high-secret", "LLMGW_E2E_NORMAL_KEY": "normal-secret", "LLMGW_E2E_CRITICAL_KEY": "critical-secret", "LLMGW_E2E_LOW_KEYS": "background-secret", "LLMGW_E2E_PEER_GATEWAY_URL": "http://replica:8080"}
+	parse := func(values map[string]string) (e2eConfig, error) {
+		return parseE2EConfig(func(name string) (string, bool) { v, ok := values[name]; return v, ok }, modeReserve)
+	}
+	if cfg, err := parse(base); err != nil || cfg.peerURL.Host != "replica:8080" {
+		t.Fatalf("reserve config failed: %v", err)
+	}
+	for _, name := range []string{"LLMGW_E2E_NORMAL_KEY", "LLMGW_E2E_CRITICAL_KEY", "LLMGW_E2E_LOW_KEYS"} {
+		values := cloneStringMap(base)
+		delete(values, name)
+		if _, err := parse(values); err == nil {
+			t.Fatalf("accepted missing %s", name)
+		}
+	}
+	values := cloneStringMap(base)
+	values["LLMGW_E2E_NORMAL_KEY"] = base["LLMGW_E2E_HIGH_KEY"]
+	if _, err := parse(values); err == nil || strings.Contains(err.Error(), base["LLMGW_E2E_HIGH_KEY"]) {
+		t.Fatalf("duplicate key validation did not reject/redact: %v", err)
+	}
+	for _, peer := range []string{"file:///etc/passwd", "http://operator:secret@replica:8080", "http://replica:8080?token=secret", "http://replica:8080#secret"} {
+		values = cloneStringMap(base)
+		values["LLMGW_E2E_PEER_GATEWAY_URL"] = peer
+		if _, err := parse(values); err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatal("unsafe peer URL validation did not reject/redact")
+		}
+	}
+}
+
 func TestInferenceReadinessHonorsContextDeadline(t *testing.T) {
 	t.Run("deadline", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
@@ -576,7 +605,7 @@ func TestAdminPUTHelpersPreserveFieldsAuthenticateAndRedactErrors(t *testing.T) 
 	const secret = "do-not-expose-admin-password"
 	pool := adminPool{
 		ID: 11, PublicModelName: "qwen", UpstreamModelName: "Qwen/Qwen3", Enabled: true,
-		MaxGatewayInflight: 17, MaxWaiting: 9,
+		MaxGatewayInflight: 17, HighPriorityReserve: 6, MaxWaiting: 9,
 	}
 	backend := adminBackend{
 		ID: 21, ModelPoolID: pool.ID, Name: "gpu-a", BaseURL: "http://127.0.0.1:9001", Enabled: true,
@@ -627,7 +656,7 @@ func TestAdminPUTHelpersPreserveFieldsAuthenticateAndRedactErrors(t *testing.T) 
 	}
 	wantPool := poolUpdateInput{
 		PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName, Enabled: pool.Enabled,
-		MaxGatewayInflight: pool.MaxGatewayInflight, MaxWaiting: pool.MaxWaiting,
+		MaxGatewayInflight: pool.MaxGatewayInflight, HighPriorityReserve: pool.HighPriorityReserve, MaxWaiting: pool.MaxWaiting,
 	}
 	if !reflect.DeepEqual(seenPool, wantPool) {
 		t.Fatalf("pool PUT = %+v, want %+v", seenPool, wantPool)

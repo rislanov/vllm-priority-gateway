@@ -275,9 +275,7 @@ func TestCircuitBreakerRecoveryWithRealVLLM(t *testing.T) {
 		}
 	})
 
-	isolatedPool := pool
-	isolatedPool.MaxGatewayInflight = 0
-	isolatedPool.MaxWaiting = 0
+	isolatedPool := isolatePoolGatewayInflight(pool, 0)
 	if _, err := h.updatePool(context.Background(), isolatedPool); err != nil {
 		t.Fatalf("disable pool limits for isolated circuit scenario: %v", err)
 	}
