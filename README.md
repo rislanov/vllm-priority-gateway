@@ -26,6 +26,8 @@ A normal HTTP load balancer can distribute requests, but it usually does not kno
 
 The gateway combines server-side client policy with live vLLM health and Prometheus metrics:
 
+Pools can also reserve admission slots for High/Critical before pressure throttling activates. With `maxGatewayInflight=20` and `highPriorityReserve=6`, Normal/Background together can occupy at most 14 slots. The reserve is global in PostgreSQL mode and local to the single SQLite replica; it defaults to zero. [Configuration and limits](docs/operations.md#reserved-admission-capacity), [PostgreSQL upgrade](docs/postgresql-production.md#priority-reserve-upgrade).
+
 ```text
 production requests  ── high ────────┐
 interactive agents   ── normal ──────┼──► shared vLLM capacity

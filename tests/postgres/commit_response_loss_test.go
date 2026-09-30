@@ -15,6 +15,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/circuitbreaker"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	coordpostgres "github.com/rislanov/vllm-priority-gateway/internal/coordination/postgres"
+	basestore "github.com/rislanov/vllm-priority-gateway/internal/store"
 )
 
 // Cut the connection after PostgreSQL confirms COMMIT, before pgx receives it.
@@ -77,33 +78,44 @@ func commitLossProxy(t *testing.T, raw string) (string, *atomic.Bool) {
 }
 
 func TestPostgresAdmissionRetriesLostCommitResponse(t *testing.T) {
-	raw := os.Getenv("LLMGW_POSTGRES_TEST_DSN")
-	if raw == "" {
-		t.Skip("LLMGW_POSTGRES_TEST_DSN is not set")
-	}
-	runtime, armed := commitLossProxy(t, raw)
-	store := openTestStoreWithMigration(t, runtime, raw)
-	f := createFixture(t, store, 10)
-	coordinator := coordpostgres.NewAdmissionCoordinator(store, 2*time.Second)
-	request := admissionRequest(f, uuid.New())
-	armed.Store(true)
-	decision, err := coordinator.Acquire(context.Background(), request)
-	if armed.Load() {
-		t.Fatal("proxy did not intercept COMMIT")
-	}
-	if err != nil || !decision.Admitted() || decision.Lease.LeaseID != request.LeaseID {
-		t.Fatalf("lost COMMIT response was not recovered: decision=%+v err=%v", decision, err)
-	}
-	var leases int
-	var balance float64
-	if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT count(*) FROM request_leases").Scan(&leases); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT balance FROM coordination_rate_state WHERE rate_kind='rpm'").Scan(&balance); err != nil {
-		t.Fatal(err)
-	}
-	if leases != 1 || balance != 9 {
-		t.Fatalf("leases=%d RPM balance=%v; want one lease and one debit", leases, balance)
+	for _, reserve := range []int{0, 1} {
+		t.Run(map[int]string{0: "disabled", 1: "enabled"}[reserve], func(t *testing.T) {
+			raw := os.Getenv("LLMGW_POSTGRES_TEST_DSN")
+			if raw == "" {
+				t.Skip("LLMGW_POSTGRES_TEST_DSN is not set")
+			}
+			runtime, armed := commitLossProxy(t, raw)
+			store := openTestStoreWithMigration(t, runtime, raw)
+			f := createFixture(t, store, 10)
+			if reserve > 0 {
+				_, err := store.UpdatePool(context.Background(), f.pool.ID, basestore.UpdatePoolParams{PublicModelName: f.pool.PublicModelName, UpstreamModelName: f.pool.UpstreamModelName, Enabled: true, MaxGatewayInflight: 1, HighPriorityReserve: reserve})
+				if err != nil {
+					t.Fatal(err)
+				}
+				f = refreshFixture(t, store, f)
+			}
+			coordinator := coordpostgres.NewAdmissionCoordinator(store, 2*time.Second)
+			request := priorityRequest(f)
+			armed.Store(true)
+			decision, err := coordinator.Acquire(context.Background(), request)
+			if armed.Load() {
+				t.Fatal("proxy did not intercept COMMIT")
+			}
+			if err != nil || !decision.Admitted() || decision.Lease.LeaseID != request.LeaseID {
+				t.Fatalf("lost COMMIT response was not recovered: decision=%+v err=%v", decision, err)
+			}
+			var leases int
+			var balance float64
+			if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT count(*) FROM request_leases").Scan(&leases); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CoordinationPool().QueryRow(context.Background(), "SELECT balance FROM coordination_rate_state WHERE rate_kind='rpm'").Scan(&balance); err != nil {
+				t.Fatal(err)
+			}
+			if leases != 1 || balance != 9 {
+				t.Fatalf("leases=%d RPM balance=%v; want one lease and one debit", leases, balance)
+			}
+		})
 	}
 }
 

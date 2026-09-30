@@ -8,6 +8,7 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
+	"github.com/rislanov/vllm-priority-gateway/internal/registry"
 )
 
 func (s *Service) acquireForwardAdmission(ctx context.Context, request ForwardRequest, resolved *resolvedForwardRequest, lifecycle *forwardLifecycle, poolRuntime domain.PoolRuntime) (func(*coordination.TokenUsage), *APIError) {
@@ -40,13 +41,14 @@ func (s *Service) acquireForwardAdmission(ctx context.Context, request ForwardRe
 		if authErr != nil {
 			return nil, authErr
 		}
-		decision, err = s.admission.Acquire(ctx, coordination.AdmissionRequest{
+		decision, err = s.acquireConfiguredAdmission(ctx, request.APIKey, coordination.AdmissionRequest{
 			LeaseID: uuid.New(), OperationStartedAt: s.now().UTC(), RequestID: request.RequestID,
 			ReplicaID: s.replicaID, ConfigurationRevision: resolved.snapshot.Revision, APIKeyID: key.ID,
 			ClientID: client.ID, PoolID: resolved.pool.ID, ClientPolicyRevision: client.Revision,
 			EffectiveClientLimit: limit, ConfiguredClientLimit: client.MaxConcurrency,
 			PoolGatewayInflightLimit: resolved.pool.MaxGatewayInflight,
-			RequestsPerMinute:        client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute, LeaseTTL: s.leaseTTL,
+			PoolHighPriorityReserve:  resolved.pool.HighPriorityReserve, PriorityClass: client.PriorityClass,
+			RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute, LeaseTTL: s.leaseTTL,
 		})
 		if decision.Reason != coordination.ReasonStaleConfiguration || attempt > 0 {
 			break
@@ -114,6 +116,32 @@ func (s *Service) acquireForwardAdmission(ctx context.Context, request ForwardRe
 		}
 		_, _ = s.admission.Complete(context.WithoutCancel(ctx), []coordination.LeaseCompletion{{Lease: decision.Lease.Identity(), Usage: usage}})
 	}, nil
+}
+
+func (s *Service) acquireConfiguredAdmission(ctx context.Context, rawKey string, req coordination.AdmissionRequest) (decision coordination.AdmissionDecision, err error) {
+	acquire := func(current *registry.Snapshot) {
+		client, key, authErr := s.validateAPIKeySnapshot(rawKey, current)
+		pool, exists := current.PoolsByID[req.PoolID]
+		if current.Revision != req.ConfigurationRevision || authErr != nil || key.ID != req.APIKeyID || client.ID != req.ClientID ||
+			client.PriorityClass != req.PriorityClass || client.Revision != req.ClientPolicyRevision || !exists || !pool.Enabled ||
+			!current.Access[req.ClientID][req.PoolID] || pool.MaxGatewayInflight != req.PoolGatewayInflightLimit || pool.HighPriorityReserve != req.PoolHighPriorityReserve {
+			decision = coordination.AdmissionDecision{Reason: coordination.ReasonStaleConfiguration}
+			return
+		}
+		decision, err = s.admission.Acquire(ctx, req)
+	}
+	if guarded, ok := s.registry.(interface {
+		WithSnapshot(func(*registry.Snapshot))
+	}); ok {
+		// Production Registry holds publication's read lock through allocation,
+		// so local admission cannot race a reserve update or a class demotion.
+		guarded.WithSnapshot(acquire)
+	} else {
+		// Snapshot-only providers are immutable fixtures; mutable production
+		// providers must implement the publication guard above.
+		acquire(s.registry.Snapshot())
+	}
+	return decision, err
 }
 
 func coordinationTokenUsage(usage *domain.TokenUsage) *coordination.TokenUsage {

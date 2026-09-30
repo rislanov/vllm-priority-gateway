@@ -47,6 +47,7 @@ All newly created or changed policies are bounded before persistence:
 |---|---:|---|
 | Client `MaxConcurrency` | 10,000 | client admission disabled (requests are rejected) |
 | Pool `MaxGatewayInflight` | 100,000 | unlimited pool gateway inflight |
+| Pool `HighPriorityReserve` | current finite `MaxGatewayInflight` | reserve disabled |
 | Client `RequestsPerMinute` | 10,000,000 | RPM disabled |
 | Client `TokensPerMinute` | 10,000,000,000,000 | soft TPM disabled |
 
@@ -59,6 +60,21 @@ Use PostgreSQL 16 or newer. Give the migration identity schema ownership and mig
 Startup applies embedded, forward-only migrations under the PostgreSQL migration driver's advisory lock. `ErrNoChange` is success. A dirty migration, lock failure, unsupported server, or schema newer than the binary prevents the listener from binding. Production never runs `Down` automatically.
 
 Configuration writes commit with `synchronous_commit=on`, increment one global revision, and notify `llmgw_config_changed`. Notifications are hints: each replica also polls with jitter and checks immediately after reconnect. Older snapshots are discarded. Admission compares the request's snapshot revision and API-key identity with PostgreSQL; a stale result forces one synchronous full reauthentication, authorization, policy-resolution, and admission retry.
+
+### Priority reserve upgrade
+
+Migration 5 adds `model_pools.high_priority_reserve` (default `0`) and the admission class on each `request_leases` row. Under the existing pool admission lock, one aggregate counts all unexpired leases and the Normal/Background subset using the same database timestamp. The authenticated class and reserve are checked against the locked database policy before allocation. Completion deletes the original lease; expiration releases capacity logically even before maintenance deletes rows. Existing leases without historical class information are conservatively backfilled as Normal.
+
+This feature changes the coordination contract from version 2 to version 3. It requires a coordinated restart even when the reserve is initially zero:
+
+1. Stop new inference admission at the load balancer on every replica and drain active requests.
+2. Stop all version 2 processes. Apply migration 5 with the migration identity.
+3. Allow old heartbeat/lease records to expire if an unclean shutdown left them active. Start only version 3 replicas with matching policy fingerprints.
+4. Verify `/coordination-readyz`, compatible replica count and fresh configuration, then enable the reserve and restore traffic.
+
+Do not enable the reserve while older binaries are serving: they do not enforce the low-priority subset limit. To roll back, first set every reserve to zero, stop admission, drain and stop all replicas, then apply migration down with the migration identity and restart compatible older binaries. The down migration refuses a nonzero reserve. Production does not perform this rollback automatically.
+
+While PostgreSQL is unavailable, Normal/Background fail closed and High/Critical may use their configured **per-replica** emergency caps, additionally bounded by client concurrency. A zero emergency cap disables that class. With N replicas, the bound on newly admitted emergency requests is N × class cap, in addition to coordinated requests already running. Emergency work is not a distributed admission lease; neither the global reserve nor the global pool inflight ceiling is guaranteed during the outage or while emergency work overlaps recovery. The normal reserve applies again to new coordinated admission after all recovery barriers succeed.
 
 Back up configuration and analytics with ordinary PostgreSQL physical or logical tooling appropriate to the selected recovery objectives. Test restoration, migration status, key revocations, and coordination-table cleanup in an isolated environment.
 

@@ -263,13 +263,17 @@ func poolInput(request *http.Request) (httpapi.PoolInput, error) {
 	if err != nil {
 		return httpapi.PoolInput{}, err
 	}
+	reserve, err := optionalFormInt(request.Form.Get("high_priority_reserve"), "high priority reserve")
+	if err != nil {
+		return httpapi.PoolInput{}, err
+	}
 	maxWaiting, err := optionalFormInt(request.Form.Get("max_waiting"), "max waiting")
 	if err != nil {
 		return httpapi.PoolInput{}, err
 	}
 	return httpapi.PoolInput{
 		PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"),
-		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, MaxWaiting: maxWaiting,
+		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, HighPriorityReserve: reserve, MaxWaiting: maxWaiting,
 	}, nil
 }
 

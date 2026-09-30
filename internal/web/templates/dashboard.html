@@ -11,8 +11,8 @@
 </section>
 <section>
   <h2>Pools</h2>
-  <div class="table-wrap"><table><thead><tr><th>Pool</th><th>State</th><th>Pressure</th><th>Gateway inflight</th><th>Waiting</th><th>Available</th><th>Max gateway inflight</th><th>Max waiting</th></tr></thead><tbody>
-  {{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong><small>{{.UpstreamModelName}}</small></td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.BestBackendPressure}}</td><td class="mono">{{.Runtime.GatewayInflight}}</td><td class="mono">{{requestCount .Runtime.TotalWaiting}}</td><td class="mono">{{.Runtime.AvailableBackends}}</td><td class="mono">{{.MaxGatewayInflight}}</td><td class="mono">{{.MaxWaiting}}</td></tr>{{else}}<tr><td colspan="8" class="empty">No model pools configured.</td></tr>{{end}}
+  <div class="table-wrap"><table><thead><tr><th>Pool</th><th>State</th><th>Pressure</th><th>Gateway inflight</th><th>Waiting</th><th>Available</th><th>Max gateway inflight</th><th>High/Critical reserve</th><th>Max waiting</th></tr></thead><tbody>
+  {{range .View.Pools}}<tr><td><strong>{{.PublicModelName}}</strong><small>{{.UpstreamModelName}}</small></td><td class="{{stateClass .Runtime.State}}">{{.Runtime.State}}</td><td class="mono pressure">{{decimal .Runtime.BestBackendPressure}}</td><td class="mono">{{.Runtime.GatewayInflight}}</td><td class="mono">{{requestCount .Runtime.TotalWaiting}}</td><td class="mono">{{.Runtime.AvailableBackends}}</td><td class="mono">{{.MaxGatewayInflight}}</td><td class="mono">{{.HighPriorityReserve}}</td><td class="mono">{{.MaxWaiting}}</td></tr>{{else}}<tr><td colspan="9" class="empty">No model pools configured.</td></tr>{{end}}
   </tbody></table></div>
 </section>
 <section>

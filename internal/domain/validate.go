@@ -79,6 +79,9 @@ func (p *ModelPool) validatePolicy(previous *ModelPool) error {
 	if p.MaxGatewayInflight > MaxPoolGatewayInflight && (previous == nil || p.MaxGatewayInflight != previous.MaxGatewayInflight) {
 		return fmt.Errorf("max gateway inflight must not exceed %d", MaxPoolGatewayInflight)
 	}
+	if p.HighPriorityReserve < 0 || (p.HighPriorityReserve > 0 && (p.MaxGatewayInflight <= 0 || p.HighPriorityReserve > p.MaxGatewayInflight)) {
+		return errors.New("high priority reserve must be non-negative and fit a positive max gateway inflight limit")
+	}
 	if p.MaxWaiting < 0 {
 		return errors.New("max waiting cannot be negative")
 	}

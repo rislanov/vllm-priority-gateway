@@ -22,8 +22,9 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
-	"github.com/rislanov/vllm-priority-gateway/internal/admission"
 	"github.com/rislanov/vllm-priority-gateway/internal/apikey"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination/local"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/fakevllm"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
@@ -60,6 +61,7 @@ type harness struct {
 	fakes        []*fakevllm.Server
 	upstreams    []*httptest.Server
 	keyUsage     *apikey.UsageRecorder
+	leases       *coordination.LeaseManager
 }
 
 type harnessOptions struct {
@@ -105,8 +107,11 @@ func newHarness(t *testing.T, settings ...harnessOptions) *harness {
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+	coordinator := local.NewAdmissionCoordinator(time.Now)
+	leases := coordination.NewLeaseManager(ctx, coordinator, coordination.LeaseManagerOptions{RenewInterval: 250 * time.Millisecond})
 	manager := monitor.NewManager(ctx, monitor.Options{
-		HTTPClient: client, HealthInterval: 15 * time.Millisecond, HealthTimeout: 100 * time.Millisecond,
+		AdmissionRuntime: coordinator,
+		HTTPClient:       client, HealthInterval: 15 * time.Millisecond, HealthTimeout: 100 * time.Millisecond,
 		MetricsInterval: 15 * time.Millisecond, MetricsTimeout: 100 * time.Millisecond, StaleAfter: 150 * time.Millisecond,
 		UnhealthyAfter: 3, RecoveryAfter: 2,
 		Limits: pressure.Limits{QueueSoft: 2, KVSoft: .8, KVHard: .95}, EWMAWindow: 10 * time.Millisecond,
@@ -125,7 +130,7 @@ func newHarness(t *testing.T, settings ...harnessOptions) *harness {
 		usage = keyUsage
 	}
 	service := gateway.New(gateway.Dependencies{
-		Registry: registryValue, HMACSecret: hmacSecret, Limiter: admission.NewLimiter(), Runtime: manager,
+		Registry: registryValue, HMACSecret: hmacSecret, Admission: coordinator, Leases: leases, LeaseTTL: 2 * time.Second, Runtime: manager,
 		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: proxy.New(client), Observer: metrics,
 		Usage: usage, LookupEnv: os.LookupEnv,
 	})
@@ -164,7 +169,7 @@ func newHarness(t *testing.T, settings ...harnessOptions) *harness {
 	h := &harness{
 		t: t, ctx: ctx, cancel: cancel, database: database, databasePath: databasePath,
 		registry: registryValue, manager: manager, metrics: metrics, server: server,
-		client: &http.Client{Transport: client.Transport, Jar: jar, Timeout: 3 * time.Second}, keyUsage: keyUsage,
+		client: &http.Client{Transport: client.Transport, Jar: jar, Timeout: 3 * time.Second}, keyUsage: keyUsage, leases: leases,
 	}
 	h.bootstrapCSRF()
 	t.Cleanup(h.close)
@@ -176,6 +181,7 @@ func (h *harness) close() {
 	if h.keyUsage != nil {
 		h.keyUsage.Close()
 	}
+	_ = h.leases.Close()
 	h.cancel()
 	h.manager.Shutdown()
 	for _, upstream := range h.upstreams {

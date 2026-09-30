@@ -22,6 +22,7 @@ type Reason string
 
 const (
 	ReasonConcurrencyExhausted    Reason = "concurrency_exhausted"
+	ReasonPoolPriorityReserve     Reason = "pool_priority_reserve"
 	ReasonRPMExhausted            Reason = "rpm_exhausted"
 	ReasonTPMExhausted            Reason = "tpm_exhausted"
 	ReasonStaleConfiguration      Reason = "stale_configuration"
@@ -56,6 +57,8 @@ type AdmissionRequest struct {
 	EffectiveClientLimit     int
 	ConfiguredClientLimit    int
 	PoolGatewayInflightLimit int
+	PoolHighPriorityReserve  int
+	PriorityClass            domain.PriorityClass
 	RequestsPerMinute        int64
 	TokensPerMinute          int64
 	LeaseTTL                 time.Duration

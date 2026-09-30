@@ -357,6 +357,11 @@ func TestPostgresGatewayOutageEmergencyReplayAndRecoveryBarriers(t *testing.T) {
 	upstream := httptest.NewServer(fake.Handler())
 	t.Cleanup(upstream.Close)
 	fixture := preparePostgresHTTPFixture(t, store, upstream.URL, 8)
+	if _, err := store.UpdatePool(context.Background(), fixture.pool.ID, basestore.UpdatePoolParams{PublicModelName: fixture.pool.PublicModelName, UpstreamModelName: fixture.pool.UpstreamModelName, Enabled: true, MaxGatewayInflight: 8, HighPriorityReserve: 2}); err != nil {
+		t.Fatal(err)
+	}
+	fixture = refreshFixture(t, store, fixture)
+
 	options := circuitbreaker.Options{FailureThreshold: 5, FailureWindow: time.Minute, OpenCooldown: time.Second, HalfOpenMaxProbes: 1}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

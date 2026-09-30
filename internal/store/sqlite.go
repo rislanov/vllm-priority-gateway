@@ -27,6 +27,7 @@ var migrations = []struct {
 	{version: 2, path: "migrations/002_pool_safety.sql"},
 	{version: 3, path: "migrations/003_usage_analytics.sql"},
 	{version: 4, path: "migrations/004_postgresql_compatibility.sql"},
+	{version: 5, path: "migrations/005_priority_capacity_reserve.sql"},
 }
 
 const sqlitePragmas = "?_pragma=journal_mode%28WAL%29&_pragma=foreign_keys%281%29&_pragma=busy_timeout%285000%29"

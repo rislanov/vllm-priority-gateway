@@ -14,7 +14,7 @@ var ErrPoolHasBackends = errors.New("model pool cannot be deleted while backends
 func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domain.ModelPool, error) {
 	pool := domain.ModelPool{
 		PublicModelName: params.PublicModelName, UpstreamModelName: params.UpstreamModelName,
-		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, MaxWaiting: params.MaxWaiting,
+		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, HighPriorityReserve: params.HighPriorityReserve, MaxWaiting: params.MaxWaiting,
 		Revision: 1,
 	}
 	if err := pool.Validate(); err != nil {
@@ -28,9 +28,9 @@ func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domai
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, revision, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, pool.Revision, timestamp(now), timestamp(now),
+		INSERT INTO model_pools (public_model_name, upstream_model_name, enabled, max_gateway_inflight, high_priority_reserve, max_waiting, revision, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.HighPriorityReserve, pool.MaxWaiting, pool.Revision, timestamp(now), timestamp(now),
 	)
 	if err != nil {
 		return domain.ModelPool{}, fmt.Errorf("insert model pool: %w", err)
@@ -51,7 +51,7 @@ func (s *SQLite) CreatePool(ctx context.Context, params CreatePoolParams) (domai
 func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolParams) (domain.ModelPool, error) {
 	pool := domain.ModelPool{
 		ID: id, PublicModelName: params.PublicModelName, UpstreamModelName: params.UpstreamModelName,
-		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, MaxWaiting: params.MaxWaiting,
+		Enabled: params.Enabled, MaxGatewayInflight: params.MaxGatewayInflight, HighPriorityReserve: params.HighPriorityReserve, MaxWaiting: params.MaxWaiting,
 	}
 	tx, err := s.begin(ctx)
 	if err != nil {
@@ -68,8 +68,8 @@ func (s *SQLite) UpdatePool(ctx context.Context, id int64, params UpdatePoolPara
 	pool.UpdatedAt = s.now().UTC()
 	var created string
 	err = tx.QueryRowContext(ctx, `
-		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, max_waiting = ?, revision = revision + 1, updated_at = ?
-		WHERE id = ? RETURNING revision, created_at`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.MaxWaiting, timestamp(pool.UpdatedAt), id).Scan(&pool.Revision, &created)
+		UPDATE model_pools SET public_model_name = ?, upstream_model_name = ?, enabled = ?, max_gateway_inflight = ?, high_priority_reserve = ?, max_waiting = ?, revision = revision + 1, updated_at = ?
+		WHERE id = ? RETURNING revision, created_at`, pool.PublicModelName, pool.UpstreamModelName, boolInt(pool.Enabled), pool.MaxGatewayInflight, pool.HighPriorityReserve, pool.MaxWaiting, timestamp(pool.UpdatedAt), id).Scan(&pool.Revision, &created)
 	if err != nil {
 		return domain.ModelPool{}, fmt.Errorf("update model pool: %w", err)
 	}
@@ -118,7 +118,7 @@ func (s *SQLite) DeletePool(ctx context.Context, id int64) error {
 
 func (s *SQLite) ListPools(ctx context.Context) ([]domain.ModelPool, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, revision, public_model_name, upstream_model_name, enabled, max_gateway_inflight, max_waiting, created_at, updated_at
+		SELECT id, revision, public_model_name, upstream_model_name, enabled, max_gateway_inflight, high_priority_reserve, max_waiting, created_at, updated_at
 		FROM model_pools ORDER BY public_model_name`)
 	if err != nil {
 		return nil, fmt.Errorf("list model pools: %w", err)
@@ -142,7 +142,7 @@ func scanPool(row scanner) (domain.ModelPool, error) {
 	var pool domain.ModelPool
 	var enabled int
 	var created, updated string
-	if err := row.Scan(&pool.ID, &pool.Revision, &pool.PublicModelName, &pool.UpstreamModelName, &enabled, &pool.MaxGatewayInflight, &pool.MaxWaiting, &created, &updated); err != nil {
+	if err := row.Scan(&pool.ID, &pool.Revision, &pool.PublicModelName, &pool.UpstreamModelName, &enabled, &pool.MaxGatewayInflight, &pool.HighPriorityReserve, &pool.MaxWaiting, &created, &updated); err != nil {
 		return domain.ModelPool{}, fmt.Errorf("scan model pool: %w", err)
 	}
 	pool.Enabled = enabled != 0

@@ -1,9 +1,10 @@
 # Real-vLLM E2E Test
 
-This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has exactly three modes:
+This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has four modes:
 
 - `smoke` is safe for a production verification window. It checks management and inference readiness separately, Admin pool/backend counts, healthy and metrics-fresh backends, model visibility, the authenticated `/v1/load` contract, one complete short stream, and required Prometheus families including all five circuit/pool gauges.
 - `priority` intentionally saturates inference capacity. It observes non-zero gateway in-flight and upstream waiting work, requires `/v1/load` to report `loaded` consistently with the pool-state and capacity gauges, proves background shedding and High/Critical priority continuity, then temporarily sets a pool-wide in-flight limit and proves that even Critical receives the bounded `429 gateway_overloaded`. It restores the limit, proves Critical streaming continuity again, and checks `medium` and `free` during hysteretic recovery.
+- `reserve` checks pool admission reserve with real streams: L=20 and R=6, 0, and 20, Normal/Background subset, High/Critical capacity, total-cap refusal, cancellation, live reserve activation, metrics reasons and policy restoration. An optional second gateway URL exercises shared PostgreSQL capacity. Use an isolated pool and distinct clients with sufficient concurrency.
 - `resilience` is destructive and isolated. It places a loopback fault proxy in front of one real backend, drains its siblings, proves inference-only `503` failures open the circuit while health/metrics remain fresh, requires `/v1/load` and Prometheus to report unavailable capacity, then observes half-open streaming recovery and closure. Run it only against a gateway on the same host and with no production traffic.
 
 The test is opt-in. Ordinary `go test ./...` compiles it and reports it as skipped unless `LLMGW_E2E_MODE` is set.
@@ -281,3 +282,30 @@ Copy the binary to an operator host and run it with the same environment variabl
 ## PostgreSQL multi-replica extension
 
 The real-vLLM modes above validate inference behavior but do not establish distributed database correctness. Before a PostgreSQL rollout, also run `make test-postgres`, the PgBouncer target when applicable, and two gateway replicas against the same dedicated database. Verify aggregate client/pool limits, RPM/soft-TPM behavior, global half-open capacity, config propagation, outage emergency caps, recovery replay, and `/coordination-readyz`. HA acceptance must use the actual synchronous-replication/promotion topology and prove retained acknowledged coordination and revocation records with the former primary fenced. Follow [PostgreSQL production profile](postgresql-production.md); never run destructive database tests against the production database.
+
+
+## Pool priority reserve with real vLLM
+
+Run `reserve` only in an isolated test deployment without unrelated requests. Use distinct Normal and Background clients with concurrency at least 20, and distinct High/Critical clients with concurrency at least 20; RPM/TPM must leave headroom. The test temporarily sets the selected pool's total limit to 20, waiting limit to zero, and reserve to 6, 0 and 20, then restores all original pool fields including `highPriorityReserve`. It does not change client classes or vLLM configuration.
+
+For this admission-isolation phase, launch the test gateway with `LLMGW_OVERLOAD_ENTER_WINDOW=5m` and `LLMGW_RESPONSE_HEADER_TIMEOUT=3m`. The longer entry window keeps pressure shedding from masking the reserve boundary during the short burst; it is not a production tuning recommendation. Run the separate `priority` mode with the normal entry window to verify pressure shedding and hysteresis. Two real vLLM workers with `max-num-seqs=1`, model length 1024 and support for `ignore_eos` suffice. Held requests generate up to 900 tokens.
+
+```bash
+export LLMGW_E2E_MODE=reserve
+export LLMGW_E2E_GATEWAY_URL='http://127.0.0.1:8080'
+export LLMGW_E2E_ADMIN_USERNAME='operator'
+export LLMGW_E2E_ADMIN_PASSWORD='read-from-the-secret-store'
+export LLMGW_E2E_MODEL='qwen'
+export LLMGW_E2E_NORMAL_KEY="$NORMAL_KEY"
+export LLMGW_E2E_LOW_KEYS="$BACKGROUND_KEY"
+export LLMGW_E2E_HIGH_KEY="$HIGH_KEY"
+export LLMGW_E2E_CRITICAL_KEY="$CRITICAL_KEY"
+export LLMGW_E2E_PROBE_TIMEOUT=90s
+# PostgreSQL only: a second gateway sharing the same dedicated database.
+# export LLMGW_E2E_PEER_GATEWAY_URL='http://127.0.0.1:8081'
+go test ./tests/e2e -run TestPriorityCapacityReserveWithRealVLLM -count=1 -v -timeout=10m
+```
+
+The test alternates requests across both gateways when a peer URL is set and requires each gateway's pool projection to report the same global counts. At R=6 it holds seven Normal and seven Background leases, checks the exact reserve rejection counter on each gateway, fills six slots with High/Critical, and checks the total rejection. Cancelling a protected lease does not grant lower capacity; cancelling a lower lease permits its replacement. One reserved High and one reserved Critical 900-token stream then finish on real vLLM with HTTP 200 and `[DONE]`. R=0 admits twenty lower leases; enabling R=6 with that work active blocks new lower admission until capacity is released, and six High/Critical requests fill the released slots. R=20 rejects all lower classes even while the pool is empty. Every phase cancels/drains outstanding requests and checks the global count returns to zero. Short complete High/Critical streams additionally check post-load continuity.
+
+The existing priority/pool-safety and resilience helpers preserve the reserve during normal updates and cleanup. Their temporary total-limit isolation explicitly sets reserve to zero, since a positive reserve cannot coexist with an unlimited total or a smaller total limit. Cleanup restores the exact captured reserve.

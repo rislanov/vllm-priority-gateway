@@ -812,6 +812,7 @@ func TestServiceLoadStatusReportsUnavailableWhenNoBackendCanServeRequests(t *tes
 
 type poolServiceOptions struct {
 	maximum                   int
+	reserve                   int
 	maxWaiting                int
 	totalWaiting              float64
 	priority                  domain.PriorityClass
@@ -842,7 +843,7 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: priority, MaxConcurrency: maximum}
 	pool := domain.ModelPool{
 		ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true,
-		MaxGatewayInflight: options.maximum, MaxWaiting: options.maxWaiting,
+		MaxGatewayInflight: options.maximum, HighPriorityReserve: options.reserve, MaxWaiting: options.maxWaiting,
 	}
 	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
 	backends := options.backends

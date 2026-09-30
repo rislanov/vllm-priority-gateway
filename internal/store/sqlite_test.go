@@ -52,8 +52,8 @@ func TestSQLiteMigratesAndReopens(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("first Close() error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 4 {
-		t.Fatalf("fresh database user_version = %d, want 4", got)
+	if got := sqliteUserVersion(t, path); got != 5 {
+		t.Fatalf("fresh database user_version = %d, want 5", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -141,14 +141,14 @@ func TestSQLiteMigratesVersionOnePoolSafetyDefaults(t *testing.T) {
 	if pool.PublicModelName != "legacy-public" || pool.UpstreamModelName != "legacy-upstream" {
 		t.Fatalf("migrated pool = %+v", pool)
 	}
-	if pool.MaxGatewayInflight != 0 || pool.MaxWaiting != 0 {
+	if pool.MaxGatewayInflight != 0 || pool.MaxWaiting != 0 || pool.HighPriorityReserve != 0 {
 		t.Fatalf("migrated safety limits = (%d, %d), want (0, 0)", pool.MaxGatewayInflight, pool.MaxWaiting)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() migrated database error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 4 {
-		t.Fatalf("migrated user_version = %d, want 4", got)
+	if got := sqliteUserVersion(t, path); got != 5 {
+		t.Fatalf("migrated user_version = %d, want 5", got)
 	}
 
 	db, err = store.Open(context.Background(), path)
@@ -261,7 +261,7 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 		);
 		CREATE TABLE future_schema_marker (value TEXT NOT NULL);
 		INSERT INTO future_schema_marker (value) VALUES ('preserve-me');
-		PRAGMA user_version = 5;`); err != nil {
+		PRAGMA user_version = 6;`); err != nil {
 		futureDB.Close()
 		t.Fatalf("prepare future database: %v", err)
 	}
@@ -271,8 +271,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 
 	if opened, err := store.Open(context.Background(), path); err == nil {
 		opened.Close()
-		t.Fatal("Open() succeeded for future schema version 5")
-	} else if !strings.Contains(err.Error(), "SQLite schema version 5 is newer than supported version 4") {
+		t.Fatal("Open() succeeded for future schema version 6")
+	} else if !strings.Contains(err.Error(), "SQLite schema version 6 is newer than supported version 5") {
 		t.Fatalf("Open() error = %v, want future schema rejection", err)
 	}
 
@@ -286,8 +286,8 @@ func TestSQLiteRejectsFutureVersionWithoutChangingDatabase(t *testing.T) {
 	if err := inspectDB.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("read rejected user_version: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("rejected user_version = %d, want 5", version)
+	if version != 6 {
+		t.Fatalf("rejected user_version = %d, want 6", version)
 	}
 
 	var publicModelName, upstreamModelName, marker string
@@ -331,8 +331,8 @@ func TestSQLiteMigratesLegacyVersionZeroDatabaseWithExistingTables(t *testing.T)
 	if pools[0].MaxGatewayInflight != 0 || pools[0].MaxWaiting != 0 {
 		t.Fatalf("legacy safety limits = (%d, %d), want (0, 0)", pools[0].MaxGatewayInflight, pools[0].MaxWaiting)
 	}
-	if got := sqliteUserVersion(t, path); got != 4 {
-		t.Fatalf("legacy user_version = %d, want 4", got)
+	if got := sqliteUserVersion(t, path); got != 5 {
+		t.Fatalf("legacy user_version = %d, want 5", got)
 	}
 }
 
@@ -382,8 +382,8 @@ func TestSQLiteMigratesPreVersionedUsageAnalyticsDatabase(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() migrated analytics database error = %v", err)
 	}
-	if got := sqliteUserVersion(t, path); got != 4 {
-		t.Fatalf("migrated analytics user_version = %d, want 4", got)
+	if got := sqliteUserVersion(t, path); got != 5 {
+		t.Fatalf("migrated analytics user_version = %d, want 5", got)
 	}
 
 	upgraded, err := sql.Open("sqlite", path)

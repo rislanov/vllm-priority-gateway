@@ -33,6 +33,7 @@ const (
 	modeSmoke      e2eMode = "smoke"
 	modePriority   e2eMode = "priority"
 	modeResilience e2eMode = "resilience"
+	modeReserve    e2eMode = "reserve"
 )
 
 type e2eConfig struct {
@@ -44,6 +45,8 @@ type e2eConfig struct {
 	highLoadKeys        []string
 	criticalKey         string
 	lowKeys             []string
+	normalKey           string
+	peerURL             *url.URL
 	expectedBackends    int
 	highRequestsPerKey  int
 	highMaxTokens       int
@@ -60,10 +63,10 @@ func loadE2EConfig(t *testing.T, required e2eMode) e2eConfig {
 	t.Helper()
 	mode := e2eMode(strings.TrimSpace(os.Getenv("LLMGW_E2E_MODE")))
 	if mode == "" {
-		t.Skip("set LLMGW_E2E_MODE=smoke, priority, or resilience to run external gateway checks")
+		t.Skip("set LLMGW_E2E_MODE=smoke, priority, resilience, or reserve to run external gateway checks")
 	}
-	if mode != modeSmoke && mode != modePriority && mode != modeResilience {
-		t.Fatalf("LLMGW_E2E_MODE = %q, want smoke, priority, or resilience", mode)
+	if mode != modeSmoke && mode != modePriority && mode != modeResilience && mode != modeReserve {
+		t.Fatalf("LLMGW_E2E_MODE = %q, want smoke, priority, resilience, or reserve", mode)
 	}
 	if required != modeSmoke && mode != required {
 		t.Skipf("set LLMGW_E2E_MODE=%s to run this external scenario", required)
@@ -77,8 +80,8 @@ func loadE2EConfig(t *testing.T, required e2eMode) e2eConfig {
 
 func parseE2EConfig(lookup func(string) (string, bool), mode e2eMode) (e2eConfig, error) {
 	configuredMode := e2eMode(strings.TrimSpace(lookupValue(lookup, "LLMGW_E2E_MODE")))
-	if configuredMode != mode || (mode != modeSmoke && mode != modePriority && mode != modeResilience) {
-		return e2eConfig{}, fmt.Errorf("LLMGW_E2E_MODE must be exactly smoke, priority, or resilience")
+	if configuredMode != mode || (mode != modeSmoke && mode != modePriority && mode != modeResilience && mode != modeReserve) {
+		return e2eConfig{}, fmt.Errorf("LLMGW_E2E_MODE must be exactly smoke, priority, resilience, or reserve")
 	}
 	baseURLValue, err := requiredLookup(lookup, "LLMGW_E2E_GATEWAY_URL")
 	if err != nil {
@@ -190,6 +193,30 @@ func parseE2EConfig(lookup func(string) (string, bool), mode e2eMode) (e2eConfig
 		}
 		if cfg.circuitFailureCount, err = positiveIntLookup(lookup, "LLMGW_E2E_CIRCUIT_FAILURE_COUNT", 5); err != nil {
 			return e2eConfig{}, err
+		}
+	}
+	if mode == modeReserve {
+		if cfg.normalKey, err = requiredLookup(lookup, "LLMGW_E2E_NORMAL_KEY"); err != nil {
+			return e2eConfig{}, err
+		}
+		if cfg.criticalKey, err = requiredLookup(lookup, "LLMGW_E2E_CRITICAL_KEY"); err != nil {
+			return e2eConfig{}, err
+		}
+		if cfg.lowKeys, err = listLookup(lookup, "LLMGW_E2E_LOW_KEYS", 1); err != nil {
+			return e2eConfig{}, err
+		}
+		keys := []namedClientKey{{name: "normal", value: cfg.normalKey}, {name: "high", value: cfg.highKey}, {name: "critical", value: cfg.criticalKey}}
+		for i, key := range cfg.lowKeys {
+			keys = append(keys, namedClientKey{name: fmt.Sprintf("background[%d]", i), value: key})
+		}
+		if first, second, duplicate := findDuplicateClientKey(keys); duplicate {
+			return e2eConfig{}, fmt.Errorf("%s and %s must use distinct client keys", first, second)
+		}
+		if peer := lookupValue(lookup, "LLMGW_E2E_PEER_GATEWAY_URL"); peer != "" {
+			cfg.peerURL, err = url.Parse(peer)
+			if err != nil || (cfg.peerURL.Scheme != "http" && cfg.peerURL.Scheme != "https") || cfg.peerURL.Host == "" || cfg.peerURL.User != nil || cfg.peerURL.RawQuery != "" || cfg.peerURL.Fragment != "" {
+				return e2eConfig{}, fmt.Errorf("LLMGW_E2E_PEER_GATEWAY_URL must be an absolute HTTP(S) URL without credentials, query or fragment")
+			}
 		}
 	}
 	return cfg, nil
@@ -414,13 +441,14 @@ type adminStatus struct {
 }
 
 type adminPool struct {
-	ID                 int64       `json:"id"`
-	PublicModelName    string      `json:"publicModelName"`
-	UpstreamModelName  string      `json:"upstreamModelName"`
-	Enabled            bool        `json:"enabled"`
-	MaxGatewayInflight int         `json:"maxGatewayInflight"`
-	MaxWaiting         int         `json:"maxWaiting"`
-	Runtime            poolRuntime `json:"runtime"`
+	ID                  int64       `json:"id"`
+	PublicModelName     string      `json:"publicModelName"`
+	UpstreamModelName   string      `json:"upstreamModelName"`
+	Enabled             bool        `json:"enabled"`
+	MaxGatewayInflight  int         `json:"maxGatewayInflight"`
+	HighPriorityReserve int         `json:"highPriorityReserve"`
+	MaxWaiting          int         `json:"maxWaiting"`
+	Runtime             poolRuntime `json:"runtime"`
 }
 
 type poolRuntime struct {
@@ -1043,6 +1071,7 @@ func isClosedCircuitBaseline(backend adminBackend, baseURL string) bool {
 
 func isolatePoolGatewayInflight(pool adminPool, maximum int) adminPool {
 	pool.MaxGatewayInflight = maximum
+	pool.HighPriorityReserve = 0
 	pool.MaxWaiting = 0
 	return pool
 }
@@ -1055,7 +1084,7 @@ func preparePoolForPriorityLoad(pool adminPool) adminPool {
 func samePoolConfiguration(left, right adminPool) bool {
 	return left.ID == right.ID && left.PublicModelName == right.PublicModelName &&
 		left.UpstreamModelName == right.UpstreamModelName && left.Enabled == right.Enabled &&
-		left.MaxGatewayInflight == right.MaxGatewayInflight && left.MaxWaiting == right.MaxWaiting
+		left.MaxGatewayInflight == right.MaxGatewayInflight && left.HighPriorityReserve == right.HighPriorityReserve && left.MaxWaiting == right.MaxWaiting
 }
 
 func (result requestResult) requireCompleteStream(t *testing.T) {
@@ -1219,11 +1248,12 @@ func (h *remoteHarness) adminMutation(path string) {
 }
 
 type poolUpdateInput struct {
-	PublicModelName    string `json:"publicModelName"`
-	UpstreamModelName  string `json:"upstreamModelName"`
-	Enabled            bool   `json:"enabled"`
-	MaxGatewayInflight int    `json:"maxGatewayInflight"`
-	MaxWaiting         int    `json:"maxWaiting"`
+	PublicModelName     string `json:"publicModelName"`
+	UpstreamModelName   string `json:"upstreamModelName"`
+	Enabled             bool   `json:"enabled"`
+	MaxGatewayInflight  int    `json:"maxGatewayInflight"`
+	HighPriorityReserve int    `json:"highPriorityReserve"`
+	MaxWaiting          int    `json:"maxWaiting"`
 }
 
 type backendUpdateInput struct {
@@ -1240,7 +1270,7 @@ type backendUpdateInput struct {
 func (h *remoteHarness) updatePool(ctx context.Context, pool adminPool) (adminPool, error) {
 	input := poolUpdateInput{
 		PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName, Enabled: pool.Enabled,
-		MaxGatewayInflight: pool.MaxGatewayInflight, MaxWaiting: pool.MaxWaiting,
+		MaxGatewayInflight: pool.MaxGatewayInflight, HighPriorityReserve: pool.HighPriorityReserve, MaxWaiting: pool.MaxWaiting,
 	}
 	var output adminPool
 	if err := h.adminPUT(ctx, "/admin/api/pools/"+strconv.FormatInt(pool.ID, 10), input, &output); err != nil {
