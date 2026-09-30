@@ -159,7 +159,7 @@ func replaceAccess(ctx context.Context, tx pgx.Tx, clientID int64, poolIDs []int
 }
 
 func (s *Store) CreatePool(ctx context.Context, p basestore.CreatePoolParams) (domain.ModelPool, error) {
-	v := domain.ModelPool{PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, MaxWaiting: p.MaxWaiting, Revision: 1}
+	v := domain.ModelPool{PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, HighPriorityReserve: p.HighPriorityReserve, MaxWaiting: p.MaxWaiting, Revision: 1}
 	if err := v.Validate(); err != nil {
 		return v, err
 	}
@@ -167,7 +167,7 @@ func (s *Store) CreatePool(ctx context.Context, p basestore.CreatePoolParams) (d
 	v.CreatedAt = now
 	v.UpdatedAt = now
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `INSERT INTO model_pools(public_model_name,upstream_model_name,enabled,max_gateway_inflight,max_waiting,created_at,updated_at) VALUES($1::text,$2::text,$3::boolean,$4::integer,$5::integer,$6::timestamptz,$6::timestamptz) RETURNING id`, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.MaxWaiting, now).Scan(&v.ID); err != nil {
+		if err := tx.QueryRow(ctx, `INSERT INTO model_pools(public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at) VALUES($1::text,$2::text,$3::boolean,$4::integer,$5::integer,$6::integer,$7::timestamptz,$7::timestamptz) RETURNING id`, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, now).Scan(&v.ID); err != nil {
 			return fmt.Errorf("insert PostgreSQL model pool: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO pool_admission_scopes(pool_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now); err != nil {
@@ -179,7 +179,7 @@ func (s *Store) CreatePool(ctx context.Context, p basestore.CreatePoolParams) (d
 }
 
 func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePoolParams) (domain.ModelPool, error) {
-	v := domain.ModelPool{ID: id, PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, MaxWaiting: p.MaxWaiting}
+	v := domain.ModelPool{ID: id, PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, HighPriorityReserve: p.HighPriorityReserve, MaxWaiting: p.MaxWaiting}
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", id); err != nil {
 			return configurationOperationError("lock pool admission scope", err)
@@ -193,7 +193,7 @@ func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePool
 		}
 		v.Revision = old.Revision + 1
 		v.UpdatedAt = time.Now().UTC()
-		tag, err := tx.Exec(ctx, `UPDATE model_pools SET public_model_name=$2::text,upstream_model_name=$3::text,enabled=$4::boolean,max_gateway_inflight=$5::integer,max_waiting=$6::integer,revision=revision+1,updated_at=$7::timestamptz WHERE id=$1::bigint`, id, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.MaxWaiting, v.UpdatedAt)
+		tag, err := tx.Exec(ctx, `UPDATE model_pools SET public_model_name=$2::text,upstream_model_name=$3::text,enabled=$4::boolean,max_gateway_inflight=$5::integer,high_priority_reserve=$6::integer,max_waiting=$7::integer,revision=revision+1,updated_at=$8::timestamptz WHERE id=$1::bigint`, id, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, v.UpdatedAt)
 		if err != nil {
 			return fmt.Errorf("update PostgreSQL model pool: %w", err)
 		}
@@ -466,13 +466,13 @@ func pgKeys(ctx context.Context, q pgx.Tx) ([]domain.APIKey, error) {
 	})
 }
 func pgPools(ctx context.Context, q pgx.Tx) ([]domain.ModelPool, error) {
-	rows, err := q.Query(ctx, "SELECT id,revision,public_model_name,upstream_model_name,enabled,max_gateway_inflight,max_waiting,created_at,updated_at FROM model_pools ORDER BY id")
+	rows, err := q.Query(ctx, "SELECT id,revision,public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at FROM model_pools ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (v domain.ModelPool, err error) {
-		err = r.Scan(&v.ID, &v.Revision, &v.PublicModelName, &v.UpstreamModelName, &v.Enabled, &v.MaxGatewayInflight, &v.MaxWaiting, &v.CreatedAt, &v.UpdatedAt)
+		err = r.Scan(&v.ID, &v.Revision, &v.PublicModelName, &v.UpstreamModelName, &v.Enabled, &v.MaxGatewayInflight, &v.HighPriorityReserve, &v.MaxWaiting, &v.CreatedAt, &v.UpdatedAt)
 		return
 	})
 }

@@ -26,6 +26,8 @@ vLLM Priority Gateway — лёгкий слой policy, admission и routing п�
 
 Gateway объединяет server-side policy клиента с live health и Prometheus-метриками vLLM:
 
+Пул может резервировать admission-слоты для High/Critical до срабатывания pressure throttling. При `maxGatewayInflight=20` и `highPriorityReserve=6` Normal/Background совместно занимают не более 14 слотов. В PostgreSQL резерв действует глобально между репликами, в SQLite — внутри единственной реплики; по умолчанию резерв равен нулю. [Настройка и ограничения](docs/operations.md#reserved-admission-capacity), [обновление PostgreSQL-профиля](docs/postgresql-production.md#priority-reserve-upgrade).
+
 ```text
 production requests  ── high ────────┐
 interactive agents   ── normal ──────┼──► общая vLLM capacity

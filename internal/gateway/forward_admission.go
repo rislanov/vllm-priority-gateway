@@ -46,7 +46,8 @@ func (s *Service) acquireForwardAdmission(ctx context.Context, request ForwardRe
 			ClientID: client.ID, PoolID: resolved.pool.ID, ClientPolicyRevision: client.Revision,
 			EffectiveClientLimit: limit, ConfiguredClientLimit: client.MaxConcurrency,
 			PoolGatewayInflightLimit: resolved.pool.MaxGatewayInflight,
-			RequestsPerMinute:        client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute, LeaseTTL: s.leaseTTL,
+			PoolHighPriorityReserve:  resolved.pool.HighPriorityReserve, PriorityClass: client.PriorityClass,
+			RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute, LeaseTTL: s.leaseTTL,
 		})
 		if decision.Reason != coordination.ReasonStaleConfiguration || attempt > 0 {
 			break

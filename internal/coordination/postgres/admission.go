@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	pgstore "github.com/rislanov/vllm-priority-gateway/internal/store/postgres"
 )
 
@@ -156,11 +157,12 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	var revision, clientRevision int64
 	var keyClient int64
 	var clientEnabled, poolEnabled bool
-	var configuredClient, poolLimit int
+	var configuredClient, poolLimit, poolReserve int
+	var configuredClass domain.PriorityClass
 	var rpm, tpm int64
 	var keyExpires *time.Time
 	var now time.Time
-	var poolCount, clientCount int
+	var poolCount, lowerCount, clientCount int
 	var configurationMissing bool
 	// Send ordered statements together to avoid network waits while holding the
 	// shared pool scope. Locks and counts must remain separate SQL statements:
@@ -168,8 +170,8 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	checks := &pgx.Batch{}
 	checks.Queue("SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", r.PoolID)
 	checks.Queue("SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", r.ClientID)
-	checks.Queue(`SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).QueryRow(func(row pgx.Row) error {
-		err := row.Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit)
+	checks.Queue(`SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight,p.high_priority_reserve,c.priority_class FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).QueryRow(func(row pgx.Row) error {
+		err := row.Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit, &poolReserve, &configuredClass)
 		configurationMissing = errors.Is(err, pgx.ErrNoRows)
 		if configurationMissing {
 			return nil
@@ -185,9 +187,10 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	checks.Queue("SELECT client_id FROM coordination_rate_state WHERE client_id=$1::bigint ORDER BY rate_kind FOR UPDATE", r.ClientID)
 	checks.Queue(`WITH at AS MATERIALIZED (SELECT clock_timestamp() AS now)
 		SELECT at.now,
-		(SELECT count(*) FROM request_leases WHERE pool_id=$1::bigint AND expires_at>at.now),
-		(SELECT count(*) FROM request_leases WHERE client_id=$2::bigint AND expires_at>at.now) FROM at`, r.PoolID, r.ClientID).QueryRow(func(row pgx.Row) error {
-		return row.Scan(&now, &poolCount, &clientCount)
+		active.total,active.lower_count,
+		(SELECT count(*) FROM request_leases WHERE client_id=$2::bigint AND expires_at>at.now) FROM at
+		CROSS JOIN LATERAL (SELECT count(*) AS total,count(*) FILTER (WHERE priority_class IN ('normal','background')) AS lower_count FROM request_leases WHERE pool_id=$1::bigint AND expires_at>at.now) active`, r.PoolID, r.ClientID).QueryRow(func(row pgx.Row) error {
+		return row.Scan(&now, &poolCount, &lowerCount, &clientCount)
 	})
 	if err = tx.SendBatch(ctx, checks).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err
@@ -195,7 +198,7 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	if configurationMissing {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
 	}
-	if revision != r.ConfigurationRevision || keyClient != r.ClientID || !clientEnabled || !poolEnabled || clientRevision != r.ClientPolicyRevision || configuredClient != r.ConfiguredClientLimit || poolLimit != r.PoolGatewayInflightLimit || rpm != r.RequestsPerMinute || tpm != r.TokensPerMinute || (keyExpires != nil && !keyExpires.After(now)) {
+	if revision != r.ConfigurationRevision || keyClient != r.ClientID || !clientEnabled || !poolEnabled || clientRevision != r.ClientPolicyRevision || configuredClient != r.ConfiguredClientLimit || poolLimit != r.PoolGatewayInflightLimit || poolReserve != r.PoolHighPriorityReserve || (r.PriorityClass != "" && r.PriorityClass != configuredClass) || (poolReserve > 0 && !r.PriorityClass.Valid()) || rpm != r.RequestsPerMinute || tpm != r.TokensPerMinute || (keyExpires != nil && !keyExpires.After(now)) {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
 	}
 	if r.EffectiveClientLimit <= 0 || r.EffectiveClientLimit > configuredClient {
@@ -206,6 +209,9 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	}
 	if poolLimit > 0 && poolCount >= poolLimit {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now, coordination.AdmissionPoolScope)
+	}
+	if poolReserve > 0 && configuredClass != domain.PriorityHigh && configuredClass != domain.PriorityCritical && lowerCount >= poolLimit-poolReserve {
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonPoolPriorityReserve, nil, now)
 	}
 	if clientCount >= r.EffectiveClientLimit {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now)
@@ -230,7 +236,7 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	}
 	lease := coordination.LeaseIdentity{LeaseID: r.LeaseID, ClientID: r.ClientID, PoolID: r.PoolID, RequestID: r.RequestID, ReplicaID: r.ReplicaID, ExpiresAt: now.Add(r.LeaseTTL), TTL: r.LeaseTTL}
 	writes := &pgx.Batch{}
-	writes.Queue(`INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at) VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz)`, lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt)
+	writes.Queue(`INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at,priority_class) VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz,$8::text)`, lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt, configuredClass)
 	writes.Queue("UPDATE admission_operations SET decision='admitted',decided_at=$2::timestamptz WHERE lease_id=$1::uuid", r.LeaseID, now)
 	if err = tx.SendBatch(ctx, writes).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err

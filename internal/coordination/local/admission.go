@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
+	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
 
 const receiptRetention = 24 * time.Hour
@@ -36,17 +37,18 @@ type ratePolicy struct {
 }
 
 type AdmissionCoordinator struct {
-	mu               sync.Mutex
-	now              func() time.Time
-	receipts         map[uuid.UUID]*admissionReceipt
-	leases           map[uuid.UUID]coordination.LeaseIdentity
-	expiries         expiryQueue
-	terminalExpiries expiryQueue
-	clientInflight   map[int64]int
-	poolInflight     map[int64]int
-	receiptCapacity  int
-	rates            map[int64]map[string]*rateState
-	policies         map[int64]ratePolicy
+	mu                sync.Mutex
+	now               func() time.Time
+	receipts          map[uuid.UUID]*admissionReceipt
+	leases            map[uuid.UUID]coordination.LeaseIdentity
+	expiries          expiryQueue
+	terminalExpiries  expiryQueue
+	clientInflight    map[int64]int
+	poolInflight      map[int64]int
+	poolLowerInflight map[int64]int
+	receiptCapacity   int
+	rates             map[int64]map[string]*rateState
+	policies          map[int64]ratePolicy
 }
 
 func NewAdmissionCoordinator(now func() time.Time) *AdmissionCoordinator {
@@ -62,7 +64,7 @@ func newAdmissionCoordinator(now func() time.Time, receiptCapacity int) *Admissi
 	}
 	return &AdmissionCoordinator{
 		now: now, receipts: make(map[uuid.UUID]*admissionReceipt), leases: make(map[uuid.UUID]coordination.LeaseIdentity),
-		clientInflight: make(map[int64]int), poolInflight: make(map[int64]int),
+		clientInflight: make(map[int64]int), poolInflight: make(map[int64]int), poolLowerInflight: make(map[int64]int),
 		receiptCapacity: receiptCapacity, rates: make(map[int64]map[string]*rateState), policies: make(map[int64]ratePolicy),
 	}
 }
@@ -136,6 +138,9 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	if req.OperationStartedAt.After(now.Add(5*time.Minute)) || !req.OperationStartedAt.After(now.Add(-receiptRetention)) {
 		return reject(coordination.ReasonStaleOperation, nil)
 	}
+	if req.PoolHighPriorityReserve < 0 || (req.PoolHighPriorityReserve > 0 && (req.PoolGatewayInflightLimit <= 0 || req.PoolHighPriorityReserve > req.PoolGatewayInflightLimit || !req.PriorityClass.Valid())) || (req.PriorityClass != "" && !req.PriorityClass.Valid()) {
+		return reject(coordination.ReasonStaleConfiguration, nil)
+	}
 	policy := c.observeRatePolicy(req)
 	if req.EffectiveClientLimit <= 0 || req.EffectiveClientLimit > req.ConfiguredClientLimit {
 		return reject(coordination.ReasonConcurrencyExhausted, nil)
@@ -143,6 +148,9 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	clientCount, poolCount := c.clientInflight[req.ClientID], c.poolInflight[req.PoolID]
 	if req.PoolGatewayInflightLimit > 0 && poolCount >= req.PoolGatewayInflightLimit {
 		return reject(coordination.ReasonConcurrencyExhausted, nil, coordination.AdmissionPoolScope)
+	}
+	if req.PoolHighPriorityReserve > 0 && req.PriorityClass != domain.PriorityHigh && req.PriorityClass != domain.PriorityCritical && c.poolLowerInflight[req.PoolID] >= req.PoolGatewayInflightLimit-req.PoolHighPriorityReserve {
+		return reject(coordination.ReasonPoolPriorityReserve, nil)
 	}
 	if clientCount >= req.EffectiveClientLimit {
 		return reject(coordination.ReasonConcurrencyExhausted, nil)
@@ -170,6 +178,9 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	c.leases[req.LeaseID] = lease
 	c.clientInflight[lease.ClientID]++
 	c.poolInflight[lease.PoolID]++
+	if req.PriorityClass != domain.PriorityHigh && req.PriorityClass != domain.PriorityCritical {
+		c.poolLowerInflight[lease.PoolID]++
+	}
 	c.expiries.add(admissionLeaseExpiry, lease.LeaseID, lease.ExpiresAt)
 	receipt.decision = coordination.AdmissionDecision{Lease: &lease}
 	return receipt.decision, nil
@@ -356,6 +367,14 @@ func (c *AdmissionCoordinator) removeLease(id uuid.UUID) {
 		return
 	}
 	delete(c.leases, id)
+	class := c.receipts[id].request.PriorityClass
+	if class != domain.PriorityHigh && class != domain.PriorityCritical {
+		if c.poolLowerInflight[lease.PoolID] <= 1 {
+			delete(c.poolLowerInflight, lease.PoolID)
+		} else {
+			c.poolLowerInflight[lease.PoolID]--
+		}
+	}
 	if c.clientInflight[lease.ClientID] <= 1 {
 		delete(c.clientInflight, lease.ClientID)
 	} else {

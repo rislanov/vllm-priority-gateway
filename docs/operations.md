@@ -88,6 +88,20 @@ Each model pool has two optional guards:
 
 Both guards return the bounded `429 gateway_overloaded` envelope before per-client priority can bypass capacity protection. Zero disables the corresponding limit; calibrate non-zero values against the selected model, GPU, and vLLM configuration.
 
+### Reserved admission capacity
+
+Set `highPriorityReserve` on a model pool through the Admin API or the **High/Critical reserve** field on the Backends page. It defaults to `0`. A positive reserve requires `maxGatewayInflight > 0` and cannot exceed that limit. For example:
+
+```json
+{"publicModelName":"shared-model","upstreamModelName":"upstream-model","enabled":true,"maxGatewayInflight":20,"highPriorityReserve":6,"maxWaiting":0}
+```
+
+Normal and Background together can hold at most 14 leases; High and Critical can use the remaining capacity up to the total of 20. Idle reserved capacity cannot be borrowed. High/Critical requests still obey their client concurrency, RPM/TPM, backend eligibility, pool waiting and total inflight checks. Lower-priority reserve refusals return the existing `429 gateway_overloaded` envelope and `Retry-After`; metrics and structured logs identify them as `pool_priority_reserve`.
+
+Pool PUT requests replace all configurable fields. Omitting `highPriorityReserve` resets it to `0`; API clients editing a reserved pool must include its current value. Raising the reserve or lowering the total limit does not cancel admitted requests: admission waits for existing occupancy to fall below the new boundaries. Changing a client's class affects future requests; each active lease keeps its admission class.
+
+PostgreSQL enforces this policy globally across compatible replicas. SQLite enforces it within its supported single-process profile. This reserves gateway admission slots, not GPU memory, KV blocks or execution time, and does not preempt active generations. Bound background request size or use a dedicated inference pool when strict latency isolation is required. During PostgreSQL degradation, the separate per-replica emergency caps apply; they are not a globally coordinated reserve. See the [upgrade and outage rules](postgresql-production.md#priority-reserve-upgrade).
+
 Circuit and pool leases are process-local in the SQLite profile. PostgreSQL mode distributes both across compatible gateway replicas.
 
 The single-replica local coordinators retain idempotency history for up to 24 hours, with at most 65,536 admission receipts and 65,536 circuit attempts in memory. At either bound, the oldest terminal records are evicted in `O(log N)` time before admitting new work; a stream of rejected or completed requests therefore cannot grow heap or disk without bound and cannot consume active-operation capacity. The coordinator fails closed only when its entire bound is occupied by active operations. Retention is best-effort under capacity pressure and does not survive a process restart. Deploy PostgreSQL when durable cross-replica coordination is required.
@@ -141,6 +155,7 @@ Rejection `reason` is deliberately independent of the public API error code:
 |---|---|
 | `pool_waiting_limit` | `429 gateway_overloaded` |
 | `pool_inflight_limit` | `429 gateway_overloaded` |
+| `pool_priority_reserve` | `429 gateway_overloaded` |
 | `priority_concurrency_limit` | `429 gateway_overloaded` |
 | `pool_unavailable` | `503 backend_unavailable` |
 | `no_eligible_backend` | `503 backend_unavailable` |
@@ -151,7 +166,7 @@ Rejection `reason` is deliberately independent of the public API error code:
 | `upstream_failure` | `502 upstream_error` |
 | `internal_error` | `500 internal_error` before a forwarding lifecycle can be established |
 
-The public error envelopes remain compatible. Existing PromQL matching `reason="gateway_overloaded"` must migrate to `reason=~"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit"`.
+The public error envelopes remain compatible. Existing PromQL matching `reason="gateway_overloaded"` must migrate to `reason=~"pool_waiting_limit|pool_inflight_limit|pool_priority_reserve|priority_concurrency_limit"`.
 
 Important capacity signals include:
 

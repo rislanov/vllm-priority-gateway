@@ -165,7 +165,7 @@
             "uid": "llmgw-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~\"$model\",priority_class=\"background\",reason=~\"pool_waiting_limit|pool_inflight_limit|priority_concurrency_limit\"}[$__rate_interval]))",
+          "expr": "sum by (model, reason) (rate(llmgw_requests_rejected_total{model=~\"$model\",priority_class=\"background\",reason=~\"pool_waiting_limit|pool_inflight_limit|pool_priority_reserve|priority_concurrency_limit\"}[$__rate_interval]))",
           "legendFormat": "{{model}} · {{reason}}",
           "range": true,
           "refId": "A"

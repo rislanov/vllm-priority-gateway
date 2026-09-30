@@ -327,6 +327,9 @@ func (s *Service) acquirePool(ctx context.Context, clientID int64, original doma
 		if !valid {
 			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
+		if s.admission == nil && pool.HighPriorityReserve > 0 {
+			return domain.PoolRuntime{}, nil, gatewayUnavailable(s.retryAfter)
+		}
 		runtime := s.runtime.PoolSnapshot(pool.ID, s.now().UTC())
 		if runtime.State == domain.PoolUnavailable {
 			return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
@@ -352,7 +355,7 @@ func (s *Service) acquirePool(ctx context.Context, clientID int64, original doma
 			release()
 			return domain.PoolRuntime{PoolID: original.ID, State: domain.PoolUnavailable}, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
 		}
-		if validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
+		if validatedPool.HighPriorityReserve != pool.HighPriorityReserve || validatedPool.MaxGatewayInflight != pool.MaxGatewayInflight || validatedPool.MaxWaiting != pool.MaxWaiting {
 			release()
 			if ctx.Err() != nil {
 				return runtime, nil, backendUnavailable(s.retryAfter, DecisionPoolUnavailable)
@@ -532,6 +535,8 @@ func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, 
 	switch reason {
 	case coordination.ReasonRPMExhausted, coordination.ReasonTPMExhausted:
 		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Rate limit exceeded", Type: "rate_limit_exceeded", Code: string(reason), RetryAfter: retryAfter}
+	case coordination.ReasonPoolPriorityReserve:
+		return overloaded(retryAfter, DecisionPoolPriorityReserve)
 	case coordination.ReasonConcurrencyExhausted:
 		return overloaded(retryAfter, DecisionPriorityConcurrencyLimit)
 	default:

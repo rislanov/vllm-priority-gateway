@@ -14,6 +14,7 @@ type DecisionReason string
 const (
 	DecisionPoolWaitingLimit         DecisionReason = "pool_waiting_limit"
 	DecisionPoolInflightLimit        DecisionReason = "pool_inflight_limit"
+	DecisionPoolPriorityReserve      DecisionReason = "pool_priority_reserve"
 	DecisionPriorityConcurrencyLimit DecisionReason = "priority_concurrency_limit"
 	DecisionPoolUnavailable          DecisionReason = "pool_unavailable"
 	DecisionNoEligibleBackend        DecisionReason = "no_eligible_backend"

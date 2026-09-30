@@ -19,6 +19,8 @@ func TestEmbeddedMigrationManifestHasContiguousUpDownPairs(t *testing.T) {
 		"migrations/000003_coordination.down.sql",
 		"migrations/000004_admission_decision_scope.up.sql",
 		"migrations/000004_admission_decision_scope.down.sql",
+		"migrations/000005_priority_capacity_reserve.up.sql",
+		"migrations/000005_priority_capacity_reserve.down.sql",
 	}
 	if !reflect.DeepEqual(manifest, want) {
 		t.Fatalf("MigrationManifest() = %v, want %v", manifest, want)

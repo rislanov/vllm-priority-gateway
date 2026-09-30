@@ -27,11 +27,12 @@ type CreateAPIKeyParams struct {
 }
 
 type CreatePoolParams struct {
-	PublicModelName    string
-	UpstreamModelName  string
-	Enabled            bool
-	MaxGatewayInflight int
-	MaxWaiting         int
+	PublicModelName     string
+	UpstreamModelName   string
+	Enabled             bool
+	MaxGatewayInflight  int
+	HighPriorityReserve int
+	MaxWaiting          int
 }
 
 type UpdatePoolParams = CreatePoolParams
