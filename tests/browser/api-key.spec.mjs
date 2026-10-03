@@ -87,16 +87,27 @@ test('copies with the fallback after Clipboard API permission is denied', async 
   await expect(name).toHaveValue(key);
 });
 
-test('selects the whole key and explains manual copying when both APIs fail', async ({page}) => {
+test('exposes copy feedback before interaction and keeps manual-copy instructions accessible', async ({page}) => {
   await page.addInitScript(() => {
     Object.defineProperty(navigator, 'clipboard', {value: undefined});
     document.execCommand = () => false;
   });
   const key = await generateKey(page);
+  const cdp = await page.context().newCDPSession(page);
+  const {root} = await cdp.send('DOM.getDocument');
+  const {nodeId} = await cdp.send('DOM.querySelector', {nodeId: root.nodeId, selector: '[data-copy-status]'});
+  const {node: {backendNodeId}} = await cdp.send('DOM.describeNode', {nodeId});
+  const {nodes: initialNodes} = await cdp.send('Accessibility.getPartialAXTree', {backendNodeId, fetchRelatives: false});
+  const initialStatus = initialNodes.find((node) => node.backendDOMNodeId === backendNodeId);
+  expect(initialStatus?.ignored).toBe(false);
+  expect(initialStatus?.role?.value).toBe('status');
   await page.getByRole('button', {name: 'Copy key', exact: true}).click();
   await expect(page.locator('[data-copy-status]')).toContainText('copy it manually');
   await expect(page.getByRole('button', {name: 'Copy key', exact: true})).toBeEnabled();
   const field = page.getByRole('textbox', {name: 'API key', exact: true});
   await expect(field).toBeFocused();
   expect(await field.evaluate((element) => element.value.slice(element.selectionStart, element.selectionEnd))).toBe(key);
+  const {nodes: updatedNodes} = await cdp.send('Accessibility.getPartialAXTree', {backendNodeId, fetchRelatives: true});
+  expect(updatedNodes.some((node) => node.role?.value === 'StaticText' && /copy it manually/.test(node.name?.value))).toBe(true);
+  await cdp.detach();
 });
