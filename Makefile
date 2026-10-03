@@ -1,10 +1,16 @@
 GO ?= go
 DIST ?= dist
 
-.PHONY: test test-race test-real-vllm test-postgres test-postgres-docker test-postgres-pooler vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean
+.PHONY: test test-web-unit test-web test-race test-real-vllm test-postgres test-postgres-docker test-postgres-pooler vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean
 
 test:
 	$(GO) test ./...
+
+test-web-unit:
+	node --test tests/browser/clipboard.unit.test.mjs
+
+test-web:
+	npm --prefix tests/browser test
 
 test-race:
 	$(GO) test -race ./...

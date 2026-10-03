@@ -109,10 +109,44 @@ jobs:
       - name: Build Docker image
         run: docker build --tag vllm-priority-gateway:ci .
 
+  browser:
+    name: Admin UI browser tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+
+      - name: Install browser test dependencies
+        run: npm ci --prefix tests/browser
+
+      - name: Install Chromium
+        working-directory: tests/browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Test clipboard unit and browser scenarios
+        run: make test-web
+
   required:
     name: Unit tests and builds
     if: ${{ always() }}
-    needs: [unit, race, vet, build, docker]
+    needs: [unit, race, vet, build, docker, browser]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -124,3 +158,4 @@ jobs:
           test "${{ needs.vet.result }}" = "success"
           test "${{ needs.build.result }}" = "success"
           test "${{ needs.docker.result }}" = "success"
+          test "${{ needs.browser.result }}" = "success"

@@ -215,7 +215,7 @@ LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 
 ## CI и релизы
 
-Для pull request и push в `main` параллельно запускаются unit tests, Go race detector, `go vet`, сборка бинарника gateway и Docker-образа. Агрегированный status **Unit tests and builds** становится успешным только после всех пяти jobs и используется как required branch check. CI не публикует артефакты.
+Для pull request и push в `main` параллельно запускаются unit tests, Go race detector, `go vet`, сборка бинарника gateway, Docker-образа и браузерные тесты Admin UI. Агрегированный status **Unit tests and builds** становится успешным только после всех шести jobs и используется как required branch check. CI не публикует артефакты.
 
 Release workflow запускается вручную, проверяет выбранный стабильный SemVer-тег, публикует Linux `amd64`/`arm64` архивы с checksum и multi-platform образ в GHCR. Использование артефактов описано в [Production deployment](docs/deployment.md), точный release-контракт — в [workflow](.github/workflows/release.yml).
 
@@ -243,6 +243,16 @@ make build
 make build-linux-amd64
 make build-e2e-linux-amd64
 ```
+
+Для тестов копирования API-ключей нужен Node.js 24. Тесты запускают отдельный локальный gateway на порту `18081` с временной SQLite-базой и проверяют полный ключ, реальный буфер обмена, обычный HTTP, отказ доступа, ручное копирование и одноразовый показ на desktop и mobile:
+
+```bash
+npm ci --prefix tests/browser
+cd tests/browser && npx playwright install chromium && cd ../..
+make test-web
+```
+
+Только JavaScript unit-тесты без установки браузера: `make test-web-unit`.
 
 ## Документация
 

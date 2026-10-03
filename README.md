@@ -217,7 +217,7 @@ LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
 
 ## CI and releases
 
-Pull requests and pushes to `main` run unit tests, the Go race detector, `go vet`, a gateway binary build, and a Docker image build in parallel. The aggregate **Unit tests and builds** status succeeds only when all five jobs pass and is the required branch check. CI never publishes artifacts.
+Pull requests and pushes to `main` run unit tests, the Go race detector, `go vet`, a gateway binary build, a Docker image build, and Admin UI browser tests in parallel. The aggregate **Unit tests and builds** status succeeds only when all six jobs pass and is the required branch check. CI never publishes artifacts.
 
 Releases are manual. The Release workflow validates the selected stable SemVer tag, publishes checksum-protected Linux `amd64` and `arm64` archives, and publishes a multi-platform GHCR image. See [Production deployment](docs/deployment.md) for artifact use and [the workflow](.github/workflows/release.yml) for the exact release contract.
 
@@ -245,6 +245,16 @@ make build
 make build-linux-amd64
 make build-e2e-linux-amd64
 ```
+
+The Admin UI clipboard tests require Node.js 24. They start an isolated local gateway on port `18081` with a temporary SQLite database and test full-key display, real clipboard contents, plain HTTP, permission denial, manual copying, and one-time visibility at desktop and mobile widths:
+
+```bash
+npm ci --prefix tests/browser
+cd tests/browser && npx playwright install chromium && cd ../..
+make test-web
+```
+
+Run only the JavaScript unit tests (no browser installation required) with `make test-web-unit`.
 
 ## Documentation
 

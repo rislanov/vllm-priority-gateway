@@ -75,10 +75,14 @@ fieldset { grid-column: 1 / -1; border: 0; padding: 0; margin: 0; }
 .row-actions { display: flex; gap: 8px; margin: 0; }
 .notice, .secret { border-radius: 8px; margin-bottom: 24px; padding: 16px 18px; }
 .notice.error { border: 1px solid #80373d; background: #26151c; color: #ffb1b7; }
-.secret { display: grid; grid-template-columns: 1fr minmax(240px, 2fr) auto; align-items: center; gap: 18px; border: 1px solid var(--accent); background: #171b1f; }
+.secret { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto; align-items: center; gap: 18px; border: 1px solid var(--accent); background: #171b1f; }
 .secret h2 { margin: 0 0 3px; color: var(--accent); }
 .secret p { margin: 0; color: var(--muted); }
-.secret code { overflow-wrap: anywhere; font-size: 14px; color: var(--text); }
+.secret > div { min-width: 0; }
+.secret textarea { display: block; width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 5px; background: #0a1522; color: var(--text); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; resize: none; }
+.secret-copy-status { grid-column: 1 / -1; }
+.secret-copy-status:empty { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.button:disabled { cursor: wait; opacity: .7; }
 .muted { color: var(--muted); }
 .url { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
 .analytics-heading { margin-bottom: 22px; }
