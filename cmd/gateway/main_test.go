@@ -713,18 +713,15 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	go func() { done <- run(ctx, mapLookup(environment), listener, &stdout, &stderr) }()
 
 	baseURL := "http://" + listener.Addr().String()
-	waitForGateway(t, 3*time.Second, func() bool {
+	poolReady := func() bool {
 		body, status, requestErr := gatewayGET(baseURL+"/admin/api/status", "operator", "correct horse battery staple")
 		if requestErr != nil || status != http.StatusOK {
 			return false
 		}
 		var view struct {
 			Pools []struct {
-				ID      int64 `json:"id"`
-				Runtime struct {
-					State             domain.PoolState `json:"state"`
-					AvailableBackends int              `json:"availableBackends"`
-				} `json:"runtime"`
+				ID      int64              `json:"id"`
+				Runtime domain.PoolRuntime `json:"runtime"`
 			} `json:"pools"`
 		}
 		if json.Unmarshal(body, &view) != nil {
@@ -732,11 +729,12 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 		}
 		for _, pool := range view.Pools {
 			if pool.ID == seed.modelPoolID {
-				return pool.Runtime.State != domain.PoolUnavailable && pool.Runtime.AvailableBackends == 1
+				return pool.Runtime.State != domain.PoolUnavailable && pool.Runtime.AvailableBackends == 1 && pool.Runtime.GatewayInflight == 0
 			}
 		}
 		return false
-	})
+	}
+	waitForGateway(t, 3*time.Second, poolReady)
 
 	ordinaryBody := `{"model":"qwen","messages":[{"role":"user","content":"` + ordinaryPrompt + `"}]}`
 	ordinaryResponse := gatewayPOST(t, baseURL+"/v1/chat/completions", seed.clientKey, "e2e-parent-ordinary", ordinaryBody)
@@ -751,6 +749,10 @@ func TestRunRecordsTokenAnalyticsEndToEndWithoutPersistingBodies(t *testing.T) {
 	if ordinaryResponse.StatusCode != http.StatusOK || string(ordinaryBytes) != wantOrdinary {
 		t.Fatalf("ordinary client response = %d %s, want %s", ordinaryResponse.StatusCode, ordinaryBytes, wantOrdinary)
 	}
+
+	// Admission completion is queued asynchronously. Wait for its acknowledgement
+	// before reusing this client's single concurrency slot for the streaming case.
+	waitForGateway(t, 3*time.Second, poolReady)
 
 	fake.SetState(fakevllm.State{
 		Tokens: []string{streamOutput},
