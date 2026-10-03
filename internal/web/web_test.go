@@ -504,6 +504,12 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 	if secret == "" {
 		t.Fatalf("complete one-time secret missing: %s", response.Body.String())
 	}
+	if !hasElementText(document, "textarea", secret) || !hasAttr(document, "readonly", "") || !allLabelsReferenceControls(document) {
+		t.Fatal("complete one-time key must be available in a labeled, read-only text field")
+	}
+	if !hasElementText(document, "button", "Copy key") || !hasAttr(document, "aria-live", "polite") {
+		t.Fatal("copy control and accessible copy feedback are missing")
+	}
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
 	if strings.Contains(response.Body.String(), `id="one-time-secret"`) || strings.Contains(response.Body.String(), secret) {

@@ -1,6 +1,11 @@
 {{define "content"}}
 <section class="page-heading"><div><h1>API Keys</h1><p>Generate client credentials and revoke access immediately.</p></div></section>
-{{if .Secret}}<section id="one-time-secret" class="secret" role="status"><div><h2>API key created</h2><p>Copy this key now. It will not be shown again.</p></div><code data-secret>{{.Secret}}</code><button class="button primary" type="button" data-copy>Copy key</button></section>{{end}}
+{{if .Secret}}<section id="one-time-secret" class="secret" aria-labelledby="secret-heading">
+  <div><h2 id="secret-heading">API key created</h2><p>Copy this key now. It will not be shown again.</p></div>
+  <div><label for="created-api-key">API key</label><textarea id="created-api-key" class="mono" rows="3" readonly spellcheck="false" autocomplete="off" autocapitalize="off" data-secret>{{.Secret}}</textarea></div>
+  <button class="button primary" type="button" data-copy>Copy key</button>
+  <p class="secret-copy-status" role="status" aria-live="polite" data-copy-status></p>
+</section>{{end}}
 <div class="table-wrap"><table><thead><tr><th>Prefix</th><th>Client</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th>Actions</th></tr></thead><tbody>
 {{range .View.Keys}}<tr><td class="mono">{{.Prefix}}…</td><td>{{.Client}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02 15:04"}}</td><td>{{timeValue .ExpiresAt}}</td><td>{{timeValue .LastUsedAt}}</td><td class="state-{{.Status}}">{{.Status}}</td><td>{{if eq .Status "active"}}<form method="post" action="/admin/keys" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="revoke"><input type="hidden" name="key_id" value="{{.ID}}"><button class="button danger small" type="submit" data-confirm="Revoke this API key?">Revoke</button></form>{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="7" class="empty">No API keys generated.</td></tr>{{end}}
 </tbody></table></div>

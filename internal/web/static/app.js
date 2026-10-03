@@ -9,9 +9,35 @@
   const copy = document.querySelector('[data-copy]');
   if (copy) copy.addEventListener('click', async () => {
     const secret = document.querySelector('[data-secret]');
-    if (!secret || !navigator.clipboard) return;
-    await navigator.clipboard.writeText(secret.textContent.trim());
-    copy.textContent = 'Copied';
+    const status = document.querySelector('[data-copy-status]');
+    if (!secret || !secret.value || copy.disabled) return;
+    copy.disabled = true;
+    copy.textContent = 'Copy key';
+    if (status) status.textContent = 'Copying…';
+    let copied = false;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(secret.value);
+        copied = true;
+      }
+    } catch {
+      // A denied Clipboard API request can still allow copying selected text.
+    }
+    if (!copied) {
+      secret.focus();
+      secret.select();
+      try {
+        // Plain HTTP has no Clipboard API; use the browser's selected-text copy.
+        copied = document.execCommand('copy');
+      } catch {
+        // Keep the complete key selected so the operator can copy it manually.
+      }
+    }
+    copy.textContent = copied ? 'Copied' : 'Copy key';
+    if (status) status.textContent = copied
+      ? 'API key copied to clipboard.'
+      : 'Automatic copying is unavailable. The key is selected; copy it manually.';
+    copy.disabled = false;
   });
   if (document.body.hasAttribute('data-dashboard')) {
     const autoRefresh = () => {
