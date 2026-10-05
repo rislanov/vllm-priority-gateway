@@ -39,18 +39,21 @@ func (h *Handler) keys(writer http.ResponseWriter, request *http.Request) {
 		if err := request.ParseForm(); err != nil {
 			data.Error = "Invalid form submission"
 		} else {
-			redirect, errorText := h.mutateKey(request)
-			if redirect != "" {
-				http.Redirect(writer, request, redirect, http.StatusSeeOther)
+			data.Secret, data.Error = h.mutateKey(request)
+			if request.Form.Get("action") == "revoke" {
+				location := "/admin/keys"
+				if data.Error != "" {
+					location += "?error=revoke"
+				}
+				http.Redirect(writer, request, location, http.StatusSeeOther)
 				return
 			}
-			data.Error = errorText
 		}
 	} else if request.Method != http.MethodGet {
 		methodNotAllowed(writer, http.MethodGet, http.MethodPost)
 		return
-	} else {
-		data.Secret = h.takeSecret(httpapi.AdminCSRFToken(request), request.URL.Query().Get("flash"))
+	} else if request.URL.Query().Get("error") == "revoke" {
+		data.Error = "Unable to revoke this API key. Check its status before trying again."
 	}
 	status := http.StatusOK
 	if data.Error != "" {
@@ -107,7 +110,7 @@ func (h *Handler) mutateClient(request *http.Request) string {
 	return errorText
 }
 
-func (h *Handler) mutateKey(request *http.Request) (redirect string, errorText string) {
+func (h *Handler) mutateKey(request *http.Request) (secret string, errorText string) {
 	id, err := positiveID(request.Form.Get(map[bool]string{true: "key_id", false: "client_id"}[request.Form.Get("action") == "revoke"]))
 	if err != nil {
 		return "", err.Error()
@@ -130,8 +133,7 @@ func (h *Handler) mutateKey(request *http.Request) (redirect string, errorText s
 	if err != nil {
 		return "", err.Error()
 	}
-	nonce := h.putSecret(httpapi.AdminCSRFToken(request), created.ID, created.Secret)
-	return "/admin/keys?flash=" + nonce, ""
+	return created.Secret, ""
 }
 
 func (h *Handler) mutateBackend(request *http.Request) string {

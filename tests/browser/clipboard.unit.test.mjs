@@ -34,7 +34,7 @@ function fixture({clipboard, legacy = true, secretPresent = true} = {}) {
     },
   };
   const navigator = {clipboard: clipboard === 'working' ? {writeText: async (value) => { clipboardText = value; }} : clipboard};
-  vm.runInNewContext(source, {document, navigator, window: {}}, {filename: 'app.js'});
+  vm.runInNewContext(source, {document, navigator, window: {addEventListener() {}}}, {filename: 'app.js'});
   return {copy, status, secret, click: () => click(), clipboard: () => clipboardText, selection: () => selected, legacyCalls: () => legacyCalls};
 }
 
