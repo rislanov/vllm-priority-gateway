@@ -17,11 +17,11 @@
   <form method="get" action="/admin/analytics" class="analytics-filter-grid">
     <div>
       <label for="analytics-from">From (UTC)</label>
-      <input id="analytics-from" name="from_local" type="datetime-local" step="0.001" value="{{.Analytics.FromValue}}" required>
+      <input id="analytics-from" name="from_local" type="datetime-local" step="60" value="{{.Analytics.FromValue}}" required>
     </div>
     <div>
       <label for="analytics-to">To (UTC)</label>
-      <input id="analytics-to" name="to_local" type="datetime-local" step="0.001" value="{{.Analytics.ToValue}}" required>
+      <input id="analytics-to" name="to_local" type="datetime-local" step="60" value="{{.Analytics.ToValue}}" required>
     </div>
     <div>
       <label for="analytics-client">Client</label>
