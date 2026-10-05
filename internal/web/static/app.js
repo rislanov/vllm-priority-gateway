@@ -1,44 +1,98 @@
 (() => {
   const refresh = document.querySelector('[data-refresh]');
   if (refresh) refresh.addEventListener('click', () => window.location.reload());
-  document.querySelectorAll('[data-confirm]').forEach((control) => {
-    control.addEventListener('click', (event) => {
-      if (!window.confirm(control.dataset.confirm)) event.preventDefault();
+  bindConfirmations(document);
+  function bindConfirmations(root) {
+    root.querySelectorAll('[data-confirm]').forEach((control) => {
+      control.addEventListener('click', (event) => {
+        if (!window.confirm(control.dataset.confirm)) event.preventDefault();
+      });
     });
-  });
-  const copy = document.querySelector('[data-copy]');
-  if (copy) copy.addEventListener('click', async () => {
-    const secret = document.querySelector('[data-secret]');
-    const status = document.querySelector('[data-copy-status]');
-    if (!secret || !secret.value || copy.disabled) return;
-    copy.disabled = true;
-    copy.textContent = 'Copy key';
-    if (status) status.textContent = 'Copying…';
-    let copied = false;
-    try {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        await navigator.clipboard.writeText(secret.value);
-        copied = true;
-      }
-    } catch {
-      // A denied Clipboard API request can still allow copying selected text.
-    }
-    if (!copied) {
-      secret.focus();
-      secret.select();
+  }
+  initKeyControls();
+  window.addEventListener('pagehide', () => document.querySelector('#one-time-secret')?.remove());
+
+  function initKeyControls() {
+    const copy = document.querySelector('[data-copy]');
+    if (copy) copy.addEventListener('click', async () => {
+      const secret = document.querySelector('[data-secret]');
+      const status = document.querySelector('[data-copy-status]');
+      if (!secret || !secret.value || copy.disabled) return;
+      copy.disabled = true;
+      copy.textContent = 'Copy key';
+      if (status) status.textContent = 'Copying…';
+      let copied = false;
       try {
-        // Plain HTTP has no Clipboard API; use the browser's selected-text copy.
-        copied = document.execCommand('copy');
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(secret.value);
+          copied = true;
+        }
       } catch {
-        // Keep the complete key selected so the operator can copy it manually.
+        // A denied Clipboard API request can still allow copying selected text.
       }
+      if (!copied) {
+        secret.focus();
+        secret.select();
+        try {
+          // Plain HTTP has no Clipboard API; use the browser's selected-text copy.
+          copied = document.execCommand('copy');
+        } catch {
+          // Keep the complete key selected so the operator can copy it manually.
+        }
+      }
+      copy.textContent = copied ? 'Copied' : 'Copy key';
+      if (status) status.textContent = copied
+        ? 'API key copied to clipboard.'
+        : 'Automatic copying is unavailable. The key is selected; copy it manually.';
+      copy.disabled = false;
+    });
+    const form = document.querySelector('[data-key-create]');
+    if (form) {
+      let submitting = false;
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (submitting) return;
+        submitting = true;
+        const button = form.querySelector('[type="submit"]');
+        const status = form.querySelector('[data-key-create-status]');
+        button.disabled = true;
+        status.textContent = 'Creating API key…';
+        document.querySelector('#one-time-secret')?.remove();
+        try {
+          // Keep the page on a GET so refresh cannot resubmit a successful POST.
+          // Never follow a redirect or retry an ambiguous creation automatically.
+          const response = await fetch(form.getAttribute('action'), {
+            method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams(new FormData(form)),
+          });
+          const result = new DOMParser().parseFromString(await response.text(), 'text/html');
+          if (!response.ok) {
+            status.textContent = result.querySelector('.notice.error')?.textContent
+              || 'API key creation failed. Check the key list before trying again.';
+            return;
+          }
+          const main = result.querySelector('main');
+          const secret = main?.querySelector('[data-secret]');
+          if (!secret || !/^llmgw_[A-Za-z0-9_-]{43}$/.test(secret.value)) throw new Error('Missing creation result');
+          document.querySelector('main').replaceWith(main);
+          document.querySelector('footer').replaceWith(result.querySelector('footer'));
+          window.history.replaceState(null, '', form.getAttribute('action'));
+          bindConfirmations(main);
+          initKeyControls();
+          main.querySelector('[data-secret]').focus();
+        } catch {
+          status.textContent = 'Unable to confirm API key creation. A key may have been created. Check the key list and revoke any key you cannot copy before trying again.';
+        } finally {
+          submitting = false;
+          button.disabled = false;
+        }
+      });
+      // Enable only after the fetch handler is installed; native submission
+      // would leave a POST document that can be resubmitted on refresh.
+      form.querySelector('[type="submit"]').disabled = false;
     }
-    copy.textContent = copied ? 'Copied' : 'Copy key';
-    if (status) status.textContent = copied
-      ? 'API key copied to clipboard.'
-      : 'Automatic copying is unavailable. The key is selected; copy it manually.';
-    copy.disabled = false;
-  });
+  }
   if (document.body.hasAttribute('data-dashboard')) {
     const autoRefresh = () => {
       const focused = document.activeElement && document.activeElement !== document.body;

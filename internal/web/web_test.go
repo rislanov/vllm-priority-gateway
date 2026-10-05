@@ -187,7 +187,7 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 			t.Fatalf("self-hosted chart script missing %q: %s", required, script.Body.String())
 		}
 	}
-	for _, forbidden := range []string{"fetch(", "/admin/api/analytics", "innerHTML"} {
+	for _, forbidden := range []string{"/admin/api/analytics", "innerHTML"} {
 		if strings.Contains(script.Body.String(), forbidden) {
 			t.Fatalf("chart script must use only server-rendered series, found %q: %s", forbidden, script.Body.String())
 		}
@@ -550,12 +550,9 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	location := response.Header().Get("Location")
-	if response.Code != http.StatusSeeOther || !strings.HasPrefix(location, "/admin/keys?flash=") {
+	if response.Code != http.StatusOK || response.Header().Get("Location") != "" {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
 	document, err := html.Parse(strings.NewReader(response.Body.String()))
 	if err != nil {
 		t.Fatal(err)
@@ -574,7 +571,7 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 		t.Fatal("copy control and accessible copy feedback are missing")
 	}
 	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/keys", nil))
 	if strings.Contains(response.Body.String(), `id="one-time-secret"`) || strings.Contains(response.Body.String(), secret) {
 		t.Fatalf("one-time secret survived refresh: %s", response.Body.String())
 	}
@@ -582,7 +579,6 @@ func TestKeyFormRendersOneTimeSecretRegion(t *testing.T) {
 
 func TestOverlappingKeyCreationsKeepSeparateOneTimeSecrets(t *testing.T) {
 	handler := newWebFixture(t)
-	locations := make(chan string, 2)
 	var wait sync.WaitGroup
 	for range 2 {
 		wait.Add(1)
@@ -592,31 +588,12 @@ func TestOverlappingKeyCreationsKeepSeparateOneTimeSecrets(t *testing.T) {
 			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
-			if response.Code != http.StatusSeeOther {
-				t.Errorf("status = %d body=%s", response.Code, response.Body.String())
-				return
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `id="one-time-secret"`) {
+				t.Errorf("creation response did not include its one-time secret: status=%d", response.Code)
 			}
-			locations <- response.Header().Get("Location")
 		}()
 	}
 	wait.Wait()
-	close(locations)
-
-	seen := make(map[string]bool)
-	for location := range locations {
-		if location == "" || seen[location] {
-			t.Fatalf("flash redirect was not unique: %q", location)
-		}
-		seen[location] = true
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
-		if !strings.Contains(response.Body.String(), `id="one-time-secret"`) {
-			t.Fatalf("secret for %q was lost: %s", location, response.Body.String())
-		}
-	}
-	if len(seen) != 2 {
-		t.Fatalf("one-time secret redirects = %v", seen)
-	}
 }
 
 func TestClientEditPagePrefillsExistingPolicy(t *testing.T) {
@@ -717,7 +694,7 @@ func TestAdminResourceDeletionFormsAndMutations(t *testing.T) {
 	}
 
 	response := postForm("/admin/keys", "client_id=1&action=create")
-	if response.Code != http.StatusSeeOther {
+	if response.Code != http.StatusOK {
 		t.Fatalf("create key response = %d body=%s", response.Code, response.Body.String())
 	}
 

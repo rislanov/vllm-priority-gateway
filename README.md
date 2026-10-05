@@ -213,7 +213,11 @@ make vet
 make build
 make container-smoke  # requires Docker
 LLMGW_POSTGRES_TEST_DSN='postgres://...' make test-postgres  # opt-in
+make test-web  # single gateway with SQLite; requires installed Playwright/Chromium
+LLMGW_BROWSER_POSTGRES_DSN='postgres://...' make test-web  # two gateway processes with an alternating proxy
 ```
+
+The PostgreSQL browser workflow requires an existing, disposable local test database. It starts two gateway processes on ports 18082 and 18083 and proxies port 18081 without sticky sessions. It does not download database images or browsers. API-key generation requires JavaScript so a page refresh cannot resubmit creation; the Admin API remains available for scripted key creation.
 
 ## CI and releases
 

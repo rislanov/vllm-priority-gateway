@@ -1,8 +1,6 @@
 package web
 
 import (
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -10,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/analytics"
@@ -21,20 +18,7 @@ type Handler struct {
 	service   *httpapi.AdminService
 	templates map[string]*template.Template
 	static    http.Handler
-	secretMu  sync.Mutex
-	secrets   map[string]secretFlash
 }
-
-type secretFlash struct {
-	value     string
-	expiresAt time.Time
-	timer     *time.Timer
-}
-
-const (
-	secretFlashTTL   = 5 * time.Minute
-	maxSecretFlashes = 256
-)
 
 type pageData struct {
 	Title       string
@@ -132,7 +116,7 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{service: service, templates: templates, static: http.FileServer(http.FS(staticFS)), secrets: make(map[string]secretFlash)}, nil
+	return &Handler{service: service, templates: templates, static: http.FileServer(http.FS(staticFS))}, nil
 }
 
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -345,65 +329,6 @@ func formatInteger(value int64) string {
 		raw = raw[:position] + "," + raw[position:]
 	}
 	return raw
-}
-
-func (h *Handler) putSecret(session string, id int64, secret string) string {
-	digest := sha256.Sum256([]byte(strconv.FormatInt(id, 10) + "\x00" + secret))
-	nonce := base64.RawURLEncoding.EncodeToString(digest[:16])
-	key := session + "\x00" + nonce
-	now := time.Now()
-	expiresAt := now.Add(secretFlashTTL)
-	h.secretMu.Lock()
-	for existingKey, flash := range h.secrets {
-		if !flash.expiresAt.After(now) {
-			flash.timer.Stop()
-			delete(h.secrets, existingKey)
-		}
-	}
-	if len(h.secrets) >= maxSecretFlashes {
-		var oldestKey string
-		var oldestAt time.Time
-		for existingKey, flash := range h.secrets {
-			if oldestKey == "" || flash.expiresAt.Before(oldestAt) {
-				oldestKey, oldestAt = existingKey, flash.expiresAt
-			}
-		}
-		if oldestKey != "" {
-			h.secrets[oldestKey].timer.Stop()
-			delete(h.secrets, oldestKey)
-		}
-	}
-	flash := secretFlash{value: secret, expiresAt: expiresAt}
-	flash.timer = time.AfterFunc(secretFlashTTL, func() { h.expireSecret(key, expiresAt) })
-	h.secrets[key] = flash
-	h.secretMu.Unlock()
-	return nonce
-}
-
-func (h *Handler) takeSecret(session, nonce string) string {
-	if nonce == "" {
-		return ""
-	}
-	key := session + "\x00" + nonce
-	h.secretMu.Lock()
-	flash, exists := h.secrets[key]
-	delete(h.secrets, key)
-	if exists {
-		flash.timer.Stop()
-	}
-	h.secretMu.Unlock()
-	if !exists || !flash.expiresAt.After(time.Now()) {
-		return ""
-	}
-	return flash.value
-}
-
-func (h *Handler) expireSecret(key string, expiresAt time.Time) {
-	h.secretMu.Lock()
-	if flash, exists := h.secrets[key]; exists && flash.expiresAt.Equal(expiresAt) {
-		delete(h.secrets, key)
-	}
-	h.secretMu.Unlock()
 }
 
 func (h *Handler) render(writer http.ResponseWriter, request *http.Request, name string, data pageData, status int) {

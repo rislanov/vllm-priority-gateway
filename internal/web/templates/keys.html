@@ -9,10 +9,12 @@
 <div class="table-wrap"><table><thead><tr><th>Prefix</th><th>Client</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th><th>Actions</th></tr></thead><tbody>
 {{range .View.Keys}}<tr><td class="mono">{{.Prefix}}…</td><td>{{.Client}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02 15:04"}}</td><td>{{timeValue .ExpiresAt}}</td><td>{{timeValue .LastUsedAt}}</td><td class="state-{{.Status}}">{{.Status}}</td><td>{{if eq .Status "active"}}<form method="post" action="/admin/keys" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="revoke"><input type="hidden" name="key_id" value="{{.ID}}"><button class="button danger small" type="submit" data-confirm="Revoke this API key?">Revoke</button></form>{{else}}—{{end}}</td></tr>{{else}}<tr><td colspan="7" class="empty">No API keys generated.</td></tr>{{end}}
 </tbody></table></div>
-<section class="editor compact"><h2>Generate API key</h2><form method="post" action="/admin/keys" class="form-grid">
+<section class="editor compact"><h2>Generate API key</h2><form method="post" action="/admin/keys" class="form-grid" data-key-create>
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create">
   <div><label for="key-client">Client</label><select id="key-client" name="client_id" required>{{range .View.Clients}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></div>
   <div><label for="key-expiry">Expiry (optional)</label><input id="key-expiry" name="expires_at" type="date"></div>
-  <div class="form-actions"><button class="button primary" type="submit">Generate API key</button></div>
+  <div class="form-actions"><button class="button primary" type="submit" disabled>Generate API key</button></div>
+  <noscript><p>JavaScript is required to generate a key safely. Enable it or use the Admin API.</p></noscript>
+  <p class="form-actions" role="status" aria-live="polite" data-key-create-status></p>
 </form></section>
 {{end}}
