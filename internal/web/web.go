@@ -241,10 +241,16 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 	if query.Offset > 0 {
 		pageValues.Set("offset", strconv.Itoa(query.Offset))
 	}
+	fromInput := query.Filter.From.UTC().Truncate(time.Minute)
+	toInput := query.Filter.To.UTC().Truncate(time.Minute)
+	// Keep precise sub-minute ranges editable without rendering equal bounds.
+	if !toInput.After(fromInput) {
+		toInput = fromInput.Add(time.Minute)
+	}
 	page := &analyticsPage{
 		Dataset: dataset, Requests: requests,
-		FromValue:     query.Filter.From.UTC().Format("2006-01-02T15:04:05.000"),
-		ToValue:       query.Filter.To.UTC().Format("2006-01-02T15:04:05.000"),
+		FromValue:     fromInput.Format("2006-01-02T15:04"),
+		ToValue:       toInput.Format("2006-01-02T15:04"),
 		FromCanonical: query.Filter.From.UTC().Format(time.RFC3339Nano),
 		ToCanonical:   query.Filter.To.UTC().Format(time.RFC3339Nano),
 		Limit:         query.Limit,

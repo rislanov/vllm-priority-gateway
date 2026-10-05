@@ -47,7 +47,7 @@ func TestAnalyticsPageRendersCanonicalFiltersSummaryAndPagination(t *testing.T) 
 	}
 	for _, expected := range []string{
 		`href="/admin/analytics" aria-current="page"`,
-		`value="2026-08-26T09:00:00.000"`, `value="2026-08-26T12:00:00.000"`,
+		`value="2026-08-26T09:00"`, `value="2026-08-26T12:00"`,
 		`value="1" selected`, `value="true" selected`,
 		"Requests", "2", "Usage coverage", "100%", "Input tokens", "150",
 		"Output tokens", "30", "Cache-read tokens", "40", "Cache-hit ratio", "40%",
@@ -324,7 +324,7 @@ func TestAnalyticsPageRendersSilentBucketAsZeroChartPoint(t *testing.T) {
 	}
 }
 
-func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *testing.T) {
+func TestAnalyticsMinuteInputsPreservePreciseLinksAndChartSource(t *testing.T) {
 	handler := newAnalyticsWebFixture(t)
 	values := url.Values{
 		"from":            {"2026-08-26T09:59:59.123Z"},
@@ -341,7 +341,7 @@ func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *
 	}
 	body := response.Body.String()
 	for _, expected := range []string{
-		`step="0.001"`, `value="2026-08-26T09:59:59.123"`, `value="2026-08-26T11:00:00.456"`,
+		`step="60"`, `value="2026-08-26T09:59"`, `value="2026-08-26T11:00"`,
 		`data-range-from="2026-08-26T09:59:59.123Z"`, `data-range-to="2026-08-26T11:00:00.456Z"`,
 	} {
 		if !strings.Contains(body, expected) {
@@ -356,9 +356,11 @@ func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *
 	assertAnalyticsLink(t, attrForElementWithText(document, "a", "Next", "href"), "/admin/analytics", values, true)
 	assertAnalyticsSeriesSource(t, document)
 
+	values.Set("from", "2026-08-26T09:59:00Z")
+	values.Set("to", "2026-08-26T11:00:00Z")
 	form := url.Values{
-		"from_local":      {"2026-08-26T09:59:59.123"},
-		"to_local":        {"2026-08-26T11:00:00.456"},
+		"from_local":      {"2026-08-26T09:59"},
+		"to_local":        {"2026-08-26T11:00"},
 		"client_id":       {"1"},
 		"model_pool_id":   {"1"},
 		"usage_available": {"true"},
@@ -376,7 +378,7 @@ func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *
 	}
 	for _, name := range []string{"from", "to", "client_id", "model_pool_id", "usage_available", "limit"} {
 		if got := parsed.Query().Get(name); got != values.Get(name) {
-			t.Fatalf("unchanged Apply altered %s = %q, want %q (%s)", name, got, values.Get(name), location)
+			t.Fatalf("minute-precision Apply returned %s = %q, want %q (%s)", name, got, values.Get(name), location)
 		}
 	}
 	response = httptest.NewRecorder()
@@ -384,11 +386,72 @@ func TestAnalyticsFractionalRangePreservedAcrossPageLinksChartSourceAndApply(t *
 	if response.Code != http.StatusOK {
 		t.Fatalf("canonical target status = %d body=%s", response.Code, response.Body.String())
 	}
-	canonicalDocument, err := html.Parse(strings.NewReader(response.Body.String()))
-	if err != nil {
-		t.Fatal(err)
+	for _, expected := range []string{`data-range-from="2026-08-26T09:59:00Z"`, `data-range-to="2026-08-26T11:00:00Z"`} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("applied minute range missing %q", expected)
+		}
 	}
-	assertAnalyticsSeriesSource(t, canonicalDocument)
+}
+
+func TestAnalyticsSubMinuteRangeCanBeAppliedFromRenderedInputs(t *testing.T) {
+	for _, tc := range []struct {
+		name, from, to, appliedFrom, appliedTo string
+	}{
+		{"seconds", "2026-08-26T09:59:10Z", "2026-08-26T09:59:50Z", "2026-08-26T09:59:00Z", "2026-08-26T10:00:00Z"},
+		{"fractional at midnight", "2026-08-26T23:59:59.123Z", "2026-08-26T23:59:59.456Z", "2026-08-26T23:59:00Z", "2026-08-27T00:00:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newAnalyticsWebFixture(t)
+			values := url.Values{"from": {tc.from}, "to": {tc.to}}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?"+values.Encode(), nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("original range status = %d body=%s", response.Code, response.Body.String())
+			}
+			document, err := html.Parse(strings.NewReader(response.Body.String()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertAnalyticsLink(t, attrForElementWithText(document, "a", "Download CSV", "href"), "/admin/api/analytics/export.csv", values, false)
+			for _, expected := range []string{`data-range-from="` + tc.from + `"`, `data-range-to="` + tc.to + `"`} {
+				if !strings.Contains(response.Body.String(), expected) {
+					t.Fatalf("original chart range missing %q", expected)
+				}
+			}
+			form := url.Values{"client_id": {"1"}}
+			var collectInputs func(*html.Node)
+			collectInputs = func(node *html.Node) {
+				if node.Type == html.ElementNode && node.Data == "input" {
+					name := nodeAttr(node, "name")
+					if name == "from_local" || name == "to_local" || name == "limit" {
+						form.Set(name, nodeAttr(node, "value"))
+					}
+				}
+				for child := node.FirstChild; child != nil; child = child.NextSibling {
+					collectInputs(child)
+				}
+			}
+			collectInputs(document)
+			redirect := httptest.NewRecorder()
+			handler.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "/admin/analytics?"+form.Encode(), nil))
+			if redirect.Code != http.StatusSeeOther {
+				t.Fatalf("Apply status = %d body=%s", redirect.Code, redirect.Body.String())
+			}
+			location := redirect.Header().Get("Location")
+			response = httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, location, nil))
+			if response.Code != http.StatusOK {
+				t.Fatalf("applied range status = %d body=%s", response.Code, response.Body.String())
+			}
+			parsed, err := url.Parse(location)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := parsed.Query(); got.Get("from") != tc.appliedFrom || got.Get("to") != tc.appliedTo || got.Get("client_id") != "1" {
+				t.Fatalf("unexpected applied range: %s", location)
+			}
+		})
+	}
 }
 
 func TestAnalyticsChartStatusIsHonestWithoutJavaScript(t *testing.T) {
