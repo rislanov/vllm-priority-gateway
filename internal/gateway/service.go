@@ -49,45 +49,57 @@ type UsageRecorder interface {
 }
 
 type Dependencies struct {
-	Registry            SnapshotProvider
-	HMACSecret          []byte
-	Limiter             *admission.Limiter
-	Admission           coordination.AdmissionCoordinator
-	Leases              *coordination.LeaseManager
-	ReplicaID           uuid.UUID
-	LeaseTTL            time.Duration
-	Emergency           *coordination.EmergencyAdmission
-	CoordinationAllowed func() bool
-	CoordinationReady   func() bool
-	Runtime             Runtime
-	Router              *routing.Router
-	Forwarder           Forwarder
-	Usage               UsageRecorder
-	Observer            Observer
-	Now                 func() time.Time
-	LookupEnv           func(string) (string, bool)
-	RetryAfter          time.Duration
+	Tokenization             coordination.TokenizationCoordinator
+	TokenizationPolicy       coordination.TokenizationPolicy
+	TokenizationForwarder    TokenizationForwarder
+	TokenizationObserver     TokenizationObserver
+	TokenizationHealthMaxAge time.Duration
+	CoordinationTimeout      time.Duration
+	Registry                 SnapshotProvider
+	HMACSecret               []byte
+	Limiter                  *admission.Limiter
+	Admission                coordination.AdmissionCoordinator
+	Leases                   *coordination.LeaseManager
+	ReplicaID                uuid.UUID
+	LeaseTTL                 time.Duration
+	Emergency                *coordination.EmergencyAdmission
+	CoordinationAllowed      func() bool
+	CoordinationReady        func() bool
+	Runtime                  Runtime
+	Router                   *routing.Router
+	Forwarder                Forwarder
+	Usage                    UsageRecorder
+	Observer                 Observer
+	Now                      func() time.Time
+	LookupEnv                func(string) (string, bool)
+	RetryAfter               time.Duration
 }
 
 type Service struct {
-	registry            SnapshotProvider
-	hmacSecret          []byte
-	limiter             *admission.Limiter
-	admission           coordination.AdmissionCoordinator
-	leases              *coordination.LeaseManager
-	replicaID           uuid.UUID
-	leaseTTL            time.Duration
-	emergency           *coordination.EmergencyAdmission
-	coordinationAllowed func() bool
-	coordinationReady   func() bool
-	runtime             Runtime
-	router              *routing.Router
-	forwarder           Forwarder
-	usage               UsageRecorder
-	observer            Observer
-	now                 func() time.Time
-	lookupEnv           func(string) (string, bool)
-	retryAfter          time.Duration
+	tokenization             coordination.TokenizationCoordinator
+	tokenizationPolicy       coordination.TokenizationPolicy
+	tokenizationForwarder    TokenizationForwarder
+	tokenizationObserver     TokenizationObserver
+	tokenizationHealthMaxAge time.Duration
+	coordinationTimeout      time.Duration
+	registry                 SnapshotProvider
+	hmacSecret               []byte
+	limiter                  *admission.Limiter
+	admission                coordination.AdmissionCoordinator
+	leases                   *coordination.LeaseManager
+	replicaID                uuid.UUID
+	leaseTTL                 time.Duration
+	emergency                *coordination.EmergencyAdmission
+	coordinationAllowed      func() bool
+	coordinationReady        func() bool
+	runtime                  Runtime
+	router                   *routing.Router
+	forwarder                Forwarder
+	usage                    UsageRecorder
+	observer                 Observer
+	now                      func() time.Time
+	lookupEnv                func(string) (string, bool)
+	retryAfter               time.Duration
 }
 
 func New(dependencies Dependencies) *Service {
@@ -130,6 +142,7 @@ func New(dependencies Dependencies) *Service {
 		emergency = coordination.NewEmergencyAdmission(0, 0)
 	}
 	return &Service{
+		tokenization: dependencies.Tokenization, tokenizationPolicy: dependencies.TokenizationPolicy, tokenizationForwarder: dependencies.TokenizationForwarder, tokenizationObserver: dependencies.TokenizationObserver, tokenizationHealthMaxAge: dependencies.TokenizationHealthMaxAge, coordinationTimeout: dependencies.CoordinationTimeout,
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
 		limiter: limiter, admission: dependencies.Admission, leases: dependencies.Leases, replicaID: replicaID, leaseTTL: leaseTTL, emergency: emergency, coordinationAllowed: coordinationAllowed, coordinationReady: coordinationReady, runtime: dependencies.Runtime, router: dependencies.Router,
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,

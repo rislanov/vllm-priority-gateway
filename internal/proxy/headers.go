@@ -29,6 +29,19 @@ func PrepareUpstreamHeaders(source http.Header, requestID string, priority int, 
 	return headers
 }
 
+func PrepareTokenizationHeaders(source http.Header, requestID, upstreamAPIKey string) http.Header {
+	headers := cloneEndToEndHeaders(source)
+	for _, key := range []string{"Authorization", "X-Vllm-Priority", "X-LLM-Session-Id", "X-Session-Id", "Content-Length", "Idempotency-Key", "X-Idempotency-Key"} {
+		headers.Del(key)
+	}
+	headers.Set("X-Request-Id", requestID)
+	headers.Set("Content-Type", "application/json")
+	if upstreamAPIKey != "" {
+		headers.Set("Authorization", "Bearer "+upstreamAPIKey)
+	}
+	return headers
+}
+
 func CopyResponseHeaders(destination, source http.Header) {
 	clean := cloneEndToEndHeaders(source)
 	for key, values := range clean {

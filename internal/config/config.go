@@ -8,11 +8,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 )
 
 type LookupFunc func(string) (string, bool)
 
 type Config struct {
+	Tokenization                  coordination.TokenizationPolicy
 	postgresSettingsExplicit      bool
 	ListenAddress                 string
 	DatabaseDriver                string
@@ -68,6 +71,9 @@ type Config struct {
 
 func Load(lookup LookupFunc) (Config, error) {
 	cfg := defaultConfig()
+	if err := cfg.loadTokenization(lookup); err != nil {
+		return Config{}, err
+	}
 
 	cfg.ListenAddress = stringValue(lookup, "LLMGW_LISTEN_ADDRESS", cfg.ListenAddress)
 	cfg.DatabasePath = stringValue(lookup, "LLMGW_DATABASE_PATH", cfg.DatabasePath)
@@ -105,6 +111,7 @@ func Load(lookup LookupFunc) (Config, error) {
 
 func defaultConfig() Config {
 	return Config{
+		Tokenization:                  coordination.DefaultTokenizationPolicy(),
 		ListenAddress:                 ":8080",
 		DatabaseDriver:                "sqlite",
 		DatabasePath:                  "./data/llmgw.db",

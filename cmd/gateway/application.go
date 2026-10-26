@@ -106,17 +106,20 @@ func newGatewayApplication(
 		OpenCooldown: cfg.CircuitOpenCooldown, HalfOpenMaxProbes: cfg.CircuitHalfOpenMaxProbes,
 	}
 	var admissionCoordinator coordination.AdmissionCoordinator
+	var tokenizationCoordinator coordination.TokenizationCoordinator
 	var circuitCoordinator coordination.CircuitCoordinator
 	var replicaManager *coordpostgres.ReplicaManager
 	if postgresDatabase, ok := database.(*pgstore.Store); ok {
 		admissionCoordinator = coordpostgres.NewAdmissionCoordinator(postgresDatabase, cfg.CoordinationTimeout)
+		tokenizationCoordinator = coordpostgres.NewTokenizationCoordinator(postgresDatabase, cfg.Tokenization, cfg.CoordinationTimeout)
 		circuitCoordinator, err = coordpostgres.NewCircuitCoordinator(postgresDatabase, cfg.CoordinationTimeout, circuitOptions)
 		if err != nil {
 			return nil, fmt.Errorf("initialize circuit coordination: %w", err)
 		}
-		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions}, cfg.CoordinationTimeout)
+		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout)
 	} else {
 		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
+		tokenizationCoordinator = coordlocal.NewTokenizationCoordinator(cfg.Tokenization, time.Now)
 		circuitCoordinator, err = coordlocal.NewCircuitCoordinator(circuitOptions, time.Now)
 		if err != nil {
 			return nil, fmt.Errorf("initialize local circuit coordination: %w", err)
@@ -257,7 +260,21 @@ func newGatewayApplication(
 			(replicaManager == nil || replicaManager.Compatible() && !replicaManager.Status().Permanent) &&
 			(recoveryManager == nil || recoveryManager.Status().State != coordination.RecoveryPermanentFault)
 	}
+	tokenizationObserver := metrics.NewTokenizationObserver(logger, registryValue.Snapshot, tokenizationCoordinator)
+	application.startWorker(func() {
+		ticker := time.NewTicker(cfg.ConfigPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tokenizationObserver.Reconcile()
+			}
+		}
+	})
 	service := gateway.New(gateway.Dependencies{
+		Tokenization: tokenizationCoordinator, TokenizationPolicy: cfg.Tokenization, TokenizationForwarder: proxy.New(upstreamClient), TokenizationObserver: tokenizationObserver, TokenizationHealthMaxAge: cfg.HealthInterval*time.Duration(cfg.UnhealthyAfter) + cfg.HealthTimeout, CoordinationTimeout: cfg.CoordinationTimeout,
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Admission: admissionCoordinator, Leases: leaseManager, ReplicaID: replicaID, LeaseTTL: cfg.LeaseTTL,
 		Emergency: coordination.NewEmergencyAdmission(cfg.EmergencyCriticalMaxInflight, cfg.EmergencyHighMaxInflight), CoordinationAllowed: coordinationAllowed, CoordinationReady: adminMutationsAllowed,
 		Runtime: manager, Router: routing.NewWithSessionAffinity(
@@ -324,6 +341,7 @@ func newGatewayApplication(
 	router.Get("/inference-readyz", inferenceReadinessHandler.ServeHTTP)
 	router.Handle("/metrics", metrics.Handler())
 	router.Handle("/v1", publicHandler)
+	router.Handle("/tokenize", publicHandler)
 	router.Handle("/v1/*", publicHandler)
 	router.Handle("/admin/api", security.Wrap(adminAPI))
 	router.Handle("/admin/api/*", security.Wrap(adminAPI))
@@ -343,7 +361,7 @@ func newGatewayApplication(
 	})
 	if _, ok := database.(*pgstore.Store); ok {
 		application.startWorker(func() {
-			runCoordinationCleanup(ctx, admissionCoordinator.(coordination.CleanupBatcher), circuitCoordinator.(coordination.CleanupBatcher))
+			runCoordinationCleanup(ctx, admissionCoordinator.(coordination.CleanupBatcher), circuitCoordinator.(coordination.CleanupBatcher), tokenizationCoordinator.(coordination.CleanupBatcher))
 		})
 	}
 	if err := startupCtx.Err(); err != nil {

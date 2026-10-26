@@ -64,7 +64,7 @@ func resetDatabase(t *testing.T, store *pgstore.Store) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := store.ConfigPool().Exec(ctx, `TRUNCATE TABLE backend_circuit_active_failures,backend_circuit_failures,backend_circuit_failure_receipts,backend_circuit_probes,backend_circuit_state,coordination_rate_state,request_leases,admission_operations,coordination_replicas,client_admission_scopes,pool_admission_scopes,usage_requests,client_model_access,api_keys,backends,clients,model_pools RESTART IDENTITY CASCADE; UPDATE config_meta SET revision=0 WHERE singleton=1`)
+	_, err := store.ConfigPool().Exec(ctx, `TRUNCATE TABLE tokenization_leases,tokenization_operations,tokenization_rate_state,tokenization_client_scopes,tokenization_backend_scopes,backend_circuit_active_failures,backend_circuit_failures,backend_circuit_failure_receipts,backend_circuit_probes,backend_circuit_state,coordination_rate_state,request_leases,admission_operations,coordination_replicas,client_admission_scopes,pool_admission_scopes,usage_requests,client_model_access,api_keys,backends,clients,model_pools RESTART IDENTITY CASCADE; UPDATE config_meta SET revision=0 WHERE singleton=1`)
 	if err != nil {
 		t.Fatalf("reset dedicated PostgreSQL test database: %v", err)
 	}

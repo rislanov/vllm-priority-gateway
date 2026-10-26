@@ -29,6 +29,7 @@ type ReplicaPolicy struct {
 	Circuit            circuitbreaker.Options
 	RateAlgorithm      int
 	ContractVersion    int
+	Tokenization       coordination.TokenizationPolicy
 }
 
 func PolicyFingerprint(policy ReplicaPolicy) [32]byte {

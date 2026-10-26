@@ -26,6 +26,7 @@ function stop(code = 0) {
   process.exitCode = code;
 }
 for (const port of ports) {
+  if (stopping) break;
   const gateway = spawn(binary, [], {
     cwd: root, stdio: 'inherit',
     env: {
@@ -44,6 +45,17 @@ for (const port of ports) {
   gateways.push(gateway);
   gateway.on('error', (error) => { console.error(error); stop(1); });
   gateway.on('exit', (code) => { if (!stopping) stop(code ?? 1); });
+  // Finish one replica's startup/recovery barrier before registering the next.
+  // The browser suite tests cross-replica HTTP behavior; simultaneous serializable
+  // registration races have their own deterministic PostgreSQL integration tests.
+  if (postgresDSN) {
+    const deadline = Date.now() + 30_000;
+    while (!stopping) {
+      try { if ((await fetch(`http://127.0.0.1:${port}/readyz`)).ok) break; } catch {}
+      if (Date.now() > deadline) { stop(1); break; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => stop());
 if (postgresDSN) {

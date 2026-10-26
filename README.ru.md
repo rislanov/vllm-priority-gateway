@@ -2,6 +2,17 @@
 
 # vLLM Priority Gateway
 
+Gateway поддерживает авторизованный **`POST /tokenize`** для текстовых prompt и chat messages. Публичное имя модели переводится в upstream-имя; ответ возвращается от токенизатора выбранного vLLM. Токенизация имеет отдельные лимиты клиента/backend и RPM, общие для PostgreSQL-реплик, и не меняет inference-квоты и аналитику. [Политика и порядок обновления](docs/operations.md#tokenization).
+
+```sh
+curl http://localhost:8080/tokenize \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"public-model","messages":[{"role":"user","content":"Hello"}],"add_generation_prompt":true}'
+```
+
+Reverse proxy должен направлять корневой `/tokenize` в gateway вместе с `/v1/*`.
+
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)

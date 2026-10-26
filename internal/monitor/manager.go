@@ -158,6 +158,19 @@ func (m *Manager) Snapshot(backendID int64, at time.Time) domain.BackendRuntime 
 	return snapshot
 }
 
+// BackendHealth reads a matching worker without consulting or acquiring the
+// inference circuit. Publication can precede Reconcile, so match the full
+// backend identity rather than accepting an old worker with the same ID.
+func (m *Manager) BackendHealth(expected domain.Backend, at time.Time) (domain.BackendRuntime, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	managed := m.workers[expected.ID]
+	if m.shutdown || managed == nil || managed.worker.Backend() != expected {
+		return domain.BackendRuntime{}, false
+	}
+	return managed.worker.Snapshot(at), true
+}
+
 func (m *Manager) PoolSnapshot(poolID int64, at time.Time) domain.PoolRuntime {
 	m.mu.Lock()
 	defer m.mu.Unlock()
