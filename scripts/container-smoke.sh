@@ -24,6 +24,11 @@ port="$(docker port "$container" 8080/tcp | sed -n 's/.*://p' | head -n 1)"
 attempt=0
 while [ "$attempt" -lt 50 ]; do
   if curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null; then
+    # Exercise temporary-file creation as the image's unprivileged runtime user.
+    # An empty ledger must still export its CSV header successfully.
+    csv="$(curl -fsS -u 'operator:correct horse battery staple' \
+      "http://127.0.0.1:$port/admin/api/analytics/export.csv?from=2026-01-15T00%3A00%3A00Z&to=2026-01-16T00%3A00%3A00Z")"
+    printf '%s\n' "$csv" | grep -q '^id,occurred_at,request_id,'
     exit 0
   fi
   attempt=$((attempt + 1))
