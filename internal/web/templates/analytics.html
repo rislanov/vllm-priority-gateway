@@ -4,7 +4,7 @@
     <h1>Usage analytics</h1>
     <p>Request volume and token usage for the live gateway ledger.</p>
   </div>
-  <a class="button" href="{{.Analytics.CSVURL}}">Download CSV</a>
+  <div><a class="button" href="{{.Analytics.CSVURL}}">Download CSV</a><small class="csv-timezone">CSV timestamps: UTC</small></div>
 </section>
 
 <section class="analytics-filters" aria-labelledby="analytics-filter-title">
@@ -14,14 +14,16 @@
       {{range .Analytics.Presets}}<a class="preset{{if .Active}} active{{end}}" href="{{.URL}}"{{if .Active}} aria-current="true"{{end}}>{{.Label}}</a>{{end}}
     </div>
   </div>
-  <form method="get" action="/admin/analytics" class="analytics-filter-grid">
+  <form method="get" action="/admin/analytics" class="analytics-filter-grid" data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
     <div>
-      <label for="analytics-from">From (UTC)</label>
-      <input id="analytics-from" name="from_local" type="datetime-local" step="60" value="{{.Analytics.FromValue}}" required>
+      <label for="analytics-from">From (<span data-analytics-timezone>UTC</span>)</label>
+      <input id="analytics-from" name="from_local" type="datetime-local" step="60" value="{{.Analytics.FromValue}}" data-utc-input="{{.Analytics.FromValue}}" aria-describedby="analytics-from-offset analytics-range-hint" required>
+      <small id="analytics-from-offset" class="analytics-offset" data-analytics-offset="from">UTC+00:00</small>
     </div>
     <div>
-      <label for="analytics-to">To (UTC)</label>
-      <input id="analytics-to" name="to_local" type="datetime-local" step="60" value="{{.Analytics.ToValue}}" required>
+      <label for="analytics-to">To (<span data-analytics-timezone>UTC</span>)</label>
+      <input id="analytics-to" name="to_local" type="datetime-local" step="60" value="{{.Analytics.ToValue}}" data-utc-input="{{.Analytics.ToValue}}" aria-describedby="analytics-to-offset analytics-range-hint" required>
+      <small id="analytics-to-offset" class="analytics-offset" data-analytics-offset="to">UTC+00:00</small>
     </div>
     <div>
       <label for="analytics-client">Client</label>
@@ -50,6 +52,8 @@
       <a class="button" href="/admin/analytics">Reset</a>
       <button class="button primary" type="submit">Apply</button>
     </div>
+    <p id="analytics-range-hint" class="analytics-range-hint">Enter range boundaries in UTC. CSV exports use UTC.</p>
+    <p class="analytics-range-error" data-analytics-range-error role="alert" hidden></p>
   </form>
 </section>
 
@@ -68,7 +72,7 @@
 
 <section class="analytics-section" aria-labelledby="movement-title">
   <div class="section-heading">
-    <div><h2 id="movement-title">Movement</h2><p>UTC buckets adapt to the selected range.</p></div>
+    <div><h2 id="movement-title">Movement</h2><p>UTC buckets adapt to the selected range. Labels: <span data-analytics-timezone>UTC</span>.</p></div>
   </div>
   <div class="chart-grid">
     <article class="chart-panel" aria-labelledby="request-volume-title">
@@ -79,25 +83,38 @@
       </div>
       <details class="chart-fallback">
         <summary>View request volume data</summary>
-        <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (UTC)</th><th>Requests</th></tr></thead><tbody data-analytics-series data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
-          {{range .Analytics.Dataset.Series}}<tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}"{{with .CacheReadTokens}} data-cache-read-tokens="{{.}}"{{end}}{{with .CacheHitRatio}} data-cache-hit-ratio="{{.}}"{{end}}><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+        <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Requests</th></tr></thead><tbody data-analytics-series data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
+          {{range .Analytics.Dataset.Series}}<tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}"{{with .CacheReadTokens}} data-cache-read-tokens="{{.}}"{{end}}{{with .CacheHitRatio}} data-cache-hit-ratio="{{.}}"{{end}}><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
-    <article class="chart-panel" aria-labelledby="token-volume-title">
-      <h3 id="token-volume-title">Input and output tokens</h3>
-      <p class="chart-note">Two independent, non-stacked series from a zero baseline.</p>
-      <div class="chart-stage" data-analytics-chart="tokens">
+    <article class="chart-panel" aria-labelledby="input-tokens-title">
+      <h3 id="input-tokens-title">Input tokens</h3>
+      <p class="chart-note">Input tokens per UTC bucket, shown from a zero baseline on an independent scale.</p>
+      <div class="chart-stage" data-analytics-chart="input-tokens">
         <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
       </div>
       <details class="chart-fallback">
-        <summary>View input and output token data</summary>
-        <div class="table-wrap"><table><caption>Input and output token data</caption><thead><tr><th>Bucket (UTC)</th><th>Input</th><th>Output</th></tr></thead><tbody>
-          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{integer .InputTokens}}</td><td class="mono">{{integer .OutputTokens}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
+        <summary>View input token data</summary>
+        <div class="table-wrap"><table><caption>Input token data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Input tokens</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .InputTokens}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
-    <article class="chart-panel chart-panel-wide" aria-labelledby="cache-usage-title">
+    <article class="chart-panel" aria-labelledby="output-tokens-title">
+      <h3 id="output-tokens-title">Output tokens</h3>
+      <p class="chart-note">Output tokens per UTC bucket, shown from a zero baseline on an independent scale.</p>
+      <div class="chart-stage" data-analytics-chart="output-tokens">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
+      </div>
+      <details class="chart-fallback">
+        <summary>View output token data</summary>
+        <div class="table-wrap"><table><caption>Output token data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Output tokens</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .OutputTokens}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+        </tbody></table></div>
+      </details>
+    </article>
+    <article class="chart-panel" aria-labelledby="cache-usage-title">
       <h3 id="cache-usage-title">Cache usage</h3>
       <p class="chart-note">Aligned token and ratio plots for cache-known buckets only. Gaps mean unavailable data.</p>
       <div class="chart-stage chart-stage-tall" data-analytics-chart="cache">
@@ -105,8 +122,8 @@
       </div>
       <details class="chart-fallback">
         <summary>View cache-known usage data</summary>
-        <div class="table-wrap"><table><caption>Cache-known usage data</caption><thead><tr><th>Bucket (UTC)</th><th>Cache read</th><th>Cache hit</th></tr></thead><tbody>
-          {{range .Analytics.Dataset.Series}}<tr><td class="mono">{{utcTimestamp .BucketStart}}</td><td class="mono">{{optionalInteger .CacheReadTokens}}</td><td class="mono">{{optionalRatio .CacheHitRatio}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
+        <div class="table-wrap"><table><caption>Cache-known usage data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Cache read</th><th>Cache hit</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{optionalInteger .CacheReadTokens}}</td><td class="mono">{{optionalRatio .CacheHitRatio}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
@@ -129,12 +146,12 @@
 
 <section class="analytics-section" aria-labelledby="requests-title">
   <div class="section-heading">
-    <div><h2 id="requests-title">Request detail</h2><p>Operational timestamps are precise UTC; token fields are em dashes when usage was not reported.</p></div>
+    <div><h2 id="requests-title">Request detail</h2><p>Operational timestamps are precise <span data-analytics-timezone>UTC</span>; token fields are em dashes when usage was not reported.</p></div>
     {{if .Analytics.Requests.Requests}}<p class="page-count">Showing {{integer .Analytics.FirstRequest}}–{{integer .Analytics.LastRequest}} of {{integer .Analytics.Requests.Total}}</p>{{end}}
   </div>
   <div class="table-wrap"><table class="request-table"><thead><tr><th>Occurred at</th><th>Request ID</th><th>Client</th><th>Model</th><th>Backend</th><th>Status</th><th>Duration</th><th>TTFT</th><th>Retries</th><th>Input</th><th>Output</th><th>Cache read</th></tr></thead><tbody>
     {{range .Analytics.Requests.Requests}}<tr>
-      <td class="mono timestamp">{{utcTimestamp .OccurredAt}}</td>
+      <td class="mono timestamp"><time datetime="{{canonicalTime .OccurredAt}}" data-analytics-time>{{utcTimestamp .OccurredAt}}</time></td>
       <td><strong class="mono request-id">{{.RequestID}}</strong>{{if .ParentRequestID}}<small class="mono">Parent {{.ParentRequestID}}</small>{{end}}</td>
       <td>{{.ClientName}}</td><td>{{.ModelName}}</td><td>{{.BackendName}}</td>
       <td class="mono">{{.HTTPStatus}}{{if .Disconnected}}<small>Disconnected</small>{{end}}</td>

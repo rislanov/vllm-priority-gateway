@@ -129,6 +129,16 @@ Analytics is metadata-only. It stores timestamps, generated request IDs, configu
 
 Cache-read tokens are a subset of input tokens. Missing cache detail means the upstream did not report it; it is unknown, not zero. Cache totals and hit ratios therefore use only the cache-known subset.
 
+### Analytics time zones and shared ranges
+
+Usage analytics displays request timestamps, chart labels, chart data tables, and From/To inputs in the browser's time zone. The active IANA zone is shown in the labels and footer. Request timestamps keep millisecond precision and include the numeric UTC offset at that instant, so repeated local times remain distinguishable. Chart buckets and preset durations keep their existing UTC boundaries and duration semantics; they are not rebased to local calendar days.
+
+Applying an edited local boundary converts it to an absolute UTC instant. Unchanged boundaries preserve their exact canonical timestamp strings, including seconds and nanoseconds, even though the editable fields show minutes. Editing one boundary preserves the other boundary's precision. Pagination, CSV links, and shared canonical range URLs retain those absolute UTC instants: opening the same link in different zones changes the display, not the selected interval. CSV exports and API timestamps remain UTC, as does stored usage data.
+
+New or edited times skipped by a daylight-saving clock change are rejected. New or edited repeated times select the earlier occurrence; the effective offset is shown beside each input. An unchanged boundary already identifying the later occurrence retains that exact instant and its offset. For example, in `America/New_York`, a new `2026-11-01 01:30` selects `05:30Z` (UTC-04:00), while an existing `06:30Z` boundary remains the later `01:30` (UTC-05:00) unless edited.
+
+Without JavaScript, or if time localization cannot initialize, analytics retains explicitly labeled UTC timestamps and UTC From/To interpretation. This fallback applies the minute-resolution values shown in its form. Other Admin pages continue to display UTC. On narrow screens, charts scroll horizontally to keep their labels readable.
+
 ## Metrics and logs
 
 `GET /metrics` exposes request, decision, in-flight, pool/backend pressure, duration, queue wait, TTFT, circuit, failure/retry, and token-usage series under the `llmgw_*` namespace. The decision-focused contract is:

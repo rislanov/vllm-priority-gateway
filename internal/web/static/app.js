@@ -105,6 +105,91 @@
     window.setTimeout(autoRefresh, 15000);
   }
 
+  const analyticsTimeZone = initAnalyticsTime();
+
+  function initAnalyticsTime() {
+    const form = document.querySelector('.analytics-filter-grid');
+    const time = window.LLMGWAnalyticsTime;
+    if (!form || !time) return null;
+    const changes = [];
+    const bindings = [];
+    let committed = false;
+    function change(element, property, value) {
+      if (!element) throw new Error('Missing analytics time control');
+      changes.push({element, property, previous: element[property], value});
+    }
+    function bind(element, type, handler) {
+      element.addEventListener(type, handler);
+      bindings.push({element, type, handler});
+    }
+    try {
+      const timeZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (!timeZone) return null;
+      const boundaries = ['from', 'to'].map((name) => {
+        const input = form.querySelector(`#analytics-${name}`);
+        const original = form.dataset[name === 'from' ? 'rangeFrom' : 'rangeTo'];
+        const initial = time.toLocalInput(input.dataset.utcInput);
+        const resolved = time.resolveBoundary(initial, initial, original);
+        change(input, 'value', initial);
+        const hint = form.querySelector(`[data-analytics-offset="${name}"]`);
+        change(hint, 'textContent', resolved.offsetLabel);
+        return {name, input, hint, initial, original};
+      });
+      document.querySelectorAll('[data-analytics-time]').forEach((element) => {
+        change(element, 'textContent', time.formatTimestamp(element.getAttribute('datetime'), {timeZone, precision: 'millisecond'}));
+      });
+      document.querySelectorAll('[data-analytics-timezone]').forEach((element) => change(element, 'textContent', timeZone));
+      change(form.querySelector('#analytics-range-hint'), 'textContent',
+        'Times use your browser time zone. New or edited repeated times select the earlier occurrence; the effective UTC offset is shown beside each field. Times skipped by a clock change are invalid. Unchanged boundaries keep their exact precision. CSV exports use UTC.');
+      const error = form.querySelector('[data-analytics-range-error]');
+      if (!error) throw new Error('Missing analytics validation message');
+      const resolve = (boundary) => time.resolveBoundary(boundary.input.value, boundary.initial, boundary.original);
+      boundaries.forEach((boundary) => bind(boundary.input, 'input', () => {
+        boundary.input.setCustomValidity('');
+        const result = resolve(boundary);
+        boundary.hint.textContent = result.error ? 'Invalid local time' : result.offsetLabel;
+        error.hidden = true;
+      }));
+      bind(form, 'submit', (event) => {
+        if (!committed) return;
+        event.preventDefault();
+        try {
+          const target = new URL(form.action, window.location.href);
+          target.search = '';
+          for (const boundary of boundaries) {
+            const result = resolve(boundary);
+            boundary.input.setCustomValidity(result.error || '');
+            if (result.error) {
+              error.textContent = result.error;
+              error.hidden = false;
+              boundary.input.focus();
+              boundary.input.reportValidity();
+              return;
+            }
+            target.searchParams.set(boundary.name, result.canonical);
+          }
+          for (const name of ['client_id', 'model_pool_id', 'usage_available', 'limit']) {
+            const value = form.elements.namedItem(name)?.value;
+            if (value) target.searchParams.set(name, value);
+          }
+          // Ordering is validated by the server at full RFC3339Nano precision.
+          window.location.assign(target.href);
+        } catch {
+          error.textContent = 'Unable to convert this range. Reload the page and try again.';
+          error.hidden = false;
+        }
+      });
+      // All formatting/conversion must succeed before changing the UTC fallback.
+      changes.forEach(({element, property, value}) => { element[property] = value; });
+      committed = true;
+      return timeZone;
+    } catch {
+      bindings.forEach(({element, type, handler}) => element.removeEventListener(type, handler));
+      changes.forEach(({element, property, previous}) => { element[property] = previous; });
+      return null;
+    }
+  }
+
   const svgNamespace = 'http://www.w3.org/2000/svg';
   const palette = {grid: '#34475a', text: '#9aa8ba', request: '#ffb32c', input: '#38d6a2', output: '#b883f4', cache: '#78b8ff', ratio: '#ffb32c'};
   const chartContainers = [...document.querySelectorAll('[data-analytics-chart]')];
@@ -117,15 +202,44 @@
     cacheReadTokens: nullableDatasetNumber(point.dataset, 'cacheReadTokens'),
     cacheHitRatio: nullableDatasetNumber(point.dataset, 'cacheHitRatio'),
   }));
-  chartContainers.forEach((container) => renderChart(container, series));
+  const renderedWidths = new WeakMap();
+  chartContainers.forEach((container) => {
+    renderChart(container, series);
+    renderedWidths.set(container, container.clientWidth);
+  });
+  if (typeof ResizeObserver === 'function') {
+    const pending = new Set();
+    let scheduled = false;
+    const observer = new ResizeObserver((entries) => {
+      entries.forEach(({target}) => {
+        if (target.clientWidth > 0 && target.clientWidth !== renderedWidths.get(target)) pending.add(target);
+      });
+      if (pending.size === 0 || scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        pending.forEach((container) => {
+          const width = container.clientWidth;
+          if (width > 0 && width !== renderedWidths.get(container)) {
+            renderChart(container, series);
+            renderedWidths.set(container, width);
+          }
+        });
+        pending.clear();
+      });
+    });
+    chartContainers.forEach((container) => observer.observe(container));
+  }
 
   function renderChart(container, series) {
+    if (container.clientWidth === 0) return;
     if (series.length === 0) {
       setChartMessage(container, 'No series data is available for this range.');
       return;
     }
     if (container.dataset.analyticsChart === 'requests') renderRequestChart(container, series);
-    if (container.dataset.analyticsChart === 'tokens') renderTokenChart(container, series);
+    if (container.dataset.analyticsChart === 'input-tokens') renderTokenChart(container, series, 'inputTokens');
+    if (container.dataset.analyticsChart === 'output-tokens') renderTokenChart(container, series, 'outputTokens');
     if (container.dataset.analyticsChart === 'cache') renderCacheChart(container, series);
   }
 
@@ -135,22 +249,21 @@
     drawGrid(frame, 48, 210, Math.max(1, ...values), (value) => compactNumber(value));
     drawSeries(frame, series, values, 48, 210, Math.max(1, ...values), palette.request, false, 'circle');
     drawTimeLabels(frame, series, 234);
-    drawLegend(frame.svg, [{label: 'Requests', color: palette.request, marker: 'circle'}], 18);
+    drawLegend(frame, [{label: 'Requests', color: palette.request, marker: 'circle'}], 18);
   }
 
-  function renderTokenChart(container, series) {
-    const input = series.map((point) => numeric(point.inputTokens));
-    const output = series.map((point) => numeric(point.outputTokens));
-    const maximum = Math.max(1, ...input, ...output);
-    const frame = chartFrame(container, series, 280, 'Input and output token chart', 'Independent input and output token lines from a zero baseline. Input is solid with circles; output is dashed with squares.');
+  function renderTokenChart(container, series, metric) {
+    const values = series.map((point) => numeric(point[metric]));
+    const maximum = Math.max(1, ...values);
+    const output = metric === 'outputTokens';
+    const label = output ? 'Output' : 'Input';
+    const color = output ? palette.output : palette.input;
+    const marker = output ? 'square' : 'circle';
+    const frame = chartFrame(container, series, 280, `${label} token chart`, `${label} tokens per UTC bucket on an independent scale from a zero baseline. ${output ? 'Dashed line with squares.' : 'Solid line with circles.'}`);
     drawGrid(frame, 48, 210, maximum, (value) => compactNumber(value));
-    drawSeries(frame, series, input, 48, 210, maximum, palette.input, false, 'circle');
-    drawSeries(frame, series, output, 48, 210, maximum, palette.output, true, 'square');
+    drawSeries(frame, series, values, 48, 210, maximum, color, output, marker);
     drawTimeLabels(frame, series, 234);
-    drawLegend(frame.svg, [
-      {label: 'Input', color: palette.input, marker: 'circle'},
-      {label: 'Output', color: palette.output, marker: 'square', dashed: true},
-    ], 18);
+    drawLegend(frame, [{label, color, marker, dashed: output}], 18);
   }
 
   function renderCacheChart(container, series) {
@@ -162,21 +275,23 @@
     }
     const frame = chartFrame(container, series, 460, 'Cache-read tokens and cache-hit ratio charts', 'Two aligned plots for cache-known buckets. The top plot uses tokens; the bottom uses percent. Gaps represent unavailable cache data.');
     const cacheMaximum = Math.max(1, ...cache.filter((value) => value !== null));
-    addText(frame.svg, 64, 36, 'Cache-read tokens — cache-known buckets', 'chart-subtitle');
+    addText(frame.svg, frame.left, 20, 'Cache-read tokens', 'chart-subtitle');
+    addText(frame.svg, frame.left, 36, 'Cache-known buckets', 'chart-subtitle');
     drawGrid(frame, 52, 184, cacheMaximum, (value) => compactNumber(value));
     drawSeries(frame, series, cache, 52, 184, cacheMaximum, palette.cache, false, 'circle');
-    addText(frame.svg, 64, 236, 'Cache-hit ratio — cache-known buckets', 'chart-subtitle');
+    addText(frame.svg, frame.left, 220, 'Cache-hit ratio', 'chart-subtitle');
+    addText(frame.svg, frame.left, 236, 'Cache-known buckets', 'chart-subtitle');
     drawGrid(frame, 252, 384, 1, (value) => `${Math.round(value * 100)}%`);
     drawSeries(frame, series, ratio, 252, 384, 1, palette.ratio, false, 'square');
     drawTimeLabels(frame, series, 410);
   }
 
   function chartFrame(container, series, height, titleText, descriptionText) {
+    const width = container.clientWidth;
     clearElement(container);
-    const svg = svgElement('svg', {viewBox: `0 0 760 ${height}`, role: 'img', preserveAspectRatio: 'xMidYMid meet'});
-    const sequence = document.querySelectorAll('svg.analytics-chart').length + 1;
-    const titleID = `analytics-chart-title-${sequence}`;
-    const descriptionID = `analytics-chart-description-${sequence}`;
+    const svg = svgElement('svg', {viewBox: `0 0 ${width} ${height}`, role: 'img', preserveAspectRatio: 'xMidYMid meet'});
+    const titleID = `analytics-chart-title-${container.dataset.analyticsChart}`;
+    const descriptionID = `analytics-chart-description-${container.dataset.analyticsChart}`;
     svg.setAttribute('class', 'analytics-chart');
     svg.setAttribute('aria-labelledby', `${titleID} ${descriptionID}`);
     const title = svgElement('title', {id: titleID});
@@ -185,7 +300,7 @@
     description.textContent = descriptionText;
     svg.append(title, description);
     container.append(svg);
-    return {svg, series, left: 64, right: 742};
+    return {svg, series, width, left: 64, right: width - 18};
   }
 
   function drawGrid(frame, top, bottom, maximum, formatter) {
@@ -217,16 +332,47 @@
       if (marker === 'square') frame.svg.append(svgElement('rect', {x: point.x - 4, y: point.y - 4, width: 8, height: 8, fill: color}));
       else frame.svg.append(svgElement('circle', {cx: point.x, cy: point.y, r: 4.5, fill: color}));
     });
-    if (known.length === 1) addText(frame.svg, known[0].x + 9, known[0].y - 9, 'One reported bucket', 'chart-sparse-label');
+    if (known.length === 1) {
+      const labelY = known[0].y <= top + 20 ? known[0].y + 18 : known[0].y - 9;
+      const label = addText(frame.svg, known[0].x, labelY, 'One reported bucket', 'chart-sparse-label', 'middle');
+      const halfWidth = label.getComputedTextLength() / 2;
+      label.setAttribute('x', Math.max(frame.left + halfWidth, Math.min(frame.right - halfWidth, known[0].x)));
+    }
   }
 
   function drawTimeLabels(frame, series, y) {
-    addText(frame.svg, frame.left, y, utcLabel(series[0].bucketStart), 'chart-axis-label', 'start');
-    if (series.length > 1) addText(frame.svg, frame.right, y, utcLabel(series[series.length - 1].bucketStart), 'chart-axis-label', 'end');
+    const draw = (point, x, anchor) => {
+      let label = utcLabel(point.bucketStart);
+      let accessible = label;
+      if (analyticsTimeZone) {
+        try {
+          label = window.LLMGWAnalyticsTime.formatAxisTimestamp(point.bucketStart, analyticsTimeZone);
+          accessible = window.LLMGWAnalyticsTime.formatTimestamp(point.bucketStart, {timeZone: analyticsTimeZone, precision: 'minute'});
+        } catch { /* Keep an explicitly UTC label if formatting fails. */ }
+      }
+      const text = addText(frame.svg, x, y, '', 'chart-axis-label', anchor);
+      if (frame.right - frame.left < 420) {
+        const [date, ...time] = label.split(' ');
+        const first = svgElement('tspan', {x, dy: 0});
+        first.textContent = date + ' ';
+        const second = svgElement('tspan', {x, dy: 16});
+        second.textContent = time.join(' ');
+        text.append(first, second);
+      } else {
+        text.textContent = label;
+      }
+      text.setAttribute('aria-label', accessible);
+      const title = svgElement('title', {});
+      title.textContent = accessible;
+      text.append(title);
+    };
+    draw(series[0], frame.left, 'start');
+    if (series.length > 1) draw(series[series.length - 1], frame.right, 'end');
   }
 
-  function drawLegend(svg, items, y) {
-    let x = 520;
+  function drawLegend(frame, items, y) {
+    const svg = frame.svg;
+    let x = frame.left;
     items.forEach((item) => {
       const line = svgElement('line', {x1: x, y1: y, x2: x + 25, y2: y, stroke: item.color, 'stroke-width': 3});
       if (item.dashed) line.setAttribute('stroke-dasharray', '7 6');
@@ -258,6 +404,7 @@
     if (anchor) label.setAttribute('text-anchor', anchor);
     label.textContent = value;
     svg.append(label);
+    return label;
   }
 
   function setChartMessage(container, message) {
