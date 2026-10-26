@@ -59,8 +59,8 @@ func TestAnalyticsCanonicalMarkersRetainPrecisionAndUTCFallback(t *testing.T) {
 		}
 		if !empty {
 			want := `<time datetime="2026-01-15T12:00:00.123456789Z" data-analytics-time>2026-01-15 12:00:00.123 UTC</time>`
-			if got := strings.Count(body, want); got != 4 {
-				t.Errorf("timestamp markers = %d, want 4", got)
+			if got := strings.Count(body, want); got != 5 {
+				t.Errorf("timestamp markers = %d, want 5", got)
 			}
 		}
 		if strings.Index(body, "analytics-time.js") > strings.Index(body, "app.js") {
@@ -210,7 +210,7 @@ func TestAnalyticsPageRendersMissingUsageAndHonestEmptyState(t *testing.T) {
 func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *testing.T) {
 	handler := newAnalyticsWebFixture(t)
 	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics", nil))
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-26T10:00:00Z&to=2026-08-26T11:05:00Z", nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 	}
@@ -219,10 +219,21 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if countElementsWithAttr(document, "data-analytics-chart") != 3 {
-		t.Fatalf("chart containers = %d, want 3: %s", countElementsWithAttr(document, "data-analytics-chart"), body)
+	if countElementsWithAttr(document, "data-analytics-chart") != 4 {
+		t.Fatalf("chart containers = %d, want 4", countElementsWithAttr(document, "data-analytics-chart"))
 	}
-	if countElements(document, "caption") < 3 || !strings.Contains(body, "Request volume data") || !strings.Contains(body, "Input and output token data") || !strings.Contains(body, "Cache-known usage data") {
+	previous := -1
+	for _, chart := range []string{"requests", "input-tokens", "output-tokens", "cache"} {
+		position := strings.Index(body, `data-analytics-chart="`+chart+`"`)
+		if position <= previous {
+			t.Fatalf("missing or out-of-order chart %s", chart)
+		}
+		previous = position
+	}
+	if countElementsWithAttr(document, "data-analytics-series") != 1 || countElementsWithAttr(document, "data-analytics-point") != 13 {
+		t.Fatal("expected one canonical source with 13 five-minute buckets")
+	}
+	if countElements(document, "caption") != 4 || !strings.Contains(body, "Request volume data") || !strings.Contains(body, "Input token data") || !strings.Contains(body, "Output token data") || !strings.Contains(body, "Cache-known usage data") {
 		t.Fatalf("server-rendered chart fallbacks missing: %s", body)
 	}
 	if !strings.Contains(body, `src="/admin/static/app.js"`) || strings.Contains(body, "https://") || strings.Contains(body, "http://") {
@@ -244,6 +255,54 @@ func TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript(t *tes
 	scriptBody := script.Body.String()
 	if namespace, render := strings.Index(scriptBody, "const svgNamespace"), strings.Index(scriptBody, "chartContainers.forEach"); namespace < 0 || render < 0 || namespace > render {
 		t.Fatal("chart script must initialize the SVG namespace before synchronously rendering SSR series")
+	}
+}
+
+func TestAnalyticsTokenFallbacksPreserveValuesZerosAndEmptyRanges(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		series        []analytics.SeriesPoint
+		input, output string
+	}{
+		{"unavailable-cache", []analytics.SeriesPoint{{BucketStart: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC), RequestCount: 1, InputTokens: 123, OutputTokens: 7}}, "123", "7"},
+		{"zero", []analytics.SeriesPoint{{BucketStart: time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)}}, "0", "0"},
+		{"empty", nil, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newWebFixtureWithQueryStore(t, nil, &dashboardQueryStoreStub{dataset: analytics.Dataset{Series: tc.series}})
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics", nil))
+			document, err := html.Parse(strings.NewReader(response.Body.String()))
+			if err != nil || response.Code != http.StatusOK {
+				t.Fatalf("render failed: status=%d err=%v", response.Code, err)
+			}
+			for caption, want := range map[string]string{"Input token data": tc.input, "Output token data": tc.output} {
+				found := false
+				var visit func(*html.Node)
+				visit = func(node *html.Node) {
+					if node.Data == "table" && hasElementText(node, "caption", caption) {
+						found = true
+						if want == "" {
+							if !hasElementText(node, "td", "No series data is available for this range.") {
+								t.Error("missing empty table state")
+							}
+						} else if !hasElementText(node, "td", want) || countElements(node, "td") != 2 {
+							t.Errorf("%s: expected one timestamp and metric %s", caption, want)
+						}
+					}
+					for child := node.FirstChild; child != nil; child = child.NextSibling {
+						visit(child)
+					}
+				}
+				visit(document)
+				if !found {
+					t.Errorf("missing fallback %s", caption)
+				}
+			}
+			if len(tc.series) > 0 && !strings.Contains(response.Body.String(), "Cache usage is unavailable for every bucket in this range.") {
+				t.Error("invented cache data")
+			}
+		})
 	}
 }
 
@@ -508,7 +567,7 @@ func TestAnalyticsChartStatusIsHonestWithoutJavaScript(t *testing.T) {
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/analytics?from=2026-08-26T09%3A00%3A00Z&to=2026-08-26T12%3A00%3A00Z", nil))
 	body := response.Body.String()
-	if response.Code != http.StatusOK || strings.Contains(body, "Loading interactive") || strings.Count(body, "Exact chart data is available in the table below. JavaScript enhances it as an SVG.") != 3 {
+	if response.Code != http.StatusOK || strings.Contains(body, "Loading interactive") || strings.Count(body, "Exact chart data is available in the table below. JavaScript enhances it as an SVG.") != 4 {
 		t.Fatalf("non-empty chart status = %d body=%s", response.Code, body)
 	}
 
