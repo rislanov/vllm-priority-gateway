@@ -1,6 +1,6 @@
 # Analytics Token Charts Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make output activity readable by separating input/output token charts and giving every analytics chart the full content width.
 
@@ -12,7 +12,7 @@
 
 **Base:** `origin/main` at `d496a04615a8ea9e0f5f059ba319d3a58161ed54`.
 **Branch:** `codex/issue-31-analytics-token-charts`.
-**Scope:** Plan only in this commit; implementation remains unchecked.
+**Scope:** Implementation and validation completed; see the execution notes below.
 
 ## Global Constraints
 
@@ -50,38 +50,47 @@ At the base revision, `internal/web/static/app.js:141` uses one maximum across b
 
 **Interfaces:** `data-analytics-chart` values become `requests`, `input-tokens`, `output-tokens`, and `cache`. Keep the existing point fields `inputTokens` and `outputTokens` and the canonical range attributes unchanged.
 
-- [ ] Extend `TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript` in `internal/web/web_test.go`: assert the four panel identifiers in order, distinct captions "Input token data" and "Output token data", and one series source. For N buckets, assert exactly N `data-analytics-point` rows.
-- [ ] Extend empty/missing-usage/zero-bucket assertions for both token tables. Preserve the cache table's unavailable values and no-JavaScript explanatory text.
-- [ ] Run `go test ./internal/web -run TestAnalytics -count=1`; expect failures in the newly added panel/table assertions.
-- [ ] Replace the combined token panel with two panels. Keep titles, IDs, descriptions, captions, and column counts consistent; render each token table with only its relevant metric.
-- [ ] Change `.chart-grid` to one column. Keep the existing cache panel behavior; remove the now-redundant wide-panel distinction only where it is no longer used.
-- [ ] Run the focused tests; expect PASS. Commit the template/style/test changes with `fix(web): split analytics token panels`.
+- [x] Extend `TestAnalyticsPageProvidesAccessibleChartFallbacksAndSelfHostedScript` in `internal/web/web_test.go`: assert the four panel identifiers in order, distinct captions "Input token data" and "Output token data", and one series source. For N buckets, assert exactly N `data-analytics-point` rows.
+- [x] Extend empty/missing-usage/zero-bucket assertions for both token tables. Preserve the cache table's unavailable values and no-JavaScript explanatory text.
+- [x] Run `go test ./internal/web -run TestAnalytics -count=1`; expect failures in the newly added panel/table assertions.
+- [x] Replace the combined token panel with two panels. Keep titles, IDs, descriptions, captions, and column counts consistent; render each token table with only its relevant metric.
+- [x] Change `.chart-grid` to one column. Keep the existing cache panel behavior; remove the now-redundant wide-panel distinction only where it is no longer used.
+- [x] Run the focused tests; expect PASS. Commit the template/style/test changes with `fix(web): split analytics token panels`.
 
 ### Task 2: Give each token chart an independent scale
 
 **Interfaces:** Replace the combined renderer with `renderTokenChart(container, series, metric)`, where `metric` is exactly `inputTokens` or `outputTokens`. `renderChart(container, series)` dispatches the two panel identifiers to that function. Existing `chartFrame`, `drawGrid`, `drawSeries`, and `drawTimeLabels` remain shared.
 
-- [ ] Add `TestWriteAnalyticsBrowserFixtures` in the new Go fixture file. Skip unless `LLMGW_BROWSER_ANALYTICS_FIXTURE_DIR` is set; render through the existing web handler/fixture store and write synthetic `imbalanced.html`, `zero.html`, `empty.html`, and `sparse.html` there. No production endpoint or persistent database fixture is added.
-- [ ] Implement `createAnalyticsFixtures()` in `tests/browser/analytics-fixtures.mjs`: create a temporary directory, run `go test ./internal/web -run '^TestWriteAnalyticsBrowserFixtures$' -count=1` at the repository root with that variable, return `{directory, dispose}`, and remove the directory in teardown. Browser tests route only the analytics document to these rendered files; static scripts/styles still load from the existing real test gateway.
-- [ ] In `analytics-charts.spec.mjs`, assert that points [1000000, 500000] and [1000, 500] reach equivalent relative heights in their respective panels. Assert that changing input alone does not change output coordinates, both baselines represent zero, all charts align the same timestamps, and no SVG contains NaN/Infinity. Cover a single nonzero bucket and an all-zero series.
-- [ ] Run `npm --prefix tests/browser run test:e2e -- analytics-charts.spec.mjs`; expect failures until the new renderer exists.
-- [ ] Compute the maximum from only the selected metric, with a floor of 1. Preserve the input circle/solid and output square/dashed styling and provide a single relevant legend and accurate accessible title/description for each panel.
-- [ ] Run `go test ./internal/web -count=1` and the focused browser tests; expect PASS. Commit with `fix(web): scale token charts independently`.
+- [x] Add `TestWriteAnalyticsBrowserFixtures` in the new Go fixture file. Skip unless `LLMGW_BROWSER_ANALYTICS_FIXTURE_DIR` is set; render through the existing web handler/fixture store and write synthetic `imbalanced.html`, `zero.html`, `empty.html`, and `sparse.html` there. No production endpoint or persistent database fixture is added.
+- [x] Implement `createAnalyticsFixtures()` in `tests/browser/analytics-fixtures.mjs`: create a temporary directory, run `go test ./internal/web -run '^TestWriteAnalyticsBrowserFixtures$' -count=1` at the repository root with that variable, return `{directory, dispose}`, and remove the directory in teardown. Browser tests route only the analytics document to these rendered files; static scripts/styles still load from the existing real test gateway.
+- [x] In `analytics-charts.spec.mjs`, assert that points [1000000, 500000] and [1000, 500] reach equivalent relative heights in their respective panels. Assert that changing input alone does not change output coordinates, both baselines represent zero, all charts align the same timestamps, and no SVG contains NaN/Infinity. Cover a single nonzero bucket and an all-zero series.
+- [x] Run `npm --prefix tests/browser run test:e2e -- analytics-charts.spec.mjs`; expect failures until the new renderer exists.
+- [x] Compute the maximum from only the selected metric, with a floor of 1. Preserve the input circle/solid and output square/dashed styling and provide a single relevant legend and accurate accessible title/description for each panel.
+- [x] Run `go test ./internal/web -count=1` and the focused browser tests; expect PASS. Commit with `fix(web): scale token charts independently`.
 
 ### Task 3: Keep full-width charts readable at every supported viewport
 
 **Interfaces:** `chartFrame` returns the existing frame fields plus a measured width; `frame.right` derives from that width. All series use the same left/right margins. A resize re-renders a panel from the immutable series data, without rebuilding the data source or multiplying observers.
 
-- [ ] Add browser cases at widths 375, 768, and 1440: four stacked panels with equal outer widths, no document-level horizontal overflow, legible fixed-size SVG text, unique accessible IDs, and stable plot heights. Resize an existing page and assert paths/labels are recalculated.
-- [ ] Run the focused browser suite; verify the geometry assertions fail before changing the fixed-width canvas.
-- [ ] Measure the chart container for the SVG viewBox width, keep regular/cache viewBox heights at 280/460, and derive the right edge from the measured width. Use a single ResizeObserver with a scheduled re-render only when width changes; skip zero-width hidden containers until measurable.
-- [ ] Keep date/time endpoint labels within the plot; use two text lines when needed rather than shrinking the entire SVG. Keep the current UTC label content in this issue.
-- [ ] Add a no-JavaScript browser case that opens all four tables and verifies the exact fixture values. Assert unavailable cache buckets remain gaps after enhancement.
-- [ ] Run `go test ./internal/web -count=1`, `make test-web`, and `git diff --check`; expect PASS. Visually inspect the synthetic imbalanced fixture at narrow and wide widths. Commit with `fix(web): keep analytics charts readable across widths`.
+- [x] Add browser cases at widths 375, 768, and 1440: four stacked panels with equal outer widths, no document-level horizontal overflow, legible fixed-size SVG text, unique accessible IDs, and stable plot heights. Resize an existing page and assert paths/labels are recalculated.
+- [x] Run the focused browser suite; verify the geometry assertions fail before changing the fixed-width canvas.
+- [x] Measure the chart container for the SVG viewBox width, keep regular/cache viewBox heights at 280/460, and derive the right edge from the measured width. Use a single ResizeObserver with a scheduled re-render only when width changes; skip zero-width hidden containers until measurable.
+- [x] Keep date/time endpoint labels within the plot; use two text lines when needed rather than shrinking the entire SVG. Keep the current UTC label content in this issue.
+- [x] Add a no-JavaScript browser case that opens all four tables and verifies the exact fixture values. Assert unavailable cache buckets remain gaps after enhancement.
+- [x] Run `go test ./internal/web -count=1`, `make test-web`, and `git diff --check`; expect PASS. Visually inspect the synthetic imbalanced fixture at narrow and wide widths. Commit with `fix(web): keep analytics charts readable across widths`.
 
 ## Completion and integration
 
-- [ ] Run `go test ./...`, `make test-web`, and `git diff --check`; record actual results.
-- [ ] Confirm the implementation diff contains no store/API changes and no private screenshots or deployment identifiers.
-- [ ] If #32 has merged, rebase and preserve its localized formatter, time-zone copy, and all timestamp markers; rerun both analytics browser suites.
-- [ ] Reference #31 in the implementation PR and include synthetic before/after images if helpful.
+- [x] Run `go test ./...`, `make test-web`, and `git diff --check`; record actual results.
+- [x] Confirm the implementation diff contains no store/API changes and no private screenshots or deployment identifiers.
+- [x] If #32 has merged, rebase and preserve its localized formatter, time-zone copy, and all timestamp markers; rerun both analytics browser suites.
+- [x] Reference #31 in implementation and acceptance evidence; push the branch as requested. No pull request was requested.
+
+## Execution notes — 2026-10-26
+
+- Synced main to `e93a6a5` and merged it into this branch before implementation, as requested. This includes issue #32; every new table preserves its localized timestamp markers and shared formatter.
+- Reused the fixture exporter and browser helper already added by issue #32. The implementation proceeded in the clean checkout on the explicitly requested branch.
+- `npm` and `make` are absent on this host. The same web checks ran with `node --test tests/browser/*.unit.test.mjs` and `node tests/browser/node_modules/@playwright/test/cli.js test --config tests/browser/playwright.config.mjs`; bundled pnpm installed the pinned dependency without a lockfile change.
+- Final checks: `go test ./...`, `go vet ./...`, 19 JS unit tests, 53 browser tests (one PostgreSQL-only test skipped), Docker image build, and real two-backend vLLM inference/browser/smoke validation passed.
+- Two independent reviewers found no critical or important issues. Both minor remarks were fixed and covered: first-bucket sparse annotation overlap and no-JavaScript cache unavailable/zero assertions. No review findings remain deferred.
+- See [acceptance evidence](../../acceptance-evidence.md#analytics-token-charts--issue-31-2026-10-26) for the environment, scope, actual token totals, and test limitations.
