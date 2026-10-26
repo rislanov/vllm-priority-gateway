@@ -11,7 +11,7 @@
 **Spec:** [GitHub issue #32](https://github.com/rislanov/vllm-priority-gateway/issues/32); user explicitly requires the user's time zone in UI and unchanged absolute-time storage.
 **Base:** `origin/main` at `d496a04615a8ea9e0f5f059ba319d3a58161ed54`.
 **Branch:** `codex/issue-32-analytics-user-timezone`.
-**Scope:** Implementation and validation completed on this branch; final review follows validation.
+**Scope:** Implementation, validation and independent subagent reviews completed on this branch.
 
 ## Global Constraints
 
@@ -114,4 +114,4 @@ Native Date's fold resolution and offset behavior are documented in [MDN Date](h
 - Fixed two rendered issues found during QA: aligned filter fields after adding offset hints, and retained readable mobile chart labels through horizontal scrolling. Browser assertions reproduced the original 24px field misalignment and 5px axis text before the CSS correction.
 - Additional scoped fix: the scratch image lacked a writable temporary directory for CSV spooling. The container smoke test reproduced HTTP 500; copying a rootfs subtree with a sticky 1777 `/tmp` made the same export pass. CSV/storage/API semantics are unchanged.
 - Issue #31 has not merged into `origin/main`; no rebase or token-panel coupling was introduced.
-- Final subagent review and any resulting corrections are recorded in subsequent commits.
+- Two independent read-only subagent reviews approved `a1608ff..d634e8a` without actionable findings. One reviewer independently ran all 12 time-helper tests; the other reran all 26 analytics browser tests and inspected the real Chromium accessibility tree. Firefox/WebKit and actual screen-reader software were not tested.
