@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}} · vLLM Priority Gateway</title>
   <link rel="stylesheet" href="/admin/static/app.css">
+  <script defer src="/admin/static/analytics-time.js"></script>
   <script defer src="/admin/static/app.js"></script>
 </head>
 <body{{if eq .Active "Dashboard"}} data-dashboard{{end}}>
@@ -24,6 +25,6 @@
     {{if .View.Degraded}}<div class="notice error" role="alert">Configuration reload degraded: {{.View.Degraded}}</div>{{end}}
     {{template "content" .}}
   </main>
-  <footer>Configuration revision <span class="mono">{{.View.Revision}}</span> · Times are shown in UTC</footer>
+  <footer>Configuration revision <span class="mono">{{.View.Revision}}</span> · Times are shown in {{if eq .Active "Analytics"}}<span data-analytics-timezone>UTC</span>{{else}}UTC{{end}}</footer>
 </body>
 </html>{{end}}
