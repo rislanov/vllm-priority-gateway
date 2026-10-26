@@ -58,10 +58,10 @@ for (const zone of zones) {
         await expect(page.locator('[data-analytics-offset="from"]')).toHaveText(zone.offset);
         for (const text of await page.locator('[data-analytics-timezone]').allTextContents()) expect(text).toMatch(zone.zone);
         await expect(page.locator('footer')).toContainText(zone.id === 'Asia/Kathmandu' ? /Asia\/Kat(h)?mandu/ : zone.id);
-        await expect(page.locator('svg.analytics-chart')).toHaveCount(3);
+        await expect(page.locator('svg.analytics-chart')).toHaveCount(4);
         const firstBucket = `${zone.prefix} ${zone.bucket}:00.123 ${zone.offset}`;
         const lastBucket = `${zone.lastPrefix} ${zone.lastBucket}:00.123 ${zone.offset}`;
-        expect(await page.locator('.chart-fallback time').allTextContents()).toEqual([firstBucket, lastBucket, firstBucket, lastBucket, firstBucket, lastBucket]);
+        expect(await page.locator('.chart-fallback time').allTextContents()).toEqual([firstBucket, lastBucket, firstBucket, lastBucket, firstBucket, lastBucket, firstBucket, lastBucket]);
         for (const svg of await page.locator('svg.analytics-chart').all()) {
           await expect(svg).toContainText(`${zone.prefix} ${zone.bucket}`);
           await expect(svg.locator('[aria-label]').first()).toHaveAttribute('aria-label', `${zone.prefix} ${zone.bucket} ${zone.offset}`);
@@ -208,7 +208,7 @@ for (const mode of ['no JavaScript', 'missing helper', 'blocked helper', 'format
       await expect(page.getByLabel('From (UTC)', {exact: true})).toBeVisible();
       await expect(page.locator('footer')).toContainText('Times are shown in UTC');
       if (mode !== 'no JavaScript') {
-        await expect(page.locator('svg.analytics-chart')).toHaveCount(3);
+        await expect(page.locator('svg.analytics-chart')).toHaveCount(4);
         await expect(page.locator('svg').first()).toContainText('2026-01-15 23:30 UTC');
       }
       await page.unroute('**/admin/analytics?**');

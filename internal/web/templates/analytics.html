@@ -88,20 +88,33 @@
         </tbody></table></div>
       </details>
     </article>
-    <article class="chart-panel" aria-labelledby="token-volume-title">
-      <h3 id="token-volume-title">Input and output tokens</h3>
-      <p class="chart-note">Two independent, non-stacked series from a zero baseline.</p>
-      <div class="chart-stage" data-analytics-chart="tokens">
+    <article class="chart-panel" aria-labelledby="input-tokens-title">
+      <h3 id="input-tokens-title">Input tokens</h3>
+      <p class="chart-note">Input tokens per UTC bucket, shown from a zero baseline on an independent scale.</p>
+      <div class="chart-stage" data-analytics-chart="input-tokens">
         <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
       </div>
       <details class="chart-fallback">
-        <summary>View input and output token data</summary>
-        <div class="table-wrap"><table><caption>Input and output token data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Input</th><th>Output</th></tr></thead><tbody>
-          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .InputTokens}}</td><td class="mono">{{integer .OutputTokens}}</td></tr>{{else}}<tr><td colspan="3" class="empty">No series data is available for this range.</td></tr>{{end}}
+        <summary>View input token data</summary>
+        <div class="table-wrap"><table><caption>Input token data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Input tokens</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .InputTokens}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
-    <article class="chart-panel chart-panel-wide" aria-labelledby="cache-usage-title">
+    <article class="chart-panel" aria-labelledby="output-tokens-title">
+      <h3 id="output-tokens-title">Output tokens</h3>
+      <p class="chart-note">Output tokens per UTC bucket, shown from a zero baseline on an independent scale.</p>
+      <div class="chart-stage" data-analytics-chart="output-tokens">
+        <p data-chart-status>{{if .Analytics.Dataset.Series}}Exact chart data is available in the table below. JavaScript enhances it as an SVG.{{else}}No series data is available for this range.{{end}}</p>
+      </div>
+      <details class="chart-fallback">
+        <summary>View output token data</summary>
+        <div class="table-wrap"><table><caption>Output token data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Output tokens</th></tr></thead><tbody>
+          {{range .Analytics.Dataset.Series}}<tr><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .OutputTokens}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+        </tbody></table></div>
+      </details>
+    </article>
+    <article class="chart-panel" aria-labelledby="cache-usage-title">
       <h3 id="cache-usage-title">Cache usage</h3>
       <p class="chart-note">Aligned token and ratio plots for cache-known buckets only. Gaps mean unavailable data.</p>
       <div class="chart-stage chart-stage-tall" data-analytics-chart="cache">
