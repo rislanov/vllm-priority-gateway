@@ -28,6 +28,9 @@ func (p *Proxy) Tokenize(ctx context.Context, r TokenizationRequest) (*http.Resp
 		return nil, e
 	}
 	req.Header = PrepareTokenizationHeaders(r.Headers, r.RequestID, r.UpstreamAPIKey)
+	// A caller must not turn this one-attempt utility operation into a
+	// replayable POST in net/http's reused-connection recovery path.
+	req.GetBody = nil
 	return p.client.Do(req)
 }
 
@@ -53,12 +56,12 @@ func (p *Proxy) ForwardTokenization(ctx context.Context, w http.ResponseWriter, 
 	}
 	defer response.Body.Close()
 	result.Status = response.StatusCode
-	CopyResponseHeaders(w.Header(), response.Header)
-	w.Header().Set("X-Request-Id", r.RequestID)
 	// Commit upstream errors immediately, preserving their status even if the
 	// error response body subsequently fails to arrive.
 	commit := func() {
 		if !result.ResponseStarted {
+			CopyResponseHeaders(w.Header(), response.Header)
+			w.Header().Set("X-Request-Id", r.RequestID)
 			w.WriteHeader(response.StatusCode)
 			result.ResponseStarted = true
 			result.FirstByte = time.Since(started)

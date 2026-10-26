@@ -270,9 +270,6 @@ func newGatewayApplication(
 				return
 			case <-ticker.C:
 				tokenizationObserver.Reconcile()
-				if cleaner, ok := tokenizationCoordinator.(coordination.CleanupBatcher); ok {
-					_, _ = cleaner.CleanupBatch(ctx, 1000)
-				}
 			}
 		}
 	})
@@ -364,7 +361,7 @@ func newGatewayApplication(
 	})
 	if _, ok := database.(*pgstore.Store); ok {
 		application.startWorker(func() {
-			runCoordinationCleanup(ctx, admissionCoordinator.(coordination.CleanupBatcher), circuitCoordinator.(coordination.CleanupBatcher))
+			runCoordinationCleanup(ctx, admissionCoordinator.(coordination.CleanupBatcher), circuitCoordinator.(coordination.CleanupBatcher), tokenizationCoordinator.(coordination.CleanupBatcher))
 		})
 	}
 	if err := startupCtx.Err(); err != nil {

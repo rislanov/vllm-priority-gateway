@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,7 +44,7 @@ func TestTokenizationPassThrough(t *testing.T) {
 	}
 }
 func TestTokenizationCancellation(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.Copy(io.Discard,r.Body); <-r.Context().Done() }))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.Copy(io.Discard, r.Body); <-r.Context().Done() }))
 	defer upstream.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -63,5 +64,102 @@ func TestTokenizationReusableAdapter(t *testing.T) {
 	b, _ := io.ReadAll(response.Body)
 	if !strings.Contains(string(b), `"count":1`) {
 		t.Fatal(string(b))
+	}
+}
+
+type tokenizationRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f tokenizationRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type tokenizationBrokenBody struct{}
+
+func (tokenizationBrokenBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (tokenizationBrokenBody) Close() error             { return nil }
+func TestTokenizationReadFailureBeforeCommitDoesNotLeakHeaders(t *testing.T) {
+	client := &http.Client{Transport: tokenizationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Length": {"99"}, "Content-Encoding": {"gzip"}, "X-Upstream": {"not-committed"}}, Body: tokenizationBrokenBody{}}, nil
+	})}
+	w := httptest.NewRecorder()
+	r := New(client).ForwardTokenization(context.Background(), w, TokenizationRequest{Backend: domain.Backend{BaseURL: "http://backend.invalid"}})
+	if r.Err == nil || r.ResponseStarted {
+		t.Fatalf("result %+v", r)
+	}
+	for _, key := range []string{"Content-Length", "Content-Encoding", "X-Upstream"} {
+		if w.Header().Get(key) != "" {
+			t.Fatalf("uncommitted upstream header %s leaked", key)
+		}
+	}
+}
+func TestTokenizationTruncatedCommittedResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		io.WriteString(w, `{"count":`)
+	}))
+	defer upstream.Close()
+	r := New(upstream.Client()).ForwardTokenization(context.Background(), httptest.NewRecorder(), TokenizationRequest{Backend: domain.Backend{BaseURL: upstream.URL}})
+	if r.Err == nil || !r.ResponseStarted || r.Status != 200 {
+		t.Fatalf("truncation not reported: %+v", r)
+	}
+}
+
+func TestTokenizationDoesNotRetryCallerIdempotencyKey(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if calls.Add(1) == 2 {
+			conn, _, e := w.(http.Hijacker).Hijack()
+			if e != nil {
+				t.Error(e)
+				return
+			}
+			conn.Close()
+			return
+		}
+		io.WriteString(w, `{"count":1}`)
+	}))
+	defer upstream.Close()
+	p := New(upstream.Client())
+	request := TokenizationRequest{Backend: domain.Backend{BaseURL: upstream.URL}, Body: []byte(`{"prompt":"synthetic"}`), Headers: http.Header{"Idempotency-Key": {"caller"}, "X-Idempotency-Key": {"caller"}}}
+	response, e := p.Tokenize(context.Background(), request)
+	if e != nil {
+		t.Fatal(e)
+	}
+	io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	response, e = p.Tokenize(context.Background(), request)
+	if response != nil {
+		response.Body.Close()
+	}
+	if e == nil || calls.Load() != 2 {
+		t.Fatalf("transport replayed tokenization: calls=%d err=%v", calls.Load(), e)
+	}
+}
+
+func TestTokenizationBoundsSlowDownstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		io.CopyN(w, strings.NewReader(strings.Repeat("x", 16<<20)), 16<<20)
+	}))
+	defer upstream.Close()
+	done := make(chan Result, 1)
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 100*time.Millisecond)
+		defer cancel()
+		done <- New(upstream.Client()).ForwardTokenization(ctx, w, TokenizationRequest{Backend: domain.Backend{BaseURL: upstream.URL}, Body: []byte(`{}`)})
+	}))
+	defer downstream.Close()
+	conn, e := net.Dial("tcp", strings.TrimPrefix(downstream.URL, "http://"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	io.WriteString(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+	select {
+	case result := <-done:
+		if result.Err == nil || !result.ResponseStarted {
+			t.Fatalf("slow delivery not bounded: %+v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("downstream write exceeded utility deadline")
 	}
 }

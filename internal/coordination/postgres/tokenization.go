@@ -203,6 +203,9 @@ func (c *TokenizationCoordinator) acquireTokenization(ctx context.Context, r coo
 	if revision != r.ConfigurationRevision || expires != nil && !expires.After(now) {
 		return reject(coordination.TokenizationStaleConfiguration)
 	}
+	if len(eligible) == 0 {
+		return reject(coordination.TokenizationStaleConfiguration)
+	}
 	if !r.ValidAt(now) {
 		return reject(coordination.TokenizationStaleOperation)
 	}

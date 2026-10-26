@@ -142,6 +142,121 @@ func TestPostgresTokenizationClientBudgetAcrossKeysAndModels(t *testing.T) {
 		t.Fatal(d, e)
 	}
 }
+
+func TestPostgresTokenizationDowngradeWaitsForConcurrentAdmission(t *testing.T) {
+	s := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sql, e := os.ReadFile("../../internal/store/postgres/migrations/000006_tokenization.down.sql")
+	if e != nil {
+		t.Fatal(e)
+	}
+	holder, e := s.CoordinationPool().Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer holder.Rollback(ctx)
+	id := uuid.New()
+	if _, e = holder.Exec(ctx, "INSERT INTO tokenization_operations VALUES($1,$2,'{}',false,clock_timestamp()+interval '24 hours')", id, make([]byte, 32)); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = holder.Exec(ctx, "INSERT INTO tokenization_leases VALUES($1,1,1,clock_timestamp()+interval '1 minute')", id); e != nil {
+		t.Fatal(e)
+	}
+	done := make(chan error, 1)
+	go func() {
+		tx, e := s.CoordinationPool().Begin(ctx)
+		if e != nil {
+			done <- e
+			return
+		}
+		defer tx.Rollback(context.Background())
+		_, e = tx.Exec(ctx, string(sql))
+		done <- e
+	}()
+	for {
+		var waiting bool
+		e = s.CoordinationPool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND relation IN ('tokenization_operations'::regclass,'tokenization_leases'::regclass))").Scan(&waiting)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if waiting {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal(ctx.Err())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if e = holder.Commit(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if e = <-done; e == nil {
+		t.Fatal("down migration dropped a concurrently committed active lease")
+	}
+}
+
+func TestPostgresTokenizationStaleBackendAndExpiryCleanup(t *testing.T) {
+	s := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, s, 0)
+	ctx := context.Background()
+	p := coordination.DefaultTokenizationPolicy()
+	p.ClientMaxInflight = 1
+	c := coordpostgres.NewTokenizationCoordinator(s, p, 2*time.Second)
+	stale := utilityRequest(f)
+	stale.Candidates[0].BackendRevision++
+	if d, e := c.Acquire(ctx, stale); e != nil || d.Reason != coordination.TokenizationStaleConfiguration {
+		t.Fatalf("stale backend should be unavailable, not capacity rejection: %+v %v", d, e)
+	}
+	d, e := c.Acquire(ctx, utilityRequest(f))
+	if e != nil || d.Lease == nil {
+		t.Fatal(d, e)
+	}
+	// Deterministically simulate a lost replica whose lease has expired, before
+	// running maintenance. Expired leases must not consume admission capacity.
+	if _, e = s.CoordinationPool().Exec(ctx, "UPDATE tokenization_leases SET expires_at=clock_timestamp()-interval '1 second'"); e != nil {
+		t.Fatal(e)
+	}
+	if d, e = c.Acquire(ctx, utilityRequest(f)); e != nil || d.Lease == nil {
+		t.Fatalf("crashed replica capacity not recovered: %+v %v", d, e)
+	}
+	if e = c.Complete(ctx, *d.Lease); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.CoordinationPool().Exec(ctx, "UPDATE tokenization_operations SET retain_until=clock_timestamp()-interval '1 second'"); e != nil {
+		t.Fatal(e)
+	}
+	more, e := c.CleanupBatch(ctx, 1)
+	if e != nil || !more {
+		t.Fatalf("bounded cleanup did not signal backlog: %v %v", more, e)
+	}
+	for more && e == nil {
+		more, e = c.CleanupBatch(ctx, 1)
+	}
+	if e != nil {
+		t.Fatal(e)
+	}
+	var n int
+	if e = s.CoordinationPool().QueryRow(ctx, "SELECT count(*) FROM tokenization_operations").Scan(&n); e != nil || n != 0 {
+		t.Fatalf("receipt backlog remains: %d %v", n, e)
+	}
+}
+
+func TestPostgresTokenizationPolicyMismatch(t *testing.T) {
+	s := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	p := coordpostgres.ReplicaPolicy{LeaseTTL: time.Minute, LeaseRenewInterval: 10 * time.Second, Tokenization: coordination.DefaultTokenizationPolicy()}
+	first := coordpostgres.NewReplicaManager(s, uuid.New(), p, time.Second)
+	if e := first.Start(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	defer first.Close()
+	p.Tokenization.ClientRPM++
+	second := coordpostgres.NewReplicaManager(s, uuid.New(), p, time.Second)
+	defer second.Close()
+	if e := second.Start(context.Background()); e == nil {
+		t.Fatal("mismatched utility budgets accepted")
+	}
+}
 func TestPostgresTokenizationSharedBudget(t *testing.T) {
 	s := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
 	f := createFixture(t, s, 0)

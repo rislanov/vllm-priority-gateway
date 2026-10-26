@@ -61,3 +61,40 @@ func TestTokenizationBackendExpiryAndRefill(t *testing.T) {
 		t.Fatal(d)
 	}
 }
+
+func TestTokenizationReceiptCapacityAndRefill(t *testing.T) {
+	now := time.Now().UTC()
+	p := coordination.TokenizationPolicy{ClientMaxInflight: 1, BackendMaxInflight: 1, ClientRPM: 1, Timeout: time.Second}
+	c := NewTokenizationCoordinator(p, func() time.Time { return now })
+	ctx := context.Background()
+	r := tokenizationRequest(now)
+	d, e := c.Acquire(ctx, r)
+	if e != nil || d.Lease == nil {
+		t.Fatal(d, e)
+	}
+	if e = c.Complete(ctx, *d.Lease); e != nil {
+		t.Fatal(e)
+	}
+	r.OperationID = uuid.New()
+	if d, e = c.Acquire(ctx, r); e != nil || d.Reason != coordination.TokenizationRateLimit {
+		t.Fatal(d, e)
+	}
+	now = now.Add(time.Minute)
+	r.OperationID = uuid.New()
+	r.OperationStartedAt = now
+	if d, e = c.Acquire(ctx, r); e != nil || d.Lease == nil {
+		t.Fatalf("RPM did not refill: %+v %v", d, e)
+	}
+	for len(c.receipts) < 65536 {
+		c.receipts[uuid.New()] = &tokenizationReceipt{completed: true, retainUntil: now.Add(time.Hour)}
+	}
+	r.OperationID = uuid.New()
+	if d, e = c.Acquire(ctx, r); e != nil || d.Reason != coordination.TokenizationUnavailable {
+		t.Fatalf("receipt cap: %+v %v", d, e)
+	}
+	now = now.Add(25 * time.Hour)
+	r.OperationStartedAt = now
+	if d, e = c.Acquire(ctx, r); e != nil || d.Lease == nil {
+		t.Fatalf("retention cleanup failed: %+v %v", d, e)
+	}
+}
