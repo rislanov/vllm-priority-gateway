@@ -166,17 +166,22 @@ test('cache-known gaps remain discontinuities and explicit cache zero remains kn
   await expect(chart(page, 'cache').locator('circle[fill="#78b8ff"]')).toHaveCount(1);
 });
 
-test('a single cache bucket keeps its annotation clear of plot subtitles', async ({page}) => {
+test('single cache annotations stay inside the plot and clear of subtitles and axes', async ({page}) => {
   await page.setViewportSize({width: 375, height: 1000});
-  await open(page, 'sparse');
-  await expect(chart(page, 'cache').locator('svg')).toBeVisible();
-  expect(await chart(page, 'cache').locator('svg').evaluate((svg) => {
-    const subtitles = [...svg.querySelectorAll('.chart-subtitle')].map((text) => text.getBoundingClientRect());
-    return [...svg.querySelectorAll('.chart-sparse-label')].some((text) => {
-      const box = text.getBoundingClientRect();
-      return subtitles.some((s) => box.left < s.right && box.right > s.left && box.top < s.bottom && box.bottom > s.top);
-    });
-  })).toBe(false);
+  for (const name of ['sparse', 'normal']) {
+    await page.unroute('**/admin/analytics?**');
+    await open(page, name);
+    await expect(chart(page, 'cache').locator('svg')).toBeVisible();
+    expect(await chart(page, 'cache').locator('svg').evaluate((svg) => {
+      const labels = [...svg.querySelectorAll('.chart-subtitle, .chart-axis-label-y')].map((text) => text.getBoundingClientRect());
+      const plot = svg.querySelector('.chart-baseline').getBoundingClientRect();
+      return [...svg.querySelectorAll('.chart-sparse-label')].every((text) => {
+        const box = text.getBoundingClientRect();
+        return box.left >= plot.left - 1 && box.right <= plot.right + 1
+          && labels.every((s) => box.left >= s.right || box.right <= s.left || box.top >= s.bottom || box.bottom <= s.top);
+      });
+    }), name).toBe(true);
+  }
 });
 
 test.describe('without JavaScript', () => {
@@ -194,5 +199,17 @@ test.describe('without JavaScript', () => {
       if (index < 3) expect(await details.locator('tbody tr td:last-child').allTextContents()).toEqual(expected[index]);
       else expect(await details.locator('tbody tr').first().locator('td').allTextContents()).toEqual(['2026-01-15 23:30:00.123 UTC', '20', '20%']);
     }
+  });
+
+  test('cache table distinguishes unavailable buckets from known zero', async ({page}) => {
+    await open(page, 'normal');
+    const cacheTable = page.getByRole('table', {name: 'Cache-known usage data'});
+    await page.getByText('View cache-known usage data', {exact: true}).click();
+    expect(await cacheTable.locator('tbody tr').nth(1).locator('td').allTextContents()).toEqual(['2026-01-16 00:30:00.123 UTC', '—', '—']);
+    await page.unroute('**/admin/analytics?**');
+    await open(page, 'zero');
+    await page.getByText('View cache-known usage data', {exact: true}).click();
+    expect(await cacheTable.locator('tbody tr').first().locator('td').allTextContents()).toEqual(['2026-01-15 23:30:00.123 UTC', '0', '0%']);
+    expect(await cacheTable.locator('tbody tr').nth(1).locator('td').allTextContents()).toEqual(['2026-01-16 00:30:00.123 UTC', '—', '—']);
   });
 });

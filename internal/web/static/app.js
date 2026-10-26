@@ -334,7 +334,9 @@
     });
     if (known.length === 1) {
       const labelY = known[0].y <= top + 20 ? known[0].y + 18 : known[0].y - 9;
-      addText(frame.svg, known[0].x, labelY, 'One reported bucket', 'chart-sparse-label', 'middle');
+      const label = addText(frame.svg, known[0].x, labelY, 'One reported bucket', 'chart-sparse-label', 'middle');
+      const halfWidth = label.getComputedTextLength() / 2;
+      label.setAttribute('x', Math.max(frame.left + halfWidth, Math.min(frame.right - halfWidth, known[0].x)));
     }
   }
 
