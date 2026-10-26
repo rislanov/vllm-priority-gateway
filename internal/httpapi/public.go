@@ -40,6 +40,7 @@ func NewPublicHandler(service *gateway.Service, bodyLimit int64, generateID IDGe
 	}
 	handler := &PublicHandler{service: service, bodyLimit: bodyLimit, generateID: generateID}
 	router := chi.NewRouter()
+	router.Post("/tokenize", handler.tokenize)
 	router.Get("/v1/load", handler.load)
 	router.Get("/v1/models", handler.models)
 	router.Post("/v1/chat/completions", handler.forward)
@@ -171,6 +172,17 @@ func (h *PublicHandler) forward(writer http.ResponseWriter, request *http.Reques
 }
 
 func (h *PublicHandler) unsupported(writer http.ResponseWriter, request *http.Request) {
+	if request.URL.Path == "/tokenize" {
+		started := time.Now()
+		id, ok := h.begin(writer)
+		status := 500
+		if ok {
+			status = 404
+			writeGatewayError(writer, unsupportedEndpoint())
+		}
+		h.service.ObserveTokenization(gateway.TokenizationEvent{RequestID: id, Status: status, Reason: "unsupported_endpoint", Duration: time.Since(started)})
+		return
+	}
 	started := time.Now()
 	requestID, ok := h.begin(writer)
 	if !ok {

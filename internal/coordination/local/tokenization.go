@@ -117,7 +117,7 @@ func (c *TokenizationCoordinator) Complete(ctx context.Context, l coordination.T
 	if rec == nil {
 		return errors.New("unknown tokenization lease")
 	}
-	if rec.decision.Lease == nil || *rec.decision.Lease != l {
+	if rec.decision.Lease == nil || !rec.decision.Lease.Matches(l) {
 		return errors.New("tokenization lease identity mismatch")
 	}
 	rec.completed = true

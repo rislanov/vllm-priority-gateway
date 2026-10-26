@@ -29,7 +29,7 @@ func Tokenization(t *testing.T, factory func(*testing.T, coordination.Tokenizati
 		t.Fatalf("first admission: %+v", first)
 	}
 	replay := acquire(req)
-	if replay.Lease == nil || *replay.Lease != *first.Lease {
+	if replay.Lease == nil || !replay.Lease.Matches(*first.Lease) {
 		t.Fatalf("replay changed lease: %+v", replay)
 	}
 	conflict := req

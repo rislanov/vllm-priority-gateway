@@ -15,6 +15,17 @@ vLLM Priority Gateway is a lightweight policy, admission, and routing layer for 
 
 ## What problem it solves
 
+The gateway also exposes authenticated **`POST /tokenize`** for text prompts and chat messages. It routes the public model name to the upstream model's tokenizer and preserves the upstream response. Tokenization has a separate client/backend concurrency and request-rate budget, shared across PostgreSQL replicas; it does not change inference quotas or analytics. See [tokenization policy and rollout](docs/operations.md#tokenization).
+
+```sh
+curl http://localhost:8080/tokenize \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"public-model","prompt":"Hello","add_special_tokens":false,"return_token_strs":true}'
+```
+
+Reverse proxies must forward the root-level `/tokenize` path as well as `/v1/*`.
+
 A normal HTTP load balancer can distribute requests, but it usually does not know:
 
 - which client may consume shared GPU capacity;

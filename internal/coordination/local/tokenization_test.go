@@ -44,6 +44,12 @@ func TestTokenizationBackendExpiryAndRefill(t *testing.T) {
 	if e := c.Complete(ctx, forged); e == nil {
 		t.Fatal("forged completion accepted")
 	}
+	serialized := *a.Lease
+	serialized.AcquiredAt = serialized.AcquiredAt.In(time.FixedZone("wire", 0))
+	serialized.ExpiresAt = serialized.ExpiresAt.In(time.FixedZone("wire", 0))
+	if e := c.Complete(ctx, serialized); e != nil {
+		t.Fatalf("wire-equivalent timestamps rejected: %v", e)
+	}
 	now = now.Add(p.LeaseTTL() + time.Second)
 	r.OperationID = uuid.New()
 	r.OperationStartedAt = now

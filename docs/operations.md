@@ -224,4 +224,33 @@ The current release does not implement TLS, OIDC, RBAC, an audit log, or a secre
 
 ## PostgreSQL coordination operations
 
+Tokenization uses its own shared budget and always fails closed when coordination is unavailable. The inference emergency caps described below do not admit utility requests.
+
 In PostgreSQL mode, client/pool inflight, RPM, soft TPM, circuit generations, and half-open permits are global rather than process-local. `/readyz` remains HTTP 200 and reports degraded components through a transient database outage; `/coordination-readyz` is the strict database/compatibility/config/circuit gate. Normal and Background fail closed during an outage, while Critical and High use only configured per-replica emergency caps. Alert on coordination operation failures/latency, PostgreSQL pool saturation, renewal loss, pending completions, circuit-cache age/replay backlog, and compatible replica count. The full recovery sequence, failover durability boundary, and separate acknowledged-data-loss disaster-recovery procedure are in [PostgreSQL production profile](postgresql-production.md).
+
+## Tokenization
+
+`POST /tokenize` requires a gateway bearer key and an enabled, accessible public `model`. The gateway validates the JSON object/model, removes caller `priority`, translates the model, and preserves other fields. The selected upstream validates tokenizer-specific options. vLLM 0.28.0 supports `prompt` or `messages`, `add_special_tokens`, `return_token_strs`, and chat formatting options such as `add_generation_prompt`, `continue_final_message`, `chat_template`, `chat_template_kwargs`, and `tools`. Responses retain `count`, `tokens`, `max_model_len`, optional `token_strs`, and future upstream fields. No local tokenizer, `/v1/tokenize` alias, `/detokenize`, or automatic inference preflight is provided.
+
+| Setting | Default | Valid range |
+| --- | --- | --- |
+| `LLMGW_TOKENIZE_CLIENT_MAX_INFLIGHT` | `4` | 1–10,000 |
+| `LLMGW_TOKENIZE_BACKEND_MAX_INFLIGHT` | `8` | 1–10,000 |
+| `LLMGW_TOKENIZE_CLIENT_RPM` | `120` | 1–10,000,000 |
+| `LLMGW_TOKENIZE_TIMEOUT` | `30s` | positive duration, at most 5m |
+
+All keys/models belonging to one client share that client's utility limits. RPM uses a token bucket with burst `min(RPM,10)` and refill `RPM/60` per second. A successful admission spends one request even if upstream later fails; rejection spends nothing. Returned token counts do not debit inference TPM. Defaults are initial configurable values, not measured backend capacity.
+
+PostgreSQL enforces client/backend budgets atomically across replicas. SQLite supports one replica and keeps this budget in memory. All replicas must use identical settings. Selection chooses the eligible backend with the fewest active utility leases, then lowest backend ID. Eligible means enabled, non-draining, healthy with a nonzero, non-future health timestamp no older than `HealthInterval * UnhealthyAfter + HealthTimeout`, and an available upstream secret. GPU pressure, GPU metric freshness and inference circuit state do not determine utility eligibility. There is no queue, session affinity, inference circuit probe, or automatic retry.
+
+Admission, upstream I/O and response delivery share the utility timeout. Leases expire after timeout plus 15 seconds, covering bounded gateway operations rather than guaranteeing remote computation stops on disconnect. Completion/cancellation/panic releases the lease; failed cleanup or a crashed replica may hold capacity until expiry. Receipt replay cannot allocate twice or charge RPM twice. Local receipts are capped at 65,536 and retained for 24h; exhaustion returns 503. PostgreSQL expiry and receipt cleanup runs periodically in bounded batches. No request/response content or token IDs/strings are stored or logged.
+
+Invalid JSON/model or an oversized body returns 400; authentication/access failures retain 401/403. Independent client concurrency, backend capacity and RPM rejection return 429 with `Retry-After`. Missing eligible backends or uncertain/unavailable coordination return 503. Transport failures return 502 and the utility deadline returns 504 before headers are committed; interrupted responses after commit are aborted. Upstream status/body, including unsupported `/tokenize`, are preserved. Client disconnects are recorded as cancelled. API-key last-used metadata may update, but inference analytics, generation inflight/circuits, RPM/TPM and usage coverage do not change.
+
+Utility telemetry uses `llmgw_tokenize_requests_total{model,backend,status}`, `llmgw_tokenize_duration_seconds{model,backend}`, `llmgw_tokenize_rejections_total{reason}`, and `llmgw_tokenize_coordination_available`. Configured model/backend labels are reconciled after deletion. Logs contain only safe completion metadata. Utility availability is reported independently; existing replica compatibility/recovery gates still apply.
+
+Reverse proxies must forward root-level `/tokenize` to the gateway in addition to `/v1/*`. Apply any deployment prefix externally and remove it before gateway routing; no particular prefix is assumed.
+
+**Rollout:** migration 000006 is additive. Drain old replicas, deploy replicas with identical tokenization settings, wait for `/coordination-readyz` and inference readiness, then expose the new path. The policy fingerprint changes; mixed old/new readiness is not supported. To roll back, drain utility requests first and stop incompatible replicas before starting the old binary. The down migration refuses active utility leases.
+
+**Real-vLLM acceptance:** the opt-in smoke suite additionally compares gateway and direct-backend tokenization when `LLMGW_E2E_TOKENIZE_BACKEND_URL` and `LLMGW_E2E_TOKENIZE_UPSTREAM_MODEL` are set (optional direct credential: `LLMGW_E2E_TOKENIZE_BACKEND_KEY`). It checks prompt/chat formatting, special-token options and optional token strings without retaining response bodies. Run `LLMGW_E2E_MODE=smoke make test-real-vllm` with the existing smoke credentials/model configuration. A skipped comparison is not compatibility evidence.

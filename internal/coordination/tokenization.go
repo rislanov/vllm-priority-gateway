@@ -66,6 +66,13 @@ type TokenizationDecision struct {
 	Reason  string
 	RetryAt *time.Time
 }
+
+// Matches compares wire identities, ignoring time.Time's process-local location
+// and monotonic-clock representation, which are not preserved in JSON/SQL.
+func (l TokenizationLease) Matches(other TokenizationLease) bool {
+	return l.OperationID == other.OperationID && l.ReplicaID == other.ReplicaID && l.ClientID == other.ClientID && l.PoolID == other.PoolID && l.BackendID == other.BackendID && l.BackendRevision == other.BackendRevision && l.AcquiredAt.Equal(other.AcquiredAt) && l.ExpiresAt.Equal(other.ExpiresAt)
+}
+
 type TokenizationCoordinator interface {
 	Acquire(context.Context, TokenizationAcquireRequest) (TokenizationDecision, error)
 	Complete(context.Context, TokenizationLease) error

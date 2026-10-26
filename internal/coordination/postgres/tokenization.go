@@ -270,7 +270,7 @@ func (c *TokenizationCoordinator) Complete(parent context.Context, l coordinatio
 	if e = json.Unmarshal(encoded, &d); e != nil {
 		return e
 	}
-	if d.Lease == nil || *d.Lease != l {
+	if d.Lease == nil || !d.Lease.Matches(l) {
 		return errors.New("tokenization lease identity mismatch")
 	}
 	if _, e = tx.Exec(ctx, "DELETE FROM tokenization_leases WHERE operation_id=$1", l.OperationID); e != nil {
