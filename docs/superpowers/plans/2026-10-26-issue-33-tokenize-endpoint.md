@@ -1,6 +1,6 @@
 # Authenticated Tokenization Endpoint Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Expose authenticated POST /tokenize with model routing and an independent tokenization budget enforced across gateway replicas.
 
@@ -12,7 +12,7 @@
 **Confirmed user decisions (2026-10-26):** Tokenization has a separate budget from generation; its limits are shared across all gateway replicas.
 **Base:** `origin/main` at `d496a04615a8ea9e0f5f059ba319d3a58161ed54`.
 **Branch:** `codex/issue-33-tokenize-endpoint`.
-**Scope:** Plan only in this commit; implementation remains unchecked.
+**Status:** Implemented and independently reviewed. Main `5ae4667` was merged first. Validation is recorded in [acceptance-evidence.md](../../acceptance-evidence.md#authenticated-tokenization--issue-33-2026-10-27).
 
 ## Global Constraints
 
@@ -95,73 +95,73 @@ Modify `internal/config/config.go`, `internal/coordination/postgres/replica.go`,
 - Construct each coordinator with immutable TokenizationPolicy. No caller-supplied limit overrides in Acquire.
 - Constructors: `local.NewTokenizationCoordinator(policy TokenizationPolicy, now func() time.Time) *TokenizationCoordinator` and `postgres.NewTokenizationCoordinator(store *pgstore.Store, policy TokenizationPolicy, timeout time.Duration) *TokenizationCoordinator` (qualify coordination types in the implementation packages).
 
-- [ ] Add shared contract cases in `internal/coordination/contracttest/tokenization.go`: two independent clients, multiple keys per client, all-model client limits, backend limits, deterministic backend choice by lowest active utility count then backend ID, RPM refill/burst, and zero inference state changes.
-- [ ] Assert repeat Acquire with the same operation/fingerprint returns the same decision without extra capacity/RPM; mismatched replay fails. Complete is idempotent; completed/expired operations cannot be resurrected. Reject operations older than 24h or more than 5m in the future, matching bounded receipt retention.
-- [ ] Run `go test ./internal/coordination/local -run Tokenization -count=1`; expect compile/assertion failures.
-- [ ] Implement the local coordinator with one mutex, injected clock, separate counters/rate state, expiry-aware counts, and bounded receipt storage (65,536 receipts; discard expired terminal entries only; return unavailable when full). Retain receipts for 24h and charge RPM only after a candidate is selected.
-- [ ] Add config parsing/default/range tests for the four environment variables. Reuse existing config error conventions and add TokenizationPolicy to the replica fingerprint; test every field changes the fingerprint.
-- [ ] Run `go test ./internal/config ./internal/coordination/local ./internal/coordination/postgres -run 'Tokenization|PolicyFingerprint' -count=1`; expect PASS. Commit with `feat: define independent tokenization admission policy`.
+- [x] Add shared contract cases in `internal/coordination/contracttest/tokenization.go`: two independent clients, multiple keys per client, all-model client limits, backend limits, deterministic backend choice by lowest active utility count then backend ID, RPM refill/burst, and zero inference state changes.
+- [x] Assert repeat Acquire with the same operation/fingerprint returns the same decision without extra capacity/RPM; mismatched replay fails. Complete is idempotent; completed/expired operations cannot be resurrected. Reject operations older than 24h or more than 5m in the future, matching bounded receipt retention.
+- [x] Run `go test ./internal/coordination/local -run Tokenization -count=1`; expect compile/assertion failures.
+- [x] Implement the local coordinator with one mutex, injected clock, separate counters/rate state, expiry-aware counts, and bounded receipt storage (65,536 receipts; discard expired terminal entries only; return unavailable when full). Retain receipts for 24h and charge RPM only after a candidate is selected.
+- [x] Add config parsing/default/range tests for the four environment variables. Reuse existing config error conventions and add TokenizationPolicy to the replica fingerprint; test every field changes the fingerprint.
+- [x] Run `go test ./internal/config ./internal/coordination/local ./internal/coordination/postgres -run 'Tokenization|PolicyFingerprint' -count=1`; expect PASS. Commit with `feat: define independent tokenization admission policy`.
 
 ### Task 2: Implement atomic budgets shared across PostgreSQL replicas
 
 **Interfaces:** Implement the same TokenizationCoordinator against `Store.CoordinationPool()`; expose `CleanupBatch(ctx, limit) (more bool, err error)` with batches capped at 1,000. Keep all utility storage separate from existing inference tables.
 
-- [ ] Add the migration with utility tables: `tokenization_client_scopes`, `tokenization_backend_scopes`, `tokenization_operations` (fingerprint, decision, backend identity, terminal state, retention), `tokenization_leases` (expiry-indexed and indexed by client/backend), and `tokenization_rate_state`. Only metadata is persisted. Down migration must reject active leases before dropping utility tables.
-- [ ] Add migration and shared contract tests against two coordinator instances connected to the same database. Use small test limits (client=1, backend=2, RPM=2) and concurrent goroutines to assert exactly the permitted number of admissions.
-- [ ] Run `make test-postgres` with a disposable `LLMGW_POSTGRES_TEST_DSN`; expect utility contract failures.
-- [ ] Implement Acquire in one durable transaction using `synchronous_commit=on`: insert/lock the operation receipt, then lock the client scope and candidate backend scopes in sorted ID order. Read counts after locks using fresh READ COMMITTED statements and DB time; select the least-active eligible utility backend, update the independent rate bucket, and write the lease/decision atomically.
-- [ ] Validate key/client/pool/access/backend identities and revisions against authoritative configuration inside the transaction. Check revoked/expired keys, disabled entities, backend drain/pool membership, and stale configuration. Do not trust only a cached candidate list or caller policy. Follow existing mutation/row-lock ordering and add concurrent mutation tests to rule out deadlocks; no inference scope lock is needed for utility counts.
-- [ ] Resolve acquisition retries through the same operation ID/fingerprint. On ambiguous commit, reconcile that receipt within the bounded coordination deadline; if still unknown, return unavailable without contacting upstream. Never mint a replacement operation to bypass uncertainty.
-- [ ] Complete only the matching operation/lease identity and retain its receipt. All counts ignore expired leases even before cleanup. Failed release may temporarily retain capacity until expiry; it cannot decrement another request or fail open.
-- [ ] Add tests for committed-but-response-lost acquisition, uncertain release/replay, expiry after replica loss, revoked key during lock contention, policy mismatch, concurrent cleanup, stale backend revision, and no changes in request_leases/coordination_rate_state.
-- [ ] Run `make test-postgres` and `go test -race ./internal/coordination/...`; require actual PostgreSQL tests to run, not only skip. Commit with `feat: coordinate tokenization budgets across replicas`.
+- [x] Add the migration with utility tables: `tokenization_client_scopes`, `tokenization_backend_scopes`, `tokenization_operations` (fingerprint, decision, backend identity, terminal state, retention), `tokenization_leases` (expiry-indexed and indexed by client/backend), and `tokenization_rate_state`. Only metadata is persisted. Down migration must reject active leases before dropping utility tables.
+- [x] Add migration and shared contract tests against two coordinator instances connected to the same database. Use small test limits (client=1, backend=2, RPM=2) and concurrent goroutines to assert exactly the permitted number of admissions.
+- [x] Run `make test-postgres` with a disposable `LLMGW_POSTGRES_TEST_DSN`; expect utility contract failures.
+- [x] Implement Acquire in one durable transaction using `synchronous_commit=on`: insert/lock the operation receipt, then lock the client scope and candidate backend scopes in sorted ID order. Read counts after locks using fresh READ COMMITTED statements and DB time; select the least-active eligible utility backend, update the independent rate bucket, and write the lease/decision atomically.
+- [x] Validate key/client/pool/access/backend identities and revisions against authoritative configuration inside the transaction. Check revoked/expired keys, disabled entities, backend drain/pool membership, and stale configuration. Do not trust only a cached candidate list or caller policy. Follow existing mutation/row-lock ordering and add concurrent mutation tests to rule out deadlocks; no inference scope lock is needed for utility counts.
+- [x] Resolve acquisition retries through the same operation ID/fingerprint. On ambiguous commit, reconcile that receipt within the bounded coordination deadline; if still unknown, return unavailable without contacting upstream. Never mint a replacement operation to bypass uncertainty.
+- [x] Complete only the matching operation/lease identity and retain its receipt. All counts ignore expired leases even before cleanup. Failed release may temporarily retain capacity until expiry; it cannot decrement another request or fail open.
+- [x] Add tests for committed-but-response-lost acquisition, uncertain release/replay, expiry after replica loss, revoked key during lock contention, policy mismatch, concurrent cleanup, stale backend revision, and no changes in request_leases/coordination_rate_state.
+- [x] Run `make test-postgres` and `go test -race ./internal/coordination/...`; require actual PostgreSQL tests to run, not only skip. Commit with `feat: coordinate tokenization budgets across replicas`.
 
 ### Task 3: Add pass-through transport with no inference side effects
 
 **Interfaces:** Add `TokenizationRequest` in `internal/proxy/tokenization.go` with Method, Path, RequestID string; Headers http.Header; Body []byte; Backend domain.Backend; UpstreamAPIKey string. Add `(*Proxy).ForwardTokenization(context.Context, http.ResponseWriter, TokenizationRequest) Result`. Result reuses transport outcome fields; Usage and usage-parser fields remain unset.
 
-- [ ] Add `internal/proxy/tokenization_test.go` tests for byte-identical JSON success/error responses, optional response fields, no redirects, gateway-key removal, upstream credentials, request-ID propagation, hop-by-hop/Connection header filtering, and removal of affinity/priority headers.
-- [ ] Assert a response containing a fake inference usage object never produces usage or inference callbacks. Assert there is no automatic second backend attempt after transport failure.
-- [ ] Add deadline/cancellation/truncation tests before and after headers; client disconnect must close the upstream body. Bound buffering with streaming copy rather than reading the entire response into memory.
-- [ ] Run `go test ./internal/proxy -run Tokenization -count=1`; expect failures before implementation.
-- [ ] Implement using the existing no-redirect transport and shared end-to-end header filtering. Add `PrepareTokenizationHeaders(source, requestID, upstreamAPIKey) http.Header`; do not call the priority-injecting header function unchanged. Forward exactly /tokenize and no gateway deployment prefix.
-- [ ] Apply the existing request context deadline to upstream I/O and a downstream write deadline through ResponseController. A failed copy after commit must terminate the response using the existing HTTP abort convention. Restore any per-request write deadline as appropriate for keep-alive.
-- [ ] Run `go test ./internal/proxy -count=1`; expect PASS, including unchanged generation proxy tests. Commit with `feat: proxy tokenization without inference accounting`.
+- [x] Add `internal/proxy/tokenization_test.go` tests for byte-identical JSON success/error responses, optional response fields, no redirects, gateway-key removal, upstream credentials, request-ID propagation, hop-by-hop/Connection header filtering, and removal of affinity/priority headers.
+- [x] Assert a response containing a fake inference usage object never produces usage or inference callbacks. Assert there is no automatic second backend attempt after transport failure.
+- [x] Add deadline/cancellation/truncation tests before and after headers; client disconnect must close the upstream body. Bound buffering with streaming copy rather than reading the entire response into memory.
+- [x] Run `go test ./internal/proxy -run Tokenization -count=1`; expect failures before implementation.
+- [x] Implement using the existing no-redirect transport and shared end-to-end header filtering. Add `PrepareTokenizationHeaders(source, requestID, upstreamAPIKey) http.Header`; do not call the priority-injecting header function unchanged. Forward exactly /tokenize and no gateway deployment prefix.
+- [x] Apply the existing request context deadline to upstream I/O and a downstream write deadline through ResponseController. A failed copy after commit must terminate the response using the existing HTTP abort convention. Restore any per-request write deadline as appropriate for keep-alive.
+- [x] Run `go test ./internal/proxy -count=1`; expect PASS, including unchanged generation proxy tests. Commit with `feat: proxy tokenization without inference accounting`.
 
 ### Task 4: Connect authentication, backend selection, and public routing
 
 **Interfaces:** Add `(*Service).Tokenize(ctx context.Context, writer http.ResponseWriter, request ForwardRequest) (proxy.Result, *APIError)`. Add dependencies for TokenizationCoordinator, TokenizationPolicy, the utility forwarder interface, and an optional TokenizationObserver. Define `TokenizationEvent` here with RequestID, Client, Model, Backend, Reason string; Status int; Duration time.Duration; Cancelled bool, and `TokenizationObserver` with `TokenizationComplete(TokenizationEvent)`. Service.Tokenize emits exactly one event once invoked; the handler emits only for failures before invoking the service. Neither path emits CompletePublic. Unresolved dimensions are empty; never use raw caller model names as labels.
 
-- [ ] Add `internal/gateway/tokenization_test.go` tests: valid/expired/revoked keys, missing/unknown/forbidden model, disabled pool, generic prompt and messages payloads, public-to-upstream model translation, and preservation of optional fields. Validate only JSON-object/model at the gateway; tokenization-specific schema errors come from upstream.
-- [ ] Add selection cases for GPU saturation, stale GPU metrics with fresh health, disabled/draining/unhealthy/stale-health backends, missing upstream secret, and all utility backend slots full. Observe health age using existing HealthInterval/HealthTimeout/UnhealthyAfter settings; zero or future LastHealthAt is not fresh.
-- [ ] Assert all inference acquire/circuit/observer hooks are untouched using spies. During Acquire, publish a revoked key or changed model/backend revision; ensure no upstream call follows. Exhausted utility capacity returns 429 while exhausted generation capacity alone does not.
-- [ ] Run `go test ./internal/gateway -run Tokenization -count=1`; expect failures.
-- [ ] Implement authenticate/model resolution using current registry helpers, remove caller priority from the JSON, preserve all other options, and translate model. Build eligible utility candidates from the latest registry and health snapshots without inference pressure/circuit eligibility. Start the timeout before Acquire.
-- [ ] Acquire once, defer idempotent release immediately after success, and revalidate current credentials/config/backend/secret and remaining deadline before dispatch. On stale configuration release and return 503; the client can retry as a new HTTP request. Use one chosen backend, with no session affinity or automatic retry.
-- [ ] Release using an independent context bounded by the existing CoordinationTimeout when request cancellation has already fired. Attempt cleanup on all exits/panics; expiry provides the crash/failure fallback. Release does not wait for analytics capacity.
-- [ ] Add `(*PublicHandler).tokenize` in `internal/httpapi/tokenization.go`: follow existing request-ID, bearer-token, body-limit, error-envelope, and post-commit-abort conventions, but use the utility completion path for early errors too.
-- [ ] Register POST /tokenize in NewPublicHandler and route /tokenize to that handler in application.go. Add full application-handler tests in `cmd/gateway/tokenization_test.go` so tests cannot pass while the outer route is missing; wrong methods/paths must not proxy upstream.
-- [ ] Wire local/PostgreSQL coordinator, policy, and utility forwarder through application.go. Add a bounded periodic utility cleanup worker using the existing worker lifecycle. Check registry/replica compatibility before utility dispatch. The telemetry observer is optional until Task 5; admission dependencies are mandatory and fail closed if absent.
-- [ ] Run `go test ./internal/gateway ./internal/httpapi ./cmd/gateway -count=1`; expect PASS. Commit with `feat: expose authenticated tokenization routing`.
+- [x] Add `internal/gateway/tokenization_test.go` tests: valid/expired/revoked keys, missing/unknown/forbidden model, disabled pool, generic prompt and messages payloads, public-to-upstream model translation, and preservation of optional fields. Validate only JSON-object/model at the gateway; tokenization-specific schema errors come from upstream.
+- [x] Add selection cases for GPU saturation, stale GPU metrics with fresh health, disabled/draining/unhealthy/stale-health backends, missing upstream secret, and all utility backend slots full. Observe health age using existing HealthInterval/HealthTimeout/UnhealthyAfter settings; zero or future LastHealthAt is not fresh.
+- [x] Assert all inference acquire/circuit/observer hooks are untouched using spies. During Acquire, publish a revoked key or changed model/backend revision; ensure no upstream call follows. Exhausted utility capacity returns 429 while exhausted generation capacity alone does not.
+- [x] Run `go test ./internal/gateway -run Tokenization -count=1`; expect failures.
+- [x] Implement authenticate/model resolution using current registry helpers, remove caller priority from the JSON, preserve all other options, and translate model. Build eligible utility candidates from the latest registry and health snapshots without inference pressure/circuit eligibility. Start the timeout before Acquire.
+- [x] Acquire once, defer idempotent release immediately after success, and revalidate current credentials/config/backend/secret and remaining deadline before dispatch. On stale configuration release and return 503; the client can retry as a new HTTP request. Use one chosen backend, with no session affinity or automatic retry.
+- [x] Release using an independent context bounded by the existing CoordinationTimeout when request cancellation has already fired. Attempt cleanup on all exits/panics; expiry provides the crash/failure fallback. Release does not wait for analytics capacity.
+- [x] Add `(*PublicHandler).tokenize` in `internal/httpapi/tokenization.go`: follow existing request-ID, bearer-token, body-limit, error-envelope, and post-commit-abort conventions, but use the utility completion path for early errors too.
+- [x] Register POST /tokenize in NewPublicHandler and route /tokenize to that handler in application.go. Add full application-handler tests in `cmd/gateway/tokenization_test.go` so tests cannot pass while the outer route is missing; wrong methods/paths must not proxy upstream.
+- [x] Wire local/PostgreSQL coordinator, policy, and utility forwarder through application.go. Add a bounded periodic utility cleanup worker using the existing worker lifecycle. Check registry/replica compatibility before utility dispatch. The telemetry observer is optional until Task 5; admission dependencies are mandatory and fail closed if absent.
+- [x] Run `go test ./internal/gateway ./internal/httpapi ./cmd/gateway -count=1`; expect PASS. Commit with `feat: expose authenticated tokenization routing`.
 
 ### Task 5: Wire lifecycle, separate telemetry, and operational verification
 
 **Interfaces:** Implement the TokenizationObserver contract from Task 4 with a dedicated metrics/logger adapter; do not attach it to the inference observer fan-out.
 
-- [ ] Add `internal/observability/tokenization_test.go`: exactly one terminal utility event per HTTP request; separate requests/duration/rejections counters; no inference requests/token/coverage/TTFT/circuit changes. Log safe metadata only; token strings must not appear even when upstream returns them.
-- [ ] Implement `llmgw_tokenize_requests_total{model,backend,status}`, `llmgw_tokenize_duration_seconds{model,backend}`, and `llmgw_tokenize_rejections_total{reason}`. Use configured names and bounded reasons; no request IDs in labels. Follow existing topology reconciliation to remove deleted model/backend series.
-- [ ] Wire the separate observer through application.go. Expose `llmgw_tokenize_coordination_available` from the utility coordinator's Status; a utility failure must not report the generation coordinator as healthy on its behalf or bypass existing compatibility gates.
-- [ ] Add integration cases where two gateway instances share PostgreSQL and a blocked synthetic upstream: verify global client/backend limits and RPM, capacity after cancellation, crash/expiry, and separate inference analytics before/after utility calls.
-- [ ] Add a real-vLLM tokenization check to the existing opt-in smoke suite using `tests/e2e/tokenization_test.go`: prompt and chat requests, public model translation, special-token options, and optional token strings. Compare direct-backend and gateway responses without retaining bodies; document when this check was not run.
-- [ ] Document environment defaults, independent budgets, 429/503 handling, timeout/lease behavior, SQLite single-replica scope, generic POST examples, and root-level reverse-proxy routing in `README.md`, `README.ru.md`, `.env.example`, and `docs/operations.md`.
-- [ ] Document rollout: apply additive migrations, drain incompatible old replicas, deploy replicas with identical policy values, wait for compatibility/readiness, then expose the endpoint. Fingerprint mismatches must not be described as harmless. Rollback drains utility requests before downgrading; no dropping active leases.
-- [ ] Run `go test ./...`, `go test -race ./...`, `go vet ./...`, `make test-postgres`, and `git diff --check`; expect PASS. Run the opt-in real-vLLM smoke test only against an authorized test deployment and record pass/skip explicitly.
-- [ ] Commit with `feat: observe and validate distributed tokenization`.
+- [x] Add `internal/observability/tokenization_test.go`: exactly one terminal utility event per HTTP request; separate requests/duration/rejections counters; no inference requests/token/coverage/TTFT/circuit changes. Log safe metadata only; token strings must not appear even when upstream returns them.
+- [x] Implement `llmgw_tokenize_requests_total{model,backend,status}`, `llmgw_tokenize_duration_seconds{model,backend}`, and `llmgw_tokenize_rejections_total{reason}`. Use configured names and bounded reasons; no request IDs in labels. Follow existing topology reconciliation to remove deleted model/backend series.
+- [x] Wire the separate observer through application.go. Expose `llmgw_tokenize_coordination_available` from the utility coordinator's Status; a utility failure must not report the generation coordinator as healthy on its behalf or bypass existing compatibility gates.
+- [x] Add integration cases where two gateway instances share PostgreSQL and a blocked synthetic upstream: verify global client/backend limits and RPM, capacity after cancellation, crash/expiry, and separate inference analytics before/after utility calls.
+- [x] Add a real-vLLM tokenization check to the existing opt-in smoke suite using `tests/e2e/tokenization_test.go`: prompt and chat requests, public model translation, special-token options, and optional token strings. Compare direct-backend and gateway responses without retaining bodies; document when this check was not run.
+- [x] Document environment defaults, independent budgets, 429/503 handling, timeout/lease behavior, SQLite single-replica scope, generic POST examples, and root-level reverse-proxy routing in `README.md`, `README.ru.md`, `.env.example`, and `docs/operations.md`.
+- [x] Document rollout: apply additive migrations, drain incompatible old replicas, deploy replicas with identical policy values, wait for compatibility/readiness, then expose the endpoint. Fingerprint mismatches must not be described as harmless. Rollback drains utility requests before downgrading; no dropping active leases.
+- [x] Run `go test ./...`, `go test -race ./...`, `go vet ./...`, `make test-postgres`, and `git diff --check`; expect PASS. Run the opt-in real-vLLM smoke test only against an authorized test deployment and record pass/skip explicitly.
+- [x] Commit with `feat: observe and validate distributed tokenization`.
 
 ## Completion and integration
 
-- [ ] Confirm the settings chosen by the user are implemented: a separate utility budget, shared across replicas.
-- [ ] Confirm #31/#32 have no functional dependency on this issue; migration numbering is rechecked against main before merging.
-- [ ] Confirm generation admission/RPM/TPM, inference circuit state, ledger row counts, and usage coverage are unchanged by tokenization success and failure.
-- [ ] Record separate outcomes for unit tests, real PostgreSQL concurrency tests, and real vLLM compatibility tests. Passing the default suite alone is not evidence that the optional environments ran.
-- [ ] Reference #33 in the implementation PR. Mention #23 only as related future work.
+- [x] Confirm the settings chosen by the user are implemented: a separate utility budget, shared across replicas.
+- [x] Confirm #31/#32 have no functional dependency on this issue; migration numbering is rechecked against main before merging.
+- [x] Confirm generation admission/RPM/TPM, inference circuit state, ledger row counts, and usage coverage are unchanged by tokenization success and failure.
+- [x] Record separate outcomes for unit tests, real PostgreSQL concurrency tests, and real vLLM compatibility tests. Passing the default suite alone is not evidence that the optional environments ran.
+- [ ] Reference #33 in an implementation PR when one is requested. This delivery commits and pushes the feature branch, as requested; #23 remains future work.

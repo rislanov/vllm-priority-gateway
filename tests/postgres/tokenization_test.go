@@ -194,6 +194,20 @@ func TestPostgresTokenizationDowngradeWaitsForConcurrentAdmission(t *testing.T) 
 	if e = <-done; e == nil {
 		t.Fatal("down migration dropped a concurrently committed active lease")
 	}
+	if _, e = s.CoordinationPool().Exec(ctx, "UPDATE tokenization_leases SET expires_at=clock_timestamp()-interval '1 second'"); e != nil {
+		t.Fatal(e)
+	}
+	downgrade, e := s.CoordinationPool().Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer downgrade.Rollback(context.Background())
+	if _, e = downgrade.Exec(ctx, string(sql)); e != nil {
+		t.Fatalf("drained downgrade failed: %v", e)
+	}
+	if e = downgrade.Rollback(ctx); e != nil {
+		t.Fatal(e)
+	}
 }
 
 func TestPostgresTokenizationStaleBackendAndExpiryCleanup(t *testing.T) {
@@ -255,6 +269,55 @@ func TestPostgresTokenizationPolicyMismatch(t *testing.T) {
 	defer second.Close()
 	if e := second.Start(context.Background()); e == nil {
 		t.Fatal("mismatched utility budgets accepted")
+	}
+}
+
+func TestPostgresTokenizationConcurrentCleanupAndAdmission(t *testing.T) {
+	s := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	f := createFixture(t, s, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := coordination.DefaultTokenizationPolicy()
+	p.ClientRPM = 100000
+	c := coordpostgres.NewTokenizationCoordinator(s, p, time.Second)
+	// Retained terminal receipts and expired leases coexist with active work.
+	for i := 0; i < 4; i++ {
+		d, e := c.Acquire(ctx, utilityRequest(f))
+		if e != nil || d.Lease == nil {
+			t.Fatal(d, e)
+		}
+		if e = c.Complete(ctx, *d.Lease); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if _, e := s.CoordinationPool().Exec(ctx, "UPDATE tokenization_operations SET retain_until=clock_timestamp()-interval '1 second'"); e != nil {
+		t.Fatal(e)
+	}
+	cleanupDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < 20; i++ {
+			if _, e := c.CleanupBatch(ctx, 1); e != nil {
+				cleanupDone <- e
+				return
+			}
+		}
+		cleanupDone <- nil
+	}()
+	for i := 0; i < 20; i++ {
+		d, e := c.Acquire(ctx, utilityRequest(f))
+		if e != nil || d.Lease == nil {
+			t.Fatal(d, e)
+		}
+		if e = c.Complete(ctx, *d.Lease); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if e := <-cleanupDone; e != nil {
+		t.Fatal(e)
+	}
+	var leases int
+	if e := s.CoordinationPool().QueryRow(ctx, "SELECT count(*) FROM tokenization_leases").Scan(&leases); e != nil || leases != 0 {
+		t.Fatalf("cleanup/release leaked leases: %d %v", leases, e)
 	}
 }
 func TestPostgresTokenizationSharedBudget(t *testing.T) {
