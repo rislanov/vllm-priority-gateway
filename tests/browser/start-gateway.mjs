@@ -8,7 +8,7 @@ import {createServer, request as proxyRequest} from 'node:http';
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const directory = mkdtempSync(join(tmpdir(), 'llmgw-browser-'));
 process.on('exit', () => rmSync(directory, {recursive: true, force: true}));
-const binary = join(directory, 'gateway');
+const binary = join(directory, process.platform === 'win32' ? 'gateway.exe' : 'gateway');
 const build = spawnSync('go', ['build', '-o', binary, './cmd/gateway'], {cwd: root, stdio: 'inherit'});
 if (build.status !== 0) process.exit(build.status ?? 1);
 // Keep the browser workflow independent from developer/production configuration.
