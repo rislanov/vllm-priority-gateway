@@ -105,6 +105,91 @@
     window.setTimeout(autoRefresh, 15000);
   }
 
+  const analyticsTimeZone = initAnalyticsTime();
+
+  function initAnalyticsTime() {
+    const form = document.querySelector('.analytics-filter-grid');
+    const time = window.LLMGWAnalyticsTime;
+    if (!form || !time) return null;
+    const changes = [];
+    const bindings = [];
+    let committed = false;
+    function change(element, property, value) {
+      if (!element) throw new Error('Missing analytics time control');
+      changes.push({element, property, previous: element[property], value});
+    }
+    function bind(element, type, handler) {
+      element.addEventListener(type, handler);
+      bindings.push({element, type, handler});
+    }
+    try {
+      const timeZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (!timeZone) return null;
+      const boundaries = ['from', 'to'].map((name) => {
+        const input = form.querySelector(`#analytics-${name}`);
+        const original = form.dataset[name === 'from' ? 'rangeFrom' : 'rangeTo'];
+        const initial = time.toLocalInput(input.dataset.utcInput);
+        const resolved = time.resolveBoundary(initial, initial, original);
+        change(input, 'value', initial);
+        const hint = form.querySelector(`[data-analytics-offset="${name}"]`);
+        change(hint, 'textContent', resolved.offsetLabel);
+        return {name, input, hint, initial, original};
+      });
+      document.querySelectorAll('[data-analytics-time]').forEach((element) => {
+        change(element, 'textContent', time.formatTimestamp(element.getAttribute('datetime'), {timeZone, precision: 'millisecond'}));
+      });
+      document.querySelectorAll('[data-analytics-timezone]').forEach((element) => change(element, 'textContent', timeZone));
+      change(form.querySelector('#analytics-range-hint'), 'textContent',
+        'Times use your browser time zone. New or edited repeated times select the earlier occurrence; the effective UTC offset is shown beside each field. Times skipped by a clock change are invalid. Unchanged boundaries keep their exact precision. CSV exports use UTC.');
+      const error = form.querySelector('[data-analytics-range-error]');
+      if (!error) throw new Error('Missing analytics validation message');
+      const resolve = (boundary) => time.resolveBoundary(boundary.input.value, boundary.initial, boundary.original);
+      boundaries.forEach((boundary) => bind(boundary.input, 'input', () => {
+        boundary.input.setCustomValidity('');
+        const result = resolve(boundary);
+        boundary.hint.textContent = result.error ? 'Invalid local time' : result.offsetLabel;
+        error.hidden = true;
+      }));
+      bind(form, 'submit', (event) => {
+        if (!committed) return;
+        event.preventDefault();
+        try {
+          const target = new URL(form.action, window.location.href);
+          target.search = '';
+          for (const boundary of boundaries) {
+            const result = resolve(boundary);
+            boundary.input.setCustomValidity(result.error || '');
+            if (result.error) {
+              error.textContent = result.error;
+              error.hidden = false;
+              boundary.input.focus();
+              boundary.input.reportValidity();
+              return;
+            }
+            target.searchParams.set(boundary.name, result.canonical);
+          }
+          for (const name of ['client_id', 'model_pool_id', 'usage_available', 'limit']) {
+            const value = form.elements.namedItem(name)?.value;
+            if (value) target.searchParams.set(name, value);
+          }
+          // Ordering is validated by the server at full RFC3339Nano precision.
+          window.location.assign(target.href);
+        } catch {
+          error.textContent = 'Unable to convert this range. Reload the page and try again.';
+          error.hidden = false;
+        }
+      });
+      // All formatting/conversion must succeed before changing the UTC fallback.
+      changes.forEach(({element, property, value}) => { element[property] = value; });
+      committed = true;
+      return timeZone;
+    } catch {
+      bindings.forEach(({element, type, handler}) => element.removeEventListener(type, handler));
+      changes.forEach(({element, property, previous}) => { element[property] = previous; });
+      return null;
+    }
+  }
+
   const svgNamespace = 'http://www.w3.org/2000/svg';
   const palette = {grid: '#34475a', text: '#9aa8ba', request: '#ffb32c', input: '#38d6a2', output: '#b883f4', cache: '#78b8ff', ratio: '#ffb32c'};
   const chartContainers = [...document.querySelectorAll('[data-analytics-chart]')];
@@ -221,8 +306,23 @@
   }
 
   function drawTimeLabels(frame, series, y) {
-    addText(frame.svg, frame.left, y, utcLabel(series[0].bucketStart), 'chart-axis-label', 'start');
-    if (series.length > 1) addText(frame.svg, frame.right, y, utcLabel(series[series.length - 1].bucketStart), 'chart-axis-label', 'end');
+    const draw = (point, x, anchor) => {
+      let label = utcLabel(point.bucketStart);
+      let accessible = label;
+      if (analyticsTimeZone) {
+        try {
+          label = window.LLMGWAnalyticsTime.formatAxisTimestamp(point.bucketStart, analyticsTimeZone);
+          accessible = window.LLMGWAnalyticsTime.formatTimestamp(point.bucketStart, {timeZone: analyticsTimeZone, precision: 'minute'});
+        } catch { /* Keep an explicitly UTC label if formatting fails. */ }
+      }
+      const text = addText(frame.svg, x, y, label, 'chart-axis-label', anchor);
+      text.setAttribute('aria-label', accessible);
+      const title = svgElement('title', {});
+      title.textContent = accessible;
+      text.append(title);
+    };
+    draw(series[0], frame.left, 'start');
+    if (series.length > 1) draw(series[series.length - 1], frame.right, 'end');
   }
 
   function drawLegend(svg, items, y) {
@@ -258,6 +358,7 @@
     if (anchor) label.setAttribute('text-anchor', anchor);
     label.textContent = value;
     svg.append(label);
+    return label;
   }
 
   function setChartMessage(container, message) {

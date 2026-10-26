@@ -7,7 +7,7 @@ test:
 	$(GO) test ./...
 
 test-web-unit:
-	node --test tests/browser/clipboard.unit.test.mjs
+	node --test tests/browser/*.unit.test.mjs
 
 test-web:
 	npm --prefix tests/browser test
