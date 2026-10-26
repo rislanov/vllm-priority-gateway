@@ -14,6 +14,8 @@
 **Branch:** `codex/issue-33-tokenize-endpoint`.
 **Status:** Implemented and independently reviewed. Main `5ae4667` was merged first. Validation is recorded in [acceptance-evidence.md](../../acceptance-evidence.md#authenticated-tokenization--issue-33-2026-10-27).
 
+**PR #36 review amendment:** SQLite uses a 65,536-receipt limit per client and a local replay/retention window of `TokenizationPolicy.LeaseTTL()` (timeout + 15s). PostgreSQL keeps its durable 24h window. Local requests outside that window are rejected by their immutable original timestamp after receipt eviction. Expiry heaps and separate active counters keep admission independent of retained-history size. Utility health is obtained through `TokenizationRuntime.BackendHealth(expectedBackend, at)`, which matches the full immutable worker configuration under the monitor lock; an ID-only health lookup is insufficient.
+
 ## Global Constraints
 
 - POST /tokenize only. No /v1/tokenize alias, /detokenize, automatic preflight token estimation, or local tokenizer. Issue #23 remains separate.
@@ -96,9 +98,9 @@ Modify `internal/config/config.go`, `internal/coordination/postgres/replica.go`,
 - Constructors: `local.NewTokenizationCoordinator(policy TokenizationPolicy, now func() time.Time) *TokenizationCoordinator` and `postgres.NewTokenizationCoordinator(store *pgstore.Store, policy TokenizationPolicy, timeout time.Duration) *TokenizationCoordinator` (qualify coordination types in the implementation packages).
 
 - [x] Add shared contract cases in `internal/coordination/contracttest/tokenization.go`: two independent clients, multiple keys per client, all-model client limits, backend limits, deterministic backend choice by lowest active utility count then backend ID, RPM refill/burst, and zero inference state changes.
-- [x] Assert repeat Acquire with the same operation/fingerprint returns the same decision without extra capacity/RPM; mismatched replay fails. Complete is idempotent; completed/expired operations cannot be resurrected. Reject operations older than 24h or more than 5m in the future, matching bounded receipt retention.
+- [x] Assert repeat Acquire with the same operation/fingerprint returns the same decision without extra capacity/RPM within the replay window; mismatched replay fails. Complete is idempotent; completed/expired operations cannot be resurrected using their original timestamp. PostgreSQL rejects operations older than 24h; SQLite uses the shorter local window in the PR amendment. Both reject operations more than 5m in the future.
 - [x] Run `go test ./internal/coordination/local -run Tokenization -count=1`; expect compile/assertion failures.
-- [x] Implement the local coordinator with one mutex, injected clock, separate counters/rate state, expiry-aware counts, and bounded receipt storage (65,536 receipts; discard expired terminal entries only; return unavailable when full). Retain receipts for 24h and charge RPM only after a candidate is selected.
+- [x] Implement the local coordinator with one mutex, injected clock, separate active counters/rate state, expiry heaps and bounded receipt storage (65,536 receipts per client; return unavailable for that client when full). Retain receipts for the bounded local replay window described in the PR review amendment and reject evicted operations by their original timestamp. Charge RPM only after a candidate is selected.
 - [x] Add config parsing/default/range tests for the four environment variables. Reuse existing config error conventions and add TokenizationPolicy to the replica fingerprint; test every field changes the fingerprint.
 - [x] Run `go test ./internal/config ./internal/coordination/local ./internal/coordination/postgres -run 'Tokenization|PolicyFingerprint' -count=1`; expect PASS. Commit with `feat: define independent tokenization admission policy`.
 

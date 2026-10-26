@@ -15,6 +15,12 @@ import (
 type TokenizationForwarder interface {
 	ForwardTokenization(context.Context, http.ResponseWriter, proxy.TokenizationRequest) proxy.Result
 }
+
+// TokenizationRuntime binds health to the immutable backend configuration that
+// was actually probed. A lookup by ID alone cannot establish this identity.
+type TokenizationRuntime interface {
+	BackendHealth(domain.Backend, time.Time) (domain.BackendRuntime, bool)
+}
 type TokenizationEvent struct {
 	RequestID, Client, Model, Backend, Reason string
 	Status                                    int
@@ -36,8 +42,12 @@ func (s *Service) tokenizationEligible(b domain.Backend, now time.Time) bool {
 	if _, ok := s.upstreamSecret(b); !ok {
 		return false
 	}
-	r := s.runtime.Snapshot(b.ID, now)
-	return r.Healthy && !r.LastHealthAt.IsZero() && !r.LastHealthAt.After(now) && s.tokenizationHealthMaxAge > 0 && now.Sub(r.LastHealthAt) <= s.tokenizationHealthMaxAge
+	runtime, ok := s.runtime.(TokenizationRuntime)
+	if !ok {
+		return false
+	}
+	r, matched := runtime.BackendHealth(b, now)
+	return matched && r.Healthy && !r.LastHealthAt.IsZero() && !r.LastHealthAt.After(now) && s.tokenizationHealthMaxAge > 0 && now.Sub(r.LastHealthAt) <= s.tokenizationHealthMaxAge
 }
 func tokenizationError(status int, reason string, retry time.Duration) *APIError {
 	kind := "server_error"

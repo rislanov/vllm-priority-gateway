@@ -10,6 +10,7 @@ import (
 )
 
 type tokenizationReceipt struct {
+	clientID    int64
 	fingerprint [32]byte
 	decision    coordination.TokenizationDecision
 	retainUntil time.Time
@@ -20,18 +21,26 @@ type tokenizationRate struct {
 	at      time.Time
 }
 type TokenizationCoordinator struct {
-	mu       sync.Mutex
-	policy   coordination.TokenizationPolicy
-	now      func() time.Time
-	receipts map[uuid.UUID]*tokenizationReceipt
-	rates    map[int64]tokenizationRate
+	mu              sync.Mutex
+	policy          coordination.TokenizationPolicy
+	now             func() time.Time
+	receipts        map[uuid.UUID]*tokenizationReceipt
+	rates           map[int64]tokenizationRate
+	receiptCounts   map[int64]int
+	receiptExpiries expiryQueue
+	leaseExpiries   expiryQueue
+	active          map[uuid.UUID]coordination.TokenizationLease
+	clientInflight  map[int64]int
+	backendInflight map[int64]int
 }
+
+const tokenizationReceiptsPerClient = 65536
 
 func NewTokenizationCoordinator(policy coordination.TokenizationPolicy, now func() time.Time) *TokenizationCoordinator {
 	if now == nil {
 		now = time.Now
 	}
-	return &TokenizationCoordinator{policy: policy, now: now, receipts: make(map[uuid.UUID]*tokenizationReceipt), rates: make(map[int64]tokenizationRate)}
+	return &TokenizationCoordinator{policy: policy, now: now, receipts: make(map[uuid.UUID]*tokenizationReceipt), rates: make(map[int64]tokenizationRate), receiptCounts: make(map[int64]int), active: make(map[uuid.UUID]coordination.TokenizationLease), clientInflight: make(map[int64]int), backendInflight: make(map[int64]int)}
 }
 func (c *TokenizationCoordinator) Status() coordination.Status {
 	return coordination.Status{Backend: "local", Available: c.policy.Validate() == nil}
@@ -42,6 +51,9 @@ func (c *TokenizationCoordinator) Acquire(ctx context.Context, r coordination.To
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if e := ctx.Err(); e != nil {
+		return coordination.TokenizationDecision{}, e
+	}
 	now := c.now().UTC()
 	if c.policy.Validate() != nil {
 		return coordination.TokenizationDecision{Reason: coordination.TokenizationUnavailable}, nil
@@ -57,34 +69,29 @@ func (c *TokenizationCoordinator) Acquire(ctx context.Context, r coordination.To
 		}
 		return cloneTokenizationDecision(old.decision), nil
 	}
-	if !r.ValidAt(now) {
+	// Local operations have one bounded HTTP lifetime and no durable cross-process
+	// recovery. Reject old input after that replay window, so deleting a terminal
+	// receipt can never resurrect its operation or spend RPM a second time.
+	if !r.ValidAt(now) || !r.OperationStartedAt.After(now.Add(-c.policy.LeaseTTL())) {
 		return coordination.TokenizationDecision{Reason: coordination.TokenizationStaleOperation}, nil
 	}
-	if len(c.receipts) >= 65536 {
+	if c.receiptCounts[r.ClientID] >= tokenizationReceiptsPerClient {
 		return coordination.TokenizationDecision{Reason: coordination.TokenizationUnavailable}, nil
 	}
-	rec := &tokenizationReceipt{fingerprint: fp, retainUntil: maxTime(now, r.OperationStartedAt).Add(24 * time.Hour)}
+	rec := &tokenizationReceipt{clientID: r.ClientID, fingerprint: fp, retainUntil: maxTime(now, r.OperationStartedAt).Add(c.policy.LeaseTTL())}
 	c.receipts[r.OperationID] = rec
+	c.receiptCounts[r.ClientID]++
+	c.receiptExpiries.add(admissionReceiptExpiry, r.OperationID, rec.retainUntil)
 	reject := func(reason string) (coordination.TokenizationDecision, error) {
 		rec.decision.Reason = reason
 		return cloneTokenizationDecision(rec.decision), nil
 	}
-	clientCount := 0
-	counts := make(map[int64]int)
-	for _, old := range c.receipts {
-		if l := old.decision.Lease; l != nil && !old.completed && l.ExpiresAt.After(now) {
-			counts[l.BackendID]++
-			if l.ClientID == r.ClientID {
-				clientCount++
-			}
-		}
-	}
-	if clientCount >= c.policy.ClientMaxInflight {
+	if c.clientInflight[r.ClientID] >= c.policy.ClientMaxInflight {
 		return reject(coordination.TokenizationClientLimit)
 	}
 	var selected coordination.TokenizationCandidate
 	for _, b := range r.Candidates {
-		if b.BackendID > 0 && counts[b.BackendID] < c.policy.BackendMaxInflight && (selected.BackendID == 0 || counts[b.BackendID] < counts[selected.BackendID] || counts[b.BackendID] == counts[selected.BackendID] && b.BackendID < selected.BackendID) {
+		if b.BackendID > 0 && c.backendInflight[b.BackendID] < c.policy.BackendMaxInflight && (selected.BackendID == 0 || c.backendInflight[b.BackendID] < c.backendInflight[selected.BackendID] || c.backendInflight[b.BackendID] == c.backendInflight[selected.BackendID] && b.BackendID < selected.BackendID) {
 			selected = b
 		}
 	}
@@ -105,6 +112,10 @@ func (c *TokenizationCoordinator) Acquire(ctx context.Context, r coordination.To
 	state.balance--
 	c.rates[r.ClientID] = state
 	rec.decision.Lease = &coordination.TokenizationLease{OperationID: r.OperationID, ReplicaID: r.ReplicaID, ClientID: r.ClientID, PoolID: r.PoolID, BackendID: selected.BackendID, BackendRevision: selected.BackendRevision, AcquiredAt: now, ExpiresAt: now.Add(c.policy.LeaseTTL())}
+	c.active[r.OperationID] = *rec.decision.Lease
+	c.clientInflight[r.ClientID]++
+	c.backendInflight[selected.BackendID]++
+	c.leaseExpiries.add(admissionLeaseExpiry, r.OperationID, rec.decision.Lease.ExpiresAt)
 	return cloneTokenizationDecision(rec.decision), nil
 }
 func (c *TokenizationCoordinator) Complete(ctx context.Context, l coordination.TokenizationLease) error {
@@ -121,18 +132,50 @@ func (c *TokenizationCoordinator) Complete(ctx context.Context, l coordination.T
 		return errors.New("tokenization lease identity mismatch")
 	}
 	rec.completed = true
+	c.releaseTokenization(l.OperationID)
 	return nil
 }
 func (c *TokenizationCoordinator) cleanup(now time.Time) {
-	for id, r := range c.receipts {
-		if !r.retainUntil.After(now) && (r.decision.Lease == nil || r.completed || !r.decision.Lease.ExpiresAt.After(now)) {
-			delete(c.receipts, id)
+	for {
+		entry, ok := c.leaseExpiries.due(now)
+		if !ok {
+			break
 		}
+		c.releaseTokenization(entry.id)
+	}
+	for {
+		entry, ok := c.receiptExpiries.due(now)
+		if !ok {
+			break
+		}
+		rec := c.receipts[entry.id]
+		if rec == nil {
+			continue
+		}
+		delete(c.receipts, entry.id)
+		decrementTokenizationCount(c.receiptCounts, rec.clientID)
 	}
 	for id, r := range c.rates {
 		if now.Sub(r.at) >= 24*time.Hour {
 			delete(c.rates, id)
 		}
+	}
+}
+
+func (c *TokenizationCoordinator) releaseTokenization(id uuid.UUID) {
+	l, ok := c.active[id]
+	if !ok {
+		return
+	}
+	delete(c.active, id)
+	decrementTokenizationCount(c.clientInflight, l.ClientID)
+	decrementTokenizationCount(c.backendInflight, l.BackendID)
+}
+func decrementTokenizationCount(counts map[int64]int, id int64) {
+	if counts[id] <= 1 {
+		delete(counts, id)
+	} else {
+		counts[id]--
 	}
 }
 func maxTime(a, b time.Time) time.Time {

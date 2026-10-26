@@ -22,6 +22,10 @@ import (
 
 type tokenizationHTTPRuntime struct{ postgresGatewayRuntime }
 
+func (r tokenizationHTTPRuntime) BackendHealth(b domain.Backend, at time.Time) (domain.BackendRuntime, bool) {
+	return r.Snapshot(b.ID, at), true
+}
+
 func (tokenizationHTTPRuntime) Snapshot(id int64, _ time.Time) domain.BackendRuntime {
 	return domain.BackendRuntime{BackendID: id, Healthy: true, LastHealthAt: time.Now().UTC().Add(-time.Millisecond)}
 }
