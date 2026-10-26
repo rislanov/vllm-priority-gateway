@@ -202,9 +202,37 @@
     cacheReadTokens: nullableDatasetNumber(point.dataset, 'cacheReadTokens'),
     cacheHitRatio: nullableDatasetNumber(point.dataset, 'cacheHitRatio'),
   }));
-  chartContainers.forEach((container) => renderChart(container, series));
+  const renderedWidths = new WeakMap();
+  chartContainers.forEach((container) => {
+    renderChart(container, series);
+    renderedWidths.set(container, container.clientWidth);
+  });
+  if (typeof ResizeObserver === 'function') {
+    const pending = new Set();
+    let scheduled = false;
+    const observer = new ResizeObserver((entries) => {
+      entries.forEach(({target}) => {
+        if (target.clientWidth > 0 && target.clientWidth !== renderedWidths.get(target)) pending.add(target);
+      });
+      if (pending.size === 0 || scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        pending.forEach((container) => {
+          const width = container.clientWidth;
+          if (width > 0 && width !== renderedWidths.get(container)) {
+            renderChart(container, series);
+            renderedWidths.set(container, width);
+          }
+        });
+        pending.clear();
+      });
+    });
+    chartContainers.forEach((container) => observer.observe(container));
+  }
 
   function renderChart(container, series) {
+    if (container.clientWidth === 0) return;
     if (series.length === 0) {
       setChartMessage(container, 'No series data is available for this range.');
       return;
@@ -221,7 +249,7 @@
     drawGrid(frame, 48, 210, Math.max(1, ...values), (value) => compactNumber(value));
     drawSeries(frame, series, values, 48, 210, Math.max(1, ...values), palette.request, false, 'circle');
     drawTimeLabels(frame, series, 234);
-    drawLegend(frame.svg, [{label: 'Requests', color: palette.request, marker: 'circle'}], 18);
+    drawLegend(frame, [{label: 'Requests', color: palette.request, marker: 'circle'}], 18);
   }
 
   function renderTokenChart(container, series, metric) {
@@ -235,7 +263,7 @@
     drawGrid(frame, 48, 210, maximum, (value) => compactNumber(value));
     drawSeries(frame, series, values, 48, 210, maximum, color, output, marker);
     drawTimeLabels(frame, series, 234);
-    drawLegend(frame.svg, [{label, color, marker, dashed: output}], 18);
+    drawLegend(frame, [{label, color, marker, dashed: output}], 18);
   }
 
   function renderCacheChart(container, series) {
@@ -247,21 +275,23 @@
     }
     const frame = chartFrame(container, series, 460, 'Cache-read tokens and cache-hit ratio charts', 'Two aligned plots for cache-known buckets. The top plot uses tokens; the bottom uses percent. Gaps represent unavailable cache data.');
     const cacheMaximum = Math.max(1, ...cache.filter((value) => value !== null));
-    addText(frame.svg, 64, 36, 'Cache-read tokens — cache-known buckets', 'chart-subtitle');
+    addText(frame.svg, frame.left, 20, 'Cache-read tokens', 'chart-subtitle');
+    addText(frame.svg, frame.left, 36, 'Cache-known buckets', 'chart-subtitle');
     drawGrid(frame, 52, 184, cacheMaximum, (value) => compactNumber(value));
     drawSeries(frame, series, cache, 52, 184, cacheMaximum, palette.cache, false, 'circle');
-    addText(frame.svg, 64, 236, 'Cache-hit ratio — cache-known buckets', 'chart-subtitle');
+    addText(frame.svg, frame.left, 220, 'Cache-hit ratio', 'chart-subtitle');
+    addText(frame.svg, frame.left, 236, 'Cache-known buckets', 'chart-subtitle');
     drawGrid(frame, 252, 384, 1, (value) => `${Math.round(value * 100)}%`);
     drawSeries(frame, series, ratio, 252, 384, 1, palette.ratio, false, 'square');
     drawTimeLabels(frame, series, 410);
   }
 
   function chartFrame(container, series, height, titleText, descriptionText) {
+    const width = container.clientWidth;
     clearElement(container);
-    const svg = svgElement('svg', {viewBox: `0 0 760 ${height}`, role: 'img', preserveAspectRatio: 'xMidYMid meet'});
-    const sequence = document.querySelectorAll('svg.analytics-chart').length + 1;
-    const titleID = `analytics-chart-title-${sequence}`;
-    const descriptionID = `analytics-chart-description-${sequence}`;
+    const svg = svgElement('svg', {viewBox: `0 0 ${width} ${height}`, role: 'img', preserveAspectRatio: 'xMidYMid meet'});
+    const titleID = `analytics-chart-title-${container.dataset.analyticsChart}`;
+    const descriptionID = `analytics-chart-description-${container.dataset.analyticsChart}`;
     svg.setAttribute('class', 'analytics-chart');
     svg.setAttribute('aria-labelledby', `${titleID} ${descriptionID}`);
     const title = svgElement('title', {id: titleID});
@@ -270,7 +300,7 @@
     description.textContent = descriptionText;
     svg.append(title, description);
     container.append(svg);
-    return {svg, series, left: 64, right: 742};
+    return {svg, series, width, left: 64, right: width - 18};
   }
 
   function drawGrid(frame, top, bottom, maximum, formatter) {
@@ -302,7 +332,10 @@
       if (marker === 'square') frame.svg.append(svgElement('rect', {x: point.x - 4, y: point.y - 4, width: 8, height: 8, fill: color}));
       else frame.svg.append(svgElement('circle', {cx: point.x, cy: point.y, r: 4.5, fill: color}));
     });
-    if (known.length === 1) addText(frame.svg, known[0].x + 9, known[0].y - 9, 'One reported bucket', 'chart-sparse-label');
+    if (known.length === 1) {
+      const labelY = known[0].y <= top + 20 ? known[0].y + 18 : known[0].y - 9;
+      addText(frame.svg, known[0].x, labelY, 'One reported bucket', 'chart-sparse-label', 'middle');
+    }
   }
 
   function drawTimeLabels(frame, series, y) {
@@ -315,7 +348,17 @@
           accessible = window.LLMGWAnalyticsTime.formatTimestamp(point.bucketStart, {timeZone: analyticsTimeZone, precision: 'minute'});
         } catch { /* Keep an explicitly UTC label if formatting fails. */ }
       }
-      const text = addText(frame.svg, x, y, label, 'chart-axis-label', anchor);
+      const text = addText(frame.svg, x, y, '', 'chart-axis-label', anchor);
+      if (frame.right - frame.left < 420) {
+        const [date, ...time] = label.split(' ');
+        const first = svgElement('tspan', {x, dy: 0});
+        first.textContent = date + ' ';
+        const second = svgElement('tspan', {x, dy: 16});
+        second.textContent = time.join(' ');
+        text.append(first, second);
+      } else {
+        text.textContent = label;
+      }
       text.setAttribute('aria-label', accessible);
       const title = svgElement('title', {});
       title.textContent = accessible;
@@ -325,8 +368,9 @@
     if (series.length > 1) draw(series[series.length - 1], frame.right, 'end');
   }
 
-  function drawLegend(svg, items, y) {
-    let x = 520;
+  function drawLegend(frame, items, y) {
+    const svg = frame.svg;
+    let x = frame.left;
     items.forEach((item) => {
       const line = svgElement('line', {x1: x, y1: y, x2: x + 25, y2: y, stroke: item.color, 'stroke-width': 3});
       if (item.dashed) line.setAttribute('stroke-dasharray', '7 6');

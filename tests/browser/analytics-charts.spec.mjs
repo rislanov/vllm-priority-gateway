@@ -93,3 +93,106 @@ test('empty range has four honest messages and empty fallback tables', async ({p
     await expect(details.locator('tbody')).toHaveText('No series data is available for this range.');
   }
 });
+
+for (const width of [375, 768, 1440]) {
+  test(`four full-width panels keep readable geometry at ${width}px`, async ({page}) => {
+    await page.setViewportSize({width, height: 1000});
+    await open(page);
+    await expect(page.locator('svg.analytics-chart')).toHaveCount(4);
+    const panels = await page.locator('.chart-panel').evaluateAll((panels) => panels.map((p) => {
+      const {x, y, width, height} = p.getBoundingClientRect(); return {x, y, width, height};
+    }));
+    expect(panels).toHaveLength(4);
+    for (let i = 1; i < panels.length; i++) {
+      expect(panels[i].x).toBe(panels[0].x);
+      expect(panels[i].width).toBe(panels[0].width);
+      expect(panels[i].y).toBeGreaterThanOrEqual(panels[i-1].y + panels[i-1].height);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    const frames = await page.locator('svg.analytics-chart').evaluateAll((svgs) => svgs.map((svg) => {
+      const box = svg.getBoundingClientRect();
+      return {width: box.width, height: box.height, canvas: svg.viewBox.baseVal.width, containerWidth: svg.parentElement.clientWidth,
+        readable: [...svg.querySelectorAll('text')].every((label) => {
+          const rect = label.getBoundingClientRect();
+          return rect.x >= box.x - 1 && rect.right <= box.right + 1 && rect.y >= box.y - 1 && rect.bottom <= box.bottom + 1
+            && Number.parseFloat(getComputedStyle(label).fontSize) * svg.getScreenCTM().a >= 10;
+        })};
+    }));
+    expect(frames.map((f) => Math.round(f.height))).toEqual([280, 280, 280, 460]);
+    for (const frame of frames) {
+      expect(Math.abs(frame.width - frame.canvas)).toBeLessThanOrEqual(1);
+      expect(frame.width).toBeLessThanOrEqual(frame.containerWidth + 1);
+      expect(frame.readable).toBe(true);
+    }
+    expect(await page.locator('svg.analytics-chart').evaluateAll((svgs) => {
+      const ids = svgs.flatMap((svg) => svg.getAttribute('aria-labelledby').split(' '));
+      return new Set(ids).size === 8 && ids.every((id) => document.querySelectorAll(`[id="${id}"]`).length === 1);
+    })).toBe(true);
+  });
+}
+
+test('resize recalculates paths and labels without duplicating points or accessible IDs', async ({page}) => {
+  await page.setViewportSize({width: 1440, height: 1000});
+  await open(page, 'gaps');
+  const path = chart(page, 'output-tokens').locator('path');
+  const before = await path.getAttribute('d');
+  for (const width of [375, 768, 1440, 375]) {
+    await page.setViewportSize({width, height: 1000});
+    await expect.poll(async () => chart(page, 'output-tokens').locator('svg').evaluate((svg) => Math.abs(svg.viewBox.baseVal.width - svg.getBoundingClientRect().width))).toBeLessThanOrEqual(1);
+    await expect(page.locator('svg.analytics-chart')).toHaveCount(4);
+    await expect(page.locator('[data-analytics-point]')).toHaveCount(3);
+    expect(await coordinates(page, 'output-tokens', '#b883f4')).toHaveLength(3);
+    expect(await page.locator('[id^="analytics-chart-"]').evaluateAll((nodes) => new Set(nodes.map((n) => n.id)).size === nodes.length)).toBe(true);
+  }
+  expect(await path.getAttribute('d')).not.toBe(before);
+});
+
+test('cache-known gaps remain discontinuities and explicit cache zero remains known', async ({page}) => {
+  await open(page, 'gaps');
+  const cache = chart(page, 'cache');
+  await expect(cache.locator('svg')).toBeVisible();
+  for (const path of await cache.locator('path').all()) {
+    expect((await path.getAttribute('d')).match(/M/g)).toHaveLength(2);
+    expect(await path.getAttribute('d')).not.toContain('L');
+  }
+  await expect(cache.locator('circle[fill="#78b8ff"]')).toHaveCount(2);
+  await page.unroute('**/admin/analytics?**');
+  await open(page, 'zero');
+  await expect(chart(page, 'cache').locator('svg')).toBeVisible();
+  await expect(chart(page, 'cache').locator('circle[fill="#78b8ff"]')).toHaveAttribute('cy', '184');
+  await page.unroute('**/admin/analytics?**');
+  await open(page, 'normal', undefined);
+  // The second bucket is unknown, rather than a fabricated zero marker.
+  await expect(chart(page, 'cache').locator('circle[fill="#78b8ff"]')).toHaveCount(1);
+});
+
+test('a single cache bucket keeps its annotation clear of plot subtitles', async ({page}) => {
+  await page.setViewportSize({width: 375, height: 1000});
+  await open(page, 'sparse');
+  await expect(chart(page, 'cache').locator('svg')).toBeVisible();
+  expect(await chart(page, 'cache').locator('svg').evaluate((svg) => {
+    const subtitles = [...svg.querySelectorAll('.chart-subtitle')].map((text) => text.getBoundingClientRect());
+    return [...svg.querySelectorAll('.chart-sparse-label')].some((text) => {
+      const box = text.getBoundingClientRect();
+      return subtitles.some((s) => box.left < s.right && box.right > s.left && box.top < s.bottom && box.bottom > s.top);
+    });
+  })).toBe(false);
+});
+
+test.describe('without JavaScript', () => {
+  test.use({javaScriptEnabled: false});
+  test('all four tables retain exact fixture values and UTC timestamps', async ({page}) => {
+    await open(page);
+    await expect(page.locator('svg')).toHaveCount(0);
+    const expected = [
+      ['2', '1'], ['1,000,000', '500,000'], ['1,000', '500'],
+    ];
+    for (const [index, details] of (await page.locator('.chart-fallback').all()).entries()) {
+      await details.locator('summary').click();
+      await expect(details.locator('table')).toBeVisible();
+      await expect(details.locator('time').first()).toHaveText('2026-01-15 23:30:00.123 UTC');
+      if (index < 3) expect(await details.locator('tbody tr td:last-child').allTextContents()).toEqual(expected[index]);
+      else expect(await details.locator('tbody tr').first().locator('td').allTextContents()).toEqual(['2026-01-15 23:30:00.123 UTC', '20', '20%']);
+    }
+  });
+});
