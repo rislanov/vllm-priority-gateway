@@ -210,7 +210,8 @@
       return;
     }
     if (container.dataset.analyticsChart === 'requests') renderRequestChart(container, series);
-    if (container.dataset.analyticsChart === 'tokens') renderTokenChart(container, series);
+    if (container.dataset.analyticsChart === 'input-tokens') renderTokenChart(container, series, 'inputTokens');
+    if (container.dataset.analyticsChart === 'output-tokens') renderTokenChart(container, series, 'outputTokens');
     if (container.dataset.analyticsChart === 'cache') renderCacheChart(container, series);
   }
 
@@ -223,19 +224,18 @@
     drawLegend(frame.svg, [{label: 'Requests', color: palette.request, marker: 'circle'}], 18);
   }
 
-  function renderTokenChart(container, series) {
-    const input = series.map((point) => numeric(point.inputTokens));
-    const output = series.map((point) => numeric(point.outputTokens));
-    const maximum = Math.max(1, ...input, ...output);
-    const frame = chartFrame(container, series, 280, 'Input and output token chart', 'Independent input and output token lines from a zero baseline. Input is solid with circles; output is dashed with squares.');
+  function renderTokenChart(container, series, metric) {
+    const values = series.map((point) => numeric(point[metric]));
+    const maximum = Math.max(1, ...values);
+    const output = metric === 'outputTokens';
+    const label = output ? 'Output' : 'Input';
+    const color = output ? palette.output : palette.input;
+    const marker = output ? 'square' : 'circle';
+    const frame = chartFrame(container, series, 280, `${label} token chart`, `${label} tokens per UTC bucket on an independent scale from a zero baseline. ${output ? 'Dashed line with squares.' : 'Solid line with circles.'}`);
     drawGrid(frame, 48, 210, maximum, (value) => compactNumber(value));
-    drawSeries(frame, series, input, 48, 210, maximum, palette.input, false, 'circle');
-    drawSeries(frame, series, output, 48, 210, maximum, palette.output, true, 'square');
+    drawSeries(frame, series, values, 48, 210, maximum, color, output, marker);
     drawTimeLabels(frame, series, 234);
-    drawLegend(frame.svg, [
-      {label: 'Input', color: palette.input, marker: 'circle'},
-      {label: 'Output', color: palette.output, marker: 'square', dashed: true},
-    ], 18);
+    drawLegend(frame.svg, [{label, color, marker, dashed: output}], 18);
   }
 
   function renderCacheChart(container, series) {
