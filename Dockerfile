@@ -22,4 +22,5 @@ USER 65532:65532
 ENV LLMGW_DATABASE_PATH=/data/llmgw.db
 VOLUME ["/data"]
 EXPOSE 8080
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 CMD ["/gateway", "healthcheck"]
 ENTRYPOINT ["/gateway"]

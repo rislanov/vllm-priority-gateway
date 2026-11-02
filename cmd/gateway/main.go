@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,7 +23,11 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		healthCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		if err := checkGatewayHealth(healthCtx, "http://127.0.0.1:8080/healthz"); err != nil {
+		endpoint, err := gatewayHealthEndpoint(os.Getenv("LLMGW_LISTEN_ADDRESS"))
+		if err == nil {
+			err = checkGatewayHealth(healthCtx, endpoint)
+		}
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -32,6 +37,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func gatewayHealthEndpoint(address string) (string, error) {
+	if address == "" {
+		address = ":8080"
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("parse gateway healthcheck listen address: %w", err)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		// net.Listen("tcp", "[::]:port") also accepts IPv4, including its
+		// fallback when the container has IPv6 disabled.
+		host = "127.0.0.1"
+	}
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: "/healthz"}).String(), nil
 }
 
 func checkGatewayHealth(ctx context.Context, endpoint string) error {
