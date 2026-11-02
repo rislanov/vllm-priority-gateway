@@ -1,4 +1,4 @@
-{{define "content"}}
+
 <section class="page-heading"><div><h1>Clients</h1><p>Control priority, concurrency, and explicit model access.</p></div><a class="button primary" href="/admin/clients#create-client">Create client</a></section>
 <div class="table-wrap"><table><thead><tr><th>Name</th><th>Class</th><th>vLLM priority</th><th>Max concurrency</th><th>RPM / TPM</th><th>Models</th><th>Status</th><th>Actions</th></tr></thead><tbody>
 {{range .View.Clients}}<tr><td><strong>{{.Name}}</strong></td><td>{{.PriorityClass}}</td><td class="mono">{{.VLLMPriority}}</td><td class="mono">{{.MaxConcurrency}}</td><td class="mono">{{.RequestsPerMinute}} / {{.TokensPerMinute}}</td><td>{{join .Models ", "}}</td><td class="{{if .Enabled}}state-healthy{{else}}state-disabled{{end}}">{{if .Enabled}}Enabled{{else}}Disabled{{end}}</td><td><div class="row-actions"><a class="button secondary small" href="/admin/clients?edit={{.ID}}#client-editor">Edit</a>
@@ -9,11 +9,11 @@
   <form method="post" action="/admin/clients" class="row-actions"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{.ID}}"><button class="button danger small" type="submit" data-confirm="Delete this client and all of its API keys?">Delete</button></form></div>
 </td></tr>{{else}}<tr><td colspan="7" class="empty">No clients configured.</td></tr>{{end}}
 </tbody></table></div>
-{{if .EditClient}}
-{{$client := .EditClient}}<section id="client-editor" class="editor"><h2>Edit client: {{$client.Name}}</h2><form method="post" action="/admin/clients" class="form-grid">
+<!--{{if .EditClient}}-->
+<!--{{$client := .EditClient}}--><section id="client-editor" class="editor"><h2>Edit client: {{$client.Name}}</h2><form method="post" action="/admin/clients" class="form-grid">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="update"><input type="hidden" name="id" value="{{$client.ID}}">
   <div><label for="edit-client-name">Name</label><input id="edit-client-name" name="name" value="{{$client.Name}}" required autocomplete="off"></div>
-  <div><label for="edit-priority-class">Priority class</label><select id="edit-priority-class" name="priority_class"><option{{if eq $client.PriorityClass "critical"}} selected{{end}}>critical</option><option{{if eq $client.PriorityClass "high"}} selected{{end}}>high</option><option{{if eq $client.PriorityClass "normal"}} selected{{end}}>normal</option><option{{if eq $client.PriorityClass "background"}} selected{{end}}>background</option></select></div>
+  <div><label for="edit-priority-class">Priority class</label><select id="edit-priority-class" name="priority_class">{{if eq $client.PriorityClass "critical"}}<option selected>critical</option>{{else}}<option>critical</option>{{end}}{{if eq $client.PriorityClass "high"}}<option selected>high</option>{{else}}<option>high</option>{{end}}{{if eq $client.PriorityClass "normal"}}<option selected>normal</option>{{else}}<option>normal</option>{{end}}{{if eq $client.PriorityClass "background"}}<option selected>background</option>{{else}}<option>background</option>{{end}}</select></div>
   <div><label for="edit-vllm-priority">vLLM priority</label><input id="edit-vllm-priority" name="vllm_priority" type="number" value="{{$client.VLLMPriority}}" required></div>
   <div><label for="edit-max-concurrency">Max concurrency</label>{{if gt $client.MaxConcurrency 10000}}<p class="warning">Legacy value exceeds 10,000; leave unchanged or lower it.</p>{{end}}<input id="edit-max-concurrency" name="max_concurrency" type="number" min="0"{{if le $client.MaxConcurrency 10000}} max="10000"{{end}} value="{{$client.MaxConcurrency}}" required></div>
   <div><label for="edit-rpm">Requests per minute (0 disables)</label><input id="edit-rpm" name="requests_per_minute" type="number" min="0" max="10000000" value="{{$client.RequestsPerMinute}}" required></div>
@@ -22,7 +22,7 @@
   <label class="check" for="edit-client-enabled"><input id="edit-client-enabled" name="enabled" type="checkbox"{{if $client.Enabled}} checked{{end}}>Enabled</label>
   <div class="form-actions"><a class="button secondary" href="/admin/clients">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
 </form></section>
-{{else}}
+<!--{{else}}-->
 <section id="create-client" class="editor"><h2>Create client</h2><form method="post" action="/admin/clients" class="form-grid">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="create">
   <div><label for="client-name">Name</label><input id="client-name" name="name" required autocomplete="off"></div>
@@ -35,5 +35,4 @@
   <label class="check" for="client-enabled"><input id="client-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create client</button></div>
 </form></section>
-{{end}}
-{{end}}
+<!--{{end}}-->

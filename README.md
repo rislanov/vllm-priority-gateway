@@ -250,7 +250,7 @@ See the [technical specification](docs/technical-specification.md) for the broad
 
 ## Development
 
-Requirements: Go 1.27 and macOS or Linux. The SQLite driver is pure Go; builds do not require CGO.
+Requirements: Go 1.27.3 or newer and macOS or Linux. The SQLite driver is pure Go; builds do not require CGO.
 
 ```bash
 make test

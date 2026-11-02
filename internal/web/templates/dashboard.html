@@ -1,4 +1,4 @@
-{{define "content"}}
+
 <section class="page-heading">
   <div><h1>Gateway overview</h1><p>Real-time status of model pools and inference backends.</p></div>
   <button class="button secondary" type="button" data-refresh>Refresh status</button>
@@ -21,4 +21,3 @@
   {{range .View.Backends}}<tr><td><strong>{{.Name}}</strong><small>{{.ModelPool}}</small></td><td class="{{stateClass .Runtime.State}}">{{if .Draining}}draining{{else}}{{.Runtime.State}}{{end}}</td><td class="mono">{{.Runtime.CircuitState}}</td><td class="mono">{{requestCount .Runtime.Running}}</td><td class="mono">{{requestCount .Runtime.Waiting}}</td><td class="mono">{{percent .Runtime.KVCacheUsage}}</td><td class="mono pressure">{{decimal .Runtime.Pressure}}</td></tr>{{else}}<tr><td colspan="7" class="empty">No backends configured.</td></tr>{{end}}
   </tbody></table></div>
 </section>
-{{end}}

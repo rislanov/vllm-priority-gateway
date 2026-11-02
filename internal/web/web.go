@@ -45,14 +45,15 @@ type analyticsPage struct {
 	UsageAvailable string
 	HasCacheSeries bool
 	Limit          int
-	CSVURL         string
-	Presets        []analyticsPreset
-	HasPrevious    bool
-	PreviousURL    string
-	HasNext        bool
-	NextURL        string
-	FirstRequest   int64
-	LastRequest    int64
+	// These links omit the leading slash, which is fixed in the templates.
+	CSVURL       string
+	Presets      []analyticsPreset
+	HasPrevious  bool
+	PreviousURL  string
+	HasNext      bool
+	NextURL      string
+	FirstRequest int64
+	LastRequest  int64
 }
 
 type analyticsPreset struct {
@@ -104,9 +105,22 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 			return false
 		},
 	}
+	layoutSource, err := assets.ReadFile("templates/layout.html")
+	if err != nil {
+		return nil, fmt.Errorf("read layout template: %w", err)
+	}
 	templates := make(map[string]*template.Template, 5)
 	for _, page := range []string{"dashboard", "analytics", "clients", "keys", "backends"} {
-		parsed, err := template.New("layout.html").Funcs(functions).ParseFS(assets, "templates/layout.html", "templates/"+page+".html")
+		contentSource, err := assets.ReadFile("templates/" + page + ".html")
+		if err != nil {
+			return nil, fmt.Errorf("read %s template: %w", page, err)
+		}
+		// Name the fragments here, keeping definition directives out of HTML.
+		parsed, err := template.New("layout").Funcs(functions).Parse(string(layoutSource))
+		if err != nil {
+			return nil, fmt.Errorf("parse layout template: %w", err)
+		}
+		_, err = parsed.New("content").Parse(string(contentSource))
 		if err != nil {
 			return nil, fmt.Errorf("parse %s template: %w", page, err)
 		}
@@ -238,7 +252,7 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		FromCanonical: query.Filter.From.UTC().Format(time.RFC3339Nano),
 		ToCanonical:   query.Filter.To.UTC().Format(time.RFC3339Nano),
 		Limit:         query.Limit,
-		CSVURL:        analyticsURL("/admin/api/analytics/export.csv", filterValues),
+		CSVURL:        analyticsURL("admin/api/analytics/export.csv", filterValues),
 	}
 	if query.Filter.ClientID != nil {
 		page.ClientID = strconv.FormatInt(*query.Filter.ClientID, 10)
@@ -264,7 +278,7 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		presetValues.Del("to")
 		presetValues.Set("range", preset.label)
 		page.Presets = append(page.Presets, analyticsPreset{
-			Label: preset.label, URL: analyticsURL("/admin/analytics", presetValues),
+			Label: preset.label, URL: analyticsURL("admin/analytics", presetValues),
 			Active: query.Range == preset.label || (query.Range == "" && query.Filter.To.Sub(query.Filter.From) == preset.width),
 		})
 	}
@@ -280,13 +294,13 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		} else {
 			values.Set("offset", strconv.Itoa(previous))
 		}
-		page.PreviousURL = analyticsURL("/admin/analytics", values)
+		page.PreviousURL = analyticsURL("admin/analytics", values)
 	}
 	page.HasNext = int64(query.Offset+len(requests.Requests)) < requests.Total
 	if page.HasNext {
 		values := pageValues.Clone()
 		values.Set("offset", strconv.Itoa(query.Offset+query.Limit))
-		page.NextURL = analyticsURL("/admin/analytics", values)
+		page.NextURL = analyticsURL("admin/analytics", values)
 	}
 	if len(requests.Requests) > 0 {
 		page.FirstRequest = int64(query.Offset + 1)

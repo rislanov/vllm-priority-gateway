@@ -61,6 +61,10 @@ func (p *Proxy) ForwardTokenization(ctx context.Context, w http.ResponseWriter, 
 	commit := func() {
 		if !result.ResponseStarted {
 			CopyResponseHeaders(w.Header(), response.Header)
+			// Tokenization is a data endpoint. Never let an upstream error page or
+			// reflected token text select an executable browser content type.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Request-Id", r.RequestID)
 			w.WriteHeader(response.StatusCode)
 			result.ResponseStarted = true

@@ -1,4 +1,4 @@
-{{define "content"}}
+
 <section class="page-heading"><div><h1>API Keys</h1><p>Generate client credentials and revoke access immediately.</p></div></section>
 {{if .Secret}}<section id="one-time-secret" class="secret" aria-labelledby="secret-heading">
   <div><h2 id="secret-heading">API key created</h2><p>Copy this key now. It will not be shown again.</p></div>
@@ -17,4 +17,3 @@
   <noscript><p>JavaScript is required to generate a key safely. Enable it or use the Admin API.</p></noscript>
   <p class="form-actions" role="status" aria-live="polite" data-key-create-status></p>
 </form></section>
-{{end}}

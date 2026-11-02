@@ -66,6 +66,28 @@ func TestGatewayHealthcheckRequiresHTTP200(t *testing.T) {
 	})
 }
 
+func TestGatewayHealthEndpointUsesConfiguredListener(t *testing.T) {
+	for _, test := range []struct{ address, want string }{
+		{"", "http://127.0.0.1:8080/healthz"},
+		{":9090", "http://127.0.0.1:9090/healthz"},
+		{"0.0.0.0:9090", "http://127.0.0.1:9090/healthz"},
+		{"127.0.0.1:9090", "http://127.0.0.1:9090/healthz"},
+		{"[::]:9090", "http://127.0.0.1:9090/healthz"},
+		{"[::1]:9090", "http://[::1]:9090/healthz"},
+		{"localhost:9090", "http://localhost:9090/healthz"},
+	} {
+		t.Run(test.address, func(t *testing.T) {
+			got, err := gatewayHealthEndpoint(test.address)
+			if err != nil || got != test.want {
+				t.Fatalf("gatewayHealthEndpoint(%q) = %q, %v; want %q", test.address, got, err, test.want)
+			}
+		})
+	}
+	if _, err := gatewayHealthEndpoint("missing-port"); err == nil {
+		t.Fatal("invalid listener address was accepted")
+	}
+}
+
 func TestProjectedKeyUsageUpdatesRegistryAfterDurableWrite(t *testing.T) {
 	destination := &keyUsageStoreStub{}
 	projection := &keyUsageRegistryStub{}
