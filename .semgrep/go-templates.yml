@@ -1,0 +1,35 @@
+rules:
+  - id: go-template-mutation-form-missing-csrf
+    message: Mutation forms must include the request CSRF token from .CSRF or $.CSRF in an input named csrf_token.
+    languages: [generic]
+    severity: ERROR
+    metadata:
+      category: security
+      technology: [go, html-templates]
+      cwe: "CWE-352: Cross-Site Request Forgery (CSRF)"
+      confidence: MEDIUM
+    paths:
+      include: ["internal/web/templates/*.html"]
+    patterns:
+      # Skip comments and quoted attribute values when recognizing markup.
+      # Match the whole form without generic mode's ten-line ellipsis limit.
+      - pattern-regex: >-
+          (?isx)
+          <!-- .*? --> (*SKIP)(*F) |
+          \{\{ -? \s* /\* .*? \*/ \s* -? \}\} (*SKIP)(*F) |
+          <form\b
+          (?= (?: "[^"]*" | '[^']*' | [^"'>] )* \smethod\s*=\s*
+          (?: "(?:post|put|delete|patch)" | '(?:post|put|delete|patch)' | (?:post|put|delete|patch)(?=[\s/>]) ) )
+          (?: "[^"]*" | '[^']*' | [^"'>] )* >
+          (?:(?!</form\s*>).)* </form\s*>
+      # Only actual, enabled inputs with a request-bound token are accepted.
+      # data-name/data-value attributes and token-shaped comments do not count.
+      - pattern-not-regex: >-
+          (?isx)
+          <!-- .*? --> (*SKIP)(*F) |
+          \{\{ -? \s* /\* .*? \*/ \s* -? \}\} (*SKIP)(*F) |
+          <input\b
+          (?= (?: "[^"]*" | '[^']*' | [^"'>] )* \sname\s*=\s* (?: "(?-i:csrf_token)" | '(?-i:csrf_token)' ) )
+          (?= (?: "[^"]*" | '[^']*' | [^"'>] )* \svalue\s*=\s* (?: "\{\{\s*(?-i:\$?\.CSRF)\s*\}\}" | '\{\{\s*(?-i:\$?\.CSRF)\s*\}\}' ) )
+          (?! (?: "[^"]*" | '[^']*' | [^"'>] )* \sdisabled(?=[\s=/>]|\{\{) )
+          (?: "[^"]*" | '[^']*' | [^"'>] )* >

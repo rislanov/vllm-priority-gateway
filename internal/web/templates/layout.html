@@ -8,15 +8,15 @@
   <script defer src="/admin/static/analytics-time.js"></script>
   <script defer src="/admin/static/app.js"></script>
 </head>
-<body{{if eq .Active "Dashboard"}} data-dashboard{{end}}>
+{{if eq .Active "Dashboard"}}<body data-dashboard>{{else}}<body>{{end}}
   <header class="app-header">
     <a class="brand" href="/admin">vLLM <span>Priority Gateway</span></a>
     <nav aria-label="Admin navigation">
-      <a href="/admin"{{if eq .Active "Dashboard"}} aria-current="page"{{end}}>Dashboard</a>
-      <a href="/admin/analytics"{{if eq .Active "Analytics"}} aria-current="page"{{end}}>Analytics</a>
-      <a href="/admin/clients"{{if eq .Active "Clients"}} aria-current="page"{{end}}>Clients</a>
-      <a href="/admin/keys"{{if eq .Active "API Keys"}} aria-current="page"{{end}}>API Keys</a>
-      <a href="/admin/backends"{{if eq .Active "Backends"}} aria-current="page"{{end}}>Backends</a>
+      {{if eq .Active "Dashboard"}}<a href="/admin" aria-current="page">Dashboard</a>{{else}}<a href="/admin">Dashboard</a>{{end}}
+      {{if eq .Active "Analytics"}}<a href="/admin/analytics" aria-current="page">Analytics</a>{{else}}<a href="/admin/analytics">Analytics</a>{{end}}
+      {{if eq .Active "Clients"}}<a href="/admin/clients" aria-current="page">Clients</a>{{else}}<a href="/admin/clients">Clients</a>{{end}}
+      {{if eq .Active "API Keys"}}<a href="/admin/keys" aria-current="page">API Keys</a>{{else}}<a href="/admin/keys">API Keys</a>{{end}}
+      {{if eq .Active "Backends"}}<a href="/admin/backends" aria-current="page">Backends</a>{{else}}<a href="/admin/backends">Backends</a>{{end}}
     </nav>
     <span class="ready"><i></i>{{if .View.Degraded}}Degraded{{else}}Ready{{end}}</span>
   </header>

@@ -1,7 +1,17 @@
 GO ?= go
 DIST ?= dist
+SEMGREP ?= semgrep
 
-.PHONY: test test-web-unit test-web test-race test-real-vllm test-postgres test-postgres-docker test-postgres-pooler vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean
+.PHONY: test test-web-unit test-web test-race test-real-vllm test-postgres test-postgres-docker test-postgres-pooler vet build build-linux-amd64 build-e2e-linux-amd64 container-smoke fake-vllm loadgen clean semgrep semgrep-templates test-semgrep
+
+semgrep: test-semgrep
+	SEMGREP="$(SEMGREP)" ./scripts/semgrep.sh
+
+semgrep-templates: test-semgrep
+	SEMGREP="$(SEMGREP)" ./scripts/semgrep.sh --error internal/web/templates
+
+test-semgrep:
+	$(SEMGREP) --test --config .semgrep/go-templates.yml --metrics off --disable-version-check .semgrep/go-templates.html
 
 test:
 	$(GO) test ./...

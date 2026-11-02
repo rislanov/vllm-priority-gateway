@@ -1,0 +1,58 @@
+<!-- ok: go-template-mutation-form-missing-csrf -->
+<form method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"></form>
+
+<!-- ok: go-template-mutation-form-missing-csrf -->
+<form action="/admin/keys" method="POST"><input value='{{ $.CSRF }}' name='csrf_token' type="hidden"></form>
+
+<!-- ok: go-template-mutation-form-missing-csrf -->
+<form method="get"><input name="query"></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><input name="action" value="create"></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method='delete'><input name="csrf_token" value=""></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="put"><input name="csrf_token" value="static-token"></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method=patch><input name="other_token" value="{{.CSRF}}"></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post">
+  <p>Mutation forms longer than the generic default ten-line span are checked.</p>
+  <label>One</label>
+  <label>Two</label>
+  <label>Three</label>
+  <label>Four</label>
+  <label>Five</label>
+  <label>Six</label>
+  <label>Seven</label>
+  <label>Eight</label>
+  <label>Nine</label>
+  <label>Ten</label>
+  <label>Eleven</label>
+  <button type="submit">Save</button>
+</form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<FORM METHOD="POST"><button type="submit">Save</button></FORM>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><!-- <input type="hidden" name="csrf_token" value="{{.CSRF}}"> --></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post">{{/* <input type="hidden" name="csrf_token" value="{{.CSRF}}"> */}}</form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}" disabled></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><input data-name="csrf_token" data-value="{{.CSRF}}"></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><input title='name="csrf_token" value="{{.CSRF}}"'></form>
+
+<!-- ruleid: go-template-mutation-form-missing-csrf -->
+<form method="post"><input name="CSRF_TOKEN" value="{{.CSRF}}"></form>

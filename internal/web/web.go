@@ -45,14 +45,15 @@ type analyticsPage struct {
 	UsageAvailable string
 	HasCacheSeries bool
 	Limit          int
-	CSVURL         string
-	Presets        []analyticsPreset
-	HasPrevious    bool
-	PreviousURL    string
-	HasNext        bool
-	NextURL        string
-	FirstRequest   int64
-	LastRequest    int64
+	// These links omit the leading slash, which is fixed in the templates.
+	CSVURL       string
+	Presets      []analyticsPreset
+	HasPrevious  bool
+	PreviousURL  string
+	HasNext      bool
+	NextURL      string
+	FirstRequest int64
+	LastRequest  int64
 }
 
 type analyticsPreset struct {
@@ -238,7 +239,7 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		FromCanonical: query.Filter.From.UTC().Format(time.RFC3339Nano),
 		ToCanonical:   query.Filter.To.UTC().Format(time.RFC3339Nano),
 		Limit:         query.Limit,
-		CSVURL:        analyticsURL("/admin/api/analytics/export.csv", filterValues),
+		CSVURL:        analyticsURL("admin/api/analytics/export.csv", filterValues),
 	}
 	if query.Filter.ClientID != nil {
 		page.ClientID = strconv.FormatInt(*query.Filter.ClientID, 10)
@@ -264,7 +265,7 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		presetValues.Del("to")
 		presetValues.Set("range", preset.label)
 		page.Presets = append(page.Presets, analyticsPreset{
-			Label: preset.label, URL: analyticsURL("/admin/analytics", presetValues),
+			Label: preset.label, URL: analyticsURL("admin/analytics", presetValues),
 			Active: query.Range == preset.label || (query.Range == "" && query.Filter.To.Sub(query.Filter.From) == preset.width),
 		})
 	}
@@ -280,13 +281,13 @@ func buildAnalyticsPage(query httpapi.AnalyticsQuery, dataset analytics.Dataset,
 		} else {
 			values.Set("offset", strconv.Itoa(previous))
 		}
-		page.PreviousURL = analyticsURL("/admin/analytics", values)
+		page.PreviousURL = analyticsURL("admin/analytics", values)
 	}
 	page.HasNext = int64(query.Offset+len(requests.Requests)) < requests.Total
 	if page.HasNext {
 		values := pageValues.Clone()
 		values.Set("offset", strconv.Itoa(query.Offset+query.Limit))
-		page.NextURL = analyticsURL("/admin/analytics", values)
+		page.NextURL = analyticsURL("admin/analytics", values)
 	}
 	if len(requests.Requests) > 0 {
 		page.FirstRequest = int64(query.Offset + 1)

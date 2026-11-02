@@ -4,14 +4,16 @@
     <h1>Usage analytics</h1>
     <p>Request volume and token usage for the live gateway ledger.</p>
   </div>
-  <div><a class="button" href="{{.Analytics.CSVURL}}">Download CSV</a><small class="csv-timezone">CSV timestamps: UTC</small></div>
+  <div><a class="button" href="/{{.Analytics.CSVURL}}">Download CSV</a><small class="csv-timezone">CSV timestamps: UTC</small></div>
 </section>
 
 <section class="analytics-filters" aria-labelledby="analytics-filter-title">
   <div class="filter-heading">
     <h2 id="analytics-filter-title">Filters</h2>
     <div class="preset-list" aria-label="Time range presets">
-      {{range .Analytics.Presets}}<a class="preset{{if .Active}} active{{end}}" href="{{.URL}}"{{if .Active}} aria-current="true"{{end}}>{{.Label}}</a>{{end}}
+      {{range .Analytics.Presets}}
+        {{if .Active}}<a class="preset active" href="/{{.URL}}" aria-current="true">{{.Label}}</a>{{else}}<a class="preset" href="/{{.URL}}">{{.Label}}</a>{{end}}
+      {{end}}
     </div>
   </div>
   <form method="get" action="/admin/analytics" class="analytics-filter-grid" data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
@@ -29,22 +31,26 @@
       <label for="analytics-client">Client</label>
       <select id="analytics-client" name="client_id">
         <option value="">All clients</option>
-        {{range .Analytics.Dataset.Clients}}<option value="{{.ID}}"{{if eq (printf "%d" .ID) $.Analytics.ClientID}} selected{{end}}>{{.Name}}</option>{{end}}
+        {{range .Analytics.Dataset.Clients}}
+          {{if eq (printf "%d" .ID) $.Analytics.ClientID}}<option value="{{.ID}}" selected>{{.Name}}</option>{{else}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+        {{end}}
       </select>
     </div>
     <div>
       <label for="analytics-model">Model</label>
       <select id="analytics-model" name="model_pool_id">
         <option value="">All models</option>
-        {{range .Analytics.Dataset.Models}}<option value="{{.ID}}"{{if eq (printf "%d" .ID) $.Analytics.ModelPoolID}} selected{{end}}>{{.Name}}</option>{{end}}
+        {{range .Analytics.Dataset.Models}}
+          {{if eq (printf "%d" .ID) $.Analytics.ModelPoolID}}<option value="{{.ID}}" selected>{{.Name}}</option>{{else}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+        {{end}}
       </select>
     </div>
     <div>
       <label for="analytics-usage">Usage availability</label>
       <select id="analytics-usage" name="usage_available">
-        <option value=""{{if eq .Analytics.UsageAvailable ""}} selected{{end}}>All requests</option>
-        <option value="true"{{if eq .Analytics.UsageAvailable "true"}} selected{{end}}>Usage available</option>
-        <option value="false"{{if eq .Analytics.UsageAvailable "false"}} selected{{end}}>Usage unavailable</option>
+        {{if eq .Analytics.UsageAvailable ""}}<option value="" selected>All requests</option>{{else}}<option value="">All requests</option>{{end}}
+        {{if eq .Analytics.UsageAvailable "true"}}<option value="true" selected>Usage available</option>{{else}}<option value="true">Usage available</option>{{end}}
+        {{if eq .Analytics.UsageAvailable "false"}}<option value="false" selected>Usage unavailable</option>{{else}}<option value="false">Usage unavailable</option>{{end}}
       </select>
     </div>
     <input type="hidden" name="limit" value="{{.Analytics.Limit}}">
@@ -84,7 +90,19 @@
       <details class="chart-fallback">
         <summary>View request volume data</summary>
         <div class="table-wrap"><table><caption>Request volume data</caption><thead><tr><th>Bucket (<span data-analytics-timezone>UTC</span>)</th><th>Requests</th></tr></thead><tbody data-analytics-series data-range-from="{{.Analytics.FromCanonical}}" data-range-to="{{.Analytics.ToCanonical}}">
-          {{range .Analytics.Dataset.Series}}<tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}"{{with .CacheReadTokens}} data-cache-read-tokens="{{.}}"{{end}}{{with .CacheHitRatio}} data-cache-hit-ratio="{{.}}"{{end}}><td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .RequestCount}}</td></tr>{{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
+          {{range .Analytics.Dataset.Series}}
+            {{if and .CacheReadTokens .CacheHitRatio}}
+              <tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}" data-cache-read-tokens="{{.CacheReadTokens}}" data-cache-hit-ratio="{{.CacheHitRatio}}">
+            {{else if .CacheReadTokens}}
+              <tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}" data-cache-read-tokens="{{.CacheReadTokens}}">
+            {{else if .CacheHitRatio}}
+              <tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}" data-cache-hit-ratio="{{.CacheHitRatio}}">
+            {{else}}
+              <tr data-analytics-point data-bucket-start="{{canonicalTime .BucketStart}}" data-request-count="{{.RequestCount}}" data-input-tokens="{{.InputTokens}}" data-output-tokens="{{.OutputTokens}}">
+            {{end}}
+              <td class="mono"><time datetime="{{canonicalTime .BucketStart}}" data-analytics-time>{{utcTimestamp .BucketStart}}</time></td><td class="mono">{{integer .RequestCount}}</td>
+              </tr>
+          {{else}}<tr><td colspan="2" class="empty">No series data is available for this range.</td></tr>{{end}}
         </tbody></table></div>
       </details>
     </article>
@@ -160,8 +178,8 @@
     </tr>{{else}}<tr><td colspan="12" class="empty">No requests match the active filters.</td></tr>{{end}}
   </tbody></table></div>
   {{if or .Analytics.HasPrevious .Analytics.HasNext}}<nav class="pagination" aria-label="Request pages">
-    {{if .Analytics.HasPrevious}}<a class="button" href="{{.Analytics.PreviousURL}}">Previous</a>{{else}}<span></span>{{end}}
-    {{if .Analytics.HasNext}}<a class="button" href="{{.Analytics.NextURL}}">Next</a>{{end}}
+    {{if .Analytics.HasPrevious}}<a class="button" href="/{{.Analytics.PreviousURL}}">Previous</a>{{else}}<span></span>{{end}}
+    {{if .Analytics.HasNext}}<a class="button" href="/{{.Analytics.NextURL}}">Next</a>{{end}}
   </nav>{{end}}
 </section>
 {{end}}
