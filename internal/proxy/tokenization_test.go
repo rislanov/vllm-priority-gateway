@@ -84,7 +84,7 @@ func TestTokenizationReadFailureBeforeCommitDoesNotLeakHeaders(t *testing.T) {
 	if r.Err == nil || r.ResponseStarted {
 		t.Fatalf("result %+v", r)
 	}
-	for _, key := range []string{"Content-Length", "Content-Encoding", "X-Upstream"} {
+	for _, key := range []string{"Content-Length", "Content-Encoding", "Content-Type", "X-Content-Type-Options", "X-Upstream"} {
 		if w.Header().Get(key) != "" {
 			t.Fatalf("uncommitted upstream header %s leaked", key)
 		}

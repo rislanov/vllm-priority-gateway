@@ -27,6 +27,46 @@ type circuitCoordinatorStub struct {
 	completePanic bool
 }
 
+func TestManagerReconcileConstructionErrorsReleaseMutex(t *testing.T) {
+	for _, kind := range []string{"circuit", "worker"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			options := monitorOptions(http.DefaultClient)
+			if kind == "circuit" {
+				options.Circuit.FailureThreshold = -1
+			} else {
+				options.HealthTimeout = 0
+			}
+			manager := monitor.NewManager(ctx, options)
+			done := make(chan error, 1)
+			go func() {
+				err := manager.Reconcile([]domain.Backend{testBackend("http://127.0.0.1:1", 1, 1)})
+				if err == nil {
+					done <- errors.New("invalid construction options were accepted")
+					manager.Shutdown()
+					return
+				}
+				count := manager.WorkerCount()
+				manager.Shutdown()
+				if count != 0 {
+					done <- errors.New("failed worker construction registered a worker")
+					return
+				}
+				done <- nil
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("manager remained locked after a construction error")
+			}
+		})
+	}
+}
+
 func (f *circuitCoordinatorStub) Reconcile(_ context.Context, v []coordination.BackendIdentity) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
