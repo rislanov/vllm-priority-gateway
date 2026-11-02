@@ -152,10 +152,17 @@ jobs:
 
     steps:
       - name: Verify required jobs passed
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          RACE_RESULT: ${{ needs.race.result }}
+          VET_RESULT: ${{ needs.vet.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
         run: |
-          test "${{ needs.unit.result }}" = "success"
-          test "${{ needs.race.result }}" = "success"
-          test "${{ needs.vet.result }}" = "success"
-          test "${{ needs.build.result }}" = "success"
-          test "${{ needs.docker.result }}" = "success"
-          test "${{ needs.browser.result }}" = "success"
+          test "$UNIT_RESULT" = "success"
+          test "$RACE_RESULT" = "success"
+          test "$VET_RESULT" = "success"
+          test "$BUILD_RESULT" = "success"
+          test "$DOCKER_RESULT" = "success"
+          test "$BROWSER_RESULT" = "success"
