@@ -105,9 +105,22 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 			return false
 		},
 	}
+	layoutSource, err := assets.ReadFile("templates/layout.html")
+	if err != nil {
+		return nil, fmt.Errorf("read layout template: %w", err)
+	}
 	templates := make(map[string]*template.Template, 5)
 	for _, page := range []string{"dashboard", "analytics", "clients", "keys", "backends"} {
-		parsed, err := template.New("layout.html").Funcs(functions).ParseFS(assets, "templates/layout.html", "templates/"+page+".html")
+		contentSource, err := assets.ReadFile("templates/" + page + ".html")
+		if err != nil {
+			return nil, fmt.Errorf("read %s template: %w", page, err)
+		}
+		// Name the fragments here, keeping definition directives out of HTML.
+		parsed, err := template.New("layout").Funcs(functions).Parse(string(layoutSource))
+		if err != nil {
+			return nil, fmt.Errorf("parse layout template: %w", err)
+		}
+		_, err = parsed.New("content").Parse(string(contentSource))
 		if err != nil {
 			return nil, fmt.Errorf("parse %s template: %w", page, err)
 		}

@@ -17,6 +17,13 @@ fixtures include valid GET forms, both root/scoped tokens, attribute ordering,
 quote styles and mutation forms longer than ten lines. This static check does
 not replace the server's CSRF verification or the rendering/browser tests.
 
-Semgrep CE's HTML parser may still emit partial-parsing warnings for Go template
-directives. Generic template rules and the local CSRF rule still run. A scan
+Template files are HTML fragments. The Go loader assigns the `layout` and
+`content` names instead of embedding `define` directives at document level.
+Document-level control directives in the editor fragments sit inside HTML
+comments, which `html/template` removes from the response. Actual HTML elements
+remain outside those comments and are still visible to the HTML rules.
+
+`make semgrep-templates` uses `--strict`: parser warnings fail the check as well
+as findings. Do not add rule exclusions or ignore parser errors to make it pass.
+Rendering/browser tests protect the resulting DOM and form behavior. A scan
 without findings is not a proof of complete vulnerability coverage.

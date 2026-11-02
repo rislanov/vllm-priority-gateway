@@ -42,6 +42,58 @@ func TestTemplatesKeepNavigationAndDashboardMarkerScoped(t *testing.T) {
 	}
 }
 
+func TestTemplateControlCommentsDoNotReachRenderedPages(t *testing.T) {
+	handler := newWebFixture(t)
+	for _, path := range []string{"/admin", "/admin/analytics", "/admin/clients", "/admin/clients?edit=1", "/admin/keys", "/admin/backends", "/admin/backends?edit=1", "/admin/backends?edit_pool=1"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		body := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(body, "</html>") {
+			t.Errorf("%s: incomplete rendered page, status %d", path, response.Code)
+		}
+		if strings.Contains(body, "<!--") || strings.Contains(body, "-->") {
+			t.Errorf("%s: template control comment leaked into HTML", path)
+		}
+	}
+}
+
+func TestClientPriorityEditorKeepsExactlyOneSelection(t *testing.T) {
+	handler := newWebFixture(t)
+	for _, priority := range []string{"critical", "high", "normal", "background"} {
+		form := "action=update&id=1&name=payments&priority_class=" + priority + "&vllm_priority=0&max_concurrency=24&requests_per_minute=600&tokens_per_minute=60000&model_pool_id=1&enabled=on"
+		request := httptest.NewRequest(http.MethodPost, "/admin/clients", strings.NewReader(form))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("update priority %s: %d", priority, response.Code)
+		}
+		response = httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/admin/clients?edit=1", nil))
+		document, err := html.Parse(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected := 0
+		walkTemplateElements(document, func(node *html.Node) {
+			if node.Data != "select" || nodeAttr(node, "name") != "priority_class" {
+				return
+			}
+			for option := node.FirstChild; option != nil; option = option.NextSibling {
+				if option.Type == html.ElementNode && option.Data == "option" && nodeHasAttr(option, "selected") {
+					selected++
+					if strings.TrimSpace(nodeText(option)) != priority {
+						t.Errorf("priority %s selected %s", priority, nodeText(option))
+					}
+				}
+			}
+		})
+		if selected != 1 {
+			t.Errorf("priority %s: %d selected options, want one", priority, selected)
+		}
+	}
+}
+
 func TestEveryRenderedMutationFormCarriesCSRFToken(t *testing.T) {
 	handler := newWebFixture(t)
 	token := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))

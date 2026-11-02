@@ -9,7 +9,7 @@ rules:
       cwe: "CWE-352: Cross-Site Request Forgery (CSRF)"
       confidence: MEDIUM
     paths:
-      include: ["internal/web/templates/*.html"]
+      include: ["**/internal/web/templates/*.html"]
     patterns:
       # Skip comments and quoted attribute values when recognizing markup.
       # Match the whole form without generic mode's ten-line ellipsis limit.

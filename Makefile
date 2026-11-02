@@ -8,7 +8,7 @@ semgrep: test-semgrep
 	SEMGREP="$(SEMGREP)" ./scripts/semgrep.sh
 
 semgrep-templates: test-semgrep
-	SEMGREP="$(SEMGREP)" ./scripts/semgrep.sh --error internal/web/templates
+	SEMGREP="$(SEMGREP)" ./scripts/semgrep.sh --strict --error internal/web/templates
 
 test-semgrep:
 	$(SEMGREP) --test --config .semgrep/go-templates.yml --metrics off --disable-version-check .semgrep/go-templates.html
