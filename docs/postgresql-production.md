@@ -94,8 +94,8 @@ PostgreSQL retains terminal coordination receipts for the strict 24-hour replay 
 
 ### Automatic coordination upgrades
 
-**Unreleased behavior:** this section requires a build containing automatic startup
-waiting and graceful unregister. Released v0.6.2 does not implement either; setting
+**Available since v0.6.3:** automatic startup waiting and graceful unregister.
+Released v0.6.2 does not implement either; setting
 the new environment variable on that version does not add the behavior.
 
 Recommended configuration:
@@ -145,7 +145,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: gateway
-          # Set image to your build containing automatic upgrade support.
+          image: ghcr.io/rislanov/vllm-priority-gateway:0.6.3
           env:
             - name: LLMGW_SHUTDOWN_GRACE_PERIOD
               value: "30s"
