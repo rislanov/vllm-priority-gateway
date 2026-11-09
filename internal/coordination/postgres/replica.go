@@ -44,14 +44,15 @@ func PolicyFingerprint(policy ReplicaPolicy) [32]byte {
 }
 
 type ReplicaManager struct {
-	pool        *pgxpool.Pool
-	replicaID   uuid.UUID
-	startedAt   time.Time
-	binary      string
-	policy      ReplicaPolicy
-	fingerprint [32]byte
-	interval    time.Duration
-	timeout     time.Duration
+	pool         *pgxpool.Pool
+	replicaID    uuid.UUID
+	startedAt    time.Time
+	binary       string
+	policy       ReplicaPolicy
+	fingerprint  [32]byte
+	interval     time.Duration
+	timeout      time.Duration
+	resetOnStart bool
 
 	mu           sync.RWMutex
 	status       coordination.Status
@@ -62,7 +63,14 @@ type ReplicaManager struct {
 	failures     failurePublisher
 }
 
-func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy ReplicaPolicy, timeout time.Duration) *ReplicaManager {
+// ReplicaManagerOptions controls startup operations, not coordination policy.
+type ReplicaManagerOptions struct {
+	// ResetOnStart removes incompatible registrations atomically with initial
+	// registration. Operators must drain and stop all old processes first.
+	ResetOnStart bool
+}
+
+func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy ReplicaPolicy, timeout time.Duration, options ...ReplicaManagerOptions) *ReplicaManager {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -74,6 +82,7 @@ func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy Replica
 		pool: store.CoordinationPool(), replicaID: replicaID, startedAt: time.Now().UTC(),
 		binary: binaryVersion(), policy: policy, fingerprint: PolicyFingerprint(policy),
 		interval: interval, timeout: timeout, status: coordination.Status{Backend: "postgres"}, done: make(chan struct{}),
+		resetOnStart: len(options) > 0 && options[0].ResetOnStart,
 	}
 }
 
@@ -193,13 +202,29 @@ func (m *ReplicaManager) heartbeatOnce(parent context.Context, registration bool
 			resultErr = coordination.PermanentError{Err: resultErr}
 		}
 	}()
-	tx, err := m.pool.BeginTx(parent, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	reset := registration && m.resetOnStart
+	isolation := pgx.Serializable
+	if reset {
+		// The table writer lock below serializes reset/registration transactions.
+		// READ COMMITTED gives waiting startups a fresh snapshot after the lock,
+		// so matching new replicas are preserved without serialization retries.
+		isolation = pgx.ReadCommitted
+	}
+	tx, err := m.pool.BeginTx(parent, pgx.TxOptions{IsoLevel: isolation})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(parent)
 	if _, err = tx.Exec(parent, "SET LOCAL synchronous_commit=on"); err != nil {
 		return err
+	}
+	if reset {
+		if _, err = tx.Exec(parent, "LOCK TABLE coordination_replicas IN SHARE ROW EXCLUSIVE MODE"); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(parent, "DELETE FROM coordination_replicas WHERE policy_fingerprint<>$1::bytea", m.fingerprint[:]); err != nil {
+			return err
+		}
 	}
 	var now time.Time
 	if err = tx.QueryRow(parent, "SELECT clock_timestamp()").Scan(&now); err != nil {

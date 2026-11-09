@@ -116,7 +116,8 @@ func newGatewayApplication(
 		if err != nil {
 			return nil, fmt.Errorf("initialize circuit coordination: %w", err)
 		}
-		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout)
+		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout,
+			coordpostgres.ReplicaManagerOptions{ResetOnStart: cfg.CoordinationResetOnStart})
 	} else {
 		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
 		tokenizationCoordinator = coordlocal.NewTokenizationCoordinator(cfg.Tokenization, time.Now)
@@ -172,6 +173,10 @@ func newGatewayApplication(
 		circuitCoordinator.(*coordpostgres.CircuitCoordinator).SetFailureObserver(recoveryManager)
 		replicaManager.SetFailureObserver(recoveryManager)
 		application.replica = replicaManager
+		if cfg.CoordinationResetOnStart {
+			logger.Warn("resetting incompatible coordination replica registrations on startup; all old gateway processes must already be stopped",
+				"setting", "LLMGW_COORDINATION_RESET_ON_START")
+		}
 		if err := replicaManager.StartRuntime(startupCtx, runtimeCtx); err != nil {
 			return nil, fmt.Errorf("register PostgreSQL coordination replica: %w", err)
 		}

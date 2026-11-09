@@ -86,9 +86,45 @@ Admission locks pool scopes before client scopes and uses one post-lock server t
 
 Circuit state, rolling failure receipts, generations, and half-open probe permits are global. Every upstream attempt is authorized even though routing reads a local cache. Probe capacity is shared by replicas, expired probes reopen the circuit conservatively, and stale generations cannot heal or penalize the current generation. Backend revision changes, disabling, draining, and deletion supersede unfinished permits atomically. The Admin API and HTML UI can delete clients, backends, and unreferenced pools. Client deletion cascades keys and model access; pool deletion is rejected while it has backend references. Admission scopes, circuit tombstones, and terminal receipts remain available so in-flight work can finish and ambiguous operations can be replayed safely. Deleted clients do not recreate rate state at completion.
 
-Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, and circuit policy. Every row carries the expiry calculated from that replica's own TTL. Registration and heartbeat serialize through the same compatibility transaction, so an incompatible live replica prevents both startup and reactivation. Coordination-critical setting changes therefore require a full stop/start without overlap.
+Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, circuit policy, and tokenization policy. Every row carries the expiry calculated from that replica's own TTL. By default, an incompatible live replica prevents both startup and reactivation. Coordination-critical setting changes therefore require a full stop/start without overlap.
 
 PostgreSQL retains terminal coordination receipts for the strict 24-hour replay window. SQLite/local history is process-local and bounded to 65,536 admission receipts and 65,536 circuit attempts; capacity pressure can evict terminal records early, and an evicted UUID can be evaluated again. Choose PostgreSQL when that durable replay guarantee is required.
+
+### Reset old replica registrations during deployment
+
+To deploy a new coordination policy without waiting for stopped replicas' heartbeat
+TTL, set this variable in the **new gateway processes' environment**:
+
+```text
+LLMGW_COORDINATION_RESET_ON_START=true
+```
+
+The toggle works with any deployment system. It defaults to `false`; enabling it
+requires `LLMGW_DATABASE_DRIVER=postgres`. Stop ingress, drain all active requests,
+and stop **every old gateway process connected to this database** before enabling
+it. Prevent the orchestrator from restarting old processes during the deployment.
+The toggle does not stop other processes and does not support mixed-version rolling
+upgrades. All new replicas must use identical coordination settings.
+
+On startup, the gateway removes only `coordination_replicas` rows with a different
+policy fingerprint, then registers itself in the same transaction. Matching rows
+are preserved, so multiple new replicas can start with the toggle enabled without
+erasing each other's registrations. A warning is logged whenever the toggle is
+enabled. A failed registration rolls back the deletion; lock/query failures abort
+startup within `LLMGW_COORDINATION_TIMEOUT`.
+
+Leases, rate buckets, circuit state, replay receipts, configuration, API keys, and
+analytics are not cleared. Residual unexpired leases still count against capacity.
+Heartbeat and recovery keep enforcing compatibility; they never repeat the reset.
+This skips only the wait for old replica registrations, not a release's migration
+or request-draining requirements.
+
+After every new replica passes `/coordination-readyz`, restore ingress and set the
+toggle back to `false` in the deployment configuration. This restores the default
+startup guard for future restarts; the toggle itself is not part of the fingerprint.
+For Compose, the repository passes this variable through to the gateway container;
+the default Compose profile remains SQLite, so PostgreSQL configuration is still
+required separately.
 
 ## Outage and recovery
 
