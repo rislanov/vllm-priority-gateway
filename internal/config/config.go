@@ -27,6 +27,7 @@ type Config struct {
 	PostgresCoordinationMaxConns  int
 	ConfigPollInterval            time.Duration
 	CoordinationTimeout           time.Duration
+	CoordinationResetOnStart      bool
 	LeaseTTL                      time.Duration
 	LeaseRenewInterval            time.Duration
 	CoordinationCompletionBacklog int
@@ -429,6 +430,13 @@ func finitePositive(value float64) bool {
 }
 
 func (c *Config) loadCoordination(lookup LookupFunc) error {
+	if raw, exists := lookup("LLMGW_COORDINATION_RESET_ON_START"); exists {
+		var err error
+		c.CoordinationResetOnStart, err = strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("parse LLMGW_COORDINATION_RESET_ON_START: %w", err)
+		}
+	}
 	for _, key := range []string{"LLMGW_DATABASE_URL", "LLMGW_DATABASE_MIGRATION_URL", "LLMGW_POSTGRES_CONFIG_MAX_CONNS", "LLMGW_POSTGRES_ANALYTICS_MAX_CONNS", "LLMGW_POSTGRES_COORDINATION_MAX_CONNS", "LLMGW_CONFIG_POLL_INTERVAL", "LLMGW_COORDINATION_TIMEOUT"} {
 		if _, exists := lookup(key); exists {
 			c.postgresSettingsExplicit = true
@@ -474,6 +482,9 @@ func (c *Config) loadCoordination(lookup LookupFunc) error {
 func (c Config) validateDatabaseProfile() error {
 	switch c.DatabaseDriver {
 	case "sqlite":
+		if c.CoordinationResetOnStart {
+			return errors.New("LLMGW_COORDINATION_RESET_ON_START requires LLMGW_DATABASE_DRIVER=postgres")
+		}
 		if strings.TrimSpace(c.DatabasePath) == "" {
 			return errors.New("LLMGW_DATABASE_PATH is required for sqlite")
 		}
