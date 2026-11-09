@@ -27,6 +27,7 @@ Other coordination settings are:
 LLMGW_CONFIG_POLL_INTERVAL=5s
 LLMGW_COORDINATION_TIMEOUT=500ms
 LLMGW_COORDINATION_RESET_ON_START=false
+LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m
 LLMGW_LEASE_TTL=90s
 LLMGW_LEASE_RENEW_INTERVAL=30s
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
@@ -87,9 +88,92 @@ Admission locks pool scopes before client scopes and uses one post-lock server t
 
 Circuit state, rolling failure receipts, generations, and half-open probe permits are global. Every upstream attempt is authorized even though routing reads a local cache. Probe capacity is shared by replicas, expired probes reopen the circuit conservatively, and stale generations cannot heal or penalize the current generation. Backend revision changes, disabling, draining, and deletion supersede unfinished permits atomically. The Admin API and HTML UI can delete clients, backends, and unreferenced pools. Client deletion cascades keys and model access; pool deletion is rejected while it has backend references. Admission scopes, circuit tombstones, and terminal receipts remain available so in-flight work can finish and ambiguous operations can be replayed safely. Deleted clients do not recreate rate state at completion.
 
-Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, circuit policy, and tokenization policy. Every row carries the expiry calculated from that replica's own TTL. By default, an incompatible live replica prevents both startup and reactivation. Coordination-critical setting changes therefore require a full stop/start without overlap.
+Each process registers a random replica UUID and a fingerprint covering the coordination contract, lease timings, rate algorithm, circuit policy, and tokenization policy. Every row carries the expiry calculated from that replica's own TTL. An incompatible live replica prevents registration and reactivation. In builds with automatic upgrade support, initial registration waits within a bounded budget; incompatibility found after successful startup still latches for that process. Coordination-critical setting changes therefore require a full stop/start without overlap.
 
 PostgreSQL retains terminal coordination receipts for the strict 24-hour replay window. SQLite/local history is process-local and bounded to 65,536 admission receipts and 65,536 circuit attempts; capacity pressure can evict terminal records early, and an evicted UUID can be evaluated again. Choose PostgreSQL when that durable replay guarantee is required.
+
+### Automatic coordination upgrades
+
+**Unreleased behavior:** this section requires a build containing automatic startup
+waiting and graceful unregister. Released v0.6.2 does not implement either; setting
+the new environment variable on that version does not add the behavior.
+
+Recommended configuration:
+
+```text
+LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m
+LLMGW_COORDINATION_RESET_ON_START=false
+```
+
+The startup wait is read once and does not change the policy fingerprint. `0`
+restores immediate failure on incompatibility; negative or malformed durations are
+rejected. SQLite accepts this shared environment setting but does not use it.
+Only the initial `idempotency_conflict` from live incompatible registrations is
+retried, about once a second. Database, permission, lock, and other failures still
+abort; each attempt is bounded by `LLMGW_COORDINATION_TIMEOUT` and the remaining
+startup budget. Process cancellation interrupts waiting. Logs identify the wait
+and its outcome without logging every poll. Waiting never deletes foreign rows.
+
+The HTTP listener is opened **after** registration succeeds. `/healthz` and
+readiness endpoints therefore cannot respond during this wait. After startup,
+`/coordination-readyz` must pass on each replica, and `/inference-readyz` must pass
+before inference traffic is restored. Runtime compatibility errors remain sticky;
+waiting does not enable mixed incompatible policies or zero-downtime upgrades.
+
+Graceful shutdown drains HTTP requests, completes queued lease operations, stops
+heartbeats and deletes only the process's UUID with its own fingerprint before
+closing PostgreSQL. If shutdown is canceled, its budget expires, or the database
+is unavailable, the registration expires by its existing TTL. Crashes and forced
+termination likewise rely on TTL. Rows left by v0.6.2 are not unregistered: allow
+at least their remaining TTL on the first upgrade. Residual leases and replay
+receipts are retained and continue protecting capacity and replay correctness.
+
+For Kubernetes, use `Recreate` **only if this one Deployment owns every gateway
+connected to the database**. Other Deployments, Jobs, systemd processes, and
+external clusters must also stop; otherwise waiting correctly times out. A
+Recreate rollout has downtime. This fragment assumes a 30-second gateway shutdown
+grace, the default 90-second lease TTL, and the 3-minute startup wait; adapt all
+budgets to your configuration and migration/provisioning time:
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+  progressDeadlineSeconds: 600
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: gateway
+          # Set image to your build containing automatic upgrade support.
+          env:
+            - name: LLMGW_SHUTDOWN_GRACE_PERIOD
+              value: "30s"
+            - name: LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT
+              value: "3m"
+            - name: LLMGW_COORDINATION_RESET_ON_START
+              value: "false"
+          startupProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /inference-readyz, port: 8080}
+            periodSeconds: 5
+```
+
+The startup probe gates liveness while the HTTP port is unavailable; readiness
+must not be used as liveness. Kubernetes termination grace must exceed gateway
+shutdown grace plus any preStop hook and cleanup margin. The startup probe budget
+must exceed startup waiting plus migrations/provisioning, and the rollout deadline
+must cover shutdown, TTL waiting, scheduling and readiness. Choose a startup wait
+longer than the largest old replica TTL, including margin. No force toggle or
+manual registration deletion is needed in this flow. Compose/systemd deployments
+need the equivalent ordered stop-all/start-all operation; a plain container restart
+does not apply changed environment variables.
 
 ### Reset old replica registrations during deployment
 

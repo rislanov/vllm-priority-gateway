@@ -27,17 +27,25 @@ The reverse proxy must:
 
 ## PostgreSQL upgrades with a coordination policy change
 
-A new binary or changed coordination settings can produce
-`register PostgreSQL coordination replica: coordination: idempotency_conflict`
-while old heartbeat registrations remain active. After draining requests and
-stopping **all** old gateway processes, a supporting binary can start with
-`LLMGW_COORDINATION_RESET_ON_START=true` to remove incompatible registrations
-without waiting for their TTL. Set it back to `false` for subsequent starts.
+For builds containing the upcoming automatic-upgrade behavior (not v0.6.2),
+keep `LLMGW_COORDINATION_RESET_ON_START=false` and use a stop/start deployment.
+New replicas wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for old
+incompatible registrations to expire or unregister. Graceful shutdown removes
+only the exiting process's own registration after HTTP drain and lease completion.
+The first upgrade from v0.6.2 still waits for old heartbeat TTLs.
 
-This environment toggle is independent of Docker, Kubernetes, systemd, or a custom
-deployment system. It does not stop replicas or enable mixed-version rolling
-upgrades. Follow the [reset deployment sequence and troubleshooting guide](postgresql-production.md#reset-old-replica-registrations-during-deployment),
-including per-replica readiness checks and container environment handling.
+Kubernetes `Recreate` automates this only when a single Deployment owns **all**
+gateways connected to that database. Allow downtime, prevent old processes from
+restarting, and give startup probes enough time for the compatibility wait plus
+migration/provisioning. HTTP is not listening while registration waits. Liveness
+must not restart waiting replicas; readiness controls traffic after startup.
+Size `terminationGracePeriodSeconds` above the gateway shutdown grace with margin;
+size rollout deadlines above shutdown, old TTL wait, and provisioning combined.
+See the [automatic upgrade manifest and constraints](postgresql-production.md#automatic-coordination-upgrades).
+
+For Docker, systemd, or multiple controllers, explicitly stop all old gateways
+before starting replacements. Forced reset remains an emergency operator option
+[with stricter prerequisites](postgresql-production.md#reset-old-replica-registrations-during-deployment).
 
 ## Docker deployment
 

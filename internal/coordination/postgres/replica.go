@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -44,15 +46,17 @@ func PolicyFingerprint(policy ReplicaPolicy) [32]byte {
 }
 
 type ReplicaManager struct {
-	pool         *pgxpool.Pool
-	replicaID    uuid.UUID
-	startedAt    time.Time
-	binary       string
-	policy       ReplicaPolicy
-	fingerprint  [32]byte
-	interval     time.Duration
-	timeout      time.Duration
-	resetOnStart bool
+	pool               *pgxpool.Pool
+	replicaID          uuid.UUID
+	startedAt          time.Time
+	binary             string
+	policy             ReplicaPolicy
+	fingerprint        [32]byte
+	interval           time.Duration
+	timeout            time.Duration
+	resetOnStart       bool
+	startupWaitTimeout time.Duration
+	logger             *slog.Logger
 
 	mu           sync.RWMutex
 	status       coordination.Status
@@ -68,6 +72,9 @@ type ReplicaManagerOptions struct {
 	// ResetOnStart removes incompatible registrations atomically with initial
 	// registration. Operators must drain and stop all old processes first.
 	ResetOnStart bool
+	// StartupWaitTimeout bounds initial compatibility waiting; zero fails fast.
+	StartupWaitTimeout time.Duration
+	Logger             *slog.Logger
 }
 
 func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy ReplicaPolicy, timeout time.Duration, options ...ReplicaManagerOptions) *ReplicaManager {
@@ -78,12 +85,17 @@ func NewReplicaManager(store *pgstore.Store, replicaID uuid.UUID, policy Replica
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return &ReplicaManager{
+	m := &ReplicaManager{
 		pool: store.CoordinationPool(), replicaID: replicaID, startedAt: time.Now().UTC(),
 		binary: binaryVersion(), policy: policy, fingerprint: PolicyFingerprint(policy),
 		interval: interval, timeout: timeout, status: coordination.Status{Backend: "postgres"}, done: make(chan struct{}),
 		resetOnStart: len(options) > 0 && options[0].ResetOnStart,
 	}
+	if len(options) > 0 {
+		m.startupWaitTimeout = options[0].StartupWaitTimeout
+		m.logger = options[0].Logger
+	}
+	return m
 }
 
 func binaryVersion() string {
@@ -100,13 +112,57 @@ func (m *ReplicaManager) Start(parent context.Context) error {
 // StartRuntime keeps startup registration cancellable independently of the
 // heartbeat lifetime, which must cover the HTTP shutdown drain.
 func (m *ReplicaManager) StartRuntime(startup, runtime context.Context) error {
-	if err := m.heartbeat(startup, true); err != nil {
+	if err := m.register(startup); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(runtime)
 	m.cancel = cancel
 	go m.run(ctx)
 	return nil
+}
+
+// register retries only a live incompatible registration, never database errors.
+func (m *ReplicaManager) register(ctx context.Context) (resultErr error) {
+	if m.startupWaitTimeout < 0 {
+		return errors.New("coordination startup wait timeout must be non-negative")
+	}
+	if m.startupWaitTimeout == 0 {
+		return m.heartbeat(ctx, true)
+	}
+	ctx, cancel := context.WithTimeout(ctx, m.startupWaitTimeout)
+	defer cancel()
+	waiting := false
+	started := time.Now()
+	defer func() {
+		if waiting && m.logger != nil {
+			if resultErr != nil {
+				m.logger.Warn("coordination startup compatibility wait ended", "elapsed", time.Since(started), "error", resultErr)
+			} else {
+				m.logger.Info("coordination startup compatibility wait completed", "elapsed", time.Since(started))
+			}
+		}
+	}()
+	for {
+		err := m.heartbeat(ctx, true)
+		if err == nil {
+			return nil
+		}
+		var reason coordination.ReasonError
+		if !errors.As(err, &reason) || reason.Reason != coordination.ReasonIdempotencyConflict {
+			return err
+		}
+		if !waiting && m.logger != nil {
+			m.logger.Info("waiting for incompatible coordination replica registrations to expire or unregister", "timeout", m.startupWaitTimeout)
+		}
+		waiting = true
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for incompatible coordination replica registrations: %w: %w", ctx.Err(), err)
+		case <-timer.C:
+		}
+	}
 }
 
 func isSerializationFailure(err error) bool {
@@ -150,6 +206,28 @@ func (m *ReplicaManager) Close() {
 	<-m.done
 }
 
+// CloseContext stops heartbeats and removes only this process's registration.
+// Call after HTTP drain and lease completion, before closing the database. A
+// failed or canceled cleanup leaves the heartbeat TTL as the fallback. It also
+// cleans up a registration whose startup commit outcome was ambiguous.
+func (m *ReplicaManager) CloseContext(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, m.timeout)
+	defer cancel()
+	if m.cancel != nil {
+		m.cancel()
+		select {
+		case <-m.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := m.pool.Exec(ctx, "DELETE FROM coordination_replicas WHERE replica_id=$1::uuid AND policy_fingerprint=$2::bytea", m.replicaID, m.fingerprint[:])
+	return err
+}
+
 func (m *ReplicaManager) Status() coordination.Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -184,7 +262,9 @@ func (m *ReplicaManager) heartbeat(parent context.Context, registration bool) (r
 		if !permanentCoordinationError(resultErr) && !errors.As(resultErr, &reason) {
 			m.failed()
 		}
-		m.failures.report(resultErr)
+		if !registration {
+			m.failures.report(resultErr)
+		}
 	}
 	return resultErr
 }
@@ -241,7 +321,9 @@ func (m *ReplicaManager) heartbeatOnce(parent context.Context, registration bool
 	}
 	if incompatible > 0 {
 		m.mu.Lock()
-		m.incompatible = true
+		if !registration {
+			m.incompatible = true
+		}
 		m.status = coordination.Status{Backend: "postgres", Available: false, Reason: coordination.ReasonIdempotencyConflict}
 		m.mu.Unlock()
 		return coordination.ReasonError{Reason: coordination.ReasonIdempotencyConflict}
