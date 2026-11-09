@@ -117,7 +117,7 @@ func newGatewayApplication(
 			return nil, fmt.Errorf("initialize circuit coordination: %w", err)
 		}
 		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout,
-			coordpostgres.ReplicaManagerOptions{ResetOnStart: cfg.CoordinationResetOnStart})
+			coordpostgres.ReplicaManagerOptions{ResetOnStart: cfg.CoordinationResetOnStart, StartupWaitTimeout: cfg.CoordinationStartupWaitTimeout, Logger: logger})
 	} else {
 		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
 		tokenizationCoordinator = coordlocal.NewTokenizationCoordinator(cfg.Tokenization, time.Now)
@@ -391,11 +391,11 @@ func (a *gatewayApplication) Close(ctx context.Context) error {
 		if a.manager != nil {
 			a.manager.Shutdown()
 		}
-		if a.replica != nil {
-			a.replica.Close()
-		}
 		if a.leases != nil {
 			a.closeErr = errors.Join(a.closeErr, a.leases.CloseContext(ctx))
+		}
+		if a.replica != nil {
+			a.closeErr = errors.Join(a.closeErr, a.replica.CloseContext(ctx))
 		}
 		if a.apiKeyUsage != nil {
 			a.apiKeyUsage.Close()

@@ -15,59 +15,60 @@ import (
 type LookupFunc func(string) (string, bool)
 
 type Config struct {
-	Tokenization                  coordination.TokenizationPolicy
-	postgresSettingsExplicit      bool
-	ListenAddress                 string
-	DatabaseDriver                string
-	DatabasePath                  string
-	DatabaseURL                   string
-	DatabaseMigrationURL          string
-	PostgresConfigMaxConns        int
-	PostgresAnalyticsMaxConns     int
-	PostgresCoordinationMaxConns  int
-	ConfigPollInterval            time.Duration
-	CoordinationTimeout           time.Duration
-	CoordinationResetOnStart      bool
-	LeaseTTL                      time.Duration
-	LeaseRenewInterval            time.Duration
-	CoordinationCompletionBacklog int
-	EmergencyCriticalMaxInflight  int
-	EmergencyHighMaxInflight      int
-	AdminUsername                 string
-	AdminPassword                 string
-	APIKeyHMACSecret              []byte
-	HealthInterval                time.Duration
-	HealthTimeout                 time.Duration
-	MetricsInterval               time.Duration
-	MetricsTimeout                time.Duration
-	MetricsStaleAfter             time.Duration
-	UnhealthyAfter                int
-	RecoveryAfter                 int
-	CircuitFailureThreshold       int
-	CircuitFailureWindow          time.Duration
-	CircuitOpenCooldown           time.Duration
-	CircuitHalfOpenMaxProbes      int
-	QueueSoftLimit                float64
-	KVSoftLimit                   float64
-	KVHardLimit                   float64
-	EWMAWindow                    time.Duration
-	BusyThreshold                 float64
-	SaturatedThreshold            float64
-	EmergencyThreshold            float64
-	BusyRecoveryThreshold         float64
-	SaturatedRecoveryThreshold    float64
-	EmergencyRecoveryThreshold    float64
-	OverloadEnterWindow           time.Duration
-	OverloadRecoveryWindow        time.Duration
-	RequestBodyLimit              int64
-	RetryAfter                    time.Duration
-	RoutingPressureEpsilon        float64
-	SessionAffinityMaxPressure    float64
-	DialTimeout                   time.Duration
-	TLSHandshakeTimeout           time.Duration
-	ResponseHeaderTimeout         time.Duration
-	ShutdownGracePeriod           time.Duration
-	AnalyticsRetention            time.Duration
+	Tokenization                   coordination.TokenizationPolicy
+	postgresSettingsExplicit       bool
+	ListenAddress                  string
+	DatabaseDriver                 string
+	DatabasePath                   string
+	DatabaseURL                    string
+	DatabaseMigrationURL           string
+	PostgresConfigMaxConns         int
+	PostgresAnalyticsMaxConns      int
+	PostgresCoordinationMaxConns   int
+	ConfigPollInterval             time.Duration
+	CoordinationTimeout            time.Duration
+	CoordinationResetOnStart       bool
+	CoordinationStartupWaitTimeout time.Duration
+	LeaseTTL                       time.Duration
+	LeaseRenewInterval             time.Duration
+	CoordinationCompletionBacklog  int
+	EmergencyCriticalMaxInflight   int
+	EmergencyHighMaxInflight       int
+	AdminUsername                  string
+	AdminPassword                  string
+	APIKeyHMACSecret               []byte
+	HealthInterval                 time.Duration
+	HealthTimeout                  time.Duration
+	MetricsInterval                time.Duration
+	MetricsTimeout                 time.Duration
+	MetricsStaleAfter              time.Duration
+	UnhealthyAfter                 int
+	RecoveryAfter                  int
+	CircuitFailureThreshold        int
+	CircuitFailureWindow           time.Duration
+	CircuitOpenCooldown            time.Duration
+	CircuitHalfOpenMaxProbes       int
+	QueueSoftLimit                 float64
+	KVSoftLimit                    float64
+	KVHardLimit                    float64
+	EWMAWindow                     time.Duration
+	BusyThreshold                  float64
+	SaturatedThreshold             float64
+	EmergencyThreshold             float64
+	BusyRecoveryThreshold          float64
+	SaturatedRecoveryThreshold     float64
+	EmergencyRecoveryThreshold     float64
+	OverloadEnterWindow            time.Duration
+	OverloadRecoveryWindow         time.Duration
+	RequestBodyLimit               int64
+	RetryAfter                     time.Duration
+	RoutingPressureEpsilon         float64
+	SessionAffinityMaxPressure     float64
+	DialTimeout                    time.Duration
+	TLSHandshakeTimeout            time.Duration
+	ResponseHeaderTimeout          time.Duration
+	ShutdownGracePeriod            time.Duration
+	AnalyticsRetention             time.Duration
 }
 
 func Load(lookup LookupFunc) (Config, error) {
@@ -112,52 +113,53 @@ func Load(lookup LookupFunc) (Config, error) {
 
 func defaultConfig() Config {
 	return Config{
-		Tokenization:                  coordination.DefaultTokenizationPolicy(),
-		ListenAddress:                 ":8080",
-		DatabaseDriver:                "sqlite",
-		DatabasePath:                  "./data/llmgw.db",
-		PostgresConfigMaxConns:        4,
-		PostgresAnalyticsMaxConns:     4,
-		PostgresCoordinationMaxConns:  16,
-		ConfigPollInterval:            5 * time.Second,
-		CoordinationTimeout:           500 * time.Millisecond,
-		LeaseTTL:                      90 * time.Second,
-		LeaseRenewInterval:            30 * time.Second,
-		CoordinationCompletionBacklog: 4096,
-		EmergencyCriticalMaxInflight:  4,
-		EmergencyHighMaxInflight:      2,
-		HealthInterval:                2 * time.Second,
-		HealthTimeout:                 time.Second,
-		MetricsInterval:               time.Second,
-		MetricsTimeout:                time.Second,
-		MetricsStaleAfter:             5 * time.Second,
-		UnhealthyAfter:                3,
-		RecoveryAfter:                 2,
-		CircuitFailureThreshold:       5,
-		CircuitFailureWindow:          30 * time.Second,
-		CircuitOpenCooldown:           15 * time.Second,
-		CircuitHalfOpenMaxProbes:      1,
-		QueueSoftLimit:                2,
-		KVSoftLimit:                   .80,
-		KVHardLimit:                   .95,
-		EWMAWindow:                    4 * time.Second,
-		BusyThreshold:                 .70,
-		SaturatedThreshold:            1.00,
-		EmergencyThreshold:            1.40,
-		BusyRecoveryThreshold:         .55,
-		SaturatedRecoveryThreshold:    .85,
-		EmergencyRecoveryThreshold:    1.20,
-		OverloadEnterWindow:           3 * time.Second,
-		OverloadRecoveryWindow:        10 * time.Second,
-		RequestBodyLimit:              16 << 20,
-		RetryAfter:                    2 * time.Second,
-		RoutingPressureEpsilon:        .02,
-		SessionAffinityMaxPressure:    1.00,
-		DialTimeout:                   3 * time.Second,
-		TLSHandshakeTimeout:           3 * time.Second,
-		ResponseHeaderTimeout:         30 * time.Second,
-		ShutdownGracePeriod:           30 * time.Second,
-		AnalyticsRetention:            2160 * time.Hour,
+		Tokenization:                   coordination.DefaultTokenizationPolicy(),
+		ListenAddress:                  ":8080",
+		DatabaseDriver:                 "sqlite",
+		DatabasePath:                   "./data/llmgw.db",
+		PostgresConfigMaxConns:         4,
+		PostgresAnalyticsMaxConns:      4,
+		PostgresCoordinationMaxConns:   16,
+		ConfigPollInterval:             5 * time.Second,
+		CoordinationTimeout:            500 * time.Millisecond,
+		CoordinationStartupWaitTimeout: 3 * time.Minute,
+		LeaseTTL:                       90 * time.Second,
+		LeaseRenewInterval:             30 * time.Second,
+		CoordinationCompletionBacklog:  4096,
+		EmergencyCriticalMaxInflight:   4,
+		EmergencyHighMaxInflight:       2,
+		HealthInterval:                 2 * time.Second,
+		HealthTimeout:                  time.Second,
+		MetricsInterval:                time.Second,
+		MetricsTimeout:                 time.Second,
+		MetricsStaleAfter:              5 * time.Second,
+		UnhealthyAfter:                 3,
+		RecoveryAfter:                  2,
+		CircuitFailureThreshold:        5,
+		CircuitFailureWindow:           30 * time.Second,
+		CircuitOpenCooldown:            15 * time.Second,
+		CircuitHalfOpenMaxProbes:       1,
+		QueueSoftLimit:                 2,
+		KVSoftLimit:                    .80,
+		KVHardLimit:                    .95,
+		EWMAWindow:                     4 * time.Second,
+		BusyThreshold:                  .70,
+		SaturatedThreshold:             1.00,
+		EmergencyThreshold:             1.40,
+		BusyRecoveryThreshold:          .55,
+		SaturatedRecoveryThreshold:     .85,
+		EmergencyRecoveryThreshold:     1.20,
+		OverloadEnterWindow:            3 * time.Second,
+		OverloadRecoveryWindow:         10 * time.Second,
+		RequestBodyLimit:               16 << 20,
+		RetryAfter:                     2 * time.Second,
+		RoutingPressureEpsilon:         .02,
+		SessionAffinityMaxPressure:     1.00,
+		DialTimeout:                    3 * time.Second,
+		TLSHandshakeTimeout:            3 * time.Second,
+		ResponseHeaderTimeout:          30 * time.Second,
+		ShutdownGracePeriod:            30 * time.Second,
+		AnalyticsRetention:             2160 * time.Hour,
 	}
 }
 
@@ -314,6 +316,9 @@ func (c Config) validate() error {
 			return fmt.Errorf("%s must be positive", name)
 		}
 	}
+	if c.CoordinationStartupWaitTimeout < 0 {
+		return errors.New("LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT must be non-negative")
+	}
 	if c.UnhealthyAfter <= 0 || c.RecoveryAfter <= 0 {
 		return errors.New("health transition counts must be positive")
 	}
@@ -460,6 +465,9 @@ func (c *Config) loadCoordination(lookup LookupFunc) error {
 		return err
 	}
 	if c.CoordinationTimeout, err = durationValue(lookup, "LLMGW_COORDINATION_TIMEOUT", c.CoordinationTimeout); err != nil {
+		return err
+	}
+	if c.CoordinationStartupWaitTimeout, err = durationValue(lookup, "LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT", c.CoordinationStartupWaitTimeout); err != nil {
 		return err
 	}
 	if c.LeaseTTL, err = durationValue(lookup, "LLMGW_LEASE_TTL", c.LeaseTTL); err != nil {

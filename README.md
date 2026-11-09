@@ -81,7 +81,7 @@ The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Sl
 
 The deployment footprint is one static Go binary and an explicitly selected persistence profile: SQLite for one replica (the default), or PostgreSQL 16+ for coordinated multi-replica production. See the [PostgreSQL production profile](docs/postgresql-production.md).
 
-For PostgreSQL upgrades that change coordination policy, drain requests and stop all old gateways first. The optional `LLMGW_COORDINATION_RESET_ON_START=true` startup toggle clears incompatible replica registrations without waiting for heartbeat expiry; disable it after deployment. See the [deployment sequence and limitations](docs/postgresql-production.md#reset-old-replica-registrations-during-deployment).
+For PostgreSQL coordination-policy upgrades, the upcoming release supports automatic stop/start deployment: new gateways wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for incompatible registrations to expire or unregister. Graceful shutdown unregisters the stopped replica. Use Kubernetes `Recreate` when one Deployment owns every gateway using the database; keep `LLMGW_COORDINATION_RESET_ON_START=false`. This requires a supporting build (not v0.6.2), permits downtime, and does not support incompatible rolling upgrades. See the [automatic deployment guide](docs/postgresql-production.md#automatic-coordination-upgrades).
 
 ## Engineering highlights
 

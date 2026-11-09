@@ -36,3 +36,15 @@ func TestLoadCoordinationResetValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadCoordinationStartupWaitValidation(t *testing.T) {
+	for _, value := range []string{"-1s", "invalid"} {
+		env := validEnvironment()
+		env["LLMGW_DATABASE_DRIVER"] = "postgres"
+		env["LLMGW_DATABASE_URL"] = "postgres://gateway:secret@db.example/llmgw"
+		env["LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT"] = value
+		if _, err := config.Load(lookup(env)); err == nil {
+			t.Fatalf("accepted wait timeout %q", value)
+		}
+	}
+}

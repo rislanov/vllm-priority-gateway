@@ -35,6 +35,7 @@ func coordinationResetFixture(t *testing.T) (context.Context, *pgstore.Store, ma
 	env["LLMGW_DATABASE_DRIVER"] = "postgres"
 	env["LLMGW_DATABASE_URL"] = dsn
 	env["LLMGW_COORDINATION_TIMEOUT"] = "5s"
+	env["LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT"] = "0"
 	return ctx, db, env
 }
 

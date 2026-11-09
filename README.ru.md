@@ -80,7 +80,7 @@ Gateway **не** развёртывает модели, не планирует 
 
 Для развёртывания нужны один статический Go-бинарник и выбранное хранилище: SQLite для одного gateway по умолчанию или PostgreSQL 16+ для нескольких реплик с общей координацией. См. [руководство PostgreSQL production](docs/postgresql-production.md).
 
-При обновлении PostgreSQL-профиля с изменением политики координации сначала завершите запросы и остановите все старые gateway. Опциональный тогл `LLMGW_COORDINATION_RESET_ON_START=true` при запуске удаляет несовместимые регистрации реплик без ожидания истечения heartbeat; после деплоя отключите его. См. [порядок деплоя и ограничения](docs/postgresql-production.md#reset-old-replica-registrations-during-deployment).
+В готовящемся релизе обновление политики координации PostgreSQL можно автоматизировать через полный stop/start: новые gateway ждут до `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m`, пока несовместимые регистрации истекут или будут удалены владельцами при штатном завершении. Если все gateway этой БД принадлежат одному Kubernetes Deployment, используйте `Recreate` и оставьте `LLMGW_COORDINATION_RESET_ON_START=false`. Нужна сборка с этой поддержкой (в v0.6.2 её нет); обновление допускает простой, несовместимый rolling update не поддерживается. См. [инструкцию автоматического обновления](docs/postgresql-production.md#automatic-coordination-upgrades).
 
 ## Инженерные особенности
 
