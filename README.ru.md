@@ -80,6 +80,8 @@ Gateway **не** развёртывает модели, не планирует 
 
 Для развёртывания нужны один статический Go-бинарник и выбранное хранилище: SQLite для одного gateway по умолчанию или PostgreSQL 16+ для нескольких реплик с общей координацией. См. [руководство PostgreSQL production](docs/postgresql-production.md).
 
+При обновлении PostgreSQL-профиля с изменением политики координации сначала завершите запросы и остановите все старые gateway. Опциональный тогл `LLMGW_COORDINATION_RESET_ON_START=true` при запуске удаляет несовместимые регистрации реплик без ожидания истечения heartbeat; после деплоя отключите его. См. [порядок деплоя и ограничения](docs/postgresql-production.md#reset-old-replica-registrations-during-deployment).
+
 ## Инженерные особенности
 
 - Server-side priority: входящие priority headers и JSON-поля удаляются и заменяются сохранённой policy клиента.

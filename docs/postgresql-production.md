@@ -26,6 +26,7 @@ Other coordination settings are:
 ```text
 LLMGW_CONFIG_POLL_INTERVAL=5s
 LLMGW_COORDINATION_TIMEOUT=500ms
+LLMGW_COORDINATION_RESET_ON_START=false
 LLMGW_LEASE_TTL=90s
 LLMGW_LEASE_RENEW_INTERVAL=30s
 LLMGW_COORDINATION_COMPLETION_BACKLOG=4096
@@ -69,7 +70,7 @@ This feature changes the coordination contract from version 2 to version 3. It r
 
 1. Stop new inference admission at the load balancer on every replica and drain active requests.
 2. Stop all version 2 processes. Apply migration 5 with the migration identity.
-3. Allow old heartbeat/lease records to expire if an unclean shutdown left them active. Start only version 3 replicas with matching policy fingerprints.
+3. Allow old heartbeat/lease records to expire if an unclean shutdown left them active. A binary supporting the [startup reset toggle](#reset-old-replica-registrations-during-deployment) can clear incompatible heartbeat registrations after all old processes stop; it does not clear leases. Start only version 3 replicas with matching policy fingerprints.
 4. Verify `/coordination-readyz`, compatible replica count and fresh configuration, then enable the reserve and restore traffic.
 
 Do not enable the reserve while older binaries are serving: they do not enforce the low-priority subset limit. To roll back, first set every reserve to zero, stop admission, drain and stop all replicas, then apply migration down with the migration identity and restart compatible older binaries. The down migration refuses a nonzero reserve. Production does not perform this rollback automatically.
@@ -106,6 +107,22 @@ it. Prevent the orchestrator from restarting old processes during the deployment
 The toggle does not stop other processes and does not support mixed-version rolling
 upgrades. All new replicas must use identical coordination settings.
 
+Deployment sequence:
+
+1. Block new ingress and wait for active requests, including streams, to finish.
+2. Stop every old gateway using the database and prevent automatic restarts.
+3. Set `LLMGW_COORDINATION_RESET_ON_START=true` in the environment supplied to the
+   new gateway processes, then deploy the new binary/image with matching settings.
+4. Check `/coordination-readyz` on **each** new replica and inference readiness
+   before restoring traffic.
+5. Set the toggle to `false` in the configuration used for subsequent starts.
+
+The variable is read at process startup, not hot-reloaded. Editing a host `.env`
+file does not change an existing container's environment; a plain container
+restart retains that environment. Recreate containers with the updated environment
+when applying `false`. It is safe for matching replicas to use different values
+of this toggle because it is excluded from the policy fingerprint.
+
 On startup, the gateway removes only `coordination_replicas` rows with a different
 policy fingerprint, then registers itself in the same transaction. Matching rows
 are preserved, so multiple new replicas can start with the toggle enabled without
@@ -125,6 +142,24 @@ startup guard for future restarts; the toggle itself is not part of the fingerpr
 For Compose, the repository passes this variable through to the gateway container;
 the default Compose profile remains SQLite, so PostgreSQL configuration is still
 required separately.
+
+### Troubleshooting the startup reset
+
+- `register PostgreSQL coordination replica: coordination: idempotency_conflict`:
+  verify the new binary supports this toggle and the variable actually reaches
+  the gateway process. Enabled startup logs a warning naming
+  `LLMGW_COORDINATION_RESET_ON_START`. An older binary can ignore this variable;
+  adding it to an older release does not add reset support.
+- Lock/deadline or permission errors: startup still fails. The reset uses the
+  runtime coordination connection (`LLMGW_DATABASE_URL`), not the migration role;
+  it needs permission to delete replica registrations and acquire the table writer
+  lock. Check database availability, role grants, blocking transactions, and
+  `LLMGW_COORDINATION_TIMEOUT` before retrying.
+- Incompatibility after successful startup: check for old processes that restarted
+  or new replicas with different coordination settings. Heartbeat deliberately
+  continues checking compatibility; the toggle is not a permanent bypass.
+- Capacity remains occupied: the reset preserves leases. Complete/drain old work
+  or allow its leases to expire; do not clear unrelated coordination tables.
 
 ## Outage and recovery
 

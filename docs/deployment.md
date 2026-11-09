@@ -25,6 +25,20 @@ The reverse proxy must:
 - expose `/v1/*` to client networks;
 - restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, `/inference-readyz`, and `/coordination-readyz` to operator, monitoring, and load-balancer networks.
 
+## PostgreSQL upgrades with a coordination policy change
+
+A new binary or changed coordination settings can produce
+`register PostgreSQL coordination replica: coordination: idempotency_conflict`
+while old heartbeat registrations remain active. After draining requests and
+stopping **all** old gateway processes, a supporting binary can start with
+`LLMGW_COORDINATION_RESET_ON_START=true` to remove incompatible registrations
+without waiting for their TTL. Set it back to `false` for subsequent starts.
+
+This environment toggle is independent of Docker, Kubernetes, systemd, or a custom
+deployment system. It does not stop replicas or enable mixed-version rolling
+upgrades. Follow the [reset deployment sequence and troubleshooting guide](postgresql-production.md#reset-old-replica-registrations-during-deployment),
+including per-replica readiness checks and container environment handling.
+
 ## Docker deployment
 
 Use the repository's canonical [`compose.yaml`](../compose.yaml) with [`compose.release.yaml`](../compose.release.yaml) for release deployment. This tested topology works with Linux Docker Engine and Docker Desktop: Compose pulls the selected gateway image from GHCR, starts two pinned vLLM services, creates their private DNS/network, and owns the SQLite and model-cache volumes. Docker Compose 2.24.4 or newer is required for the override file's [reset merge tag](https://docs.docker.com/reference/compose-file/merge/#reset-value).
