@@ -81,7 +81,7 @@ The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Sl
 
 The deployment footprint is one static Go binary and an explicitly selected persistence profile: SQLite for one replica (the default), or PostgreSQL 16+ for coordinated multi-replica production. See the [PostgreSQL production profile](docs/postgresql-production.md).
 
-For PostgreSQL coordination-policy upgrades, the upcoming release supports automatic stop/start deployment: new gateways wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for incompatible registrations to expire or unregister. Graceful shutdown unregisters the stopped replica. Use Kubernetes `Recreate` when one Deployment owns every gateway using the database; keep `LLMGW_COORDINATION_RESET_ON_START=false`. This requires a supporting build (not v0.6.2), permits downtime, and does not support incompatible rolling upgrades. See the [automatic deployment guide](docs/postgresql-production.md#automatic-coordination-upgrades).
+For PostgreSQL coordination-policy upgrades, v0.6.3 supports automatic stop/start deployment: new gateways wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for incompatible registrations to expire or unregister. Graceful shutdown unregisters the stopped replica. Use Kubernetes `Recreate` when one Deployment owns every gateway using the database; keep `LLMGW_COORDINATION_RESET_ON_START=false`. This permits downtime and does not support incompatible rolling upgrades. See the [automatic deployment guide](docs/postgresql-production.md#automatic-coordination-upgrades).
 
 ## Engineering highlights
 
@@ -111,9 +111,9 @@ This path connects the published gateway to vLLM servers you already operate. Th
 2. Start the released image with persistent SQLite state:
 
    ```console
-   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.6.2
+   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.6.3
    docker volume create llmgw-data
-   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.6.2
+   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.6.3
    ```
 
 3. Open `http://127.0.0.1:8080/admin`, then create:

@@ -27,12 +27,12 @@ The reverse proxy must:
 
 ## PostgreSQL upgrades with a coordination policy change
 
-For builds containing the upcoming automatic-upgrade behavior (not v0.6.2),
+Starting with v0.6.3,
 keep `LLMGW_COORDINATION_RESET_ON_START=false` and use a stop/start deployment.
 New replicas wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for old
 incompatible registrations to expire or unregister. Graceful shutdown removes
 only the exiting process's own registration after HTTP drain and lease completion.
-The first upgrade from v0.6.2 still waits for old heartbeat TTLs.
+When upgrading from v0.6.2 with a changed fingerprint, allow old heartbeat TTLs to expire.
 
 Kubernetes `Recreate` automates this only when a single Deployment owns **all**
 gateways connected to that database. Allow downtime, prevent old processes from
