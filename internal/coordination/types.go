@@ -23,6 +23,8 @@ type Reason string
 const (
 	ReasonConcurrencyExhausted    Reason = "concurrency_exhausted"
 	ReasonPoolPriorityReserve     Reason = "pool_priority_reserve"
+	ReasonTokenBudgetExhausted    Reason = "token_budget_exhausted"
+	ReasonTokenPolicyTransition   Reason = "token_policy_transition"
 	ReasonRPMExhausted            Reason = "rpm_exhausted"
 	ReasonTPMExhausted            Reason = "tpm_exhausted"
 	ReasonStaleConfiguration      Reason = "stale_configuration"
@@ -62,6 +64,7 @@ type AdmissionRequest struct {
 	RequestsPerMinute        int64
 	TokensPerMinute          int64
 	LeaseTTL                 time.Duration
+	TokenReservation         TokenReservation `json:",omitzero"`
 }
 
 type LeaseIdentity struct {
@@ -94,6 +97,7 @@ type AdmissionDecision struct {
 	Reason           Reason
 	RetryAt          *time.Time
 	ConcurrencyScope AdmissionScope
+	TokenBudgetScope AdmissionScope
 }
 
 func (d AdmissionDecision) Admitted() bool { return d.Lease != nil && d.Reason == "" }
