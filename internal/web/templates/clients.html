@@ -18,6 +18,7 @@
   <div><label for="edit-max-concurrency">Max concurrency</label>{{if gt $client.MaxConcurrency 10000}}<p class="warning">Legacy value exceeds 10,000; leave unchanged or lower it.</p>{{end}}<input id="edit-max-concurrency" name="max_concurrency" type="number" min="0"{{if le $client.MaxConcurrency 10000}} max="10000"{{end}} value="{{$client.MaxConcurrency}}" required></div>
   <div><label for="edit-rpm">Requests per minute (0 disables)</label><input id="edit-rpm" name="requests_per_minute" type="number" min="0" max="10000000" value="{{$client.RequestsPerMinute}}" required></div>
   <div><label for="edit-tpm">Tokens per minute (0 disables)</label><input id="edit-tpm" name="tokens_per_minute" type="number" min="0" max="10000000000000" value="{{$client.TokensPerMinute}}" required></div>
+  {{template "client-request-size" $client}}
   <fieldset><legend>Model access</legend>{{range .View.Pools}}<label class="check" for="edit-client-pool-{{.ID}}"><input id="edit-client-pool-{{.ID}}" name="model_pool_id" type="checkbox" value="{{.ID}}"{{if hasPool $client.ModelPoolIDs .ID}} checked{{end}}>{{.PublicModelName}}</label>{{end}}</fieldset>
   <label class="check" for="edit-client-enabled"><input id="edit-client-enabled" name="enabled" type="checkbox"{{if $client.Enabled}} checked{{end}}>Enabled</label>
   <div class="form-actions"><a class="button secondary" href="/admin/clients">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
@@ -31,8 +32,19 @@
   <div><label for="max-concurrency">Max concurrency</label><input id="max-concurrency" name="max_concurrency" type="number" min="0" max="10000" value="8" required></div>
   <div><label for="rpm">Requests per minute (0 disables)</label><input id="rpm" name="requests_per_minute" type="number" min="0" max="10000000" value="0" required></div>
   <div><label for="tpm">Tokens per minute (0 disables)</label><input id="tpm" name="tokens_per_minute" type="number" min="0" max="10000000000000" value="0" required></div>
+  {{template "client-request-size"}}
   <fieldset><legend>Model access</legend>{{range .View.Pools}}<label class="check" for="client-pool-{{.ID}}"><input id="client-pool-{{.ID}}" name="model_pool_id" type="checkbox" value="{{.ID}}">{{.PublicModelName}}</label>{{else}}<p class="muted">Create a model pool before granting access.</p>{{end}}</fieldset>
   <label class="check" for="client-enabled"><input id="client-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create client</button></div>
 </form></section>
 <!--{{end}}-->
+
+{{define "client-request-size"}}
+<fieldset class="wide"><legend>Request size limits</legend>
+  <p>Applies to pools with request size admission enabled. Zero inherits pool and class size limits or removes the client outstanding cap.</p>
+  <label>Maximum input tokens<input name="max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum outstanding tokens across enabled pools<input name="max_outstanding_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxOutstandingTokens}}{{else}}0{{end}}" required></label>
+</fieldset>
+{{end}}

@@ -124,12 +124,12 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** produces `RequestSizePolicy`, `RequestSizeLimits`, and `ResolveRequestSizePolicy`; snapshots carry policy/revisions; update DTOs distinguish absent fields from explicit zero/false. The PostgreSQL migration adds a nullable legacy marker / token metadata to leases/receipts; enabled defaults to false.
 
-- [ ] Add `TestResolveRequestSizePolicy`: pool input/output/default=8192/2048/512, Background=2048/256/128, client maxOutput=64 → effective input=2048/output=64/default=64. Client default=32 → default=32. Client=0 inherits; negative values and values >10^12 are rejected.
-- [ ] Add `TestRequestSizePolicyRoundTripAndLegacyUpdate`: creating through the old DTO defaults to disabled; a name-only update preserves token policy; explicit enabled=false disables it; class/pool/client changes update the revision; forms do not reset fields they do not expose.
-- [ ] Add migration tests: old schema→new zero defaults, equivalent policy after reload, and downgrade refusal with a live nonzero reservation. Use existing project fixtures, not a new test framework.
-- [ ] Run `go test ./internal/domain ./internal/store/... ./internal/httpapi ./internal/web -run RequestSize -count=1` and verify the expected failures for the new contracts.
-- [ ] Implement policy/validation, SQLite/PostgreSQL CRUD/snapshots, and Admin/form persistence. Add cross-entity validation/error handling. Use pointer/presence-aware DTOs for new JSON fields; do not refactor unrelated API validation.
-- [ ] Rerun the tests and separately execute migration tests against disposable PostgreSQL. Commit: `feat: persist opt-in request size admission policies`.
+- [x] Add `TestResolveRequestSizePolicy`: pool input/output/default=8192/2048/512, Background=2048/256/128, client maxOutput=64 → effective input=2048/output=64/default=64. Client default=32 → default=32. Client=0 inherits; negative values and values >10^12 are rejected.
+- [x] Add `TestRequestSizePolicyRoundTripAndLegacyUpdate`: creating through the old DTO defaults to disabled; a name-only update preserves token policy; explicit enabled=false disables it; class/pool/client changes update the revision; forms do not reset fields they do not expose.
+- [x] Add migration tests: old schema→new zero defaults, equivalent policy after reload, and downgrade refusal with a live nonzero reservation. Use existing project fixtures, not a new test framework.
+- [x] Run `go test ./internal/domain ./internal/store/... ./internal/httpapi ./internal/web -run RequestSize -count=1` and verify the expected failures for the new contracts.
+- [x] Implement policy/validation, SQLite/PostgreSQL CRUD/snapshots, and Admin/form persistence. Add cross-entity validation/error handling. Use pointer/presence-aware DTOs for new JSON fields; do not refactor unrelated API validation.
+- [x] Rerun the tests and separately execute migration tests against disposable PostgreSQL. Commit: `feat: persist opt-in request size admission policies`.
 
 ## Task 2: Payload bounds and bounded token estimation
 

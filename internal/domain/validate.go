@@ -49,7 +49,7 @@ func (c *Client) validatePolicy(previous *Client) error {
 	if c.TokensPerMinute < 0 || c.TokensPerMinute > MaxTokensPerMinute {
 		return fmt.Errorf("tokens per minute must be between 0 and %d", MaxTokensPerMinute)
 	}
-	return nil
+	return validateClientRequestSize(*c)
 }
 
 func (p *ModelPool) Validate() error {
@@ -85,7 +85,7 @@ func (p *ModelPool) validatePolicy(previous *ModelPool) error {
 	if p.MaxWaiting < 0 {
 		return errors.New("max waiting cannot be negative")
 	}
-	return nil
+	return p.RequestSizeAdmission.Validate()
 }
 
 func (b *Backend) Validate() error {

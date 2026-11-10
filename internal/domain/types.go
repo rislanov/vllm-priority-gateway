@@ -57,17 +57,19 @@ const (
 )
 
 type Client struct {
-	ID                int64
-	Revision          int64
-	Name              string
-	Enabled           bool
-	PriorityClass     PriorityClass
-	VLLMPriority      int
-	MaxConcurrency    int
-	RequestsPerMinute int64
-	TokensPerMinute   int64
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                   int64
+	Revision             int64
+	Name                 string
+	Enabled              bool
+	PriorityClass        PriorityClass
+	VLLMPriority         int
+	MaxConcurrency       int
+	RequestsPerMinute    int64
+	TokensPerMinute      int64
+	RequestSizeLimits    RequestSizeLimits
+	MaxOutstandingTokens int64
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type APIKey struct {
@@ -88,16 +90,17 @@ type ClientModelAccess struct {
 }
 
 type ModelPool struct {
-	ID                  int64
-	Revision            int64
-	PublicModelName     string
-	UpstreamModelName   string
-	Enabled             bool
-	MaxGatewayInflight  int
-	HighPriorityReserve int
-	MaxWaiting          int
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                   int64
+	Revision             int64
+	PublicModelName      string
+	UpstreamModelName    string
+	Enabled              bool
+	MaxGatewayInflight   int
+	HighPriorityReserve  int
+	RequestSizeAdmission RequestSizePolicy
+	MaxWaiting           int
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 type Backend struct {

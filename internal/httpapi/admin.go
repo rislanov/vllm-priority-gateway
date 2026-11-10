@@ -100,23 +100,28 @@ func (s *AdminService) requireMutationAvailability() error {
 }
 
 type ClientInput struct {
-	Name              string               `json:"name"`
-	Enabled           bool                 `json:"enabled"`
-	PriorityClass     domain.PriorityClass `json:"priorityClass"`
-	VLLMPriority      int                  `json:"vllmPriority"`
-	MaxConcurrency    int                  `json:"maxConcurrency"`
-	RequestsPerMinute int64                `json:"requestsPerMinute"`
-	TokensPerMinute   int64                `json:"tokensPerMinute"`
-	ModelPoolIDs      []int64              `json:"modelPoolIds"`
+	Name                 string               `json:"name"`
+	Enabled              bool                 `json:"enabled"`
+	PriorityClass        domain.PriorityClass `json:"priorityClass"`
+	VLLMPriority         int                  `json:"vllmPriority"`
+	MaxConcurrency       int                  `json:"maxConcurrency"`
+	RequestsPerMinute    int64                `json:"requestsPerMinute"`
+	TokensPerMinute      int64                `json:"tokensPerMinute"`
+	MaxInputTokens       *int64               `json:"maxInputTokens"`
+	MaxOutputTokens      *int64               `json:"maxOutputTokens"`
+	DefaultOutputTokens  *int64               `json:"defaultOutputTokens"`
+	MaxOutstandingTokens *int64               `json:"maxOutstandingTokens"`
+	ModelPoolIDs         []int64              `json:"modelPoolIds"`
 }
 
 type PoolInput struct {
-	PublicModelName     string `json:"publicModelName"`
-	UpstreamModelName   string `json:"upstreamModelName"`
-	Enabled             bool   `json:"enabled"`
-	MaxGatewayInflight  int    `json:"maxGatewayInflight"`
-	HighPriorityReserve int    `json:"highPriorityReserve"`
-	MaxWaiting          int    `json:"maxWaiting"`
+	PublicModelName      string                   `json:"publicModelName"`
+	UpstreamModelName    string                   `json:"upstreamModelName"`
+	Enabled              bool                     `json:"enabled"`
+	MaxGatewayInflight   int                      `json:"maxGatewayInflight"`
+	HighPriorityReserve  int                      `json:"highPriorityReserve"`
+	MaxWaiting           int                      `json:"maxWaiting"`
+	RequestSizeAdmission *RequestSizeAdmissionDTO `json:"requestSizeAdmission"`
 }
 
 type BackendInput struct {
@@ -144,8 +149,10 @@ type AdminClient struct {
 	MaxConcurrency    int                  `json:"maxConcurrency"`
 	RequestsPerMinute int64                `json:"requestsPerMinute"`
 	TokensPerMinute   int64                `json:"tokensPerMinute"`
-	ModelPoolIDs      []int64              `json:"modelPoolIds"`
-	Models            []string             `json:"models"`
+	domain.RequestSizeLimits
+	MaxOutstandingTokens int64    `json:"maxOutstandingTokens"`
+	ModelPoolIDs         []int64  `json:"modelPoolIds"`
+	Models               []string `json:"models"`
 }
 
 type AdminKey struct {
@@ -161,15 +168,16 @@ type AdminKey struct {
 }
 
 type AdminPool struct {
-	ID                  int64              `json:"id"`
-	Revision            int64              `json:"revision"`
-	PublicModelName     string             `json:"publicModelName"`
-	UpstreamModelName   string             `json:"upstreamModelName"`
-	Enabled             bool               `json:"enabled"`
-	MaxGatewayInflight  int                `json:"maxGatewayInflight"`
-	HighPriorityReserve int                `json:"highPriorityReserve"`
-	MaxWaiting          int                `json:"maxWaiting"`
-	Runtime             domain.PoolRuntime `json:"runtime"`
+	ID                   int64                   `json:"id"`
+	Revision             int64                   `json:"revision"`
+	PublicModelName      string                  `json:"publicModelName"`
+	UpstreamModelName    string                  `json:"upstreamModelName"`
+	Enabled              bool                    `json:"enabled"`
+	MaxGatewayInflight   int                     `json:"maxGatewayInflight"`
+	HighPriorityReserve  int                     `json:"highPriorityReserve"`
+	MaxWaiting           int                     `json:"maxWaiting"`
+	RequestSizeAdmission RequestSizeAdmissionDTO `json:"requestSizeAdmission"`
+	Runtime              domain.PoolRuntime      `json:"runtime"`
 }
 
 type AdminBackend struct {
@@ -214,6 +222,7 @@ func (s *AdminService) View() AdminView {
 			ID: client.ID, Revision: client.Revision, Name: client.Name, Enabled: client.Enabled, PriorityClass: client.PriorityClass,
 			VLLMPriority: client.VLLMPriority, MaxConcurrency: client.MaxConcurrency,
 			RequestsPerMinute: client.RequestsPerMinute, TokensPerMinute: client.TokensPerMinute,
+			RequestSizeLimits: client.RequestSizeLimits, MaxOutstandingTokens: client.MaxOutstandingTokens,
 		}
 		for poolID, allowed := range snapshot.Access[client.ID] {
 			if !allowed {
@@ -248,7 +257,8 @@ func (s *AdminService) View() AdminView {
 		view.Pools = append(view.Pools, AdminPool{
 			ID: pool.ID, Revision: pool.Revision, PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName,
 			Enabled: pool.Enabled, MaxGatewayInflight: pool.MaxGatewayInflight, HighPriorityReserve: pool.HighPriorityReserve, MaxWaiting: pool.MaxWaiting,
-			Runtime: s.runtime.PoolSnapshot(pool.ID, at),
+			RequestSizeAdmission: requestSizeAdmissionDTO(pool.RequestSizeAdmission),
+			Runtime:              s.runtime.PoolSnapshot(pool.ID, at),
 		})
 	}
 	for _, backend := range snapshot.BackendsByID {
@@ -363,7 +373,7 @@ func (s *AdminService) CreatePool(ctx context.Context, input PoolInput) (AdminPo
 	if err := s.requireMutationAvailability(); err != nil {
 		return AdminPool{}, err
 	}
-	pool, err := s.store.CreatePool(ctx, store.CreatePoolParams(input))
+	pool, err := s.store.CreatePool(ctx, input.storeParams())
 	if err != nil {
 		return AdminPool{}, err
 	}
@@ -377,7 +387,7 @@ func (s *AdminService) UpdatePool(ctx context.Context, id int64, input PoolInput
 	if err := s.requireMutationAvailability(); err != nil {
 		return AdminPool{}, err
 	}
-	pool, err := s.store.UpdatePool(ctx, id, store.UpdatePoolParams(input))
+	pool, err := s.store.UpdatePool(ctx, id, input.storeParams())
 	if err != nil {
 		return AdminPool{}, err
 	}
