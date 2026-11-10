@@ -137,13 +137,13 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** consumes Task 1 policy; produces PreparedRequestSize, TokenEstimate, and InputEstimator. Transport remains `Proxy.Tokenize(ctx, proxy.TokenizationRequest) (*http.Response,error)`. Normal preflight obtains a utility lease through the existing TokenizationCoordinator; Task 5 supplies emergency acquisition dependencies.
 
-- [ ] `TestPrepareRequestSizeEndpoints`: missing cap →512 (or effective default); explicit 2049 with max2048 →400; chat aliases 128/128 normalize, 128/64 reject; preserve response max_output_tokens; reject min_tokens>cap; streaming uses the same cap.
-- [ ] `TestReservationTokensMultipliers`: inputs=[100,200], output=50,n=2 →800; inputs=[0],output=50,n=1 →51; reject n=0/>32, batch>32, invalid mixed batches, overflow, and amounts >10^12.
-- [ ] `TestEstimatorCompatibility`: provide separate fixtures for every row of the normative field matrix in spec §5; materialize Unicode, BOS/special tokens, generation prompt, and continue_final_message consistently; tools/schema/inline function history use explicit fallback/rejection. Reject unknown top-level fields; treat token-ID input as one prompt. Unsupported Responses with fallback=reject →400; utf8_bytes →byteLength(canonicalJSON)+overhead, never 0.
-- [ ] `TestEstimatorBoundsAndPrivacy`: 2s total deadline across the batch, 8 MiB maximum response, cancellation, noninteger/missing count, count/tokens mismatch, context overflow, 401/403, 404/501, 429/5xx; fallback only for unsupported cases, not transient failures. No utility retries, inference counters, or body content in errors.
-- [ ] Run `go test ./internal/admission ./internal/gateway ./internal/proxy ./internal/config -run 'RequestSize|ReservationTokens|Estimator' -count=1`; record expected failures.
-- [ ] Implement pure validation and estimation, including the input-bearing field table/allowlist. Fixtures pin the v0.28.0 mapping; ambiguous variants use fallback/rejection, not a content-only heuristic.
-- [ ] Verify PASS and run `go test ./internal/gateway ./internal/proxy -run Tokenization -count=1`. Commit: `feat: estimate request tokens and enforce output allowances`.
+- [x] `TestPrepareRequestSizeEndpoints`: missing cap →512 (or effective default); explicit 2049 with max2048 →400; chat aliases 128/128 normalize, 128/64 reject; preserve response max_output_tokens; reject min_tokens>cap; streaming uses the same cap.
+- [x] `TestReservationTokensMultipliers`: inputs=[100,200], output=50,n=2 →800; inputs=[0],output=50,n=1 →51; reject n=0/>32, batch>32, invalid mixed batches, overflow, and amounts >10^12.
+- [x] `TestEstimatorCompatibility`: provide separate fixtures for every row of the normative field matrix in spec §5; materialize Unicode, BOS/special tokens, generation prompt, and continue_final_message consistently; tools/schema/inline function history use explicit fallback/rejection. Reject unknown top-level fields; treat token-ID input as one prompt. Unsupported Responses with fallback=reject →400; utf8_bytes →byteLength(canonicalJSON)+overhead, never 0.
+- [x] `TestEstimatorBoundsAndPrivacy`: 2s total deadline across the batch, 8 MiB maximum response, cancellation, noninteger/missing count, count/tokens mismatch, context overflow, 401/403, 404/501, 429/5xx; fallback only for unsupported cases, not transient failures. No utility retries, inference counters, or body content in errors.
+- [x] Run `go test ./internal/admission ./internal/gateway ./internal/proxy ./internal/config -run 'RequestSize|ReservationTokens|Estimator' -count=1`; record expected failures.
+- [x] Implement pure validation and estimation, including the input-bearing field table/allowlist. Fixtures pin the v0.28.0 mapping; ambiguous variants use fallback/rejection, not a content-only heuristic.
+- [x] Verify PASS and run `go test ./internal/gateway ./internal/proxy -run Tokenization -count=1`. Commit: `feat: estimate request tokens and enforce output allowances`.
 
 ## Task 3: Local atomic reservations and safe owner lifecycle
 
