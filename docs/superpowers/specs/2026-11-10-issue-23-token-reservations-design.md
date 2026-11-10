@@ -1,220 +1,220 @@
-# Issue #23: request-size-aware admission — спецификация
+# Issue #23: Request-size-aware admission — specification
 
-Статус: проект для согласования, реализация не начата. Дата: 2026-11-10.
+Status: draft for approval; implementation has not started. Date: 2026-11-10.
 Issue: https://github.com/rislanov/vllm-priority-gateway/issues/23
-Ветка: `codex/issue-23-token-reservations`.
-База: `c072e66466d68088c924b94421af3d7c9646d171` (`origin/main`).
+Branch: `codex/issue-23-token-reservations`.
+Base: `c072e66466d68088c924b94421af3d7c9646d171` (`origin/main`).
 
-Пользователь подтвердил #23 и потребовал **сохранить emergency-допуск**. Остальные решения ниже — предложения автора спецификации, а не ранее согласованные требования пользователя.
+The user confirmed #23 and explicitly required **preserving emergency admission**. The other decisions below are the specification author's proposals, not previously approved user requirements.
 
-## 1. Задача и границы
+## 1. Objective and boundaries
 
-Не допускать одновременно слишком много больших запросов, пока их фактическое потребление ещё не появилось в soft TPM. Перед генерацией оценивать input, ограничивать output и атомарно резервировать `R` токенов на весь inference lifecycle. Применять ограничения по модели, классу и клиенту. PostgreSQL координирует реплики; SQLite остаётся single-replica с in-memory coordination.
+Prevent too many large requests from being admitted concurrently before their actual consumption appears in soft TPM. Before generation, estimate input, bound output, and atomically reserve `R` tokens for the entire inference lifecycle. Apply limits by model, priority class, and client. PostgreSQL coordinates replicas; SQLite remains a single-replica deployment with in-memory coordination.
 
-Существующие client concurrency, pool inflight, High/Critical slot reserve, RPM, soft TPM, waiting limits, backend eligibility и circuit protection продолжают работать. Caller-supplied priority и оценки токенов не являются доверенными.
+Existing client concurrency, pool inflight, High/Critical slot reserve, RPM, soft TPM, waiting limits, backend eligibility, and circuit protection remain in effect. Caller-supplied priority and token estimates are untrusted.
 
-Не обещаем GPU/KV allocation, preemption, exactly-once inference, фиксированный TTFT или глобальную изоляцию при отказе PostgreSQL. Не добавляем очередь, локальную библиотеку tokenizer, хранилище промптов, новую систему биллинга или переработку аналитики. Публичный `/tokenize` сохраняет отдельный lifecycle и прежнее fail-closed поведение.
+This does not promise GPU/KV allocation, preemption, exactly-once inference, a fixed TTFT, or global isolation during PostgreSQL outages. It adds no queue, local tokenizer library, prompt storage, new billing system, or analytics redesign. Public `/tokenize` retains its separate lifecycle and existing fail-closed behavior.
 
-## 2. Рассмотренные подходы
+## 2. Approaches considered
 
-| Подход | Преимущество | Цена / решение |
+| Approach | Benefit | Cost / decision |
 | --- | --- | --- |
-| Отдельный outstanding-token budget, soft TPM по actual usage | Совместимость с существующими квотами; один lease на запрос | Рекомендуется. Это ограничение незавершённой работы, не резерв RPM/TPM |
-| Предоплата из TPM с возвратом разницы | Заранее ограничивает минутное потребление | Меняет действующий контракт, требует политики debt/refund при refill, смене revision и неизвестном usage; отдельное расширение |
-| Только лимиты input/output | Простая интеграция | Не ограничивает сумму одновременно допущенных запросов; недостаточно для #23 |
+| Separate outstanding-token budget; soft TPM based on actual usage | Compatible with existing quotas; one lease per request | Recommended. Bounds unfinished work rather than reserving RPM/TPM |
+| Prepay from TPM and refund the difference | Bounds per-minute consumption before dispatch | Changes the existing contract and requires debt/refund rules for refill, revision changes, and unknown usage; a separate extension |
+| Input/output limits only | Simple integration | Does not bound the total work admitted concurrently; insufficient for #23 |
 
-Emergency сохраняется через отдельные per-replica token caps. Отказ от emergency ради глобального бюджета пользователь отверг.
+Emergency admission is preserved through separate per-replica token caps. The user rejected removing emergency admission to enforce a global budget.
 
-## 3. Текущее устройство и точки изменения
+## 3. Current architecture and change points
 
-1. `internal/gateway/forward.go`: auth/snapshot → response-completion reservation → повторная auth → prepare payload → pool gate → admission → backend selection → proxy → deferred completion. Сетевую оценку нельзя выполнять под registry lock или SQL transaction.
-2. `internal/gateway/forward_admission.go`: строит `AdmissionRequest`, один раз перезагружает stale config, при временном отказе координации использует `EmergencyAdmission`. После перезагрузки потребуется пересчитать payload и estimate.
-3. `internal/coordination/local/admission.go`: mutex, leases, receipts, client/pool counters; RPM списывается при admission, TPM — по валидному usage в `Complete`. Nil usage сейчас не списывает TPM.
-4. `internal/coordination/postgres/admission.go`: receipt и fingerprint, pool → client locks, fresh READ COMMITTED counts, lease и RPM в одной durable transaction. Повтор после ambiguous commit использует тот же LeaseID. Completion сериализован теми же scopes.
-5. `internal/coordination/lease_manager.go`: renewal, bounded completion delivery, partial-prefix retry. При переполнении completion backlog прекращает tracking; освобождение обеспечивается TTL, actual TPM может не дойти.
-6. `internal/proxy/tokenization.go`: `Proxy.Tokenize` уже предоставляет общий upstream adapter. `Service.Tokenize` является публичным utility lifecycle; вызывать его рекурсивно из inference нельзя.
-7. Utility tokenizer имеет отдельные client/backend concurrency и RPM, общий PostgreSQL budget; defaults 4 / 8 / 120 RPM, timeout 30s. Внутренний preflight должен учитывать его нагрузку.
-8. `internal/coordination/postgres/replica.go`: coordination contract version сейчас 3; изменение persistent admission semantics требует нового contract version и upgrade evidence.
+1. `internal/gateway/forward.go`: auth/snapshot → response-completion reservation → repeated auth → prepare payload → pool gate → admission → backend selection → proxy → deferred completion. Network estimation must not run under a registry lock or SQL transaction.
+2. `internal/gateway/forward_admission.go`: builds `AdmissionRequest`, reloads stale configuration once, and uses `EmergencyAdmission` for transient coordination failures. Payload and estimate must be recomputed after reloading.
+3. `internal/coordination/local/admission.go`: mutex, leases, receipts, and client/pool counters; RPM is debited at admission, TPM from valid usage in `Complete`. Nil usage currently does not debit TPM.
+4. `internal/coordination/postgres/admission.go`: receipt and fingerprint, pool → client locks, fresh READ COMMITTED counts, and lease/RPM writes in one durable transaction. An ambiguous-commit retry uses the same LeaseID. Completion is serialized through the same scopes.
+5. `internal/coordination/lease_manager.go`: renewal, bounded completion delivery, and partial-prefix retry. Completion-backlog overflow stops tracking; TTL provides eventual release, and actual TPM usage may never arrive.
+6. `internal/proxy/tokenization.go`: `Proxy.Tokenize` already provides a shared upstream adapter. `Service.Tokenize` is the public utility lifecycle and must not be called recursively from inference.
+7. Utility tokenization has separate client/backend concurrency and RPM limits with a shared PostgreSQL budget; defaults are 4 / 8 / 120 RPM with a 30s timeout. Internal preflight must account for its load.
+8. `internal/coordination/postgres/replica.go`: coordination contract version is currently 3; changing persistent admission semantics requires a new contract version and upgrade evidence.
 
-Наблюдение для обязательной проверки: local `Renew` вызывает `removeLease` при несовпадении ClientID/PoolID. До добавления token counters нужен regression test, доказывающий, что чужой identity не освобождает чужой резерв. Это также связано с #43; полный lifecycle QA не входит в #23.
+Required verification lead: local `Renew` calls `removeLease` when ClientID/PoolID does not match. Before adding token counters, a regression test must prove that a foreign identity cannot release another request's reservation. This also relates to #43; comprehensive lifecycle QA is outside #23.
 
-## 4. Конфигурационный контракт
+## 4. Configuration contract
 
-Все token amounts — `int64`, допустимый диапазон `0..10^12`; арифметика checked, никакого float для reservation. JSON field names ниже нормативны. Новые поля отсутствуют/равны нулю в мигрированных конфигурациях.
+All token amounts are `int64`, in the range `0..10^12`; use checked arithmetic and no floating-point reservation accounting. The JSON field names below are normative. New fields are absent or zero in migrated configurations.
 
-### Pool: объект `requestSizeAdmission`
+### Pool: `requestSizeAdmission` object
 
-| Поле | Значение / правило |
+| Field | Value / rule |
 | --- | --- |
-| `enabled` | false по умолчанию; master switch для данного pool |
-| `maxOutstandingTokens` | >0 при enabled; общий pool budget |
-| `maxInputTokens`, `maxOutputTokens`, `defaultOutputTokens` | >0 при enabled; default ≤ maxOutput |
-| `classLimits` | Фиксированные поля critical/high/normal/background с maxInputTokens/maxOutputTokens/defaultOutputTokens; 0 означает наследовать |
-| `fallbackMode` | `reject` по умолчанию; опционально `utf8_bytes` для self-contained text |
-| `fallbackOverheadTokens` | >0 для utf8_bytes; оператор калибрует model/template overhead |
-| `estimationProfile` | Непустой идентификатор проверенного tokenizer/template/model deployment при enabled; не автоматически полученное доказательство идентичности |
-| `emergencyMaxOutstandingTokens` | 0 означает наследовать maxOutstandingTokens **на каждой реплике**; положительное значение ≤ maxOutstandingTokens |
+| `enabled` | Defaults to false; master switch for this pool |
+| `maxOutstandingTokens` | >0 when enabled; shared pool budget |
+| `maxInputTokens`, `maxOutputTokens`, `defaultOutputTokens` | >0 when enabled; default ≤ maxOutput |
+| `classLimits` | Fixed critical/high/normal/background fields containing maxInputTokens/maxOutputTokens/defaultOutputTokens; 0 means inherit |
+| `fallbackMode` | Defaults to `reject`; optional `utf8_bytes` for self-contained text |
+| `fallbackOverheadTokens` | >0 for utf8_bytes; the operator calibrates model/template overhead |
+| `estimationProfile` | Nonempty identifier for a qualified tokenizer/template/model deployment when enabled; not automatically obtained proof of identity |
+| `emergencyMaxOutstandingTokens` | 0 inherits maxOutstandingTokens **on each replica**; a positive value must be ≤ maxOutstandingTokens |
 
-Ограничения клиента: `maxInputTokens`, `maxOutputTokens`, `defaultOutputTokens`, `maxOutstandingTokens`. Все по умолчанию 0. Первые три ограничивают запрос в enabled pool, последнее — общий клиентский outstanding budget по всем enabled pools и ключам клиента. Отключённые pools не включаются в новый token accounting; UI обязан явно показывать эту границу.
+Client limits: `maxInputTokens`, `maxOutputTokens`, `defaultOutputTokens`, and `maxOutstandingTokens`, all defaulting to 0. The first three constrain requests in enabled pools; the last is the client's shared outstanding budget across all enabled pools and client API keys. Disabled pools do not participate in new token accounting; the UI must make this boundary explicit.
 
-Effective input/output maximum = минимум положительных pool, class и client значений. Default: client, иначе class, иначе pool; итоговый default = min(выбранный default, effective output maximum). Explicit output выше maximum — ошибка, не молчаливое обрезание. Обновление pool/class/client проверяет диапазоны и relationships; если cross-entity изменение временно делает policy несовместимой, admission отклоняется как invalid/stale policy, а не снимает лимиты.
+The effective input/output maximum is the minimum positive pool, class, and client value. Default precedence is client, then class, then pool; the final default is min(selected default, effective output maximum). An explicit output allowance above the maximum is an error, not a silent clamp. Pool/class/client updates validate ranges and relationships; if a cross-entity change temporarily makes a policy incompatible, admission rejects it as invalid/stale policy rather than removing limits.
 
-Рекомендуемая конфигурация, **не product default**: pool input 8192, output 2048, default 512, outstanding 32768; Background input 2048/output 256/default 128, client outstanding 8192. Числа надо калибровать на целевой модели.
+Suggested configuration, **not a product default**: pool input 8192, output 2048, default 512, outstanding 32768; Background input 2048/output 256/default 128, client outstanding 8192. Calibrate these values for the target model.
 
-При `enabled=false` нет preflight, новых output rewrites и token reservations; действует прежний admission, включая emergency и soft TPM. Смена false→true на работающем pool требует drain ранее допущенных legacy leases: пока есть unexpired lease без token accounting, новые enabled admissions получают retryable 503 `token_policy_transition`. Новое class/client ограничение существующие token leases не пересчитывает. Снижение budget ниже outstanding запрещает новые admission до освобождения; старые запросы не прерываются. true→false не обнуляет уже выданные reservations: они завершаются по сохранённому lease contract. Такие старые token leases продолжают входить в pool/client sums независимо от текущего enabled; исключаются лишь новые legacy leases, выданные после выключения.
+With `enabled=false`, there is no preflight, new output rewriting, or token reservation; existing admission applies, including emergency and soft TPM. Changing false→true on an active pool requires draining previously admitted legacy leases: while any unexpired lease lacks token accounting, new enabled admissions receive retryable 503 `token_policy_transition`. New class/client limits do not recalculate existing token leases. Lowering a budget below outstanding usage blocks new admissions until capacity is released; existing requests are not interrupted. Changing true→false does not clear issued reservations: they complete under their stored lease contract. These old token leases remain in pool/client sums regardless of the current enabled flag; only new legacy leases issued after disabling are excluded.
 
-Для false→true оператор обязан остановить admission и дренировать **все реплики**, в том числе legacy emergency streams, затем включить policy и возобновить traffic. Shared lease gate — дополнительная защита, не распределённое доказательство завершения emergency: PG их не видит. На своей реплике gateway отслеживает legacy emergency lifecycles по pool и возвращает `token_policy_transition` также из emergency path до их завершения. Этот отказ не переключается обратно в legacy mode. Включать политику во время продолжающейся аварии без cluster-wide drain не поддерживается.
+For false→true, the operator must stop admission and drain **all replicas**, including legacy emergency streams, then enable the policy and resume traffic. The shared lease gate is additional protection, not distributed proof that emergency work has finished: PostgreSQL cannot see it. Each gateway tracks its own legacy emergency lifecycles by pool and returns `token_policy_transition` from the emergency path until they finish. This rejection does not fall back to legacy mode. Enabling the policy during an ongoing outage without a cluster-wide drain is unsupported.
 
-## 5. Endpoint и payload contract
+## 5. Endpoint and payload contract
 
-Поддержка ниже относится к **enabled** pool. Disabled сохраняет существующий pass-through.
+The support described below applies to **enabled** pools. Disabled pools retain existing pass-through behavior.
 
 | Endpoint | Output limit | Input estimate |
 | --- | --- | --- |
-| `/v1/chat/completions` | `max_completion_tokens`; legacy `max_tokens` принимается как alias | `/tokenize` с messages и проверенными template options |
-| `/v1/completions` | `max_tokens` | `/tokenize` для string prompt; token-ID input — проверенная длина; batch — сумма отдельных элементов |
-| `/v1/responses` | `max_output_tokens` | Явный `utf8_bytes` fallback для self-contained text; при fallback=reject — 400 `token_estimation_unsupported` |
+| `/v1/chat/completions` | `max_completion_tokens`; legacy `max_tokens` is accepted as an alias | `/tokenize` with messages and qualified template options |
+| `/v1/completions` | `max_tokens` | `/tokenize` for string prompts; validated length for token-ID input; sum of individual items for batches |
+| `/v1/responses` | `max_output_tokens` | Explicit `utf8_bytes` fallback for self-contained text; fallback=reject returns 400 `token_estimation_unsupported` |
 
-Нет output limit / null → подставить effective default. Числа должны быть положительными целыми, без coercion из string/bool/float. Для chat два ненулевых alias с разными значениями → 400; одинаковые нормализовать в `max_completion_tokens`, удалить `max_tokens`. Wrong-endpoint output alias и конфликтующий `min_tokens` → 400. Backend получает ровно тот cap, который участвовал в резервировании. Streaming использует те же правила.
+A missing/null output limit receives the effective default. Values must be positive integers, without coercion from strings, booleans, or floating-point values. Two non-null chat aliases with different values return 400; equal values are normalized to `max_completion_tokens`, removing `max_tokens`. An output alias for the wrong endpoint or a conflicting `min_tokens` returns 400. The backend receives exactly the cap used for the reservation. Streaming follows the same rules.
 
-Для completions разрешены string, непустой token-ID array, непустой homogeneous array строк или token-ID arrays. ID — неотрицательные int64. Не считать token-ID array как batch. Максимум 32 prompts и `n` от 1 до 32; checked multiplication. `n=null` трактуется как 1 только там, где upstream это поддерживает. Для каждого prompt input limit проверяется отдельно, aggregate input — сумма. Для chat один prompt. Для Responses n не поддерживается.
+Completions accepts a string, a nonempty token-ID array, or a nonempty homogeneous array of strings or token-ID arrays. IDs are nonnegative int64 values. Do not interpret a token-ID array as a batch. Allow at most 32 prompts and `n` from 1 to 32; use checked multiplication. Treat `n=null` as 1 only where upstream supports it. Validate the input limit separately for each prompt; aggregate input is their sum. Chat has one prompt. Responses does not support n.
 
-Консервативная формула: `R = n × (sum(inputEstimate[j]) + promptCount × effectiveOutputAllowance)`. Она намеренно учитывает input для каждой генерации, даже если upstream умеет sharing. Input tokens после prefix-cache hit не вычитаются. `best_of`, beam search и неизвестные generation multipliers в v1 rejected, чтобы не резервировать меньше фактического fan-out. Пустой prompt может иметь фактический нулевой count, но accounting minimum каждого prompt = 1; отличать это от ошибки estimator.
+Conservative formula: `R = n × (sum(inputEstimate[j]) + promptCount × effectiveOutputAllowance)`. It deliberately accounts for input per generation even if upstream can share it. Do not subtract input tokens for prefix-cache hits. Reject `best_of`, beam search, and unknown generation multipliers in v1 to avoid reserving less than the actual fan-out. An empty prompt may have a genuine zero count, but the accounting minimum per prompt is 1; distinguish that from an estimator failure.
 
-В v1 enabled-policy отклоняет media/remote files, `previous_response_id`, server-side prompt references, Responses `background=true` и server-side tool execution: полный input или срок generation неизвестен шлюзу. Self-contained text и inline function-call history допустимы лишь через проверенный adapter/fallback. Внешние tools не вызываются шлюзом. Отказы — документированный opt-in compatibility boundary, не скрытый обход лимита. Новые варианты payload расширяются отдельными contract fixtures.
+In v1, an enabled policy rejects media/remote files, `previous_response_id`, server-side prompt references, Responses `background=true`, and server-side tool execution: the gateway cannot know the full input or generation lifetime. Self-contained text and inline function-call history are allowed only through a qualified adapter/fallback. The gateway does not invoke external tools. These rejections are documented opt-in compatibility boundaries, not hidden limit bypasses. Add new payload variants through explicit contract fixtures.
 
-`truncate_prompt_tokens`, Responses truncation=auto и другие input truncation overrides в enabled v1 rejected: admission не должен считать один prompt, а отправлять другой. Передача клиентского chat template допускается только если tokenizer adapter передаёт идентичные options; недоказанное соответствие, включая model-specific tool/response-format rendering, переводится в explicit fallback либо reject.
+Reject `truncate_prompt_tokens`, Responses truncation=auto, and other input-truncation overrides in enabled v1: admission must not count one prompt and dispatch another. A client-supplied chat template is allowed only if the tokenizer adapter forwards identical options; unproven equivalence, including model-specific tool/response-format rendering, requires explicit fallback or rejection.
 
-### Нормативная матрица input fields v1
+### Normative v1 input-field matrix
 
-| Поля / форма | Exact adapter | Fallback canonical input |
+| Fields / shape | Exact adapter | Fallback canonical input |
 | --- | --- | --- |
-| Chat `messages` с role system/developer/user/assistant, content string либо text-only parts | Передать messages без изменения; без tool/function history | Весь messages, включая роли и text parts |
-| Chat `add_generation_prompt`, `continue_final_message`, `add_special_tokens`, `chat_template`, `chat_template_kwargs` | Передать все присутствующие поля; absent materialize defaults true/false/false для первых трёх; если continue_final_message=true и generation flag absent, materialize generation=false в обоих запросах | Все эти поля с теми же effective defaults |
-| Chat tools/tool_choice, response_format, function_call/functions; messages с tool_calls/tool role/function role/reasoning fields | В v1 не exact: explicit fallback или reject | Полные структуры вместе с messages; не вынимать только arguments/content |
-| Completions prompt string | Передать prompt и effective add_special_tokens (default=true) | Объект prompt+effective add_special_tokens |
-| Completions token-ID prompt | Count validated IDs, не вызывать tokenizer; IDs не дополняются специальными tokens | Fallback не нужен |
-| Completions batch | Обработать каждый prompt по предыдущим двум строкам | По одному canonical input на prompt |
-| Responses input string / inline message items с input_text/output_text; inline function_call/function_call_output | Нет direct `/tokenize` mapping | Полные input, instructions, tools (только type=function), tool_choice, text, reasoning, chat_template_kwargs |
+| Chat `messages` with system/developer/user/assistant roles and string content or text-only parts | Forward messages unchanged; no tool/function history | Entire messages, including roles and text parts |
+| Chat `add_generation_prompt`, `continue_final_message`, `add_special_tokens`, `chat_template`, `chat_template_kwargs` | Forward all present fields; materialize true/false/false defaults for the first three when absent; if continue_final_message=true and the generation flag is absent, materialize generation=false in both requests | All these fields with the same effective defaults |
+| Chat tools/tool_choice, response_format, function_call/functions; messages containing tool_calls/tool role/function role/reasoning fields | Not exact in v1: explicit fallback or rejection | Complete structures together with messages; do not extract only arguments/content |
+| Completions string prompt | Forward prompt and effective add_special_tokens (default=true) | Object containing prompt and effective add_special_tokens |
+| Completions token-ID prompt | Count validated IDs without calling the tokenizer; do not append special tokens | No fallback needed |
+| Completions batch | Process each prompt according to the preceding two rows | One canonical input per prompt |
+| Responses string input / inline message items with input_text/output_text; inline function_call/function_call_output | No direct `/tokenize` mapping | Complete input, instructions, tools (type=function only), tool_choice, text, reasoning, chat_template_kwargs |
 | Responses previous_response_id, prompt reference, previous_input_messages, background=true, non-function tools | Reject | Reject |
-| Media content, URL/file references, prompt_embeds, mm_processor_kwargs/media_io_kwargs, multimodal или скрытый history | Reject | Reject |
+| Media content, URL/file references, prompt_embeds, mm_processor_kwargs/media_io_kwargs, multimodal or hidden history | Reject | Reject |
 
-Exact chat qualification остаётся model-profile-specific: даже совпадающие поля не доказывают совпадения renderer; профиль должен подтвердить count относительно generation usage на fixtures. Completions token-ID форма требует backend profile, где generation не добавляет к supplied IDs скрытые tokens; иначе reject.
+Exact chat qualification remains specific to the model profile: matching fields alone do not prove renderer equivalence; fixtures must compare the profile's count with generation usage. Completions token-ID input requires a backend profile in which generation does not add hidden tokens to supplied IDs; otherwise reject it.
 
-Top-level fields, которые v1 разрешает как sampling/response-only и исключает из canonical input: model (записывается в profile), stream, stream_options, output aliases, n, min_tokens, temperature, top_p, top_k, min_p, seed, stop, stop_token_ids, frequency_penalty, presence_penalty, repetition_penalty, ignore_eos, logprobs, top_logprobs, logit_bias, echo, skip_special_tokens, spaces_between_special_tokens, include_stop_str_in_output, return_token_ids, return_tokens_as_token_ids, user, metadata, store, service_tier. Их влияние на hidden generation work проверяет output/multiplier validator; `service_tier` не меняет доверенный priority class. Request-level priority удаляется как сегодня. Любое другое top-level поле в enabled v1 rejected `token_estimation_unsupported`, пока явно не классифицировано. JSON null в optional input fields нормализуется по upstream baseline defaults; для required input null rejected. Для Responses absent/false background допустим, truncation absent/disabled допустим; они не входят в input. Chat response_format всегда fallback, даже если без tools.
+Top-level fields allowed as sampling/response-only in v1 and excluded from canonical input: model (recorded in the profile), stream, stream_options, output aliases, n, min_tokens, temperature, top_p, top_k, min_p, seed, stop, stop_token_ids, frequency_penalty, presence_penalty, repetition_penalty, ignore_eos, logprobs, top_logprobs, logit_bias, echo, skip_special_tokens, spaces_between_special_tokens, include_stop_str_in_output, return_token_ids, return_tokens_as_token_ids, user, metadata, store, service_tier. The output/multiplier validator checks their effects on hidden generation work; `service_tier` does not change the trusted priority class. Request-level priority is removed as today. Any other top-level field in enabled v1 is rejected with `token_estimation_unsupported` until explicitly classified. Normalize JSON null in optional input fields to upstream baseline defaults; reject null for required input. Responses accepts absent/false background and absent/disabled truncation; these are not input fields. Chat response_format always requires fallback, even without tools.
 
-Canonical JSON строится из фиксированного whitelist полей выше через детерминированную сериализацию, без whitespace и с UTF-8 вместо HTML escaping. Вложенные значения input structures сохраняются полностью; nested media/remote references проверяются до сериализации. Для batch каждый объект независим. Эта таблица намеренно ограничивает v1, а не обещает все upstream extensions.
+Build canonical JSON from the fixed field allowlist above using deterministic serialization, no whitespace, and UTF-8 rather than HTML escaping. Preserve nested input structures in full; validate nested media/remote references before serialization. Each batch object is independent. This table intentionally limits v1 rather than promising support for every upstream extension.
 
 ### Fallback
 
-`utf8_bytes`: `I = max(1, UTF8ByteLength(canonicalInputJSON) + fallbackOverheadTokens)` на prompt. Canonical input включает все input-bearing fields, роли, инструкции, историю, tools/schema и template options; исключает credentials, telemetry IDs и sampling-only fields. Непонятный input-bearing extension → unsupported, не silent omission. Для Responses canonical input включает instructions и весь inline input. Множитель bytes=1 фиксирован; overhead положительный и калибруемый.
+`utf8_bytes`: `I = max(1, UTF8ByteLength(canonicalInputJSON) + fallbackOverheadTokens)` per prompt. Canonical input includes all input-bearing fields, roles, instructions, history, tools/schema, and template options; it excludes credentials, telemetry IDs, and sampling-only fields. An unknown input-bearing extension is unsupported, not silently omitted. For Responses, canonical input includes instructions and all inline input. The byte multiplier is fixed at 1; overhead is positive and calibrated.
 
-Это оценка для явно включённого fallback, **не математическая гарантия фактического token count произвольной модели**. Input limit в этом режиме применяется к оценке. Exact model-token enforcement требует проверенного upstream adapter. Не включать fallback автоматически после timeout/429/5xx: это скрытый fail-open и обход utility capacity. Fallback применяется только к явно unsupported model/payload/endpoint (включая проверенный 404/501); 401/403 upstream — конфигурационная ошибка 503, не unsupported.
+This is an estimate for an explicitly enabled fallback, **not a mathematical guarantee of an arbitrary model's actual token count**. The input limit applies to the estimate in this mode. Exact model-token enforcement requires a qualified upstream adapter. Do not activate fallback automatically after timeout/429/5xx: that would silently fail open and bypass utility capacity. Fallback applies only to an explicitly unsupported model/payload/endpoint (including a verified 404/501); upstream 401/403 is a configuration error returned as 503, not an unsupported case.
 
-## 6. Estimator и routing
+## 6. Estimator and routing
 
-1. После auth, model access, payload/output validation и pool precheck выполнить bounded preflight; до inference admission, без inference counters/circuit permits.
-2. Normal mode использует существующий TokenizationCoordinator и `Proxy.Tokenize`. Общие client/backend utility limits учитывают public tokenize + internal preflight. RPM utility списывается один раз за каждый реально приобретённый preflight operation; batch из нескольких prompts делает несколько operations последовательно. Inference RPM до успешного inference admission не списывается.
-3. Новый `LLMGW_ADMISSION_ESTIMATE_TIMEOUT=2s`, диапазон (0,30s]; total deadline на весь preflight, не на один prompt. Ответ не более 8 MiB (`LLMGW_ADMISSION_ESTIMATE_MAX_RESPONSE_BYTES`, диапазон 1 KiB..64 MiB); bounded decoding, body закрывается во всех исходах. Не сохранять tokens/token_strs; наружу нужны только count и max_model_len.
-4. Validate count ≥0, max_model_len >0, integer bounds, count/tokens consistency если tokens присутствуют. Count missing/null, malformed/truncated response → 503 `token_estimation_unavailable`. `I+O` для каждого prompt не превышает известный model context; ошибку не маскировать как overload.
-5. Не считать `/tokenize` универсальным JSON pass-through: adapter строит версионный request из inference fields с теми же chat-formatting defaults. Профиль совместимости на vLLM v0.28.0, pinned в compose; иные версии требуют qualification fixtures.
-6. Pool должен быть однородным по model/tokenizer/template/options. `estimationProfile` фиксирует операторское утверждение, которое проверяется acceptance-прогоном для всех backend. Если профиль не квалифицирован, включать pool нельзя организационно; шлюз не может доказать совпадение скрытых server settings только по model name.
-7. Нормальная routing/affinity и один pre-byte retry сохраняются в пределах неизменного pool/profile. Оценка с одного backend применима к другому только в этом профиле. Изменение pool model/profile/revision во время preflight → re-resolve/re-estimate максимум один раз; дальше retryable 503. Ни одного повторного Acquire с новым UUID после ambiguous admission outcome в normal mode.
-8. Перед dispatch проверить актуальные auth/access, pool/profile и backend identity. После успешного admission новые size-policy limits не применяются к этому lease задним числом; смена model/profile запрещает dispatch старого payload. Retry не создаёт второй token reservation.
+1. After auth, model access, payload/output validation, and the pool precheck, run bounded preflight before inference admission, without inference counters/circuit permits.
+2. Normal mode uses the existing TokenizationCoordinator and `Proxy.Tokenize`. Shared client/backend utility limits cover public tokenize plus internal preflight. Debit utility RPM once per acquired preflight operation; a batch of prompts performs multiple operations sequentially. Do not debit inference RPM before successful inference admission.
+3. Add `LLMGW_ADMISSION_ESTIMATE_TIMEOUT=2s`, range (0,30s]; this is the total deadline for the entire preflight, not one prompt. Limit responses to 8 MiB (`LLMGW_ADMISSION_ESTIMATE_MAX_RESPONSE_BYTES`, range 1 KiB..64 MiB); bound decoding and close the body on every outcome. Do not retain tokens/token_strs; only count and max_model_len are needed outside the adapter.
+4. Validate count ≥0, max_model_len >0, integer bounds, and count/tokens consistency when tokens are present. Missing/null count or malformed/truncated responses return 503 `token_estimation_unavailable`. `I+O` for each prompt must not exceed the known model context; do not disguise this error as overload.
+5. Do not treat `/tokenize` as universal JSON pass-through: the adapter builds a version-specific request from inference fields using the same chat-formatting defaults. The compatibility baseline is vLLM v0.28.0, pinned in compose; other versions require qualification fixtures.
+6. A pool must be homogeneous in model/tokenizer/template/options. `estimationProfile` records an operator assertion verified by acceptance runs on every backend. An unqualified profile must not be enabled operationally; the gateway cannot prove identical hidden server settings from the model name alone.
+7. Preserve normal routing/affinity and one pre-byte retry within an unchanged pool/profile. An estimate from one backend applies to another only within that profile. A pool model/profile/revision change during preflight triggers at most one re-resolution/re-estimation, then a retryable 503. Never retry Acquire with a new UUID after an ambiguous admission outcome in normal mode.
+8. Before dispatch, check current auth/access, pool/profile, and backend identity. After successful admission, new size-policy limits do not apply retroactively to that lease; a model/profile change prevents dispatch of the old payload. A retry does not create another token reservation.
 
-## 7. Atomic accounting и lifecycle
+## 7. Atomic accounting and lifecycle
 
-В `AdmissionRequest` добавляются immutable `TokenReservation` (enabled, estimate, output allowance, prompt count, n, reserved total, estimator kind/profile, client/pool limits, policy revisions). Fingerprint включает эти поля. Raw payload и даже его hash не включаются в durable storage. Normal lease и reservation — одна admission transaction/critical section, не две независимо успешные операции.
+Add immutable `TokenReservation` to `AdmissionRequest` (enabled, estimate, output allowance, prompt count, n, reserved total, estimator kind/profile, client/pool limits, policy revisions). Include these fields in the fingerprint. Do not put the raw payload or even its hash in durable storage. The normal lease and reservation use one admission transaction/critical section, not two independently successful operations.
 
-При включённых budgets:
+With budgets enabled:
 
 ```
 poolOutstanding + R <= poolBudget
-clientOutstanding + R <= clientBudget  // если clientBudget > 0
+clientOutstanding + R <= clientBudget  // if clientBudget > 0
 ```
 
-Budget exhaustion даёт 429 `token_budget_exhausted` + Retry-After; scope=client/pool в bounded telemetry. `R` выше полного budget также 429, с пояснением, что уменьшение запроса/смена policy необходимо: Retry-After не обещает достаточную будущую ёмкость. Проверка всех лимитов предшествует RPM debit/lease insert. Суммы вычисляются в int64 с overflow guard; PostgreSQL SUM(bigint) приводится только после проверки диапазона.
+Budget exhaustion returns 429 `token_budget_exhausted` with Retry-After; bounded telemetry records scope=client/pool. `R` greater than the entire budget also returns 429, explaining that the request must shrink or policy must change: Retry-After does not promise sufficient future capacity. Check all limits before RPM debit/lease insertion. Compute sums in int64 with overflow guards; cast PostgreSQL SUM(bigint) only after range validation.
 
-| Событие | Outstanding | TPM / evidence |
+| Event | Outstanding | TPM / evidence |
 | --- | --- | --- |
-| Успешный Acquire | +R ровно один раз | RPM один раз; TPM остаётся soft |
-| Duplicate Acquire того же fingerprint | Без изменения | Возвращает тот же live lease / terminal rejection |
-| Изменённый fingerprint | Без изменения | Idempotency conflict |
-| Generation retry | Без изменения | Тот же lease, отдельный backend attempt |
-| Renew | Продлить срок R, не изменить величину | Неверный owner не меняет ни одного поля |
-| Complete с valid usage | −R один раз | Actual input+output дебитуют soft TPM один раз; фиксируется difference actual−R |
-| Complete без valid usage / cancel / transport error | −R один раз после завершения локального lifecycle | Usage=unknown, не actual=0; soft TPM не выдумывает расход |
-| Потеря completion / replica crash | R остаётся до TTL | После TTL исключается из sums независимо от cleanup; usage unknown |
-| Late completion после expiry | Outstanding не уменьшается второй раз | При retained receipt actual TPM можно применить один раз как сегодня |
-| Duplicate completion | Без изменения | Первый terminal completion wins; поздний альтернативный usage не переписывает результат |
+| Successful Acquire | +R exactly once | RPM once; TPM remains soft |
+| Duplicate Acquire with the same fingerprint | Unchanged | Returns the same live lease / terminal rejection |
+| Changed fingerprint | Unchanged | Idempotency conflict |
+| Generation retry | Unchanged | Same lease, separate backend attempt |
+| Renew | Extend R's lifetime without changing its amount | An invalid owner changes no fields |
+| Complete with valid usage | −R once | Actual input+output debit soft TPM once; record actual−R difference |
+| Complete without valid usage / cancellation / transport error | −R once after the local lifecycle finishes | Usage=unknown, not actual=0; soft TPM does not invent consumption |
+| Lost completion / replica crash | R remains until TTL | Excluded from sums after TTL independently of cleanup; usage unknown |
+| Late completion after expiry | No second outstanding decrement | With a retained receipt, actual TPM can be applied once as today |
+| Duplicate completion | Unchanged | First terminal completion wins; later alternative usage does not overwrite it |
 
-Консервативность здесь: весь R удерживается без промежуточных refunds до terminal/expiry; ошибка estimate не уменьшает резерв автоматически. Actual>R не создаёт отрицательные counters и не отменяет доставленный ответ; это telemetry/calibration failure. Успех после early EOS освобождает весь R, а не R−actual: completed work больше не outstanding.
+Conservative accounting means retaining all of R without intermediate refunds until terminal completion/expiry; an estimation error does not automatically reduce the reservation. Actual>R does not create negative counters or undo a delivered response; it is a telemetry/calibration failure. Success after early EOS releases all of R, not R−actual: completed work is no longer outstanding.
 
-Missing usage не означает бесплатную гарантию потребления: TPM остаётся soft, cancellation может скрыть расход, и TTL не доказывает остановку GPU. Эти ограничения сохраняются явно. Требование prepaid TPM при unknown usage — другой выбранный подход, не скрытая часть реализации.
+Missing usage does not imply guaranteed free consumption: TPM remains soft, cancellation can hide consumption, and TTL does not prove that GPU work has stopped. These limitations remain explicit. Requiring prepaid TPM for unknown usage would select a different approach, not an implicit part of this implementation.
 
-PostgreSQL хранит reserved amount на request_leases; immutable metadata и reconciliation outcome — на admission_operations. Counts используют expires_at>database-now под прежними pool→client locks. Нет отдельной таблицы суммарных counters, которую надо чинить после crash. Local хранит суммы по client/pool и снимает ровно сохранённый R через общий removeLease path. Во всех Renew/Complete проверяются LeaseID, ClientID, PoolID, RequestID, ReplicaID по сохранённому owner, но не ExpiresAt из старого handle (renewal его меняет).
+PostgreSQL stores the reserved amount on request_leases, with immutable metadata and reconciliation outcome on admission_operations. Counts use expires_at>database-now under the existing pool→client locks. There is no separate aggregate-counter table to repair after a crash. Local coordination stores client/pool sums and removes exactly the stored R through the common removeLease path. All Renew/Complete operations validate LeaseID, ClientID, PoolID, RequestID, and ReplicaID against the stored owner, but not ExpiresAt from an old handle (renewal changes it).
 
-Local receipt history уже ограничена capacity/retention. Для enabled reservations evicted receipt не должен позволять replay ещё допустимого operation timestamp: хранить bounded per-process replay cutoff, reject older/equal timestamps после eviction. Сначала искать existing receipt/live lease и валидировать fingerprint, затем проверять cutoff только для нового operation. Cutoff продвигается до max OperationStartedAt вытесненных token receipts, но receipt с OperationStartedAt>now нельзя вытеснять до достижения его времени. Если нет допустимого terminal eviction candidate — отказ coordination_unavailable, без продвижения cutoff в будущее. Таким образом future skew до 5m не блокирует все свежие admission на 5m; capacity exhaustion остаётся честным отказом. При совпадении timestamp с cutoff новый operation получает stale_operation; gateway не повторяет его автоматически новым ID. Регресс wall clock ниже cutoff может временно снизить доступность; safety предпочтительнее resurrect. Legacy-only requests не меняют прежний replay contract, но не могут вытеснять protected token receipts в обход правил. PostgreSQL продолжает 24h receipt retention. Полный parity terminal-history retention не обещается.
+Local receipt history is already bounded by capacity/retention. For enabled reservations, eviction must not permit replay of an otherwise valid operation timestamp: maintain a bounded per-process replay cutoff and reject older/equal timestamps after eviction. First look up an existing receipt/live lease and validate the fingerprint, then apply the cutoff only to new operations. Advance the cutoff to the maximum OperationStartedAt of evicted token receipts, but do not evict a receipt with OperationStartedAt>now until its time arrives. If no eligible terminal eviction candidate exists, return coordination_unavailable without advancing the cutoff into the future. Thus, allowed future skew of up to 5m does not block all fresh admissions for 5m; capacity exhaustion remains an explicit rejection. A new operation whose timestamp equals the cutoff receives stale_operation; the gateway does not automatically retry it with a new ID. A wall-clock regression below the cutoff may temporarily reduce availability; safety takes precedence over resurrection. Legacy-only requests retain their prior replay contract but cannot evict protected token receipts outside these rules. PostgreSQL retains its 24h receipt retention. Full parity of terminal-history retention is not promised.
 
-## 8. Emergency — требование пользователя
+## 8. Emergency — user requirement
 
-При recoverable outage / recovery gate High и Critical сохраняют admission при существующих class/client concurrency caps. Normal/Background не получают emergency. Permanent consistency fault по-прежнему запрещает новые admissions. Новый механизм не лечит readiness и не обходится поверх revoked/disabled identity из последнего доверенного snapshot.
+During recoverable outages or while the recovery gate is active, High and Critical retain admission within existing class/client concurrency caps. Normal/Background do not receive emergency admission. Permanent consistency faults still prohibit new admissions. The new mechanism does not restore readiness or bypass revoked/disabled identities from the latest trusted snapshot.
 
-В enabled pool emergency атомарно проверяет существующие emergency concurrency + `R` по client и pool **в одной локальной critical section**. Pool cap = emergencyMaxOutstandingTokens либо pool maxOutstandingTokens; client cap = min(положительный client budget, pool emergency cap), при client=0 — pool emergency cap. Суммы только emergency-запросов этой реплики, включая пережившие recovery. Release idempotent. Возвращение normal mode не обнуляет emergency counters и не переносит их задним числом в PostgreSQL.
+For enabled pools, emergency admission atomically checks existing emergency concurrency plus `R` by client and pool **in one local critical section**. The pool cap is emergencyMaxOutstandingTokens or pool maxOutstandingTokens; the client cap is min(positive client budget, pool emergency cap), or the pool emergency cap when client=0. Sums cover only this replica's emergency requests, including those surviving recovery. Release is idempotent. Returning to normal mode does not clear emergency counters or retroactively move them into PostgreSQL.
 
-Preflight при outage не зависит от недоступного PostgreSQL: отдельный внутренний emergency tokenizer limiter, client concurrency=1, backend concurrency=1, client RPM=30 с burst=1, total estimate timeout=2s (или меньший настроенный normal timeout). Backend health/auth/secret checks сохраняются. Эти defaults конфигурируются `LLMGW_ADMISSION_EMERGENCY_ESTIMATE_CLIENT_MAX_INFLIGHT`, `...BACKEND_MAX_INFLIGHT`, `...CLIENT_RPM` с диапазонами существующего TokenizationPolicy; fingerprint включает их. Public `/tokenize` остаётся на обычном coordinator и не получает emergency.
+Outage preflight does not depend on unavailable PostgreSQL: use a separate internal emergency tokenizer limiter, client concurrency=1, backend concurrency=1, client RPM=30 with burst=1, total estimate timeout=2s (or a smaller configured normal timeout). Preserve backend health/auth/secret checks. Configure these defaults through `LLMGW_ADMISSION_EMERGENCY_ESTIMATE_CLIENT_MAX_INFLIGHT`, `...BACKEND_MAX_INFLIGHT`, and `...CLIENT_RPM`, using the existing TokenizationPolicy ranges; include them in the fingerprint. Public `/tokenize` remains on the normal coordinator and receives no emergency mode.
 
-Emergency tokenization не меняет inference circuit, не пишет inference usage и не расходует durable utility RPM. Это дополнительная per-replica utility capacity при аварии; её нельзя рекламировать как общий utility cap. Если tokenizer недоступен или estimate нельзя получить по выбранной политике — конкретный запрос получает 503; сохранение emergency не означает обход size validation.
+Emergency tokenization does not modify inference circuits, record inference usage, or debit durable utility RPM. It provides additional per-replica utility capacity during outages and must not be advertised as a shared utility cap. If tokenization is unavailable or the selected policy cannot produce an estimate, that request receives 503; preserving emergency admission does not bypass size validation.
 
-Если normal TokenizationCoordinator.Acquire теряет БД до upstream HTTP dispatch, gateway после recheck recoverable status может ровно один раз перейти normal→emergency для eligible High/Critical. Permanent fault, utility 429, upstream timeout/5xx и token_policy_transition такого перехода не разрешают. Total preflight deadline начинается до первой попытки и не перезапускается. Уже полученные batch estimates можно использовать только при том же snapshot/model/profile; failed-to-acquire prompt получает новый **utility** emergency operation ID, normal utility ID не replay через local coordinator. Неизвестный durable utility lease может оставаться до TTL; это входит в объявленный overlap. Если deadline исчерпан, ответ503, не unbounded retry. Весь inference request после такого перехода использует emergency reservation даже если readiness успела восстановиться; повторный permanent/auth/profile check перед dispatch обязателен. Если outage возник после успешного normal preflight, готовый estimate используется в emergency без повторной токенизации при неизменном профиле.
+If normal TokenizationCoordinator.Acquire loses database access before upstream HTTP dispatch, the gateway may transition normal→emergency exactly once for eligible High/Critical after rechecking recoverable status. Permanent faults, utility 429, upstream timeout/5xx, and token_policy_transition do not permit this transition. The total preflight deadline starts before the first attempt and is never reset. Already obtained batch estimates may be reused only with the same snapshot/model/profile; the prompt whose acquisition failed receives a new emergency **utility** operation ID, and the normal utility ID is not replayed through the local coordinator. An unresolved durable utility lease may remain until TTL; this is part of the documented overlap. If the deadline is exhausted, return 503 rather than retrying without bounds. After this transition, the entire inference request uses an emergency reservation even if readiness recovers; repeat permanent-fault/auth/profile checks before dispatch. If the outage starts after successful normal preflight, reuse the estimate for emergency without retokenizing when the profile is unchanged.
 
-Если normal Acquire закончился неопределённым результатом, возможен оставшийся distributed reservation до TTL и один emergency lifecycle. Генерация стартует не более одного раза со стороны gateway до его обычного upstream retry; повторный normal allocation для того же запроса не выполняется. Такой overlap снижает доступную distributed capacity, но не повторно применяет completion к неизвестному lease. Ghost RPM/lease при ambiguous commit — документировать и проверять.
+If normal Acquire ends with an ambiguous outcome, a distributed reservation may remain until TTL alongside one emergency lifecycle. The gateway starts generation at most once before its ordinary upstream retry; it does not perform another normal allocation for that request. This overlap reduces available distributed capacity but does not apply completion to an unknown lease again. Document and test ghost RPM/leases after ambiguous commits.
 
-При N репликах steady shared budget и emergency budgets могут сосуществовать: ориентир outstanding bookkeeping — `B_shared + sum(B_emergency_replica)`, а при снижении policy старые leases могут быть выше новых caps. Это не GPU bound. Глобальный ceiling в outage/recovery не обещается; slot reserve и новый token budget — разные ограничения. Общий pool token budget также не гарантирует token headroom для High: отдельный High token reserve в #23 не добавляется.
+With N replicas, the steady shared budget and emergency budgets may coexist: the outstanding-bookkeeping reference is `B_shared + sum(B_emergency_replica)`, while policy reductions may leave old leases above the new caps. This is not a GPU bound. No global ceiling is promised during outage/recovery; the slot reserve and new token budget are different limits. A shared pool token budget also does not guarantee token headroom for High: #23 adds no separate High token reserve.
 
-## 9. API, telemetry, privacy
+## 9. API, telemetry, and privacy
 
-Errors используют текущий OpenAI-shaped envelope. 400: `input_token_limit_exceeded`, `output_token_limit_exceeded`, `token_estimation_unsupported` и invalid payload. 429: `token_budget_exhausted`, либо существующие utility/concurrency/rate причины. 503: unavailable estimation/coordination, stale policy/profile и enable transition. Временные 429/503 содержат Retry-After; cancellation сохраняет существующее поведение до/после response commitment.
+Errors use the existing OpenAI-shaped envelope. 400: `input_token_limit_exceeded`, `output_token_limit_exceeded`, `token_estimation_unsupported`, and invalid payload. 429: `token_budget_exhausted` or existing utility/concurrency/rate reasons. 503: unavailable estimation/coordination, stale policy/profile, and enable transition. Transient 429/503 responses include Retry-After; cancellation retains existing behavior before/after response commitment.
 
-Добавить numeric-only reservation fields к gateway RequestEvent и отдельный bounded observer accounting event (coordinator/expiry), чтобы видеть releases без HTTP completion. Метрики: estimated/reserved/actual token histograms, outstanding gauge по pool+mode, unknown-usage/underestimate/rejection counters, preflight latency и mode normal/emergency. Gauge distributed берётся из authoritative snapshot; не складывать одинаковый shared gauge разных replicas. Labels: pool, class, estimator kind, scope, mode, bounded reason; никаких request IDs, fingerprints, prompt hashes и произвольных errors.
+Add numeric-only reservation fields to gateway RequestEvent and a separate bounded accounting observer event (coordinator/expiry) to expose releases without HTTP completion. Metrics: estimated/reserved/actual token histograms, outstanding gauge by pool+mode, unknown-usage/underestimate/rejection counters, preflight latency, and normal/emergency mode. Obtain the distributed gauge from an authoritative snapshot; do not sum identical shared gauges across replicas. Labels: pool, class, estimator kind, scope, mode, bounded reason; no request IDs, fingerprints, prompt hashes, or arbitrary errors.
 
-Actual metrics существующей usage analytics не заполнять оценками. Дубли receipt replay не дают повторного accounting event. Логи только числовые amounts и bounded outcomes. Не сохранять prompts, generation, token strings/IDs, raw tokenizer response, credentials. Проверить sentinel strings в stdout, observer events, SQL metadata и errors. Input/output для вызова upstream существуют только в памяти request lifecycle; кэш промптов не добавляется.
+Do not populate existing actual-usage analytics with estimates. Duplicate receipt replay must not emit another accounting event. Log only numeric amounts and bounded outcomes. Do not store prompts, generated content, token strings/IDs, raw tokenizer responses, or credentials. Check sentinel strings in stdout, observer events, SQL metadata, and errors. Upstream input/output exists only in request-lifecycle memory; no prompt cache is added.
 
-Admin API и существующие client/pool формы показывают enabled, effective limits, class overrides, fallback и emergency per-replica семантику. Существующие редактирования, не знающие новых fields, не должны молча сбрасывать policy: omitted `requestSizeAdmission`/client token fields при update сохраняют прежние значения; явное false/0 выключает/сбрасывает. Create defaults zero. Persisted policy — часть snapshot/revision, не process-only env.
+The Admin API and existing client/pool forms expose enabled state, effective limits, class overrides, fallback, and per-replica emergency semantics. Existing edits that do not know the new fields must not silently reset policy: omitted `requestSizeAdmission`/client token fields on update preserve previous values; explicit false/0 disables/resets them. Creation defaults to zero. Persisted policy is part of the snapshot/revision, not process-only environment configuration.
 
 ## 10. Acceptance matrix
 
-| ID | Проверяемый критерий | Доказательство |
+| ID | Verifiable criterion | Evidence |
 | --- | --- | --- |
-| AC01 | Disabled/default сохраняет payload, прежние admission/TPM/emergency; нет tokenizer calls | HTTP golden + existing suite |
+| AC01 | Disabled/default preserves payload and existing admission/TPM/emergency behavior; no tokenizer calls | HTTP golden tests + existing suite |
 | AC02 | Pool/class/client precedence, invalid values, persistence/reload, partial legacy updates | Domain + SQLite + PostgreSQL + Admin/form tests |
-| AC03 | Chat/completion exact adapter, Unicode/tools/templates; Responses явный fallback/reject; missing/invalid count никогда не =0 | Payload fixtures + real model comparison |
-| AC04 | Все три endpoints, streaming, output aliases/defaults, n/batch/overflow и unsupported forms | Table-driven HTTP tests |
-| AC05 | Client/pool token sums атомарны с concurrency/RPM; same request/replay не выделяет второй резерв | Shared local/PG contract, parallel two-replica test |
-| AC06 | Уменьшение лимита, смена класса/профиля, revoke и enable transition не обходят policy | Concurrent publication/DB mutation tests |
-| AC07 | Complete/cancel/error/retry/renew/expiry/cleanup не дают утечки или double release; чужой owner не меняет lease | Shared lifecycle matrix + race tests |
-| AC08 | Missing usage, under/overestimate, completion backlog drop, late/duplicate completion имеют указанные semantics | Fault injection, fake clock, bounded backlog |
-| AC09 | Ambiguous Acquire/Complete и partial committed batch не double-charge; receipts после eviction не resurrect | Existing commit-loss proxy extended + local replay tests |
-| AC10 | High/Critical emergency проходит в пределах local token/concurrency caps; Normal/Background reject; tokenizer работает без DB; recovery не сбрасывает active emergency | Service + two HTTP gateways + outage/recovery |
-| AC11 | Tokenizer bounded по time/body/concurrency/rate, без generation circuit/analytics side effects | Slow/malformed/oversize response and saturation tests |
-| AC12 | Distinct reason/scope/mode, unknown != zero, корректный shared gauge и отсутствие содержимого в persistence/logs | Observer/Prometheus/privacy fixtures |
-| AC13 | Migrations zero defaults, contract-version incompatibility, drain upgrade/downgrade и rollback без потери active reservations | Migration + startup tests |
-| AC14 | Повторяемое сравнение High admission и TTFT под short-High/long-Background на настоящем vLLM | Real-vLLM report: model/version/hardware/config/seed, enabled vs disabled |
+| AC03 | Exact chat/completion adapter, Unicode/tools/templates; explicit Responses fallback/rejection; missing/invalid count never becomes 0 | Payload fixtures + real-model comparison |
+| AC04 | All three endpoints, streaming, output aliases/defaults, n/batch/overflow, and unsupported forms | Table-driven HTTP tests |
+| AC05 | Client/pool token sums are atomic with concurrency/RPM; request replay allocates no second reservation | Shared local/PG contract, concurrent two-replica test |
+| AC06 | Limit reductions, class/profile changes, revocation, and enable transitions do not bypass policy | Concurrent publication/DB mutation tests |
+| AC07 | Complete/cancel/error/retry/renew/expiry/cleanup cause no leaks or double release; foreign owners cannot mutate leases | Shared lifecycle matrix + race tests |
+| AC08 | Missing usage, under/overestimation, completion-backlog drops, late/duplicate completion follow specified semantics | Fault injection, fake clock, bounded backlog |
+| AC09 | Ambiguous Acquire/Complete and partially committed batches do not double-charge; evicted receipts cannot resurrect | Extended commit-loss proxy + local replay tests |
+| AC10 | High/Critical emergency admission respects local token/concurrency caps; Normal/Background reject; tokenizer works without DB; recovery preserves active emergency accounting | Service + two HTTP gateways + outage/recovery |
+| AC11 | Tokenizer is bounded by time/body/concurrency/rate, without generation circuit/analytics side effects | Slow/malformed/oversized-response and saturation tests |
+| AC12 | Distinct reason/scope/mode, unknown != zero, correct shared gauge, and no content in persistence/logs | Observer/Prometheus/privacy fixtures |
+| AC13 | Zero migration defaults, contract-version incompatibility, drain upgrades/downgrades, and rollback without losing active reservations | Migration + startup tests |
+| AC14 | Repeatable comparison of High admission and TTFT under short-High/long-Background traffic on real vLLM | Real-vLLM report: model/version/hardware/config/seed, enabled vs disabled |
 
-Пример deterministic accounting: Bpool=1000, Bclient=800, R=600 → первый admit, второй этого клиента reject; другой клиент R=400 admit до ровно 1000; R=1 reject; completion первого освобождает 600, replay completion освобождает 0. High не обходит total token/client/RPM/TPM limits.
+Deterministic accounting example: Bpool=1000, Bclient=800, R=600 → admit the first request, reject a second from that client; admit another client's R=400 to reach exactly 1000; reject R=1; completing the first releases 600, replaying completion releases 0. High does not bypass total token/client/RPM/TPM limits.
 
-## 11. Real-vLLM qualification и rollout
+## 11. Real-vLLM qualification and rollout
 
-Для AC14: фиксированные model/tokenizer/template revisions, vLLM image digest, hardware, scheduling/cache config, gateway commit, topology и все budgets. Две серии disabled/enabled с одинаковыми seeded prompts и load schedule, 3 повтора каждого режима после warm-up, минимум 100 High probe attempts на повтор. Записывать attempted/admitted/rejected по причинам, TTFT p50/p95/p99 **для завершившихся High**, end-to-end latency включая preflight, preflight latency, Background throughput, estimation error, missing usage и peak outstanding. Не сравнивать TTFT только оставшихся successful запросов без admission fraction.
+For AC14, pin model/tokenizer/template revisions, vLLM image digest, hardware, scheduling/cache configuration, gateway commit, topology, and all budgets. Run paired disabled/enabled series with identical seeded prompts and load schedules, 3 repetitions per mode after warm-up, and at least 100 High probe attempts per repetition. Record attempted/admitted/rejected counts by reason, TTFT p50/p95/p99 **for completed High requests**, end-to-end latency including preflight, preflight latency, Background throughput, estimation error, missing usage, and peak outstanding. Do not compare TTFT only for surviving successful requests without reporting the admission fraction.
 
-Сценарий обязан реально упереться в token budget (не раньше в utility RPM или concurrency); подобрать нагрузку и зафиксировать calibration до сравнения. Hard pass: expected token denials, eligible High допускается при достаточных всех budgets, output caps соблюдаются, accounting восстанавливается; численное улучшение TTFT не гарантировано. Отчёт обязан показать изменение admission/TTFT и объяснить ухудшение, если оно есть. Synthetic backend не заменяет GPU evidence. Без real-vLLM прогона AC14 остаётся pending, issue не объявлять полностью закрытым.
+The scenario must actually hit the token budget before utility RPM or concurrency limits; tune the workload and record calibration before comparing modes. Hard pass conditions: expected token denials, eligible High admission when all budgets permit it, enforced output caps, and recovered accounting; numerical TTFT improvement is not guaranteed. The report must show the admission/TTFT change and explain any regression. A synthetic backend does not replace GPU evidence. Without a real-vLLM run, AC14 remains pending and the issue must not be declared fully complete.
 
-Миграции: SQLite `006_request_size_admission.sql`; PostgreSQL `000007_request_size_admission.up/down.sql` (перепроверить номера перед реализацией). Persist policy JSON/text с валидацией и сохранением сравнимости domain structs; не добавлять map/slice в ModelPool, который сравнивается через `!=`. Для class overrides использовать fixed struct с четырьмя полями. PostgreSQL coordination contract 3→4. Старые процессы drain/stop перед запуском новой группы; существующий startup wait/unregister применяется. Down migration не удаляет nonzero active token leases/незавершённый контракт. SQLite runtime counters не durable; restart требует прекращения старого процесса, не HA deployment.
+Migrations: SQLite `006_request_size_admission.sql`; PostgreSQL `000007_request_size_admission.up/down.sql` (recheck numbering before implementation). Persist validated policy JSON/text while keeping domain structs comparable; do not add maps/slices to ModelPool, which is compared with `!=`. Use a fixed four-field struct for class overrides. PostgreSQL coordination contract changes 3→4. Drain/stop old processes before starting the new group; existing startup wait/unregister applies. Down migration must not remove nonzero active token leases or an unfinished contract. SQLite runtime counters are not durable; restart requires the old process to stop and does not provide HA deployment.
 
-## 12. Источники и ограничения анализа
+## 12. Sources and analysis limitations
 
-Локальные исходники и тесты на указанной базе; Tier 2 graph navigation с exact source verification. Coverage проверена; no_recorded_issue означает только отсутствие зарегистрированных gaps. Граф может смешивать одноимённые Go methods (например Complete разных coordinators); важные выводы подтверждены чтением файлов.
+Local source and tests at the stated base; Tier 2 graph navigation with exact source verification. Coverage was checked; no_recorded_issue means only that no gaps were recorded. The graph can conflate Go methods with the same name (for example Complete on different coordinators); material conclusions were confirmed by reading files.
 
-Upstream baseline: [tokenize protocol v0.28.0](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/serve/tokenize/protocol.py), [chat protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/chat_completion/protocol.py), [completion protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/completion/protocol.py), [Responses protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/responses/protocol.py). Они подтверждают разные request schemas/output aliases; работоспособность на пользовательском deployment пока не проверена. Новые renderer APIs из latest docs не считаются доступными в baseline и не вводятся скрытой зависимостью.
+Upstream baseline: [tokenize protocol v0.28.0](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/serve/tokenize/protocol.py), [chat protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/chat_completion/protocol.py), [completion protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/completion/protocol.py), [Responses protocol](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/entrypoints/openai/responses/protocol.py). These confirm the different request schemas/output aliases; behavior on the user's deployment has not been verified. New renderer APIs from latest documentation are not assumed available in the baseline and are not introduced as hidden dependencies.
 
-Связанный план: [implementation plan](../plans/2026-11-10-issue-23-token-reservations.md). Анализ и baseline evidence: [evidence](../../issue-23-analysis-and-evidence.md).
+Related plan: [implementation plan](../plans/2026-11-10-issue-23-token-reservations.md). Analysis and baseline evidence: [evidence](../../issue-23-analysis-and-evidence.md).

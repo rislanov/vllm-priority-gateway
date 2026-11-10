@@ -2,51 +2,51 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans or superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Реализовать #23: оценка input, server output caps и атомарные outstanding-token reservations с сохранением emergency admission.
+**Goal:** Implement #23: input estimation, server-side output caps, and atomic outstanding-token reservations while preserving emergency admission.
 
-**Architecture:** Pure policy/payload layer готовит immutable reservation. Internal estimator использует существующий upstream tokenizer transport; local/PostgreSQL admission хранит резерв вместе с inference lease. Emergency имеет явно локальные token/utility caps и переживает recovery без сброса учёта.
+**Architecture:** A pure policy/payload layer prepares an immutable reservation. The internal estimator uses the existing upstream tokenizer transport; local/PostgreSQL admission stores the reservation with the inference lease. Emergency mode has explicitly local token/utility caps and survives recovery without resetting accounting.
 
-**Tech Stack:** Go 1.27.3, net/http, chi, pgx/PostgreSQL, SQLite, существующие migrations/registry/Prometheus/contracts. Новая tokenizer dependency не требуется.
+**Tech Stack:** Go 1.27.3, net/http, chi, pgx/PostgreSQL, SQLite, existing migrations/registry/Prometheus/contracts. No new tokenizer dependency is required.
 
 **Spec:** [design](../specs/2026-11-10-issue-23-token-reservations-design.md).
 
-**Status:** Проект плана; сначала review/согласование спецификации. Product code не изменён. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
+**Status:** Draft plan; review/approve the specification first. Product code is unchanged. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
 
 ## Global Constraints
 
-- Emergency High/Critical сохраняется — подтверждено пользователем. Глобальный ceiling при outage/recovery не обещается.
-- Disabled/default сохраняет прежние inference/soft-TPM/public-tokenize semantics.
-- Token amounts int64, диапазон `0..10^12`, checked sum/multiply. Нет raw content в persistence/logs.
-- Три inference endpoints должны иметь явный enabled-policy contract; unsupported input не считается нулём.
-- Normal allocation: один receipt + один lease + один RPM debit + один reservation atomically. Retry/expiry/replay не создаёт второй резерв.
-- Existing lock order pool → client → lease → receipt и READ COMMITTED post-lock counts сохраняются; network preflight вне locks.
-- ModelPool остаётся сравнимым Go struct. ClassLimits — fixed struct, не map.
-- vLLM v0.28.0 — qualification baseline. Ни latest renderer, ни новую модель не считать проверенными автоматически.
-- История local receipts bounded; PostgreSQL replay window 24h. Сохранять различие guarantees.
+- Preserve High/Critical emergency admission, as confirmed by the user. No global ceiling is promised during outage/recovery.
+- Disabled/default retains existing inference/soft-TPM/public-tokenize semantics.
+- Token amounts are int64, range `0..10^12`, with checked addition/multiplication. No raw content in persistence/logs.
+- All three inference endpoints must have an explicit enabled-policy contract; unsupported input is not counted as zero.
+- Normal allocation atomically creates one receipt + one lease + one RPM debit + one reservation. Retry/expiry/replay does not create a second reservation.
+- Preserve the existing pool → client → lease → receipt lock order and READ COMMITTED post-lock counts; network preflight runs outside locks.
+- ModelPool remains a comparable Go struct. ClassLimits is a fixed struct, not a map.
+- vLLM v0.28.0 is the qualification baseline. Neither the latest renderer nor a new model is automatically qualified.
+- Local receipt history is bounded; PostgreSQL has a 24h replay window. Preserve the distinction between their guarantees.
 
 ## Review Focus
 
-1. Одновременно enabled-policy update, legacy leases и emergency overlap: нельзя обнулить outstanding или незаметно пропустить неоценённый запрос (Tasks 1, 3–6).
-2. Tokenizer принимает похожий, но иной prompt (templates, tools, Unicode, Responses history): оценка должна быть доказуемо применима либо явно fallback/reject (Task 2).
-3. Same LeaseID с чужим owner, изменённым R или поздним completion: ни чужого release, ни повторного RPM/TPM debit (Tasks 3–4).
-4. Recovery во время preflight и ambiguous commit: максимум один generation lifecycle, локальные caps не сбрасываются, permanent fault не маскируется emergency (Tasks 5–6).
-5. Unknown usage и telemetry replay: estimated не выдаётся за actual, distributed gauge не суммируется по репликам, содержимое не утекает (Tasks 3–4, 7).
+1. Concurrent enabled-policy updates, legacy leases, and emergency overlap must not reset outstanding amounts or silently admit an unestimated request (Tasks 1, 3–6).
+2. A tokenizer may accept a similar but different prompt (templates, tools, Unicode, Responses history): the estimate must be demonstrably applicable or use explicit fallback/rejection (Task 2).
+3. The same LeaseID with a foreign owner, changed R, or late completion must neither release another owner's resources nor repeat an RPM/TPM debit (Tasks 3–4).
+4. Recovery during preflight and ambiguous commits must preserve at most one generation lifecycle and local caps; emergency must not mask a permanent fault (Tasks 5–6).
+5. Unknown usage and telemetry replay must not present estimates as actual usage, sum shared gauges across replicas, or leak content (Tasks 3–4, 7).
 
-## Карта файлов и интерфейсов
+## File and interface map
 
-Новые focused modules:
+New focused modules:
 
-- `internal/domain/request_size.go`: comparable persistent policy/limits, effective resolution.
-- `internal/admission/request_size.go`: payload/output validation, checked reservation arithmetic.
-- `internal/gateway/token_estimator.go`: bounded preflight orchestration и выбор normal/emergency utility режима.
-- `internal/coordination/token_reservation.go`: immutable admission metadata и identity helpers.
-- `internal/coordination/contracttest/token_reservation.go`: единая accounting matrix для local и PostgreSQL.
+- `internal/domain/request_size.go`: comparable persistent policy/limits and effective policy resolution.
+- `internal/admission/request_size.go`: payload/output validation and checked reservation arithmetic.
+- `internal/gateway/token_estimator.go`: bounded preflight orchestration and normal/emergency utility mode selection.
+- `internal/coordination/token_reservation.go`: immutable admission metadata and identity helpers.
+- `internal/coordination/contracttest/token_reservation.go`: shared accounting matrix for local and PostgreSQL coordination.
 - `internal/observability/token_reservation.go`: numeric-only telemetry.
-- Новые test files рядом с каждым module; `tests/postgres/token_reservation_test.go`, `tests/integration/token_reservation_test.go`, `tests/e2e/token_reservation_test.go`.
+- New tests beside each module; `tests/postgres/token_reservation_test.go`, `tests/integration/token_reservation_test.go`, `tests/e2e/token_reservation_test.go`.
 
-Существующие integration points: `domain/types.go`, `store/models.go`, `store/clients.go`, `store/pools.go`, `store/snapshot.go`, `store/postgres/configuration.go`, `httpapi/admin.go`, `web/resources.go`, `web/templates/clients.html`, `web/templates/backends.html`, `gateway/forward.go`, `gateway/forward_admission.go`, `gateway/service.go`, `gateway/observer.go`, `coordination/{types.go,emergency.go,lease_manager.go}`, `coordination/local/admission.go`, `coordination/postgres/{admission.go,cleanup.go,replica.go}`, `cmd/gateway/application.go`, `config/config.go`, Makefile/docs.
+Existing integration points: `domain/types.go`, `store/models.go`, `store/clients.go`, `store/pools.go`, `store/snapshot.go`, `store/postgres/configuration.go`, `httpapi/admin.go`, `web/resources.go`, `web/templates/clients.html`, `web/templates/backends.html`, `gateway/forward.go`, `gateway/forward_admission.go`, `gateway/service.go`, `gateway/observer.go`, `coordination/{types.go,emergency.go,lease_manager.go}`, `coordination/local/admission.go`, `coordination/postgres/{admission.go,cleanup.go,replica.go}`, `cmd/gateway/application.go`, `config/config.go`, Makefile/docs.
 
-Нормативные новые типы (реализация тела остаётся исполнителю):
+Normative new types (bodies are left to the implementer):
 
 ```go
 // domain/request_size.go
@@ -116,118 +116,118 @@ type EstimationRequest struct {
 }
 ```
 
-Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstandingTokens int64`; pool field: `RequestSizeAdmission RequestSizePolicy`. Admin JSON uses exact names from spec through explicit DTOs (не shape Go nesting по умолчанию). Internal errors typed/enum; не выводить upstream body в API error.
+Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstandingTokens int64`; pool field: `RequestSizeAdmission RequestSizePolicy`. Admin JSON uses the specification's exact names through explicit DTOs, not the default Go nesting shape. Use typed/enum internal errors; never include upstream response bodies in API errors.
 
-## Task 1: Policy, persistence и совместимые Admin updates
+## Task 1: Policy, persistence, and compatible Admin updates
 
-**Files:** новые `domain/request_size.go`, `domain/request_size_test.go`; менять domain/store/registry/Admin/forms из карты; создать SQLite `006_request_size_admission.sql`, PostgreSQL `000007_request_size_admission.up/down.sql` и migration tests. Проверить свободные номера перед созданием.
+**Files:** create `domain/request_size.go`, `domain/request_size_test.go`; modify domain/store/registry/Admin/forms from the map; create SQLite `006_request_size_admission.sql`, PostgreSQL `000007_request_size_admission.up/down.sql`, and migration tests. Check available migration numbers before creating them.
 
-**Interfaces:** производит `RequestSizePolicy`, `RequestSizeLimits`, `ResolveRequestSizePolicy`; snapshot несёт policy/revisions; update DTO отличает absent от explicit zero/false. PostgreSQL migration добавляет nullable legacy marker / token metadata к lease/receipt; enabled=false по умолчанию.
+**Interfaces:** produces `RequestSizePolicy`, `RequestSizeLimits`, and `ResolveRequestSizePolicy`; snapshots carry policy/revisions; update DTOs distinguish absent fields from explicit zero/false. The PostgreSQL migration adds a nullable legacy marker / token metadata to leases/receipts; enabled defaults to false.
 
-- [ ] Добавить `TestResolveRequestSizePolicy`: pool input/output/default=8192/2048/512, Background=2048/256/128, client maxOutput=64 → effective input=2048/output=64/default=64. Client default=32 → default=32. Client=0 наследует; invalid negative/>10^12 rejected.
-- [ ] Добавить `TestRequestSizePolicyRoundTripAndLegacyUpdate`: создание old DTO даёт disabled; update только name сохраняет token policy; explicit enabled=false выключает; class/pool/client changes меняют revision; формы не сбрасывают невидимые поля.
-- [ ] Добавить migration tests: old schema→new zero defaults, reload equivalent policy, down refuses live nonzero reservation. Использовать native project fixtures; не создавать новый test framework.
-- [ ] Запустить `go test ./internal/domain ./internal/store/... ./internal/httpapi ./internal/web -run RequestSize -count=1`, убедиться в ожидаемом failure новых контрактов.
-- [ ] Реализовать policy/validation, SQLite/PostgreSQL CRUD/snapshot и Admin/form persistence. Добавить cross-entity validation/error path. Новые JSON поля обновлять pointer/presence-aware DTO; не превращать unrelated API validation в refactor.
-- [ ] Повторить tests, отдельно выполнить migration tests с disposable PostgreSQL. Commit: `feat: persist opt-in request size admission policies`.
+- [ ] Add `TestResolveRequestSizePolicy`: pool input/output/default=8192/2048/512, Background=2048/256/128, client maxOutput=64 → effective input=2048/output=64/default=64. Client default=32 → default=32. Client=0 inherits; negative values and values >10^12 are rejected.
+- [ ] Add `TestRequestSizePolicyRoundTripAndLegacyUpdate`: creating through the old DTO defaults to disabled; a name-only update preserves token policy; explicit enabled=false disables it; class/pool/client changes update the revision; forms do not reset fields they do not expose.
+- [ ] Add migration tests: old schema→new zero defaults, equivalent policy after reload, and downgrade refusal with a live nonzero reservation. Use existing project fixtures, not a new test framework.
+- [ ] Run `go test ./internal/domain ./internal/store/... ./internal/httpapi ./internal/web -run RequestSize -count=1` and verify the expected failures for the new contracts.
+- [ ] Implement policy/validation, SQLite/PostgreSQL CRUD/snapshots, and Admin/form persistence. Add cross-entity validation/error handling. Use pointer/presence-aware DTOs for new JSON fields; do not refactor unrelated API validation.
+- [ ] Rerun the tests and separately execute migration tests against disposable PostgreSQL. Commit: `feat: persist opt-in request size admission policies`.
 
-## Task 2: Payload bounds и bounded token estimation
+## Task 2: Payload bounds and bounded token estimation
 
-**Files:** новые `admission/request_size.go`, `admission/request_size_test.go`, `gateway/token_estimator.go`, `gateway/token_estimator_test.go`; менять `proxy/tokenization.go` только для bounded internal decoder adapter, `config/config.go`, новый `config/request_size.go`; тесты рядом.
+**Files:** create `admission/request_size.go`, `admission/request_size_test.go`, `gateway/token_estimator.go`, `gateway/token_estimator_test.go`; modify `proxy/tokenization.go` only for the bounded internal decoder adapter and `config/config.go`; create `config/request_size.go` and adjacent tests.
 
-**Interfaces:** потребляет Task 1 policy; производит PreparedRequestSize, TokenEstimate, InputEstimator. Transport остаётся `Proxy.Tokenize(ctx, proxy.TokenizationRequest) (*http.Response,error)`. Normal preflight получает utility lease через existing TokenizationCoordinator; emergency acquisition dependency внедряется в Task 5.
+**Interfaces:** consumes Task 1 policy; produces PreparedRequestSize, TokenEstimate, and InputEstimator. Transport remains `Proxy.Tokenize(ctx, proxy.TokenizationRequest) (*http.Response,error)`. Normal preflight obtains a utility lease through the existing TokenizationCoordinator; Task 5 supplies emergency acquisition dependencies.
 
-- [ ] `TestPrepareRequestSizeEndpoints`: отсутствующий cap →512 (либо effective default); explicit 2049 при max2048 →400; chat aliases 128/128 нормализуются, 128/64 rejected; response max_output_tokens сохраняется; min_tokens>cap rejected; streaming same cap.
-- [ ] `TestReservationTokensMultipliers`: inputs=[100,200], output=50,n=2 →800; inputs=[0],output=50,n=1 →51; n=0/>32, batch>32, invalid mixed batch, overflow и amount>10^12 rejected.
-- [ ] `TestEstimatorCompatibility`: все строки нормативной field matrix spec §5 имеют отдельные fixtures; Unicode, BOS/special tokens, generation prompt и continue_final_message materialize одинаково; tools/schema/inline function history используют explicit fallback/reject. Неизвестный top-level field rejected; token-ID prompt проверяется как единый prompt. Для unsupported Responses fallback=reject →400; utf8_bytes →byteLength(canonicalJSON)+overhead, никогда 0.
-- [ ] `TestEstimatorBoundsAndPrivacy`: 2s total deadline across batch, max response 8 MiB, cancellation, noninteger/missing count, count/tokens mismatch, context overflow, 401/403, 404/501, 429/5xx; fallback только для unsupported, не для temporary failures. Ни utility retries, ни inference counters, ни body в ошибке.
-- [ ] Запустить `go test ./internal/admission ./internal/gateway ./internal/proxy ./internal/config -run 'RequestSize|ReservationTokens|Estimator' -count=1`; зафиксировать expected failures.
-- [ ] Реализовать pure validation и estimator, включая table/allowlist input-bearing fields. Test fixtures закрепляют v0.28.0 mapping; неоднозначные варианты проходят fallback/reject, не эвристику «только content».
-- [ ] Проверить PASS и `go test ./internal/gateway ./internal/proxy -run Tokenization -count=1`. Commit: `feat: estimate request tokens and enforce output allowances`.
+- [ ] `TestPrepareRequestSizeEndpoints`: missing cap →512 (or effective default); explicit 2049 with max2048 →400; chat aliases 128/128 normalize, 128/64 reject; preserve response max_output_tokens; reject min_tokens>cap; streaming uses the same cap.
+- [ ] `TestReservationTokensMultipliers`: inputs=[100,200], output=50,n=2 →800; inputs=[0],output=50,n=1 →51; reject n=0/>32, batch>32, invalid mixed batches, overflow, and amounts >10^12.
+- [ ] `TestEstimatorCompatibility`: provide separate fixtures for every row of the normative field matrix in spec §5; materialize Unicode, BOS/special tokens, generation prompt, and continue_final_message consistently; tools/schema/inline function history use explicit fallback/rejection. Reject unknown top-level fields; treat token-ID input as one prompt. Unsupported Responses with fallback=reject →400; utf8_bytes →byteLength(canonicalJSON)+overhead, never 0.
+- [ ] `TestEstimatorBoundsAndPrivacy`: 2s total deadline across the batch, 8 MiB maximum response, cancellation, noninteger/missing count, count/tokens mismatch, context overflow, 401/403, 404/501, 429/5xx; fallback only for unsupported cases, not transient failures. No utility retries, inference counters, or body content in errors.
+- [ ] Run `go test ./internal/admission ./internal/gateway ./internal/proxy ./internal/config -run 'RequestSize|ReservationTokens|Estimator' -count=1`; record expected failures.
+- [ ] Implement pure validation and estimation, including the input-bearing field table/allowlist. Fixtures pin the v0.28.0 mapping; ambiguous variants use fallback/rejection, not a content-only heuristic.
+- [ ] Verify PASS and run `go test ./internal/gateway ./internal/proxy -run Tokenization -count=1`. Commit: `feat: estimate request tokens and enforce output allowances`.
 
-## Task 3: Local atomic reservation и безопасный owner lifecycle
+## Task 3: Local atomic reservations and safe owner lifecycle
 
-**Files:** новые `coordination/token_reservation.go`, `coordination/contracttest/token_reservation.go`, `coordination/local/token_reservation_test.go`; менять `coordination/types.go`, `coordination/local/admission.go`, `coordination/local/contract_test.go`.
+**Files:** create `coordination/token_reservation.go`, `coordination/contracttest/token_reservation.go`, `coordination/local/token_reservation_test.go`; modify `coordination/types.go`, `coordination/local/admission.go`, `coordination/local/contract_test.go`.
 
-**Interfaces:** `AdmissionRequest.TokenReservation`; `TokenReservationContract(t *testing.T, factory TokenReservationFactory)` с factory, которая создаёт isolated coordinator/configuration, умеет Advance/SetPolicy/Outstanding. Не привязывать assertions к storage clock. LeaseCompletion использует текущий Usage; metadata берётся из receipt.
+**Interfaces:** `AdmissionRequest.TokenReservation`; `TokenReservationContract(t *testing.T, factory TokenReservationFactory)` with a factory that creates isolated coordination/configuration and supports Advance/SetPolicy/Outstanding. Do not couple assertions to the storage clock. LeaseCompletion uses the existing Usage; metadata comes from the receipt.
 
-- [ ] В общем contract закрепить Bpool=1000/Bclient=800/R=600/400/1 example из AC05; concurrency/RPM failure не расходует tokens; token failure не расходует RPM; same Acquire 100 раз выделяет R один раз.
-- [ ] `TestTokenReservationLifecycle`: valid actual=250 → release600 и один TPM debit250; unknown usage → release600, actual unknown; expiry→release600; late actual→TPM один раз, outstanding unchanged; Complete replay→release0.
-- [ ] `TestTokenReservationOwnerMismatch`: менять по одному ClientID/PoolID/ReplicaID/RequestID в Renew и Complete; чужой operation не меняет lease, expiry, counters или TPM. Valid owner после этого продолжает работать. Показать existing Renew defect failing regression до fix.
-- [ ] `TestTokenReservationPublicationAndReplayEviction`: policy decrease не переписывает R; disable pool не убирает старые token leases из client sums; enable with legacy leases rejected until drain; evicted receipt original timestamp не resurrect; existing live lease проверяется до cutoff. Future-start token receipt не evict до now≥start, all-protected full capacity даёт unavailable без future cutoff; valid текущие owners могут завершиться.
-- [ ] Запустить `go test ./internal/coordination/local -run TokenReservation -count=1`, ожидать failures; затем добавить counters в общую mutex section и снимать только stored R через removeLease. Добавить безопасный replay cutoff для enabled admissions и immutable fingerprint metadata.
+- [ ] Encode the AC05 Bpool=1000/Bclient=800/R=600/400/1 example in the shared contract; concurrency/RPM rejection consumes no tokens; token rejection consumes no RPM; repeating the same Acquire 100 times allocates R once.
+- [ ] `TestTokenReservationLifecycle`: valid actual=250 → release600 and one TPM debit250; unknown usage → release600, actual unknown; expiry→release600; late actual→one TPM debit, outstanding unchanged; Complete replay→release0.
+- [ ] `TestTokenReservationOwnerMismatch`: change ClientID/PoolID/ReplicaID/RequestID individually in Renew and Complete; a foreign operation changes no lease, expiry, counters, or TPM. The valid owner continues operating afterward. Demonstrate the existing Renew defect with a failing regression before fixing it.
+- [ ] `TestTokenReservationPublicationAndReplayEviction`: policy reductions do not rewrite R; disabling a pool does not remove old token leases from client sums; enabling with legacy leases rejects until drain; an evicted receipt's original timestamp cannot resurrect it; existing live leases are checked before the cutoff. Do not evict future-start token receipts before now≥start; full capacity with all receipts protected returns unavailable without a future cutoff; current valid owners can still complete.
+- [ ] Run `go test ./internal/coordination/local -run TokenReservation -count=1` and expect failures; then add counters to the shared mutex section and remove only stored R through removeLease. Add a safe replay cutoff for enabled admissions and immutable fingerprint metadata.
 - [ ] `go test -race ./internal/coordination/local ./internal/coordination/contracttest` →PASS. Commit: `feat: reserve outstanding tokens in local admission`.
 
-## Task 4: PostgreSQL shared reservation и recovery contracts
+## Task 4: PostgreSQL shared reservations and recovery contracts
 
-**Files:** менять `coordination/postgres/{admission.go,cleanup.go,replica.go}`, при необходимости migration из Task1; новые `tests/postgres/token_reservation_test.go`; расширить `tests/postgres/commit_response_loss_test.go`, `cleanup_concurrency_test.go`, `configuration_delete_test.go`, `admission_parallel_test.go` и startup compatibility tests.
+**Files:** modify `coordination/postgres/{admission.go,cleanup.go,replica.go}` and, if necessary, the Task 1 migration; create `tests/postgres/token_reservation_test.go`; extend `tests/postgres/commit_response_loss_test.go`, `cleanup_concurrency_test.go`, `configuration_delete_test.go`, `admission_parallel_test.go`, and startup compatibility tests.
 
-**Interfaces:** тот же AdmissionCoordinator/TokenReservationContract; PG authoritative budget из persisted policy; normal shared outstanding=sum unexpired reserved_tokens. ContractVersion 4, RateAlgorithmVersion остаётся 1.
+**Interfaces:** the same AdmissionCoordinator/TokenReservationContract; PostgreSQL obtains authoritative budgets from persisted policy; normal shared outstanding=sum of unexpired reserved_tokens. ContractVersion becomes 4; RateAlgorithmVersion stays 1.
 
-- [ ] Запустить общий Task3 contract для PostgreSQL. Добавить 2 coordinator instances: Bpool=1000, 100 concurrent acquisitions R=100, свободные concurrency/RPM →ровно10 admits, peak1000. Разные pools одного клиента делят client budget.
-- [ ] `TestPostgresTokenReservationLostCommit`: drop successful Acquire commit response →same lease/RPM/R once; changed R/profile →idempotency conflict. Complete commit loss и partial batch retry не double-release/double-TPM.
-- [ ] `TestPostgresTokenReservationExpiryAndPolicyRace`: counts исключают expiry до cleanup; cleanup/Complete/Renew races; config delete/tombstone не мешают terminal release; policy decrease, client class change, enable transition и wrong-owner операции не обходят limits.
-- [ ] Выполнить `make test-postgres` на disposable DSN и подтвердить, что новые tests реально executed (не skip).
-- [ ] Реализовать atomic check/sums/write на existing pool→client lock order, authoritative policy validation, fingerprint и receipt metadata. Owner matching сравнивает immutable receipt identity. SUM(bigint) обрабатывать без unchecked int overflow. Сохранять pending-prefix results и synchronous_commit.
-- [ ] Проверить compatibility/drain upgrade 3→4 и rollback refusal. Измерить admission contention latency существующим test profile, не держать SQL locks во время tokenizer call.
+- [ ] Run the shared Task 3 contract for PostgreSQL. Add 2 coordinator instances: Bpool=1000, 100 concurrent acquisitions of R=100, sufficient concurrency/RPM →exactly 10 admissions, peak1000. Different pools for one client share its client budget.
+- [ ] `TestPostgresTokenReservationLostCommit`: drop a successful Acquire commit response →same lease/RPM/R once; changed R/profile →idempotency conflict. Lost Complete commit responses and partial-batch retries do not double-release or double-debit TPM.
+- [ ] `TestPostgresTokenReservationExpiryAndPolicyRace`: counts exclude expiry before cleanup; race cleanup/Complete/Renew; configuration deletion/tombstones do not prevent terminal release; policy reductions, client class changes, enable transitions, and wrong-owner operations do not bypass limits.
+- [ ] Run `make test-postgres` against a disposable DSN and verify that new tests actually execute rather than skip.
+- [ ] Implement atomic checks/sums/writes with the existing pool→client lock order, authoritative policy validation, fingerprint, and receipt metadata. Owner matching compares immutable receipt identity. Handle SUM(bigint) without unchecked integer overflow. Preserve committed-prefix results and synchronous_commit.
+- [ ] Verify compatibility/drain upgrade 3→4 and rollback refusal. Measure admission contention latency using the existing test profile; do not hold SQL locks during tokenizer calls.
 - [ ] `make test-postgres` →PASS; `go test -race ./internal/coordination/...` →PASS. Commit: `feat: coordinate token reservations across gateway replicas`.
 
-## Task 5: Emergency tokens и независимый preflight при outage
+## Task 5: Emergency tokens and independent outage preflight
 
-**Files:** менять `coordination/emergency.go`, добавить `coordination/emergency_tokens_test.go`; дописать estimator emergency provider/config, `cmd/gateway/application.go`; `gateway/service_pool_test.go` и application recovery tests.
+**Files:** modify `coordination/emergency.go`; add `coordination/emergency_tokens_test.go`; complete estimator emergency provider/configuration and `cmd/gateway/application.go`; extend `gateway/service_pool_test.go` and application recovery tests.
 
-**Interfaces:** сохранить existing Acquire для disabled flow; добавить `EmergencyAdmission.AcquireTokens(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(), bool)`. Release closure покрывает concurrency и tokens одним once. Emergency estimator использует отдельный local TokenizationCoordinator c собственными лимитами; public utility coordinator не подменять.
+**Interfaces:** preserve existing Acquire for the disabled flow; add `EmergencyAdmission.AcquireTokens(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(), bool)`. The release closure covers concurrency and tokens with one once guard. The emergency estimator uses a separate local TokenizationCoordinator with its own limits; do not replace the public utility coordinator.
 
-- [ ] `TestEmergencyTokenCaps`: High/Critical eligible, Normal/Background denied; Bpool=1000, clientBudget800, R600 →second same-client denied; другой client R400→admit; release/replay balanced; existing class caps остаются ограничивающими.
-- [ ] `TestEmergencyEstimatorWithoutDatabase`: unavailable PG, healthy tokenizer →High запрос получает bounded estimate и локальный reservation. Public `/tokenize` по-прежнему503. Concurrent emergency preflights ограничены 1/client,1/backend,30 RPM/burst1 defaults. Override config покрыт fingerprint tests.
-- [ ] `TestEmergencyEstimatorTransitionMidBatch`: первый prompt оценён, normal utility Acquire второго теряет DB →один переход в local mode с новым utility ID и оставшимся общим deadline; estimate первого сохранён только с прежним profile. Utility429/permanent fault/upstream timeout не запускают fallback. Recovery не переключает этот request обратно в normal.
-- [ ] `TestEmergencyTokenRecoveryOverlap`: normal readiness вернулась при live emergency request; локальный резерв остаётся до completion. Повторный outage не обнуляет counters; permanent error не переключается на emergency. Invalid/missing estimator не допускает unbounded запрос.
-- [ ] Запустить `go test ./internal/coordination ./internal/gateway ./internal/config ./cmd/gateway -run 'Emergency.*Token|EmergencyEstimator|TokenRecovery' -count=1`, подтвердить failures.
-- [ ] Реализовать shared local critical section, provider selection, lifetime/release и recovery overlap, сохранив семантику disabled pool. Normal tokenization и emergency tokenization budgets учитывать отдельно в telemetry.
-- [ ] Повторить targeted tests и `go test -race ./internal/coordination ./internal/gateway`; PASS. Commit: `feat: preserve bounded emergency token admission`.
+- [ ] `TestEmergencyTokenCaps`: High/Critical eligible, Normal/Background denied; Bpool=1000, clientBudget800, R600 →deny the second request from the same client; another client's R400→admit; balanced release/replay; existing class caps remain binding.
+- [ ] `TestEmergencyEstimatorWithoutDatabase`: unavailable PostgreSQL and a healthy tokenizer →a High request obtains a bounded estimate and local reservation. Public `/tokenize` still returns 503. Concurrent emergency preflights default to 1/client,1/backend,30 RPM/burst1. Fingerprint tests cover configuration overrides.
+- [ ] `TestEmergencyEstimatorTransitionMidBatch`: the first prompt has an estimate, then normal utility Acquire for the second loses DB access →one transition to local mode with a new utility ID and the remaining total deadline; retain the first estimate only with the same profile. Utility429/permanent fault/upstream timeout do not trigger fallback. Recovery does not switch this request back to normal.
+- [ ] `TestEmergencyTokenRecoveryOverlap`: normal readiness returns while an emergency request is live; its local reservation remains until completion. Another outage does not reset counters; permanent errors do not activate emergency. Invalid/missing estimation does not admit an unbounded request.
+- [ ] Run `go test ./internal/coordination ./internal/gateway ./internal/config ./cmd/gateway -run 'Emergency.*Token|EmergencyEstimator|TokenRecovery' -count=1` and confirm failures.
+- [ ] Implement the shared local critical section, provider selection, lifetime/release, and recovery overlap while preserving disabled-pool semantics. Account for normal and emergency tokenization budgets separately in telemetry.
+- [ ] Rerun targeted tests and `go test -race ./internal/coordination ./internal/gateway`; require PASS. Commit: `feat: preserve bounded emergency token admission`.
 
-## Task 6: Подключить preflight к inference lifecycle
+## Task 6: Integrate preflight into the inference lifecycle
 
-**Files:** `gateway/forward.go`, `gateway/forward_admission.go`, `gateway/service.go`, `gateway/service_retry_test.go`, `gateway/usage_test.go`, `httpapi/public_test.go`; новые `tests/integration/token_reservation_test.go`, `tests/postgres/token_reservation_http_test.go`; wiring application.
+**Files:** `gateway/forward.go`, `gateway/forward_admission.go`, `gateway/service.go`, `gateway/service_retry_test.go`, `gateway/usage_test.go`, `httpapi/public_test.go`; create `tests/integration/token_reservation_test.go`, `tests/postgres/token_reservation_http_test.go`; update application wiring.
 
-**Interfaces:** `resolvedForwardRequest` хранит PreparedRequestSize/TokenEstimate/TokenReservation и immutable admission mode. `acquireForwardAdmission` сохраняет release callback signature; estimator вызывается до allocation. Пересчёт при stale config использует исходный request.Body, не уже переписанный payload.
+**Interfaces:** `resolvedForwardRequest` stores PreparedRequestSize/TokenEstimate/TokenReservation and immutable admission mode. `acquireForwardAdmission` retains its release-callback signature; estimation runs before allocation. Recalculation after stale configuration uses the original request.Body, not the rewritten payload.
 
-- [ ] `TestTokenAdmissionHTTPMatrix`: все endpoints/streaming, no-tokenizer when disabled, budget429+Retry-After, invalid size400 без generation/RPM, preflight503, route eligibility/affinity и limits выше priority.
-- [ ] `TestTokenAdmissionPolicyChangedDuringEstimate`: revoke/disabled model/profile сменился во время blocked estimate →no dispatch; size policy change →один re-estimate; повторный change →503. Enable gate учитывает legacy distributed leases и локально выполняющиеся legacy emergency requests; deployment docs требуют cluster-wide drain для emergency overlap.
-- [ ] `TestTokenAdmissionRetryAndCancellation`: pre-byte retry→один reservation, post-byte retry запрещён; cancel после acquisition, upstream error и panic освобождают once; stream>TTL renews R; backlog overflow освобождает через expiry.
-- [ ] `TestTokenAdmissionAmbiguousFallback`: unresolved normal Acquire + valid emergency →одна generation, возможный ghost distributed reservation истекает; normal replay не меняет UUID; completion emergency не мутирует неизвестный normal lease.
-- [ ] Запустить HTTP/integration tests, получить ожидаемые failures; подключить Tasks1–5, добавить причины в coordinationAPIError и bounded decision enum.
-- [ ] Проверить `go test ./internal/gateway ./internal/httpapi ./tests/integration -count=1`, `make test-postgres`, `go test -race ./internal/gateway ./internal/coordination/...`. Commit: `feat: enforce request size admission across inference lifecycle`.
+- [ ] `TestTokenAdmissionHTTPMatrix`: all endpoints/streaming, no tokenizer when disabled, budget429+Retry-After, invalid size400 without generation/RPM, preflight503, route eligibility/affinity, and limits taking precedence over priority.
+- [ ] `TestTokenAdmissionPolicyChangedDuringEstimate`: revocation, disabled model, or profile change during blocked estimation →no dispatch; size-policy change →one re-estimation; another change →503. The enable gate covers legacy distributed leases and locally running legacy emergency requests; deployment documentation requires cluster-wide drain for emergency overlap.
+- [ ] `TestTokenAdmissionRetryAndCancellation`: pre-byte retry→one reservation; post-byte retry forbidden; cancellation after acquisition, upstream errors, and panics release once; streams longer than TTL renew R; backlog overflow releases through expiry.
+- [ ] `TestTokenAdmissionAmbiguousFallback`: unresolved normal Acquire + valid emergency →one generation; any ghost distributed reservation expires; normal replay retains its UUID; emergency completion does not mutate an unknown normal lease.
+- [ ] Run HTTP/integration tests and obtain expected failures; integrate Tasks 1–5, adding reasons to coordinationAPIError and the bounded decision enum.
+- [ ] Verify `go test ./internal/gateway ./internal/httpapi ./tests/integration -count=1`, `make test-postgres`, and `go test -race ./internal/gateway ./internal/coordination/...`. Commit: `feat: enforce request size admission across inference lifecycle`.
 
-## Task 7: Наблюдаемость, UI и эксплуатационные инструкции
+## Task 7: Observability, UI, and operating guidance
 
-**Files:** `gateway/observer.go`, новый `observability/token_reservation.go`/test; `observability/metrics.go`, `observability/log.go`, coordinator observer hooks; Admin templates/tests, `docs/operations.md`, `docs/postgresql-production.md`, README.md/README.ru.md.
+**Files:** `gateway/observer.go`; create `observability/token_reservation.go` and tests; modify `observability/metrics.go`, `observability/log.go`, coordinator observer hooks, Admin templates/tests, `docs/operations.md`, `docs/postgresql-production.md`, README.md/README.ru.md.
 
-**Interfaces:** добавить optional `TokenReservationObserver` с `TokenReservationChanged(TokenReservationEvent)`; event — pool/client IDs, class, mode, action (acquired/released/expired/reconciled), amounts, usage-known flag, bounded reason. Для Postgres events не обещать exactly-once delivery: metrics monotonic events best effort, authoritative outstanding snapshot источник истины. RequestEvent получает numeric estimate/reserve и estimator/mode.
+**Interfaces:** add optional `TokenReservationObserver` with `TokenReservationChanged(TokenReservationEvent)`; events contain pool/client IDs, class, mode, action (acquired/released/expired/reconciled), amounts, a usage-known flag, and a bounded reason. Do not promise exactly-once PostgreSQL event delivery: monotonic metric events are best effort; the authoritative outstanding snapshot is the source of truth. RequestEvent gains numeric estimate/reserve and estimator/mode fields.
 
-- [ ] `TestTokenReservationTelemetry`: reserve600/actual250/unknown — три разных состояния; replay не генерирует повторный local accounting callback; expired release виден без HTTP completion. PG uncertain callback delivery не влияет на correctness.
-- [ ] `TestTokenReservationPrivacy`: уникальные sentinel prompt/generated/tokenizer strings не встречаются в persisted receipts, structured events/logs, metrics labels или API errors. Пустой actual не сериализуется как фактический0.
-- [ ] `TestRequestSizeAdminForms`: effective limits, clear disabled/inherited labels и emergency per-replica copy; form partial update не сбрасывает policy; CSRF/auth сохраняются. Проверить текущий template test workflow.
-- [ ] Реализовать bounded metrics/observer и UI. Документировать utility preflight capacity planning, fallback calibration, disabled pools/client-budget boundary, High headroom limitation, unknown usage, enable drain и recovery overlap.
-- [ ] `go test ./internal/observability ./internal/httpapi ./internal/web -count=1` и `make test-web-unit`; PASS. Commit: `feat: expose token reservation decisions and operating limits`.
+- [ ] `TestTokenReservationTelemetry`: reserve600/actual250/unknown are three distinct states; replay emits no second local accounting callback; expiry release is visible without HTTP completion. Uncertain PostgreSQL callback delivery does not affect correctness.
+- [ ] `TestTokenReservationPrivacy`: unique sentinel prompt/generated/tokenizer strings do not appear in persisted receipts, structured events/logs, metric labels, or API errors. Missing actual usage is not serialized as actual 0.
+- [ ] `TestRequestSizeAdminForms`: effective limits, clear disabled/inherited labels, and per-replica emergency copy; partial form updates preserve policy; CSRF/auth remain intact. Check the existing template test workflow.
+- [ ] Implement bounded metrics/observers and UI. Document utility preflight capacity planning, fallback calibration, the disabled-pool/client-budget boundary, the High-headroom limitation, unknown usage, enable drain, and recovery overlap.
+- [ ] Run `go test ./internal/observability ./internal/httpapi ./internal/web -count=1` and `make test-web-unit`; require PASS. Commit: `feat: expose token reservation decisions and operating limits`.
 
-## Task 8: Qualification, real-vLLM experiment и итоговая приёмка
+## Task 8: Qualification, real-vLLM experiment, and final acceptance
 
 **Files:** `tests/e2e/token_reservation_test.go`, `tests/e2e/harness_test.go`, `tests/e2e/harness_unit_test.go`, `Makefile`, `docs/real-vllm-priority-e2e.md`, `docs/issue-23-analysis-and-evidence.md`.
 
-**Interfaces:** новый e2e mode `tokens`; `make test-real-vllm` принимает его. Использовать существующие gateway/model/admin/key env names; новые `LLMGW_E2E_TOKEN_RUNS=3`, `LLMGW_E2E_TOKEN_HIGH_PROBES=100` и воспроизводимый seed. Печать numeric experiment report без prompt content.
+**Interfaces:** add e2e mode `tokens` and accept it in `make test-real-vllm`. Use existing gateway/model/admin/key environment names; add `LLMGW_E2E_TOKEN_RUNS=3`, `LLMGW_E2E_TOKEN_HIGH_PROBES=100`, and a reproducible seed. Print a numeric experiment report without prompt content.
 
-- [ ] Unit tests конфигурации/сценария: invalid mode/missing credentials объясняются, counters различают attempts/admissions/rejections, TTFT missing не подменяется0; сценарий fail если не достиг token-pressure или не набрал100 probes/повтор.
-- [ ] Реализовать paired disabled/enabled 3× эксперимент из spec §11 с warm-up, проверкой no collateral policy edits, cleanup/restore test-owned settings, caps/unknown/error accounting и ratio/percentiles. Disabled и enabled запускать на одном workload/model config, фиксируя порядок.
-- [ ] Выполнить `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`, `make test-web-unit`, `make test-postgres`; записать commands, commit, env/profile, pass/fail/skips. Для PostgreSQL обязательны реальные two-replica executions.
-- [ ] Выполнить `LLMGW_E2E_MODE=tokens make test-real-vllm` на выделенном real-vLLM target с подтверждённым model profile и sane secrets handling. Прогнать direct tokenizer-vs-generation qualification на всех backend для поддерживаемых точных payloads. Без окружения отметить AC14 pending, не считать synthetic tests заменой.
-- [ ] Заполнить AC01–AC14 evidence со ссылками на tests и результатами. Подтверждённые дефекты устранить с regression либо явно согласовать исключение. Выполнить whole-branch review перед PR.
-- [ ] Commit: `test: qualify token reservations under mixed inference load`. Публикация PR/закрытие issue — после готового implementation/evidence, не на стадии этого проекта плана.
+- [ ] Configuration/scenario unit tests: explain invalid modes/missing credentials; distinguish attempts/admissions/rejections in counters; do not replace missing TTFT with 0; fail the scenario if it does not reach token pressure or collect 100 probes per repetition.
+- [ ] Implement the paired disabled/enabled 3× experiment from spec §11 with warm-up, checks against collateral policy edits, cleanup/restoration of test-owned settings, cap/unknown/error accounting, and ratios/percentiles. Use the same workload/model configuration for disabled and enabled runs and record their order.
+- [ ] Run `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`, `make test-web-unit`, and `make test-postgres`; record commands, commit, environment/profile, pass/fail/skips. PostgreSQL requires actual two-replica executions.
+- [ ] Run `LLMGW_E2E_MODE=tokens make test-real-vllm` against a dedicated real-vLLM target with a qualified model profile and safe secret handling. Run direct tokenizer-versus-generation qualification on every backend for supported exact payloads. Without an environment, mark AC14 pending; synthetic tests are not a substitute.
+- [ ] Populate AC01–AC14 evidence with test links and results. Fix confirmed defects with regressions or obtain explicit acceptance of exceptions. Perform a whole-branch review before the PR.
+- [ ] Commit: `test: qualify token reservations under mixed inference load`. Publish a PR/close the issue after implementation/evidence is ready, not at this draft-plan stage.
 
-## Самопроверка плана и порядок выполнения
+## Plan self-review and execution order
 
-Зависимости: 1→2/3; 3→4; 2+3→5; 1–5→6; 6→7→8. Пока выполнять последовательно: policy/fingerprint/lifecycle contracts общие, преждевременный parallel code editing увеличивает integration риск. Отдельный builder review спецификации выполнен: уточнены field matrix, normal→emergency preflight, cluster-wide drain, disabled pool old reservations и bounded replay cutoff; соответствующие tests добавлены.
+Dependencies: 1→2/3; 3→4; 2+3→5; 1–5→6; 6→7→8. Execute sequentially for now: policy/fingerprint/lifecycle contracts are shared, and premature parallel code editing increases integration risk. A separate builder review of the specification has been completed: it clarified the field matrix, normal→emergency preflight, cluster-wide drain, old reservations in disabled pools, and the bounded replay cutoff; corresponding tests were added.
 
-Матрица покрытия: AC01=6; AC02=1,7; AC03–04=2,6,8; AC05=3–4; AC06=1,3–4,6; AC07–09=3–4,6; AC10=5–6; AC11=2,5; AC12=7; AC13=1,4; AC14=8. Review Focus включён в named tests выше. Этапы заканчиваются собственным проверяемым deliverable, итоговые checks не заменяют их.
+Coverage map: AC01=6; AC02=1,7; AC03–04=2,6,8; AC05=3–4; AC06=1,3–4,6; AC07–09=3–4,6; AC10=5–6; AC11=2,5; AC12=7; AC13=1,4; AC14=8. The named tests above cover Review Focus. Each task ends with its own verifiable deliverable; final checks do not replace those checks.
 
-Перед реализацией согласовать конкретную спецификацию, особенно opt-in ограничения Responses/media, shared utility preflight budgets, отсутствие token-priority reserve и сохранение soft-TPM unknown-usage semantics. Emergency уже является обязательным требованием пользователя, повторно его не согласовывать.
+Before implementation, approve the concrete specification, particularly opt-in Responses/media restrictions, shared utility preflight budgets, the absence of a token-priority reserve, and preserved soft-TPM unknown-usage semantics. Emergency is already a mandatory user requirement and must not be submitted for approval again.
