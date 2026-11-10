@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	CoordinationContractVersion = 3
+	CoordinationContractVersion = 4
 	RateAlgorithmVersion        = 1
 )
 

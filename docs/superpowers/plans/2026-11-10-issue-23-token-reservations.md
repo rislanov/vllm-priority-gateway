@@ -164,13 +164,13 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** the same AdmissionCoordinator/TokenReservationContract; PostgreSQL obtains authoritative budgets from persisted policy; normal shared outstanding=sum of unexpired reserved_tokens. ContractVersion becomes 4; RateAlgorithmVersion stays 1.
 
-- [ ] Run the shared Task 3 contract for PostgreSQL. Add 2 coordinator instances: Bpool=1000, 100 concurrent acquisitions of R=100, sufficient concurrency/RPM →exactly 10 admissions, peak1000. Different pools for one client share its client budget.
-- [ ] `TestPostgresTokenReservationLostCommit`: drop a successful Acquire commit response →same lease/RPM/R once; changed R/profile →idempotency conflict. Lost Complete commit responses and partial-batch retries do not double-release or double-debit TPM.
-- [ ] `TestPostgresTokenReservationExpiryAndPolicyRace`: counts exclude expiry before cleanup; race cleanup/Complete/Renew; configuration deletion/tombstones do not prevent terminal release; policy reductions, client class changes, enable transitions, and wrong-owner operations do not bypass limits.
-- [ ] Run `make test-postgres` against a disposable DSN and verify that new tests actually execute rather than skip.
-- [ ] Implement atomic checks/sums/writes with the existing pool→client lock order, authoritative policy validation, fingerprint, and receipt metadata. Owner matching compares immutable receipt identity. Handle SUM(bigint) without unchecked integer overflow. Preserve committed-prefix results and synchronous_commit.
-- [ ] Verify compatibility/drain upgrade 3→4 and rollback refusal. Measure admission contention latency using the existing test profile; do not hold SQL locks during tokenizer calls.
-- [ ] `make test-postgres` →PASS; `go test -race ./internal/coordination/...` →PASS. Commit: `feat: coordinate token reservations across gateway replicas`.
+- [x] Run the shared Task 3 contract for PostgreSQL. Add 2 coordinator instances: Bpool=1000, 100 concurrent acquisitions of R=100, sufficient concurrency/RPM →exactly 10 admissions, peak1000. Different pools for one client share its client budget.
+- [x] `TestPostgresTokenReservationLostCommit`: drop a successful Acquire commit response →same lease/RPM/R once; changed R/profile →idempotency conflict. Lost Complete commit responses and partial-batch retries do not double-release or double-debit TPM.
+- [x] `TestPostgresTokenReservationExpiryAndPolicyRace`: counts exclude expiry before cleanup; race cleanup/Complete/Renew; configuration deletion/tombstones do not prevent terminal release; policy reductions, client class changes, enable transitions, and wrong-owner operations do not bypass limits.
+- [x] Run `make test-postgres` against a disposable DSN and verify that new tests actually execute rather than skip.
+- [x] Implement atomic checks/sums/writes with the existing pool→client lock order, authoritative policy validation, fingerprint, and receipt metadata. Owner matching compares immutable receipt identity. Handle SUM(bigint) without unchecked integer overflow. Preserve committed-prefix results and synchronous_commit.
+- [x] Verify compatibility/drain upgrade 3→4 and rollback refusal. Measure admission contention latency using the existing test profile; do not hold SQL locks during tokenizer calls.
+- [x] `make test-postgres` →PASS; `go test -race ./internal/coordination/...` →PASS. Commit: `feat: coordinate token reservations across gateway replicas`.
 
 ## Task 5: Emergency tokens and independent outage preflight
 

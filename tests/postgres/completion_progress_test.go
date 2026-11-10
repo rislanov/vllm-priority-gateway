@@ -71,16 +71,16 @@ func delayedPostgresDSN(t *testing.T, raw string, delay time.Duration) string {
 func TestPostgresCompletionBatchReturnsCommittedPrefixForRetryProgress(t *testing.T) {
 	raw := os.Getenv("LLMGW_POSTGRES_TEST_DSN")
 	store := openTestStore(t, raw)
-	fixture := updateFixtureLimits(t, store, createFixture(t, store, 0), 64, 64)
+	fixture := tokenReservationFixtures(t, store, 0, 10000)[0]
 	setup := coordpostgres.NewAdmissionCoordinator(store, 2*time.Second)
 	ctx := context.Background()
 	items := make([]coordination.LeaseCompletion, 0, 64)
 	for range 64 {
-		decision, err := setup.Acquire(ctx, admissionRequest(fixture, uuid.New()))
+		decision, err := setup.Acquire(ctx, postgresTokenRequest(fixture, uuid.New(), 10))
 		if err != nil || !decision.Admitted() {
 			t.Fatalf("setup admission: decision=%+v err=%v", decision, err)
 		}
-		items = append(items, coordination.LeaseCompletion{Lease: decision.Lease.Identity()})
+		items = append(items, coordination.LeaseCompletion{Lease: decision.Lease.Identity(), Usage: &coordination.TokenUsage{InputTokens: 2, OutputTokens: 1}})
 	}
 
 	delayedStore, err := pgstore.Open(ctx, pgstore.Options{
@@ -135,5 +135,12 @@ func TestPostgresCompletionBatchReturnsCommittedPrefixForRetryProgress(t *testin
 	}
 	if completedReceipts != len(items) || activeLeases != 0 {
 		t.Fatalf("durable completion state: receipts=%d leases=%d, want %d receipts and 0 leases", completedReceipts, activeLeases, len(items))
+	}
+	var actualInput, actualOutput int64
+	if err := store.ConfigPool().QueryRow(ctx, "SELECT sum(token_actual_input)::bigint, sum(token_actual_output)::bigint FROM admission_operations").Scan(&actualInput, &actualOutput); err != nil {
+		t.Fatal(err)
+	}
+	if actualInput != int64(2*len(items)) || actualOutput != int64(len(items)) {
+		t.Fatalf("completion retries recorded actual input=%d output=%d", actualInput, actualOutput)
 	}
 }

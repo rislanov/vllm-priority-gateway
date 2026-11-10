@@ -10,5 +10,10 @@ ALTER TABLE model_pools ADD COLUMN request_size_admission JSONB NOT NULL DEFAULT
 -- NULL identifies leases issued without request size accounting.
 ALTER TABLE request_leases ADD COLUMN reserved_tokens BIGINT CHECK (reserved_tokens BETWEEN 1 AND 1000000000000);
 
-ALTER TABLE admission_operations ADD COLUMN token_reservation JSONB
-    CHECK (jsonb_typeof(token_reservation) = 'object');
+ALTER TABLE admission_operations
+    ADD COLUMN token_reservation JSONB CHECK (jsonb_typeof(token_reservation) = 'object'),
+    ADD COLUMN token_budget_scope TEXT NOT NULL DEFAULT '' CHECK (token_budget_scope IN ('', 'client', 'pool')),
+    ADD COLUMN token_actual_input BIGINT CHECK (token_actual_input >= 0),
+    ADD COLUMN token_actual_output BIGINT CHECK (token_actual_output >= 0),
+    ADD CHECK (token_budget_scope = '' OR rejection_reason = 'token_budget_exhausted'),
+    ADD CHECK ((token_actual_input IS NULL) = (token_actual_output IS NULL));

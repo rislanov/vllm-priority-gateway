@@ -10,7 +10,8 @@ BEGIN
     END IF;
 END $$;
 
-ALTER TABLE admission_operations DROP COLUMN token_reservation;
+ALTER TABLE admission_operations DROP COLUMN token_reservation, DROP COLUMN token_budget_scope,
+    DROP COLUMN token_actual_input, DROP COLUMN token_actual_output;
 ALTER TABLE request_leases DROP COLUMN reserved_tokens;
 ALTER TABLE model_pools DROP COLUMN request_size_admission;
 ALTER TABLE clients DROP COLUMN max_input_tokens, DROP COLUMN max_output_tokens,

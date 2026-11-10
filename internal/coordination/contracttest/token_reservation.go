@@ -31,7 +31,9 @@ func TokenReservationContract(t *testing.T, factory TokenReservationFactory) {
 				t.Fatal("replay created a second lease")
 			}
 		}
-		acquire(request(0, 201), coordination.ReasonTokenBudgetExhausted, coordination.AdmissionClientScope)
+		denied := request(0, 201)
+		acquire(denied, coordination.ReasonTokenBudgetExhausted, coordination.AdmissionClientScope)
+		acquire(denied, coordination.ReasonTokenBudgetExhausted, coordination.AdmissionClientScope)
 		changed := firstRequest
 		changed.TokenReservation.EstimationProfile += "-other"
 		acquire(changed, coordination.ReasonIdempotencyConflict, "")
