@@ -76,6 +76,12 @@ type LeaseIdentity struct {
 
 func (l LeaseIdentity) Identity() LeaseIdentity { return l }
 
+// SameOwner compares the immutable identity. Renewal may change the expiry.
+func (l LeaseIdentity) SameOwner(other LeaseIdentity) bool {
+	return l.LeaseID == other.LeaseID && l.ClientID == other.ClientID && l.PoolID == other.PoolID &&
+		l.RequestID == other.RequestID && l.ReplicaID == other.ReplicaID
+}
+
 type AdmissionScope string
 
 const (

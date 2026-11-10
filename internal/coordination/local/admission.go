@@ -197,8 +197,7 @@ func (c *AdmissionCoordinator) Renew(ctx context.Context, leases []coordination.
 	out := make([]coordination.RenewResult, len(leases))
 	for i, want := range leases {
 		got, ok := c.leases[want.LeaseID]
-		if !ok || got.ClientID != want.ClientID || got.PoolID != want.PoolID || !got.ExpiresAt.After(now) {
-			c.removeLease(want.LeaseID)
+		if !ok || !got.SameOwner(want) || !got.ExpiresAt.After(now) {
 			out[i] = coordination.RenewResult{Lease: want, Reason: coordination.ReasonLeaseLost}
 			continue
 		}
@@ -233,7 +232,7 @@ func (c *AdmissionCoordinator) Complete(ctx context.Context, completions []coord
 			out[i] = coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Reason: coordination.ReasonStaleOperation}
 			continue
 		}
-		if rec.decision.Lease == nil {
+		if rec.decision.Lease == nil || !rec.decision.Lease.SameOwner(item.Lease) {
 			out[i] = coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: coordination.CompletionLeaseLost, Reason: coordination.ReasonLeaseLost}
 			continue
 		}
