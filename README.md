@@ -15,16 +15,7 @@ vLLM Priority Gateway is a lightweight policy, admission, and routing layer for 
 
 ## What problem it solves
 
-The gateway also exposes authenticated **`POST /tokenize`** for text prompts and chat messages. It routes the public model name to the upstream model's tokenizer and preserves the upstream response. Tokenization has a separate client/backend concurrency and request-rate budget, shared across PostgreSQL replicas; it does not change inference quotas or analytics. See [tokenization policy and rollout](docs/operations.md#tokenization).
-
-```sh
-curl http://localhost:8080/tokenize \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"public-model","prompt":"Hello","add_special_tokens":false,"return_token_strs":true}'
-```
-
-Reverse proxies must forward the root-level `/tokenize` path as well as `/v1/*`.
+When production APIs, interactive agents, and batch jobs share a vLLM cluster, background work can consume capacity needed by user-facing requests. You need a way to protect important traffic, limit each client’s usage, and route requests to healthy backends with available capacity.
 
 A normal HTTP load balancer can distribute requests, but it usually does not know:
 
@@ -36,8 +27,6 @@ A normal HTTP load balancer can distribute requests, but it usually does not kno
 - which backend best preserves prefix-cache locality.
 
 The gateway combines server-side client policy with live vLLM health and Prometheus metrics:
-
-Pools can also reserve admission slots for High/Critical before pressure throttling activates. With `maxGatewayInflight=20` and `highPriorityReserve=6`, Normal/Background together can occupy at most 14 slots. The reserve is global in PostgreSQL mode and local to the single SQLite replica; it defaults to zero. [Configuration and limits](docs/operations.md#reserved-admission-capacity), [PostgreSQL upgrade](docs/postgresql-production.md#priority-reserve-upgrade).
 
 ```text
 production requests  ── high ────────┐
@@ -80,8 +69,6 @@ production traffic ──► remains admitted
 The gateway does **not** deploy models, schedule GPUs, or replace Kubernetes, Slurm, or existing vLLM lifecycle tooling. It controls **who receives shared inference capacity and which vLLM instance receives each request**.
 
 The deployment footprint is one static Go binary and an explicitly selected persistence profile: SQLite for one replica (the default), or PostgreSQL 16+ for coordinated multi-replica production. See the [PostgreSQL production profile](docs/postgresql-production.md).
-
-For PostgreSQL coordination-policy upgrades, v0.6.3 supports automatic stop/start deployment: new gateways wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for incompatible registrations to expire or unregister. Graceful shutdown unregisters the stopped replica. Use Kubernetes `Recreate` when one Deployment owns every gateway using the database; keep `LLMGW_COORDINATION_RESET_ON_START=false`. This permits downtime and does not support incompatible rolling upgrades. See the [automatic deployment guide](docs/postgresql-production.md#automatic-coordination-upgrades).
 
 ## Engineering highlights
 
@@ -278,6 +265,8 @@ Run only the JavaScript unit tests (no browser installation required) with `make
 - [Complete real-vLLM local demo](docs/local-demo.md)
 - [Production deployment](docs/deployment.md)
 - [Operations guide](docs/operations.md)
+- [Tokenization API, examples, and rollout](docs/operations.md#tokenization)
+- [PostgreSQL production and upgrades](docs/postgresql-production.md#automatic-coordination-upgrades)
 - [Technical specification](docs/technical-specification.md)
 - [Acceptance evidence](docs/acceptance-evidence.md)
 - [Russian README](README.ru.md)
