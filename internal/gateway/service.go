@@ -82,6 +82,7 @@ type Dependencies struct {
 type Service struct {
 	emergencyTokenization    coordination.TokenizationCoordinator
 	inputEstimator           InputEstimator
+	admissionEstimateTimeout time.Duration
 	tokenization             coordination.TokenizationCoordinator
 	tokenizationPolicy       coordination.TokenizationPolicy
 	tokenizationForwarder    TokenizationForwarder
@@ -155,17 +156,17 @@ func New(dependencies Dependencies) *Service {
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
 		now: now, lookupEnv: lookupEnv, retryAfter: retryAfter,
 	}
+	service.admissionEstimateTimeout = dependencies.AdmissionEstimateTimeout
+	if service.admissionEstimateTimeout <= 0 {
+		service.admissionEstimateTimeout = 2 * time.Second
+	}
 	if transport, ok := dependencies.TokenizationForwarder.(tokenizerTransport); ok && service.inputEstimator == nil {
-		timeout := dependencies.AdmissionEstimateTimeout
-		if timeout <= 0 {
-			timeout = 2 * time.Second
-		}
 		maxBytes := dependencies.AdmissionEstimateMaxResponseBytes
 		if maxBytes <= 0 {
 			maxBytes = 8 << 20
 		}
 		service.inputEstimator = tokenEstimator{
-			timeout: timeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
+			timeout: service.admissionEstimateTimeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
 			acquire: service.acquireEstimate, mayUseEmergency: service.mayUseEmergencyEstimate,
 		}
 	}
@@ -570,6 +571,10 @@ func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, 
 	switch reason {
 	case coordination.ReasonRPMExhausted, coordination.ReasonTPMExhausted:
 		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Rate limit exceeded", Type: "rate_limit_exceeded", Code: string(reason), RetryAfter: retryAfter}
+	case coordination.ReasonTokenBudgetExhausted:
+		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Outstanding token budget exhausted. Reduce the request size if it cannot fit the configured budget.", Type: "rate_limit_error", Code: string(reason), RetryAfter: retryAfter, DecisionReason: DecisionTokenBudgetExhausted}
+	case coordination.ReasonTokenPolicyTransition:
+		return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "Request size admission is waiting for legacy leases to drain", Type: "server_error", Code: string(reason), RetryAfter: retryAfter, DecisionReason: DecisionTokenPolicyTransition}
 	case coordination.ReasonPoolPriorityReserve:
 		return overloaded(retryAfter, DecisionPoolPriorityReserve)
 	case coordination.ReasonConcurrencyExhausted:

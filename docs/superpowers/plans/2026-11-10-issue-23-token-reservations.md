@@ -192,12 +192,12 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** `resolvedForwardRequest` stores PreparedRequestSize/TokenEstimate/TokenReservation and immutable admission mode. `acquireForwardAdmission` retains its release-callback signature; estimation runs before allocation. Recalculation after stale configuration uses the original request.Body, not the rewritten payload.
 
-- [ ] `TestTokenAdmissionHTTPMatrix`: all endpoints/streaming, no tokenizer when disabled, budget429+Retry-After, invalid size400 without generation/RPM, preflight503, route eligibility/affinity, and limits taking precedence over priority.
-- [ ] `TestTokenAdmissionPolicyChangedDuringEstimate`: revocation, disabled model, or profile change during blocked estimation →no dispatch; size-policy change →one re-estimation; another change →503. The enable gate covers legacy distributed leases and locally running legacy emergency requests; deployment documentation requires cluster-wide drain for emergency overlap.
-- [ ] `TestTokenAdmissionRetryAndCancellation`: pre-byte retry→one reservation; post-byte retry forbidden; cancellation after acquisition, upstream errors, and panics release once; streams longer than TTL renew R; backlog overflow releases through expiry.
-- [ ] `TestTokenAdmissionAmbiguousFallback`: unresolved normal Acquire + valid emergency →one generation; any ghost distributed reservation expires; normal replay retains its UUID; emergency completion does not mutate an unknown normal lease.
-- [ ] Run HTTP/integration tests and obtain expected failures; integrate Tasks 1–5, adding reasons to coordinationAPIError and the bounded decision enum.
-- [ ] Verify `go test ./internal/gateway ./internal/httpapi ./tests/integration -count=1`, `make test-postgres`, and `go test -race ./internal/gateway ./internal/coordination/...`. Commit: `feat: enforce request size admission across inference lifecycle`.
+- [x] `TestTokenAdmissionHTTPMatrix`: all endpoints/streaming, no tokenizer when disabled, budget429+Retry-After, invalid size400 without generation/RPM, preflight503, route eligibility/affinity, and limits taking precedence over priority.
+- [x] `TestTokenAdmissionPolicyChangedDuringEstimate`: revocation, disabled model, or profile change during blocked estimation →no dispatch; size-policy change →one re-estimation; another change →503. The enable gate covers legacy distributed leases and locally running legacy emergency requests; deployment documentation requires cluster-wide drain for emergency overlap.
+- [x] `TestTokenAdmissionRetryAndCancellation`: pre-byte retry→one reservation; post-byte retry forbidden; cancellation after acquisition, upstream errors, and panics release once; streams longer than TTL renew R; backlog overflow releases through expiry.
+- [x] `TestTokenAdmissionAmbiguousFallback`: unresolved normal Acquire + valid emergency →one generation; any ghost distributed reservation expires; normal replay retains its UUID; emergency completion does not mutate an unknown normal lease.
+- [x] Run HTTP/integration tests and obtain expected failures; integrate Tasks 1–5, adding reasons to coordinationAPIError and the bounded decision enum.
+- [x] Verify `go test ./internal/gateway ./internal/httpapi ./tests/integration -count=1`, `make test-postgres`, and `go test -race ./internal/gateway ./internal/coordination/...`. Commit: `feat: enforce request size admission across inference lifecycle`.
 
 ## Task 7: Observability, UI, and operating guidance
 

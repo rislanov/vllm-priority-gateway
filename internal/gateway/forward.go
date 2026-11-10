@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/admission"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/proxy"
 	"github.com/rislanov/vllm-priority-gateway/internal/registry"
@@ -35,6 +37,7 @@ type forwardLifecycle struct {
 }
 
 var errAPIKeyBecameInvalid = errors.New("API key became invalid while request was waiting")
+var errEstimationProfileChanged = errors.New("estimation profile changed before dispatch")
 
 func (l *forwardLifecycle) finish(result proxy.Result, reservation ResponseCompleteReservation, apiErr *APIError) {
 	l.event.OccurredAt = l.service.now().UTC()
@@ -93,13 +96,19 @@ func invokePanicCleanup(cleanup func()) {
 }
 
 type resolvedForwardRequest struct {
-	client      domain.Client
-	pool        domain.ModelPool
-	snapshot    *registry.Snapshot
-	payload     []byte
-	publicModel string
-	sessionID   string
-	affinityKey string
+	client            domain.Client
+	pool              domain.ModelPool
+	snapshot          *registry.Snapshot
+	payload           []byte
+	publicModel       string
+	sessionID         string
+	affinityKey       string
+	originalPayload   []byte
+	preparedSize      admission.PreparedRequestSize
+	sizePolicy        domain.EffectiveRequestSizePolicy
+	tokenReservation  coordination.TokenReservation
+	estimationMode    EstimationMode
+	estimationStarted time.Time
 }
 
 func (s *Service) resolveForwardRequest(request ForwardRequest, lifecycle *forwardLifecycle) (resolvedForwardRequest, *APIError) {
@@ -128,12 +137,13 @@ func (s *Service) resolveForwardRequest(request ForwardRequest, lifecycle *forwa
 	lifecycle.event.ModelPoolID = pool.ID
 	lifecycle.event.Model = pool.PublicModelName
 	return resolvedForwardRequest{
-		client:      client,
-		pool:        pool,
-		snapshot:    snapshot,
-		payload:     payload,
-		publicModel: publicModel,
-		sessionID:   sessionID,
+		client:          client,
+		pool:            pool,
+		snapshot:        snapshot,
+		payload:         payload,
+		originalPayload: payload,
+		publicModel:     publicModel,
+		sessionID:       sessionID,
 	}, nil
 }
 
@@ -146,7 +156,23 @@ func (s *Service) prepareForwardPayload(request ForwardRequest, resolved resolve
 			strconv.FormatInt(resolved.pool.ID, 10) + "\x00" + resolved.sessionID
 	}
 
-	payload, err := forceStreamingUsage(resolved.payload, request.Path)
+	policy, err := domain.ResolveRequestSizePolicy(resolved.client, resolved.pool)
+	if err != nil {
+		return resolved, gatewayUnavailable(s.retryAfter)
+	}
+	prepared, err := admission.PrepareRequestSize(request.Path, resolved.originalPayload, policy)
+	if err != nil {
+		var sizeErr *admission.RequestSizeError
+		if errors.As(err, &sizeErr) {
+			return resolved, sizeValidationError(sizeErr.Code, sizeErr.Message)
+		}
+		return resolved, invalidRequest("Failed to prepare inference payload")
+	}
+	resolved.preparedSize = prepared
+	resolved.sizePolicy = policy
+	resolved.tokenReservation = coordination.TokenReservation{}
+
+	payload, err := forceStreamingUsage(prepared.Payload, request.Path)
 	if err != nil {
 		return resolved, invalidRequest("Failed to encode the upstream request")
 	}
@@ -159,13 +185,14 @@ func (s *Service) prepareForwardPayload(request ForwardRequest, resolved resolve
 }
 
 type targetSelector struct {
-	service   *Service
-	client    domain.Client
-	pool      domain.ModelPool
-	affinity  string
-	inflight  InflightEvent
-	lifecycle *forwardLifecycle
-	rawAPIKey string
+	service        *Service
+	client         domain.Client
+	pool           domain.ModelPool
+	affinity       string
+	inflight       InflightEvent
+	lifecycle      *forwardLifecycle
+	rawAPIKey      string
+	tokenAccounted bool
 }
 
 func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, error) {
@@ -185,6 +212,9 @@ func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, 
 			currentPool.UpstreamModelName != s.pool.UpstreamModelName || !clientExists || !currentClient.Enabled ||
 			!currentSnapshot.Access[s.client.ID][s.pool.ID] {
 			return proxy.Target{}, routing.ErrNoBackend
+		}
+		if s.tokenAccounted && (currentPool.RequestSizeAdmission.EstimationProfile != s.pool.RequestSizeAdmission.EstimationProfile || !s.service.coordinationAllowed()) {
+			return proxy.Target{}, errEstimationProfileChanged
 		}
 		selectionTime := s.service.now().UTC()
 		candidates := make([]routing.Candidate, 0, len(currentSnapshot.BackendsByPool[s.pool.ID]))
@@ -206,6 +236,28 @@ func (s targetSelector) selectTarget(exclude map[int64]struct{}) (proxy.Target, 
 		if !acquired {
 			excluded[candidate.Backend.ID] = struct{}{}
 			continue
+		}
+		if s.tokenAccounted {
+			// A shared circuit probe can wait for a database round trip.
+			// Recheck the admitted identity after acquiring the backend permit.
+			latest := s.service.registry.Snapshot()
+			client, _, authErr := s.service.validateAPIKeySnapshot(s.rawAPIKey, latest)
+			if authErr != nil || client.ID != s.client.ID {
+				completeBackend(domain.InferenceNeutral)
+				return proxy.Target{}, errAPIKeyBecameInvalid
+			}
+			pool, exists := latest.PoolsByID[s.pool.ID]
+			if !exists || !pool.Enabled || !latest.Access[client.ID][pool.ID] ||
+				pool.PublicModelName != s.pool.PublicModelName || pool.UpstreamModelName != s.pool.UpstreamModelName ||
+				pool.RequestSizeAdmission.EstimationProfile != s.pool.RequestSizeAdmission.EstimationProfile || !s.service.coordinationAllowed() {
+				completeBackend(domain.InferenceNeutral)
+				return proxy.Target{}, errEstimationProfileChanged
+			}
+			if latest.BackendsByID[candidate.Backend.ID] != candidate.Backend {
+				completeBackend(domain.InferenceNeutral)
+				excluded[candidate.Backend.ID] = struct{}{}
+				continue
+			}
 		}
 		var once sync.Once
 		completeTarget := func(outcome domain.InferenceOutcome) {
@@ -314,12 +366,15 @@ func (s *Service) Forward(
 
 	selector := targetSelector{
 		service: s, client: resolved.client, pool: resolved.pool, affinity: resolved.affinityKey,
-		inflight: inflight, lifecycle: &lifecycle, rawAPIKey: request.APIKey,
+		inflight: inflight, lifecycle: &lifecycle, rawAPIKey: request.APIKey, tokenAccounted: resolved.tokenReservation.Enabled,
 	}
 	target, err := selector.selectTarget(nil)
 	if err != nil {
 		if errors.Is(err, errAPIKeyBecameInvalid) {
 			return proxy.Result{}, reservation, invalidAPIKey()
+		}
+		if errors.Is(err, errEstimationProfileChanged) {
+			return proxy.Result{}, reservation, gatewayUnavailable(s.retryAfter)
 		}
 		return proxy.Result{}, reservation, backendUnavailable(s.retryAfter, DecisionNoEligibleBackend)
 	}
@@ -337,6 +392,9 @@ func (s *Service) Forward(
 	if result.Err != nil && !result.ResponseStarted {
 		if errors.Is(result.Err, errAPIKeyBecameInvalid) {
 			return result, reservation, invalidAPIKey()
+		}
+		if errors.Is(result.Err, errEstimationProfileChanged) {
+			return result, reservation, gatewayUnavailable(s.retryAfter)
 		}
 		if result.Cancelled || errors.Is(result.Err, context.Canceled) {
 			return result, reservation, nil

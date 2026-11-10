@@ -15,6 +15,8 @@ const (
 	DecisionPoolWaitingLimit         DecisionReason = "pool_waiting_limit"
 	DecisionPoolInflightLimit        DecisionReason = "pool_inflight_limit"
 	DecisionPoolPriorityReserve      DecisionReason = "pool_priority_reserve"
+	DecisionTokenBudgetExhausted     DecisionReason = "token_budget_exhausted"
+	DecisionTokenPolicyTransition    DecisionReason = "token_policy_transition"
 	DecisionPriorityConcurrencyLimit DecisionReason = "priority_concurrency_limit"
 	DecisionPoolUnavailable          DecisionReason = "pool_unavailable"
 	DecisionNoEligibleBackend        DecisionReason = "no_eligible_backend"

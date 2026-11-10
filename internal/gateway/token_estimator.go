@@ -86,7 +86,7 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 	}
 	for i, input := range req.Prepared.Inputs {
 		if ctx.Err() != nil {
-			return TokenEstimate{}, e.unavailable()
+			return TokenEstimate{Mode: req.Mode}, e.unavailable()
 		}
 		var count, contextLimit int64
 		kind := "upstream"
@@ -111,17 +111,17 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 			}
 			if apiErr != nil {
 				if apiErr.Code != admission.RequestSizeUnsupported || policy.FallbackMode != domain.TokenFallbackUTF8Bytes {
-					return TokenEstimate{}, apiErr
+					return TokenEstimate{Mode: req.Mode}, apiErr
 				}
 				count = int64(len(input)) + policy.FallbackOverheadTokens
 				kind = domain.TokenFallbackUTF8Bytes
 			}
 		}
 		if count > policy.Limits.MaxInputTokens {
-			return TokenEstimate{}, sizeValidationError(admission.RequestSizeInputExceeded, "Input estimate exceeds the configured maximum")
+			return TokenEstimate{Mode: req.Mode}, sizeValidationError(admission.RequestSizeInputExceeded, "Input estimate exceeds the configured maximum")
 		}
 		if contextLimit > 0 && req.Prepared.OutputAllowance > contextLimit-count {
-			return TokenEstimate{}, sizeValidationError(admission.RequestSizeInputExceeded, "Input and output allowance exceed the model context")
+			return TokenEstimate{Mode: req.Mode}, sizeValidationError(admission.RequestSizeInputExceeded, "Input and output allowance exceed the model context")
 		}
 		result.InputTokens[i] = count
 		result.ContextLimits[i] = contextLimit
@@ -132,7 +132,7 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 		}
 	}
 	if ctx.Err() != nil {
-		return TokenEstimate{}, e.unavailable()
+		return TokenEstimate{Mode: req.Mode}, e.unavailable()
 	}
 	result.Mode = req.Mode
 	return result, nil
