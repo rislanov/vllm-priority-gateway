@@ -230,6 +230,24 @@ In PostgreSQL mode, client/pool inflight, RPM, soft TPM, circuit generations, an
 
 ## Tokenization
 
+Use a gateway-issued key and the public model name to tokenize a text prompt:
+
+```sh
+curl http://localhost:8080/tokenize \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"public-model","prompt":"Hello","add_special_tokens":false,"return_token_strs":true}'
+```
+
+For chat messages, include the chat formatting options required by your model:
+
+```sh
+curl http://localhost:8080/tokenize \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"public-model","messages":[{"role":"user","content":"Hello"}],"add_generation_prompt":true}'
+```
+
 `POST /tokenize` requires a gateway bearer key and an enabled, accessible public `model`. The gateway validates the JSON object/model, removes caller `priority`, translates the model, and preserves other fields. The selected upstream validates tokenizer-specific options. vLLM 0.28.0 supports `prompt` or `messages`, `add_special_tokens`, `return_token_strs`, and chat formatting options such as `add_generation_prompt`, `continue_final_message`, `chat_template`, `chat_template_kwargs`, and `tools`. Responses retain `count`, `tokens`, `max_model_len`, optional `token_strs`, and future upstream fields. No local tokenizer, `/v1/tokenize` alias, `/detokenize`, or automatic inference preflight is provided.
 
 | Setting | Default | Valid range |

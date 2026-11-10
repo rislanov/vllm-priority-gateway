@@ -2,17 +2,6 @@
 
 # vLLM Priority Gateway
 
-Gateway поддерживает авторизованный **`POST /tokenize`** для текстовых prompt и chat messages. Публичное имя модели переводится в upstream-имя; ответ возвращается от токенизатора выбранного vLLM. Токенизация имеет отдельные лимиты клиента/backend и RPM, общие для PostgreSQL-реплик, и не меняет inference-квоты и аналитику. [Политика и порядок обновления](docs/operations.md#tokenization).
-
-```sh
-curl http://localhost:8080/tokenize \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"public-model","messages":[{"role":"user","content":"Hello"}],"add_generation_prompt":true}'
-```
-
-Reverse proxy должен направлять корневой `/tokenize` в gateway вместе с `/v1/*`.
-
 [![CI](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rislanov/vllm-priority-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/rislanov/vllm-priority-gateway)](https://github.com/rislanov/vllm-priority-gateway/releases/latest)
 [![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
@@ -26,6 +15,8 @@ vLLM Priority Gateway — лёгкий слой policy, admission и routing п�
 
 ## Какую проблему решает
 
+Когда production API, интерактивные агенты и пакетные задания используют общий кластер vLLM, фоновая работа может занять мощности, нужные пользовательским запросам. Нужен способ защитить важный трафик, ограничить потребление каждого клиента и направить запросы на здоровые backend-серверы со свободными ресурсами.
+
 Обычный HTTP load balancer распределяет запросы, но обычно не знает:
 
 - какой клиент может потреблять общую GPU capacity;
@@ -36,8 +27,6 @@ vLLM Priority Gateway — лёгкий слой policy, admission и routing п�
 - какой backend лучше сохраняет prefix-cache locality.
 
 Gateway объединяет server-side policy клиента с live health и Prometheus-метриками vLLM:
-
-Пул может резервировать admission-слоты для High/Critical до срабатывания pressure throttling. При `maxGatewayInflight=20` и `highPriorityReserve=6` Normal/Background совместно занимают не более 14 слотов. В PostgreSQL резерв действует глобально между репликами, в SQLite — внутри единственной реплики; по умолчанию резерв равен нулю. [Настройка и ограничения](docs/operations.md#reserved-admission-capacity), [обновление PostgreSQL-профиля](docs/postgresql-production.md#priority-reserve-upgrade).
 
 ```text
 production requests  ── high ────────┐
@@ -79,8 +68,6 @@ production traffic ──► остаётся admitted
 Gateway **не** развёртывает модели, не планирует GPU и не заменяет Kubernetes, Slurm или существующие lifecycle-инструменты vLLM. Он решает, **кто получает общую inference capacity и на какой экземпляр vLLM направить запрос**.
 
 Для развёртывания нужны один статический Go-бинарник и выбранное хранилище: SQLite для одного gateway по умолчанию или PostgreSQL 16+ для нескольких реплик с общей координацией. См. [руководство PostgreSQL production](docs/postgresql-production.md).
-
-Начиная с v0.6.3 обновление политики координации PostgreSQL можно автоматизировать через полный stop/start: новые gateway ждут до `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m`, пока несовместимые регистрации истекут или будут удалены владельцами при штатном завершении. Если все gateway этой БД принадлежат одному Kubernetes Deployment, используйте `Recreate` и оставьте `LLMGW_COORDINATION_RESET_ON_START=false`. Обновление допускает простой, несовместимый rolling update не поддерживается. См. [инструкцию автоматического обновления](docs/postgresql-production.md#automatic-coordination-upgrades).
 
 ## Инженерные особенности
 
@@ -272,6 +259,8 @@ make test-web
 - [Полный локальный real-vLLM demo](docs/local-demo.ru.md)
 - [Production deployment](docs/deployment.md)
 - [Operations guide](docs/operations.md)
+- [API токенизации, примеры и порядок обновления](docs/operations.md#tokenization)
+- [PostgreSQL в production и обновления](docs/postgresql-production.md#automatic-coordination-upgrades)
 - [Technical specification](docs/technical-specification.md)
 - [Acceptance evidence](docs/acceptance-evidence.md)
 - [English README](README.md)
