@@ -15,6 +15,7 @@ import (
 type LookupFunc func(string) (string, bool)
 
 type Config struct {
+	EmergencyTokenization             coordination.TokenizationPolicy
 	AdmissionEstimateTimeout          time.Duration
 	AdmissionEstimateMaxResponseBytes int64
 	Tokenization                      coordination.TokenizationPolicy

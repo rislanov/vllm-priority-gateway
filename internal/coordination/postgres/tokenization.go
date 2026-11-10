@@ -59,6 +59,9 @@ func (c *TokenizationCoordinator) Acquire(parent context.Context, r coordination
 			break
 		}
 	}
+	if err != nil && permanentCoordinationError(err) {
+		err = coordination.PermanentError{Err: err}
+	}
 	c.observe(err)
 	return d, err
 }

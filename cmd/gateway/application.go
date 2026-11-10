@@ -116,7 +116,7 @@ func newGatewayApplication(
 		if err != nil {
 			return nil, fmt.Errorf("initialize circuit coordination: %w", err)
 		}
-		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout,
+		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization, EmergencyTokenization: cfg.EmergencyTokenization}, cfg.CoordinationTimeout,
 			coordpostgres.ReplicaManagerOptions{ResetOnStart: cfg.CoordinationResetOnStart, StartupWaitTimeout: cfg.CoordinationStartupWaitTimeout, Logger: logger})
 	} else {
 		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
@@ -279,6 +279,8 @@ func newGatewayApplication(
 		}
 	})
 	service := gateway.New(gateway.Dependencies{
+		EmergencyTokenization:    coordlocal.NewEmergencyTokenizationCoordinator(cfg.EmergencyTokenization, time.Now),
+		AdmissionEstimateTimeout: cfg.AdmissionEstimateTimeout, AdmissionEstimateMaxResponseBytes: cfg.AdmissionEstimateMaxResponseBytes,
 		Tokenization: tokenizationCoordinator, TokenizationPolicy: cfg.Tokenization, TokenizationForwarder: proxy.New(upstreamClient), TokenizationObserver: tokenizationObserver, TokenizationHealthMaxAge: cfg.HealthInterval*time.Duration(cfg.UnhealthyAfter) + cfg.HealthTimeout, CoordinationTimeout: cfg.CoordinationTimeout,
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Admission: admissionCoordinator, Leases: leaseManager, ReplicaID: replicaID, LeaseTTL: cfg.LeaseTTL,
 		Emergency: coordination.NewEmergencyAdmission(cfg.EmergencyCriticalMaxInflight, cfg.EmergencyHighMaxInflight), CoordinationAllowed: coordinationAllowed, CoordinationReady: adminMutationsAllowed,

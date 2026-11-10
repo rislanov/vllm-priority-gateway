@@ -26,12 +26,13 @@ const (
 )
 
 type ReplicaPolicy struct {
-	LeaseTTL           time.Duration
-	LeaseRenewInterval time.Duration
-	Circuit            circuitbreaker.Options
-	RateAlgorithm      int
-	ContractVersion    int
-	Tokenization       coordination.TokenizationPolicy
+	LeaseTTL              time.Duration
+	LeaseRenewInterval    time.Duration
+	Circuit               circuitbreaker.Options
+	RateAlgorithm         int
+	ContractVersion       int
+	Tokenization          coordination.TokenizationPolicy
+	EmergencyTokenization coordination.TokenizationPolicy
 }
 
 func PolicyFingerprint(policy ReplicaPolicy) [32]byte {

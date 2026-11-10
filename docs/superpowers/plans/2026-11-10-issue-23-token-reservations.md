@@ -10,7 +10,7 @@
 
 **Spec:** [design](../specs/2026-11-10-issue-23-token-reservations-design.md).
 
-**Status:** Draft plan; review/approve the specification first. Product code is unchanged. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
+**Status:** Implementation in progress. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
 
 ## Global Constraints
 
@@ -176,15 +176,15 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Files:** modify `coordination/emergency.go`; add `coordination/emergency_tokens_test.go`; complete estimator emergency provider/configuration and `cmd/gateway/application.go`; extend `gateway/service_pool_test.go` and application recovery tests.
 
-**Interfaces:** preserve existing Acquire for the disabled flow; add `EmergencyAdmission.AcquireTokens(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(), bool)`. The release closure covers concurrency and tokens with one once guard. The emergency estimator uses a separate local TokenizationCoordinator with its own limits; do not replace the public utility coordinator.
+**Interfaces:** preserve existing Acquire for the disabled flow; add `EmergencyAdmission.AcquireTokens(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(), Reason, AdmissionScope)`. The release closure covers concurrency and tokens with one once guard. The emergency estimator uses a separate local TokenizationCoordinator with its own limits; do not replace the public utility coordinator.
 
-- [ ] `TestEmergencyTokenCaps`: High/Critical eligible, Normal/Background denied; Bpool=1000, clientBudget800, R600 →deny the second request from the same client; another client's R400→admit; balanced release/replay; existing class caps remain binding.
-- [ ] `TestEmergencyEstimatorWithoutDatabase`: unavailable PostgreSQL and a healthy tokenizer →a High request obtains a bounded estimate and local reservation. Public `/tokenize` still returns 503. Concurrent emergency preflights default to 1/client,1/backend,30 RPM/burst1. Fingerprint tests cover configuration overrides.
-- [ ] `TestEmergencyEstimatorTransitionMidBatch`: the first prompt has an estimate, then normal utility Acquire for the second loses DB access →one transition to local mode with a new utility ID and the remaining total deadline; retain the first estimate only with the same profile. Utility429/permanent fault/upstream timeout do not trigger fallback. Recovery does not switch this request back to normal.
-- [ ] `TestEmergencyTokenRecoveryOverlap`: normal readiness returns while an emergency request is live; its local reservation remains until completion. Another outage does not reset counters; permanent errors do not activate emergency. Invalid/missing estimation does not admit an unbounded request.
-- [ ] Run `go test ./internal/coordination ./internal/gateway ./internal/config ./cmd/gateway -run 'Emergency.*Token|EmergencyEstimator|TokenRecovery' -count=1` and confirm failures.
-- [ ] Implement the shared local critical section, provider selection, lifetime/release, and recovery overlap while preserving disabled-pool semantics. Account for normal and emergency tokenization budgets separately in telemetry.
-- [ ] Rerun targeted tests and `go test -race ./internal/coordination ./internal/gateway`; require PASS. Commit: `feat: preserve bounded emergency token admission`.
+- [x] `TestEmergencyTokenCaps`: High/Critical eligible, Normal/Background denied; Bpool=1000, clientBudget800, R600 →deny the second request from the same client; another client's R400→admit; balanced release/replay; existing class caps remain binding.
+- [x] `TestEmergencyEstimatorWithoutDatabase`: unavailable PostgreSQL and a healthy tokenizer →a High request obtains a bounded estimate and local reservation. Public `/tokenize` still returns 503. Concurrent emergency preflights default to 1/client,1/backend,30 RPM/burst1. Fingerprint tests cover configuration overrides.
+- [x] `TestEmergencyEstimatorTransitionMidBatch`: the first prompt has an estimate, then normal utility Acquire for the second loses DB access →one transition to local mode with a new utility ID and the remaining total deadline; retain the first estimate only with the same profile. Utility429/permanent fault/upstream timeout do not trigger fallback. Recovery does not switch this request back to normal.
+- [x] `TestEmergencyTokenRecoveryOverlap`: normal readiness returns while an emergency request is live; its local reservation remains until completion. Another outage does not reset counters; permanent errors do not activate emergency. Invalid/missing estimation does not admit an unbounded request.
+- [x] Run `go test ./internal/coordination ./internal/gateway ./internal/config ./cmd/gateway -run 'Emergency.*Token|EmergencyEstimator|TokenRecovery' -count=1` and confirm failures.
+- [x] Implement the shared local critical section, provider selection, lifetime/release, and recovery overlap while preserving disabled-pool semantics. Account for normal and emergency tokenization budgets separately in telemetry.
+- [x] Rerun targeted tests and `go test -race ./internal/coordination ./internal/gateway`; require PASS. Commit: `feat: preserve bounded emergency token admission`.
 
 ## Task 6: Integrate preflight into the inference lifecycle
 

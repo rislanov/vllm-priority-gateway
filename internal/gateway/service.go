@@ -49,33 +49,39 @@ type UsageRecorder interface {
 }
 
 type Dependencies struct {
-	Tokenization             coordination.TokenizationCoordinator
-	TokenizationPolicy       coordination.TokenizationPolicy
-	TokenizationForwarder    TokenizationForwarder
-	TokenizationObserver     TokenizationObserver
-	TokenizationHealthMaxAge time.Duration
-	CoordinationTimeout      time.Duration
-	Registry                 SnapshotProvider
-	HMACSecret               []byte
-	Limiter                  *admission.Limiter
-	Admission                coordination.AdmissionCoordinator
-	Leases                   *coordination.LeaseManager
-	ReplicaID                uuid.UUID
-	LeaseTTL                 time.Duration
-	Emergency                *coordination.EmergencyAdmission
-	CoordinationAllowed      func() bool
-	CoordinationReady        func() bool
-	Runtime                  Runtime
-	Router                   *routing.Router
-	Forwarder                Forwarder
-	Usage                    UsageRecorder
-	Observer                 Observer
-	Now                      func() time.Time
-	LookupEnv                func(string) (string, bool)
-	RetryAfter               time.Duration
+	EmergencyTokenization             coordination.TokenizationCoordinator
+	AdmissionEstimateTimeout          time.Duration
+	AdmissionEstimateMaxResponseBytes int64
+	InputEstimator                    InputEstimator
+	Tokenization                      coordination.TokenizationCoordinator
+	TokenizationPolicy                coordination.TokenizationPolicy
+	TokenizationForwarder             TokenizationForwarder
+	TokenizationObserver              TokenizationObserver
+	TokenizationHealthMaxAge          time.Duration
+	CoordinationTimeout               time.Duration
+	Registry                          SnapshotProvider
+	HMACSecret                        []byte
+	Limiter                           *admission.Limiter
+	Admission                         coordination.AdmissionCoordinator
+	Leases                            *coordination.LeaseManager
+	ReplicaID                         uuid.UUID
+	LeaseTTL                          time.Duration
+	Emergency                         *coordination.EmergencyAdmission
+	CoordinationAllowed               func() bool
+	CoordinationReady                 func() bool
+	Runtime                           Runtime
+	Router                            *routing.Router
+	Forwarder                         Forwarder
+	Usage                             UsageRecorder
+	Observer                          Observer
+	Now                               func() time.Time
+	LookupEnv                         func(string) (string, bool)
+	RetryAfter                        time.Duration
 }
 
 type Service struct {
+	emergencyTokenization    coordination.TokenizationCoordinator
+	inputEstimator           InputEstimator
 	tokenization             coordination.TokenizationCoordinator
 	tokenizationPolicy       coordination.TokenizationPolicy
 	tokenizationForwarder    TokenizationForwarder
@@ -141,13 +147,29 @@ func New(dependencies Dependencies) *Service {
 	if emergency == nil {
 		emergency = coordination.NewEmergencyAdmission(0, 0)
 	}
-	return &Service{
+	service := &Service{
+		emergencyTokenization: dependencies.EmergencyTokenization, inputEstimator: dependencies.InputEstimator,
 		tokenization: dependencies.Tokenization, tokenizationPolicy: dependencies.TokenizationPolicy, tokenizationForwarder: dependencies.TokenizationForwarder, tokenizationObserver: dependencies.TokenizationObserver, tokenizationHealthMaxAge: dependencies.TokenizationHealthMaxAge, coordinationTimeout: dependencies.CoordinationTimeout,
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
 		limiter: limiter, admission: dependencies.Admission, leases: dependencies.Leases, replicaID: replicaID, leaseTTL: leaseTTL, emergency: emergency, coordinationAllowed: coordinationAllowed, coordinationReady: coordinationReady, runtime: dependencies.Runtime, router: dependencies.Router,
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
 		now: now, lookupEnv: lookupEnv, retryAfter: retryAfter,
 	}
+	if transport, ok := dependencies.TokenizationForwarder.(tokenizerTransport); ok && service.inputEstimator == nil {
+		timeout := dependencies.AdmissionEstimateTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		maxBytes := dependencies.AdmissionEstimateMaxResponseBytes
+		if maxBytes <= 0 {
+			maxBytes = 8 << 20
+		}
+		service.inputEstimator = tokenEstimator{
+			timeout: timeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
+			acquire: service.acquireEstimate, mayUseEmergency: service.mayUseEmergencyEstimate,
+		}
+	}
+	return service
 }
 
 type APIError struct {

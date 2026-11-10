@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"time"
@@ -18,6 +19,7 @@ type TokenEstimate struct {
 	InputTokens   []int64
 	ContextLimits []int64
 	Kind, Profile string
+	Mode          EstimationMode
 }
 
 type EstimationMode string
@@ -53,6 +55,8 @@ type tokenEstimator struct {
 	retryAfter       time.Duration
 	transport        tokenizerTransport
 	acquire          func(context.Context, EstimationRequest) (proxy.TokenizationRequest, func(), *APIError)
+	mayUseEmergency  func(EstimationRequest) bool
+	emergencyTimeout time.Duration
 }
 
 func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) (TokenEstimate, *APIError) {
@@ -60,8 +64,21 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 	if err != nil || !policy.Enabled || len(req.Prepared.Inputs) == 0 {
 		return TokenEstimate{}, e.unavailable()
 	}
-	ctx, cancel := context.WithTimeout(parent, e.timeout)
+	if req.Mode == "" {
+		req.Mode = EstimationNormal
+	}
+	emergencyTimeout := e.emergencyTimeout
+	if emergencyTimeout <= 0 {
+		emergencyTimeout = min(2*time.Second, e.timeout)
+	}
+	start := time.Now()
+	timeout := e.timeout
+	if req.Mode == EstimationEmergency {
+		timeout = min(timeout, emergencyTimeout)
+	}
+	ctx, cancel := context.WithDeadline(parent, start.Add(timeout))
 	defer cancel()
+	emergencyDeadline := start.Add(emergencyTimeout)
 
 	result := TokenEstimate{
 		InputTokens: make([]int64, len(req.Prepared.Inputs)), ContextLimits: make([]int64, len(req.Prepared.Inputs)),
@@ -83,6 +100,15 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 		default:
 			var apiErr *APIError
 			count, contextLimit, apiErr = e.tokenize(ctx, req, input)
+			if apiErr != nil && apiErr.Code == "tokenization_"+coordination.TokenizationUnavailable &&
+				req.Mode == EstimationNormal && ctx.Err() == nil && time.Now().Before(emergencyDeadline) &&
+				e.mayUseEmergency != nil && e.mayUseEmergency(req) {
+				req.Mode = EstimationEmergency
+				emergencyCtx, cancelEmergency := context.WithDeadline(ctx, emergencyDeadline)
+				defer cancelEmergency()
+				ctx = emergencyCtx
+				count, contextLimit, apiErr = e.tokenize(ctx, req, input)
+			}
 			if apiErr != nil {
 				if apiErr.Code != admission.RequestSizeUnsupported || policy.FallbackMode != domain.TokenFallbackUTF8Bytes {
 					return TokenEstimate{}, apiErr
@@ -108,6 +134,7 @@ func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) 
 	if ctx.Err() != nil {
 		return TokenEstimate{}, e.unavailable()
 	}
+	result.Mode = req.Mode
 	return result, nil
 }
 
@@ -156,13 +183,35 @@ func sizeValidationError(code, message string) *APIError {
 		Message: message, DecisionReason: DecisionInvalidRequest}
 }
 
-// acquireNormalEstimate shares the existing utility budget with public tokenize.
-func (s *Service) acquireNormalEstimate(ctx context.Context, req EstimationRequest) (proxy.TokenizationRequest, func(), *APIError) {
+func (s *Service) mayUseEmergencyEstimate(req EstimationRequest) bool {
+	return s.coordinationAllowed() && s.emergencyTokenization != nil &&
+		s.emergency.CanServe(req.Client.PriorityClass, req.Client.ID, req.Client.MaxConcurrency)
+}
+
+// Normal preflight shares the utility budget with public tokenize. Emergency
+// preflight uses a separate process-local coordinator.
+func (s *Service) acquireEstimate(ctx context.Context, req EstimationRequest) (proxy.TokenizationRequest, func(), *APIError) {
 	unavailable := func(reason string) (proxy.TokenizationRequest, func(), *APIError) {
 		return proxy.TokenizationRequest{}, nil, tokenizationError(http.StatusServiceUnavailable, reason, s.retryAfter)
 	}
-	if req.Snapshot == nil || s.tokenization == nil || !s.coordinationAllowed() || !s.coordinationReady() {
+	if req.Snapshot == nil || !s.coordinationAllowed() {
+		return unavailable("policy_unavailable")
+	}
+	coordinator := s.tokenization
+	if req.Mode == EstimationEmergency {
+		if !s.mayUseEmergencyEstimate(req) {
+			return unavailable("policy_unavailable")
+		}
+		if s.emergency.HasLegacyPoolLeases(req.Pool.ID) {
+			return proxy.TokenizationRequest{}, nil, &APIError{HTTPStatus: http.StatusServiceUnavailable, Type: "server_error",
+				Code: string(coordination.ReasonTokenPolicyTransition), Message: "Request size policy is waiting for legacy leases to drain", RetryAfter: s.retryAfter}
+		}
+		coordinator = s.emergencyTokenization
+	} else if !s.coordinationReady() {
 		return unavailable(coordination.TokenizationUnavailable)
+	}
+	if coordinator == nil {
+		return unavailable("policy_unavailable")
 	}
 	now := s.now().UTC()
 	candidates := make([]coordination.TokenizationCandidate, 0, len(req.Snapshot.BackendsByPool[req.Pool.ID]))
@@ -175,12 +224,16 @@ func (s *Service) acquireNormalEstimate(ctx context.Context, req EstimationReque
 		return unavailable("no_eligible_backend")
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].BackendID < candidates[j].BackendID })
-	decision, err := s.tokenization.Acquire(ctx, coordination.TokenizationAcquireRequest{
+	decision, err := coordinator.Acquire(ctx, coordination.TokenizationAcquireRequest{
 		OperationID: uuid.New(), ReplicaID: s.replicaID, RequestID: req.RequestID, OperationStartedAt: now,
 		ConfigurationRevision: req.Snapshot.Revision, APIKeyID: req.APIKeyID,
 		ClientID: req.Client.ID, PoolID: req.Pool.ID, PoolRevision: req.Pool.Revision, Candidates: candidates,
 	})
 	if err != nil {
+		var permanent coordination.PermanentError
+		if errors.As(err, &permanent) || coordinator.Status().Permanent {
+			return unavailable("policy_unavailable")
+		}
 		return unavailable(coordination.TokenizationUnavailable)
 	}
 	if decision.Lease == nil {
@@ -207,7 +260,7 @@ func (s *Service) acquireNormalEstimate(ctx context.Context, req EstimationReque
 		}
 		releaseCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), minTime(deadline, time.Now().Add(timeout)))
 		defer cancel()
-		_ = s.tokenization.Complete(releaseCtx, lease)
+		_ = coordinator.Complete(releaseCtx, lease)
 	}
 
 	current := s.registry.Snapshot()
@@ -222,9 +275,13 @@ func (s *Service) acquireNormalEstimate(ctx context.Context, req EstimationReque
 		key.ID != req.APIKeyID || client.ID != req.Client.ID || !current.Access[client.ID][req.Pool.ID] ||
 		!found || !wasCandidate || backend != expected || backend.Revision != lease.BackendRevision ||
 		backend.ModelPoolID != req.Pool.ID || lease.ClientID != client.ID || lease.PoolID != req.Pool.ID ||
-		!s.tokenizationEligible(backend, s.now().UTC()) || !s.coordinationAllowed() || !s.coordinationReady() {
+		!s.tokenizationEligible(backend, s.now().UTC()) || !s.coordinationAllowed() {
 		release()
 		return unavailable(coordination.TokenizationStaleConfiguration)
+	}
+	if req.Mode != EstimationEmergency && !s.coordinationReady() {
+		release()
+		return unavailable(coordination.TokenizationUnavailable)
 	}
 	secret, ok := s.upstreamSecret(backend)
 	if !ok {
