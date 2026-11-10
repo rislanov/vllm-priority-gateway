@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 )
 
 type expiredLease struct {
@@ -127,25 +128,40 @@ func (c *AdmissionCoordinator) cleanupExpired(ctx context.Context, items []expir
 	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, "DELETE FROM request_leases WHERE lease_id=ANY($1::uuid[]) AND expires_at<=$2::timestamptz RETURNING lease_id", leases, now)
+	expired, err := removeExpiredReservations(ctx, tx, leases, now)
 	if err != nil {
 		return err
 	}
-	expired, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
-		var id uuid.UUID
-		err := row.Scan(&id)
-		return id.String(), err
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	c.observeExpiredReservations(expired)
+	return nil
+}
+
+func removeExpiredReservations(ctx context.Context, tx pgx.Tx, leases []string, now time.Time) ([]coordination.TokenReservationEvent, error) {
+	rows, err := tx.Query(ctx, `WITH expired AS (
+		DELETE FROM request_leases WHERE lease_id=ANY($1::uuid[]) AND expires_at<=$2::timestamptz
+		RETURNING lease_id,pool_id,client_id,priority_class,reserved_tokens
+	), receipts AS (
+		UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),
+			retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours'
+		WHERE lease_id IN (SELECT lease_id FROM expired) AND completed_at IS NULL
+	)
+	SELECT pool_id,client_id,priority_class,reserved_tokens FROM expired WHERE reserved_tokens IS NOT NULL`, leases, now)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (event coordination.TokenReservationEvent, err error) {
+		err = row.Scan(&event.PoolID, &event.ClientID, &event.PriorityClass, &event.ReservedTokens)
+		return
 	})
-	if err != nil {
-		return err
+}
+
+func (c *AdmissionCoordinator) observeExpiredReservations(events []coordination.TokenReservationEvent) {
+	for _, event := range events {
+		event.Observe(c.reservationObserver, coordination.ReservationExpired, coordination.ReasonLeaseLost, nil)
 	}
-	if len(expired) > 0 {
-		_, err = tx.Exec(ctx, "UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours' WHERE lease_id=ANY($1::uuid[]) AND completed_at IS NULL", expired, now)
-		if err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
 }
 
 func (c *CircuitCoordinator) Cleanup(parent context.Context, batch int) error {

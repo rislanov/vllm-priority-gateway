@@ -54,3 +54,47 @@ func (r TokenReservation) ExhaustedScope(client, pool int64) AdmissionScope {
 	}
 	return ""
 }
+
+// TokenReservationObserver consumes best-effort accounting events. Install it
+// before serving requests. Callbacks must be fast and must not call coordinators.
+type TokenReservationObserver interface {
+	TokenReservationChanged(TokenReservationEvent)
+}
+
+type TokenReservationAction string
+
+const (
+	ReservationAcquired   TokenReservationAction = "acquired"
+	ReservationReleased   TokenReservationAction = "released"
+	ReservationExpired    TokenReservationAction = "expired"
+	ReservationReconciled TokenReservationAction = "reconciled"
+)
+
+// TokenReservationEvent carries accounting data without request content.
+type TokenReservationEvent struct {
+	PoolID, ClientID          int64
+	PriorityClass             domain.PriorityClass
+	Emergency                 bool
+	Action                    TokenReservationAction
+	Reason                    Reason
+	ReservedTokens            int64
+	UsageKnown                bool
+	ActualInput, ActualOutput int64
+}
+
+func (r AdmissionRequest) ReservationEvent() TokenReservationEvent {
+	return TokenReservationEvent{PoolID: r.PoolID, ClientID: r.ClientID,
+		PriorityClass: r.PriorityClass, ReservedTokens: r.TokenReservation.ReservedTokens}
+}
+
+func (e TokenReservationEvent) Observe(observer TokenReservationObserver, action TokenReservationAction, reason Reason, usage *TokenUsage) {
+	if observer == nil || e.ReservedTokens <= 0 {
+		return
+	}
+	e.Action, e.Reason = action, reason
+	if usage != nil && usage.Valid() {
+		e.UsageKnown = true
+		e.ActualInput, e.ActualOutput = usage.InputTokens, usage.OutputTokens
+	}
+	observer.TokenReservationChanged(e)
+}

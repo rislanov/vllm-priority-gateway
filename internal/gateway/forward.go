@@ -109,6 +109,7 @@ type resolvedForwardRequest struct {
 	tokenReservation  coordination.TokenReservation
 	estimationMode    EstimationMode
 	estimationStarted time.Time
+	tokenAdmission    TokenAdmissionEvent
 }
 
 func (s *Service) resolveForwardRequest(request ForwardRequest, lifecycle *forwardLifecycle) (resolvedForwardRequest, *APIError) {
@@ -170,6 +171,7 @@ func (s *Service) prepareForwardPayload(request ForwardRequest, resolved resolve
 	}
 	resolved.preparedSize = prepared
 	resolved.sizePolicy = policy
+	resolved.tokenAdmission.Enabled = policy.Enabled
 	resolved.tokenReservation = coordination.TokenReservation{}
 
 	payload, err := forceStreamingUsage(prepared.Payload, request.Path)
@@ -343,6 +345,8 @@ func (s *Service) Forward(
 	if apiErr != nil {
 		return proxy.Result{}, reservation, apiErr
 	}
+
+	defer func() { lifecycle.event.TokenAdmission = resolved.tokenAdmission }()
 
 	lifecycle.admissionStarted = time.Now()
 	poolRuntime, releasePool, poolErr := s.acquirePool(ctx, resolved.client.ID, resolved.pool)

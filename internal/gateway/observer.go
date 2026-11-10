@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
 
@@ -43,6 +44,16 @@ type InflightEvent struct {
 	PriorityClass domain.PriorityClass
 }
 
+// TokenAdmissionEvent contains bounded metadata for inference admission.
+type TokenAdmissionEvent struct {
+	Enabled, Attempted, Estimated bool
+	Mode                          EstimationMode
+	EstimatorKind                 string
+	InputEstimate, ReservedTokens int64
+	PreflightDuration             time.Duration
+	BudgetScope                   coordination.AdmissionScope
+}
+
 // RequestEvent describes one completed public inference request. It must never
 // contain credentials, prompts, generated content, or raw request bodies.
 type RequestEvent struct {
@@ -71,6 +82,7 @@ type RequestEvent struct {
 	UsageParseFailure string
 	SoftTPMExpected   bool
 	UpstreamFailure   string
+	TokenAdmission    TokenAdmissionEvent
 }
 
 // Observer receives synchronous request-lifecycle events. Implementations

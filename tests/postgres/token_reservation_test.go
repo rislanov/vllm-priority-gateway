@@ -136,6 +136,10 @@ func TestPostgresTokenReservationLostCommit(t *testing.T) {
 	db := openTestStoreWithMigration(t, runtime, raw)
 	f := tokenReservationFixtures(t, db, 10, 500)
 	coordinator := coordpostgres.NewAdmissionCoordinator(db, 3*time.Second)
+	var events []coordination.TokenReservationEvent
+	coordinator.SetTokenReservationObserver(tokenReservationObserverFunc(func(event coordination.TokenReservationEvent) {
+		events = append(events, event)
+	}))
 	ctx := context.Background()
 	req := postgresTokenRequest(f[0], uuid.New(), 600)
 	armed.Store(true)
@@ -172,6 +176,9 @@ func TestPostgresTokenReservationLostCommit(t *testing.T) {
 	}
 	if reserved != 0 || tpm != 250 {
 		t.Fatalf("completion replay left %d reserved and %v TPM, want 0 and 250", reserved, tpm)
+	}
+	if len(events) != 0 {
+		t.Fatalf("ambiguous commits or replays emitted lifecycle events: %+v", events)
 	}
 }
 
@@ -324,4 +331,58 @@ func TestPostgresTokenReservationContractUpgrade(t *testing.T) {
 		t.Fatalf("version 4 did not start after version 3 drained: %v", err)
 	}
 	defer current.Close()
+}
+
+type tokenReservationObserverFunc func(coordination.TokenReservationEvent)
+
+func (f tokenReservationObserverFunc) TokenReservationChanged(event coordination.TokenReservationEvent) {
+	f(event)
+}
+
+func TestPostgresTokenReservationExpiryTelemetry(t *testing.T) {
+	db := openTestStore(t, os.Getenv("LLMGW_POSTGRES_TEST_DSN"))
+	fixtures := tokenReservationFixtures(t, db, 0, 0)
+	ctx := context.Background()
+	acquiring := coordpostgres.NewAdmissionCoordinator(db, 3*time.Second)
+	expiring := coordpostgres.NewAdmissionCoordinator(db, 3*time.Second)
+	var events []coordination.TokenReservationEvent
+	expiring.SetTokenReservationObserver(tokenReservationObserverFunc(func(event coordination.TokenReservationEvent) {
+		events = append(events, event)
+	}))
+	for _, via := range []string{"cleanup", "renew", "complete"} {
+		t.Run(via, func(t *testing.T) {
+			events = nil
+			request := postgresTokenRequest(fixtures[0], uuid.New(), 600)
+			result, err := acquiring.Acquire(ctx, request)
+			if err != nil || !result.Admitted() {
+				t.Fatalf("acquire = %+v, %v", result, err)
+			}
+			if _, err := db.CoordinationPool().Exec(ctx, "UPDATE request_leases SET expires_at=clock_timestamp() WHERE lease_id=$1::uuid", request.LeaseID); err != nil {
+				t.Fatal(err)
+			}
+			switch via {
+			case "cleanup":
+				err = expiring.Cleanup(ctx, 16)
+			case "renew":
+				_, err = expiring.Renew(ctx, []coordination.LeaseIdentity{*result.Lease})
+			case "complete":
+				_, err = expiring.Complete(ctx, []coordination.LeaseCompletion{{Lease: *result.Lease}})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := expiring.Cleanup(ctx, 16); err != nil {
+				t.Fatal(err)
+			}
+			want := 1
+			if via == "complete" {
+				want++
+			}
+			if len(events) != want || events[0].Action != coordination.ReservationExpired ||
+				events[0].ReservedTokens != 600 || events[0].PriorityClass != fixtures[0].client.PriorityClass ||
+				events[0].Reason != coordination.ReasonLeaseLost {
+				t.Fatalf("events = %+v", events)
+			}
+		})
+	}
 }

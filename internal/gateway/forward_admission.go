@@ -114,11 +114,13 @@ func (s *Service) acquireForwardAdmission(ctx context.Context, request ForwardRe
 		lifecycle.event.ModelPoolID, lifecycle.event.Model, lifecycle.event.PoolState = pool.ID, pool.PublicModelName, poolRuntime.State
 	}
 	if !decision.Admitted() {
+		resolved.tokenAdmission.BudgetScope = decision.TokenBudgetScope
 		if decision.Reason == "" {
 			return nil, gatewayUnavailable(s.retryAfter)
 		}
 		return nil, s.forwardDecisionError(decision.Reason, decision.RetryAt, decision.ConcurrencyScope)
 	}
+	resolved.tokenAdmission.ReservedTokens = resolved.tokenReservation.ReservedTokens
 	lifecycle.event.SoftTPMExpected = resolved.client.TokensPerMinute > 0
 	var handle *coordination.LeaseHandle
 	if s.leases != nil {
@@ -153,6 +155,10 @@ func (s *Service) estimateForwardReservation(ctx context.Context, request Forwar
 	if !resolved.sizePolicy.Enabled {
 		return nil
 	}
+	resolved.tokenAdmission.Estimated = false
+	resolved.tokenAdmission.EstimatorKind = ""
+	resolved.tokenAdmission.InputEstimate = 0
+	resolved.tokenAdmission.Mode = EstimationNormal
 	if s.emergency.HasLegacyPoolLeases(resolved.pool.ID) {
 		return s.forwardDecisionError(coordination.ReasonTokenPolicyTransition, nil, "")
 	}
@@ -174,13 +180,19 @@ func (s *Service) estimateForwardReservation(ctx context.Context, request Forwar
 	}
 	estimateCtx, cancel := context.WithDeadline(ctx, resolved.estimationStarted.Add(timeout))
 	defer cancel()
+	started := time.Now()
+	resolved.tokenAdmission.Attempted = true
 	estimate, apiErr := s.inputEstimator.Estimate(estimateCtx, EstimationRequest{
 		Path: request.Path, Prepared: resolved.preparedSize, Snapshot: resolved.snapshot,
 		Client: resolved.client, Pool: resolved.pool, APIKeyID: keyID, RequestID: request.RequestID,
 		Mode: resolved.estimationMode, apiKey: request.APIKey,
 	})
+	resolved.tokenAdmission.PreflightDuration += time.Since(started)
 	if estimate.Mode == EstimationEmergency {
 		resolved.estimationMode = EstimationEmergency
+	}
+	if resolved.estimationMode == EstimationEmergency {
+		resolved.tokenAdmission.Mode = EstimationEmergency
 	}
 	if apiErr != nil {
 		return apiErr
@@ -212,11 +224,14 @@ func (s *Service) estimateForwardReservation(ctx context.Context, request Forwar
 		return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "Token estimate is invalid", Type: "server_error",
 			Code: "token_estimation_unavailable", RetryAfter: s.retryAfter}
 	}
+	resolved.tokenAdmission.Estimated = true
+	resolved.tokenAdmission.EstimatorKind = estimate.Kind
+	resolved.tokenAdmission.InputEstimate = input
 	return nil
 }
 
 func (s *Service) acquireEmergencyForward(ctx context.Context, rawKey string, req coordination.AdmissionRequest, resolved *resolvedForwardRequest) (func(*coordination.TokenUsage), coordination.Reason) {
-	var release func()
+	var release func(*coordination.TokenUsage)
 	reason := coordination.ReasonStaleConfiguration
 	s.withAdmissionSnapshot(rawKey, req, func() {
 		if ctx.Err() != nil || !s.coordinationAllowed() {
@@ -224,12 +239,13 @@ func (s *Service) acquireEmergencyForward(ctx context.Context, rawKey string, re
 			return
 		}
 		if req.TokenReservation.Enabled {
-			release, reason, _ = s.emergency.AcquireTokens(req.PriorityClass, req.ClientID, req.PoolID, req.EffectiveClientLimit,
+			resolved.tokenAdmission.Mode = EstimationEmergency
+			release, reason, resolved.tokenAdmission.BudgetScope = s.emergency.AcquireTokensWithUsage(req.PriorityClass, req.ClientID, req.PoolID, req.EffectiveClientLimit,
 				req.TokenReservation, resolved.sizePolicy.EmergencyPoolBudget)
 		} else {
-			var ok bool
-			release, ok = s.emergency.AcquireForPool(req.PriorityClass, req.ClientID, req.PoolID, req.EffectiveClientLimit)
+			releaseLegacy, ok := s.emergency.AcquireForPool(req.PriorityClass, req.ClientID, req.PoolID, req.EffectiveClientLimit)
 			if ok {
+				release = func(*coordination.TokenUsage) { releaseLegacy() }
 				reason = ""
 			} else {
 				reason = coordination.ReasonCoordinationUnavailable
@@ -241,7 +257,8 @@ func (s *Service) acquireEmergencyForward(ctx context.Context, rawKey string, re
 		return nil, reason
 	}
 	resolved.estimationMode = EstimationEmergency
-	return func(*coordination.TokenUsage) { release() }, ""
+	resolved.tokenAdmission.ReservedTokens = req.TokenReservation.ReservedTokens
+	return release, ""
 }
 
 func (s *Service) acquireConfiguredAdmission(ctx context.Context, rawKey string, req coordination.AdmissionRequest) (decision coordination.AdmissionDecision, err error) {

@@ -19,6 +19,18 @@
   <div><label for="edit-rpm">Requests per minute (0 disables)</label><input id="edit-rpm" name="requests_per_minute" type="number" min="0" max="10000000" value="{{$client.RequestsPerMinute}}" required></div>
   <div><label for="edit-tpm">Tokens per minute (0 disables)</label><input id="edit-tpm" name="tokens_per_minute" type="number" min="0" max="10000000000000" value="{{$client.TokensPerMinute}}" required></div>
   {{template "client-request-size" $client}}
+  {{if $client.ModelPoolIDs}}
+  <details class="wide"><summary>Saved effective token limits by model</summary><ul>
+    {{range .View.Pools}}{{if hasPool $client.ModelPoolIDs .ID}}
+    <li><strong>{{.PublicModelName}}</strong>
+      {{with effectiveRequestSize $client .}}
+        {{if .Enabled}}<span>Input max {{.Limits.MaxInputTokens}}, output max {{.Limits.MaxOutputTokens}}, output default {{.Limits.DefaultOutputTokens}}.</span>
+        {{else}}<span>Request size admission disabled.</span>{{end}}
+      {{else}}<span>Invalid request size policy.</span>{{end}}
+    </li>
+    {{end}}{{end}}
+  </ul></details>
+  {{end}}
   <fieldset><legend>Model access</legend>{{range .View.Pools}}<label class="check" for="edit-client-pool-{{.ID}}"><input id="edit-client-pool-{{.ID}}" name="model_pool_id" type="checkbox" value="{{.ID}}"{{if hasPool $client.ModelPoolIDs .ID}} checked{{end}}>{{.PublicModelName}}</label>{{end}}</fieldset>
   <label class="check" for="edit-client-enabled"><input id="edit-client-enabled" name="enabled" type="checkbox"{{if $client.Enabled}} checked{{end}}>Enabled</label>
   <div class="form-actions"><a class="button secondary" href="/admin/clients">Cancel</a><button class="button primary" type="submit">Save changes</button></div>

@@ -156,3 +156,61 @@ func TestTokenReservationLifecycle(t *testing.T) {
 		t.Fatalf("unknown usage debited estimated tokens: %+v", got)
 	}
 }
+
+func TestTokenReservationTelemetry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 10, 21, 0, 0, 0, time.UTC)
+	clock := contracttest.NewClock(now)
+	c := local.NewAdmissionCoordinator(clock.Now)
+	var events reservationEvents
+	c.SetTokenReservationObserver(&events)
+	req := tokenRequest(now, 600)
+	acquire := func(r coordination.AdmissionRequest) coordination.LeaseIdentity {
+		t.Helper()
+		result, err := c.Acquire(ctx, r)
+		if err != nil || !result.Admitted() {
+			t.Fatalf("acquire = %+v, %v", result, err)
+		}
+		return *result.Lease
+	}
+	first := acquire(req)
+	acquire(req)
+	complete := func(lease coordination.LeaseIdentity, usage *coordination.TokenUsage) {
+		t.Helper()
+		if _, err := c.Complete(ctx, []coordination.LeaseCompletion{{Lease: lease, Usage: usage}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usage := &coordination.TokenUsage{InputTokens: 150, OutputTokens: 100}
+	complete(first, usage)
+	complete(first, usage)
+	complete(acquire(tokenRequest(now, 600)), nil)
+	acquire(tokenRequest(now, 600))
+	clock.Add(req.LeaseTTL)
+	if got := c.OutstandingTokenSnapshot()[req.PoolID]; got != 0 {
+		t.Fatalf("expired reservation still holds %d tokens", got)
+	}
+	want := []coordination.TokenReservationAction{
+		coordination.ReservationAcquired, coordination.ReservationReleased, coordination.ReservationReconciled,
+		coordination.ReservationAcquired, coordination.ReservationReleased, coordination.ReservationReconciled,
+		coordination.ReservationAcquired, coordination.ReservationExpired,
+	}
+	if len(events) != len(want) {
+		t.Fatalf("events = %+v", events)
+	}
+	for i, action := range want {
+		event := events[i]
+		if event.Action != action || event.ReservedTokens != 600 || event.PoolID != req.PoolID || event.ClientID != req.ClientID {
+			t.Errorf("event %d = %+v, want %s", i, event, action)
+		}
+	}
+	if known, unknown := events[2], events[5]; !known.UsageKnown || known.ActualInput+known.ActualOutput != 250 || unknown.UsageKnown {
+		t.Fatalf("known usage = %+v, unknown usage = %+v", known, unknown)
+	}
+}
+
+type reservationEvents []coordination.TokenReservationEvent
+
+func (e *reservationEvents) TokenReservationChanged(event coordination.TokenReservationEvent) {
+	*e = append(*e, event)
+}

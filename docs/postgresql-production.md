@@ -257,6 +257,12 @@ Recovery is complete only after database ping, replica compatibility check, fres
 
 If a promotion or restore may have lost acknowledged commits, do **not** use ordinary recovery. Stop ingress and every gateway, fence the old history, reconcile configuration including acknowledged key revocations, and drain or terminate old upstream work before starting a new deployment. Record the provider guarantee or PostgreSQL synchronous-standby and fencing configuration in acceptance evidence.
 
+### Request size admission
+
+Migration 000007 adds request size policy and reservation accounting. The coordination contract advances from 3 to 4. Drain ingress and stop the old replicas before starting the upgraded group with matching normal and emergency tokenization policies. Wait for strict coordination readiness on each replica. Before downgrading, disable new admissions, drain active reservations and the coordination contract, then stop upgraded replicas before starting older binaries. The down migration refuses to remove active token reservations or an unfinished coordination contract.
+
+Normal admission locks the pool and client scopes in one transaction, checks unexpired outstanding reservations, and writes the lease and receipt atomically. A pool disabled after admission can still have outstanding token leases. Replica-local emergency token reservations are independent of the database and survive coordination recovery until their owning requests finish. During the overlap, the bookkeeping bound for unchanged policies is the shared pool cap plus the sum of replica emergency caps. GPU usage can differ from these estimates. The normal outstanding gauge is a sampled cluster value on each replica. Deduplicate samples by pool and monitor emergency outstanding by replica. See [request size admission](operations.md#request-size-admission).
+
 ## Readiness and tests
 
 | Endpoint | Semantics |

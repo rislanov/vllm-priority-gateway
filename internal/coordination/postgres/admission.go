@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -19,12 +20,15 @@ import (
 )
 
 type AdmissionCoordinator struct {
-	pool     *pgxpool.Pool
-	timeout  time.Duration
-	mu       sync.RWMutex
-	status   coordination.Status
-	inflight map[int64]int
-	failures failurePublisher
+	pool                *pgxpool.Pool
+	timeout             time.Duration
+	mu                  sync.RWMutex
+	status              coordination.Status
+	inflight            map[int64]int
+	outstanding         map[int64]int64
+	inflightSampleAt    time.Time
+	failures            failurePublisher
+	reservationObserver coordination.TokenReservationObserver
 }
 
 func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *AdmissionCoordinator {
@@ -33,11 +37,21 @@ func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *Admis
 	}
 	return &AdmissionCoordinator{pool: store.CoordinationPool(), timeout: timeout, status: coordination.Status{Backend: "postgres", Available: true}, inflight: make(map[int64]int)}
 }
+func (c *AdmissionCoordinator) SetTokenReservationObserver(observer coordination.TokenReservationObserver) {
+	c.reservationObserver = observer
+}
+
 func (c *AdmissionCoordinator) PoolInflight(poolID int64) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.inflight[poolID]
 }
+func (c *AdmissionCoordinator) OutstandingTokenSnapshot() map[int64]int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return maps.Clone(c.outstanding)
+}
+
 func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultErr error) {
 	defer func() {
 		if resultErr == nil {
@@ -48,25 +62,41 @@ func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultEr
 	}()
 	ctx, cancel := c.deadline(parent)
 	defer cancel()
-	rows, err := c.pool.Query(ctx, "SELECT pool_id,count(*) FROM request_leases WHERE expires_at>clock_timestamp() GROUP BY pool_id")
+	rows, err := c.pool.Query(ctx, `WITH at AS MATERIALIZED (SELECT clock_timestamp() AS now)
+		SELECT at.now, active.pool_id, active.count, active.reserved FROM at
+		LEFT JOIN LATERAL (
+			SELECT pool_id,count(*) AS count,LEAST(COALESCE(sum(reserved_tokens),0),9223372036854775807)::bigint AS reserved
+			FROM request_leases WHERE expires_at>at.now GROUP BY pool_id
+		) active ON true`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	next := make(map[int64]int)
+	outstanding := make(map[int64]int64)
+	var sampleAt time.Time
 	for rows.Next() {
-		var id int64
-		var count int
-		if err := rows.Scan(&id, &count); err != nil {
+		var id, reserved *int64
+		var count *int
+		if err := rows.Scan(&sampleAt, &id, &count, &reserved); err != nil {
 			return err
 		}
-		next[id] = count
+		if id != nil {
+			next[*id] = *count
+			if *reserved > 0 {
+				outstanding[*id] = *reserved
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.inflight = next
+	if !sampleAt.Before(c.inflightSampleAt) {
+		c.inflight = next
+		c.outstanding = outstanding
+		c.inflightSampleAt = sampleAt
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -270,7 +300,10 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	var reservationJSON *string
 	if reservation.Enabled {
 		reservedTokens = &reservation.ReservedTokens
-		encoded, err := json.Marshal(reservation)
+		encoded, err := json.Marshal(struct {
+			coordination.TokenReservation
+			PriorityClass domain.PriorityClass
+		}{reservation, configuredClass})
 		if err != nil {
 			return coordination.AdmissionDecision{}, err
 		}
@@ -288,6 +321,7 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	if err = tx.Commit(ctx); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
+	r.ReservationEvent().Observe(c.reservationObserver, coordination.ReservationAcquired, "", nil)
 	return coordination.AdmissionDecision{Lease: &lease}, nil
 }
 
@@ -547,16 +581,14 @@ func (c *AdmissionCoordinator) renew(ctx context.Context, leases []coordination.
 	}
 	// Only actual expiry changes the receipt; an identity mismatch must not
 	// mark another replica's still-live admission as expired.
-	if _, err = tx.Exec(ctx, `WITH expired AS (
-		DELETE FROM request_leases WHERE lease_id=ANY($1::uuid[]) AND expires_at<=$2::timestamptz RETURNING lease_id
-	) UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),
-		retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours'
-		WHERE lease_id IN (SELECT lease_id FROM expired) AND completed_at IS NULL`, ids, now); err != nil {
+	expired, err := removeExpiredReservations(ctx, tx, ids, now)
+	if err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	c.observeExpiredReservations(expired)
 	return out, nil
 }
 
@@ -607,14 +639,17 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 		return coordination.CompleteResult{}, err
 	}
 	var expires *time.Time
-	leaseErr := tx.QueryRow(ctx, "SELECT expires_at FROM request_leases WHERE lease_id=$1::uuid FOR UPDATE", item.Lease.LeaseID).Scan(&expires)
+	var leaseClass domain.PriorityClass
+	leaseErr := tx.QueryRow(ctx, "SELECT expires_at,priority_class FROM request_leases WHERE lease_id=$1::uuid FOR UPDATE", item.Lease.LeaseID).Scan(&expires, &leaseClass)
 	if leaseErr != nil && !errors.Is(leaseErr, pgx.ErrNoRows) {
 		return coordination.CompleteResult{}, leaseErr
 	}
-	var tokenAccounted bool
+	event := coordination.TokenReservationEvent{PoolID: pool, ClientID: client}
+	var receiptClass *string
 	err = tx.QueryRow(ctx, `SELECT client_id,pool_id,request_id,replica_id,decision,completed_at,completion_result,operation_started_at,
-		token_reservation IS NOT NULL FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE`, item.Lease.LeaseID).
-		Scan(&owner.ClientID, &owner.PoolID, &owner.RequestID, &owner.ReplicaID, &decision, &completed, &stored, &started, &tokenAccounted)
+		COALESCE((token_reservation->>'ReservedTokens')::bigint,0),token_reservation->>'PriorityClass'
+		FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE`, item.Lease.LeaseID).
+		Scan(&owner.ClientID, &owner.PoolID, &owner.RequestID, &owner.ReplicaID, &decision, &completed, &stored, &started, &event.ReservedTokens, &receiptClass)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Reason: coordination.ReasonStaleOperation})
 	}
@@ -676,14 +711,31 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 		return coordination.CompleteResult{}, err
 	}
 	var actualInput, actualOutput *int64
-	if tokenAccounted && item.Usage != nil && item.Usage.Valid() {
+	if event.ReservedTokens > 0 && item.Usage != nil && item.Usage.Valid() {
 		actualInput, actualOutput = &item.Usage.InputTokens, &item.Usage.OutputTokens
 	}
 	_, err = tx.Exec(ctx, "UPDATE admission_operations SET completed_at=$2::timestamptz,completion_result=$3::text,retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours',token_actual_input=$4::bigint,token_actual_output=$5::bigint WHERE lease_id=$1::uuid", item.Lease.LeaseID, now, string(result), actualInput, actualOutput)
 	if err != nil {
 		return coordination.CompleteResult{}, err
 	}
-	return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: result})
+	if err := tx.Commit(ctx); err != nil {
+		return coordination.CompleteResult{}, err
+	}
+	event.PriorityClass = leaseClass
+	if receiptClass != nil {
+		event.PriorityClass = domain.PriorityClass(*receiptClass)
+	}
+	var reason coordination.Reason
+	if result == coordination.CompletionReleased {
+		event.Observe(c.reservationObserver, coordination.ReservationReleased, "", nil)
+	} else {
+		reason = coordination.ReasonLeaseLost
+		if expires != nil {
+			event.Observe(c.reservationObserver, coordination.ReservationExpired, reason, nil)
+		}
+	}
+	event.Observe(c.reservationObserver, coordination.ReservationReconciled, reason, item.Usage)
+	return coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: result}, nil
 }
 func commitComplete(ctx context.Context, tx pgx.Tx, r coordination.CompleteResult) (coordination.CompleteResult, error) {
 	return r, tx.Commit(ctx)

@@ -65,6 +65,7 @@
 <fieldset class="wide"><legend>Request size admission</legend>
   <input type="hidden" name="request_size_policy" value="1">
   <label class="check"><input name="request_size_enabled" type="checkbox"{{with .}}{{if .Enabled}} checked{{end}}{{end}}>Enable token limits</label>
+  {{if .}}{{if not .Enabled}}<p>Request size admission disabled.</p>{{end}}{{else}}<p>Request size admission disabled by default.</p>{{end}}
   <label>Estimation profile<input name="estimation_profile" value="{{with .}}{{.EstimationProfile}}{{end}}"></label>
   <label>Fallback<select name="fallback_mode"><option value="reject">Reject unsupported input</option><option value="utf8_bytes"{{with .}}{{if eq .FallbackMode "utf8_bytes"}} selected{{end}}{{end}}>Estimate from UTF-8 bytes</option></select></label>
   <label>Maximum input tokens<input name="max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxInputTokens}}{{else}}0{{end}}" required></label>
@@ -74,7 +75,7 @@
   <label>Emergency outstanding tokens per replica (0 inherits pool limit)<input name="emergency_max_outstanding_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.EmergencyMaxOutstandingTokens}}{{else}}0{{end}}" required></label>
   <label>Fallback overhead in tokens<input name="fallback_overhead_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.FallbackOverheadTokens}}{{else}}0{{end}}" required></label>
   <details><summary>Priority class overrides</summary>
-  <p>Zero inherits the pool setting.</p>
+  <p>Zero inherits the pool setting. The lowest positive maximum across the pool, class, and client applies.</p>
   <fieldset><legend>Critical</legend>
   <label>Maximum input tokens<input name="critical_max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Critical.MaxInputTokens}}{{else}}0{{end}}" required></label>
   <label>Maximum output tokens<input name="critical_max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Critical.MaxOutputTokens}}{{else}}0{{end}}" required></label>

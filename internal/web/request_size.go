@@ -76,3 +76,14 @@ func readPoolRequestSize(form url.Values) (*httpapi.RequestSizeAdmissionDTO, err
 	}
 	return policy, nil
 }
+
+func effectiveRequestSize(client *httpapi.AdminClient, pool httpapi.AdminPool) *domain.EffectiveRequestSizePolicy {
+	effective, err := domain.ResolveRequestSizePolicy(domain.Client{
+		PriorityClass: client.PriorityClass, RequestSizeLimits: client.RequestSizeLimits,
+		MaxOutstandingTokens: client.MaxOutstandingTokens,
+	}, domain.ModelPool{RequestSizeAdmission: pool.RequestSizeAdmission.Policy()})
+	if err != nil {
+		return nil
+	}
+	return &effective
+}

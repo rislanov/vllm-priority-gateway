@@ -1,6 +1,7 @@
 package coordination
 
 import (
+	"maps"
 	"sync"
 
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
@@ -10,14 +11,15 @@ import (
 // recoverable coordination outage. Existing emergency work stays in this
 // accounting until its request releases the allocation, even after recovery.
 type EmergencyAdmission struct {
-	mu                sync.Mutex
-	critical          int
-	high              int
-	byClass           map[domain.PriorityClass]int
-	byClient          map[int64]int
-	clientOutstanding map[int64]int64
-	poolOutstanding   map[int64]int64
-	poolLegacyLeases  map[int64]int
+	mu                  sync.Mutex
+	reservationObserver TokenReservationObserver
+	critical            int
+	high                int
+	byClass             map[domain.PriorityClass]int
+	byClient            map[int64]int
+	clientOutstanding   map[int64]int64
+	poolOutstanding     map[int64]int64
+	poolLegacyLeases    map[int64]int
 }
 
 func NewEmergencyAdmission(critical, high int) *EmergencyAdmission {
@@ -28,18 +30,33 @@ func NewEmergencyAdmission(critical, high int) *EmergencyAdmission {
 	}
 }
 
+func (e *EmergencyAdmission) SetTokenReservationObserver(observer TokenReservationObserver) {
+	e.reservationObserver = observer
+}
+
 func (e *EmergencyAdmission) Acquire(class domain.PriorityClass, clientID int64, clientLimit int) (func(), bool) {
 	return e.AcquireForPool(class, clientID, 0, clientLimit)
 }
 
 func (e *EmergencyAdmission) AcquireForPool(class domain.PriorityClass, clientID, poolID int64, clientLimit int) (func(), bool) {
 	release, reason, _ := e.acquire(class, clientID, poolID, clientLimit, TokenReservation{})
-	return release, reason == ""
+	if release == nil {
+		return nil, false
+	}
+	return func() { release(nil) }, reason == ""
 }
 
 // AcquireTokens checks class, concurrency, and token caps atomically.
 // The returned reason and scope distinguish a budget denial from an outage.
 func (e *EmergencyAdmission) AcquireTokens(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(), Reason, AdmissionScope) {
+	release, reason, scope := e.AcquireTokensWithUsage(class, clientID, poolID, clientLimit, reservation, emergencyPoolBudget)
+	if release == nil {
+		return nil, reason, scope
+	}
+	return func() { release(nil) }, reason, scope
+}
+
+func (e *EmergencyAdmission) AcquireTokensWithUsage(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation, emergencyPoolBudget int64) (func(*TokenUsage), Reason, AdmissionScope) {
 	if !reservation.Enabled || !reservation.Valid() || emergencyPoolBudget <= 0 || emergencyPoolBudget > reservation.PoolBudget {
 		return nil, ReasonStaleConfiguration, ""
 	}
@@ -52,7 +69,7 @@ func (e *EmergencyAdmission) AcquireTokens(class domain.PriorityClass, clientID,
 	return e.acquire(class, clientID, poolID, clientLimit, reservation)
 }
 
-func (e *EmergencyAdmission) acquire(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation) (func(), Reason, AdmissionScope) {
+func (e *EmergencyAdmission) acquire(class domain.PriorityClass, clientID, poolID int64, clientLimit int, reservation TokenReservation) (func(*TokenUsage), Reason, AdmissionScope) {
 	if e == nil || clientLimit <= 0 {
 		return nil, ReasonCoordinationUnavailable, ""
 	}
@@ -76,26 +93,34 @@ func (e *EmergencyAdmission) acquire(class domain.PriorityClass, clientID, poolI
 		e.poolLegacyLeases[poolID]++
 	}
 
-	return sync.OnceFunc(func() {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		e.byClass[class]--
-		if e.byClient[clientID] == 1 {
-			delete(e.byClient, clientID)
-		} else {
-			e.byClient[clientID]--
-		}
-		if reservation.Enabled {
-			subtractEmergencyTokens(e.clientOutstanding, clientID, reservation.ReservedTokens)
-			subtractEmergencyTokens(e.poolOutstanding, poolID, reservation.ReservedTokens)
-		} else if poolID > 0 {
-			if e.poolLegacyLeases[poolID] == 1 {
-				delete(e.poolLegacyLeases, poolID)
+	event := TokenReservationEvent{PoolID: poolID, ClientID: clientID, PriorityClass: class, Emergency: true,
+		ReservedTokens: reservation.ReservedTokens}
+	event.Observe(e.reservationObserver, ReservationAcquired, "", nil)
+	var once sync.Once
+	return func(usage *TokenUsage) {
+		once.Do(func() {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			e.byClass[class]--
+			if e.byClient[clientID] == 1 {
+				delete(e.byClient, clientID)
 			} else {
-				e.poolLegacyLeases[poolID]--
+				e.byClient[clientID]--
 			}
-		}
-	}), "", ""
+			if reservation.Enabled {
+				subtractEmergencyTokens(e.clientOutstanding, clientID, reservation.ReservedTokens)
+				subtractEmergencyTokens(e.poolOutstanding, poolID, reservation.ReservedTokens)
+			} else if poolID > 0 {
+				if e.poolLegacyLeases[poolID] == 1 {
+					delete(e.poolLegacyLeases, poolID)
+				} else {
+					e.poolLegacyLeases[poolID]--
+				}
+			}
+			event.Observe(e.reservationObserver, ReservationReleased, "", nil)
+			event.Observe(e.reservationObserver, ReservationReconciled, "", usage)
+		})
+	}, "", ""
 }
 
 func subtractEmergencyTokens(counter map[int64]int64, id, tokens int64) {
@@ -141,4 +166,13 @@ func (e *EmergencyAdmission) PoolOutstandingTokens(poolID int64) int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.poolOutstanding[poolID]
+}
+
+func (e *EmergencyAdmission) OutstandingTokenSnapshot() map[int64]int64 {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return maps.Clone(e.poolOutstanding)
 }

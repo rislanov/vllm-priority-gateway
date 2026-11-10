@@ -160,6 +160,12 @@ type AdmissionPolicyObserver interface {
 	ObserveClientRatePolicy(ClientRatePolicy)
 }
 
+// OutstandingTokenReader reports active token reservations by model pool.
+// Implementations return a snapshot the caller may modify.
+type OutstandingTokenReader interface {
+	OutstandingTokenSnapshot() map[int64]int64
+}
+
 type AdmissionRuntime interface {
 	PoolInflight(poolID int64) int
 	RefreshInflight(context.Context) error

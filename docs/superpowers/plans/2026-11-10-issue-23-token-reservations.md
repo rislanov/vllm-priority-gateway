@@ -205,11 +205,11 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** add optional `TokenReservationObserver` with `TokenReservationChanged(TokenReservationEvent)`; events contain pool/client IDs, class, mode, action (acquired/released/expired/reconciled), amounts, a usage-known flag, and a bounded reason. Do not promise exactly-once PostgreSQL event delivery: monotonic metric events are best effort; the authoritative outstanding snapshot is the source of truth. RequestEvent gains numeric estimate/reserve and estimator/mode fields.
 
-- [ ] `TestTokenReservationTelemetry`: reserve600/actual250/unknown are three distinct states; replay emits no second local accounting callback; expiry release is visible without HTTP completion. Uncertain PostgreSQL callback delivery does not affect correctness.
-- [ ] `TestTokenReservationPrivacy`: unique sentinel prompt/generated/tokenizer strings do not appear in persisted receipts, structured events/logs, metric labels, or API errors. Missing actual usage is not serialized as actual 0.
-- [ ] `TestRequestSizeAdminForms`: effective limits, clear disabled/inherited labels, and per-replica emergency copy; partial form updates preserve policy; CSRF/auth remain intact. Check the existing template test workflow.
-- [ ] Implement bounded metrics/observers and UI. Document utility preflight capacity planning, fallback calibration, the disabled-pool/client-budget boundary, the High-headroom limitation, unknown usage, enable drain, and recovery overlap.
-- [ ] Run `go test ./internal/observability ./internal/httpapi ./internal/web -count=1` and `make test-web-unit`; require PASS. Commit: `feat: expose token reservation decisions and operating limits`.
+- [x] `TestTokenReservationTelemetry`: reserve600/actual250/unknown are three distinct states; replay emits no second local accounting callback; expiry release is visible without HTTP completion. Uncertain PostgreSQL callback delivery does not affect correctness.
+- [x] `TestTokenReservationPrivacy`: unique sentinel prompt/generated/tokenizer strings do not appear in persisted receipts, structured events/logs, metric labels, or API errors. Missing actual usage is not serialized as actual 0.
+- [x] `TestRequestSizeAdminForms`: effective limits, clear disabled/inherited labels, and per-replica emergency copy; partial form updates preserve policy; CSRF/auth remain intact. Check the existing template test workflow.
+- [x] Implement bounded metrics/observers and UI. Document utility preflight capacity planning, fallback calibration, the disabled-pool/client-budget boundary, the High-headroom limitation, unknown usage, enable drain, and recovery overlap.
+- [x] Run `go test ./internal/observability ./internal/httpapi ./internal/web -count=1` and `make test-web-unit`; require PASS. Commit: `feat: expose token reservation decisions and operating limits`.
 
 ## Task 8: Qualification, real-vLLM experiment, and final acceptance
 

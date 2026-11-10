@@ -17,6 +17,7 @@ import (
 
 // Metrics owns an isolated Prometheus registry and implements gateway.Observer.
 type Metrics struct {
+	tokenAdmission         tokenAdmissionMetrics
 	registry               *prometheus.Registry
 	requests               *prometheus.CounterVec
 	requestsInflight       *prometheus.GaugeVec
@@ -207,6 +208,7 @@ func NewMetrics() *Metrics {
 		m.emergency, m.rateRejections, m.missingUsage, m.circuitCacheAge, m.circuitRefreshFailures,
 		m.circuitReplayBacklog, m.circuitReplayDropped, m.compatibleReplicas,
 	)
+	m.tokenAdmission = newTokenAdmissionMetrics(m.registry)
 	return m
 }
 
@@ -357,6 +359,7 @@ func (m *Metrics) BackendInflight(event gateway.InflightEvent, delta int) {
 }
 
 func (m *Metrics) Complete(event gateway.RequestEvent) {
+	m.tokenAdmission.observeRequest(event)
 	if event.SoftTPMExpected && event.Usage == nil {
 		m.CoordinationMissingUsage()
 	}

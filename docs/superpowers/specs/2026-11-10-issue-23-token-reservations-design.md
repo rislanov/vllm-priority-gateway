@@ -201,7 +201,7 @@ The Admin API and existing client/pool forms expose enabled state, effective lim
 | AC13 | Zero migration defaults, contract-version incompatibility, drain upgrades/downgrades, and rollback without losing active reservations | Migration + startup tests |
 | AC14 | Repeatable comparison of High admission and TTFT under short-High/long-Background traffic on real vLLM | Real-vLLM report: model/version/hardware/config/seed, enabled vs disabled |
 
-Deterministic accounting example: Bpool=1000, Bclient=800, R=600 → admit the first request, reject a second from that client; admit another client's R=400 to reach exactly 1000; reject R=1; completing the first releases 600, replaying completion releases 0. High does not bypass total token/client/RPM/TPM limits.
+Deterministic accounting example: Bpool=1000, Bclient=800, R=600 → admit the first request, reject a second from that client; admit another client's R=400 to reach exactly 1000; reject R=2; completing the first releases 600, replaying completion releases 0. High does not bypass total token/client/RPM/TPM limits.
 
 ## 11. Real-vLLM qualification and rollout
 

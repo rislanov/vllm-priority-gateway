@@ -32,11 +32,17 @@ func (input PoolInput) storeParams() store.CreatePoolParams {
 		HighPriorityReserve: input.HighPriorityReserve, MaxWaiting: input.MaxWaiting,
 	}
 	if size := input.RequestSizeAdmission; size != nil {
-		p.RequestSizeAdmission = &domain.RequestSizePolicy{
-			Enabled: size.Enabled, Limits: size.RequestSizeLimits, ClassLimits: size.ClassLimits,
-			MaxOutstandingTokens: size.MaxOutstandingTokens, EmergencyMaxOutstandingTokens: size.EmergencyMaxOutstandingTokens,
-			FallbackMode: size.FallbackMode, EstimationProfile: size.EstimationProfile, FallbackOverheadTokens: size.FallbackOverheadTokens,
-		}
+		policy := size.Policy()
+		p.RequestSizeAdmission = &policy
 	}
 	return p
+}
+
+// Policy converts the API representation to the admission policy.
+func (size RequestSizeAdmissionDTO) Policy() domain.RequestSizePolicy {
+	return domain.RequestSizePolicy{
+		Enabled: size.Enabled, Limits: size.RequestSizeLimits, ClassLimits: size.ClassLimits,
+		MaxOutstandingTokens: size.MaxOutstandingTokens, EmergencyMaxOutstandingTokens: size.EmergencyMaxOutstandingTokens,
+		FallbackMode: size.FallbackMode, EstimationProfile: size.EstimationProfile, FallbackOverheadTokens: size.FallbackOverheadTokens,
+	}
 }
