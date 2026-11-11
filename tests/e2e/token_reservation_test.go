@@ -591,6 +591,10 @@ func (h *remoteHarness) checkTokenCaps(ctx context.Context, pool adminPool) erro
 	return nil
 }
 
+func ownsExperimentTokenPolicy(current *httpapi.RequestSizeAdmissionDTO, confirmed httpapi.RequestSizeAdmissionDTO, pending *httpapi.RequestSizeAdmissionDTO) bool {
+	return current != nil && (*current == confirmed || pending != nil && *current == *pending)
+}
+
 func TestTokenReservationsWithRealVLLM(t *testing.T) {
 	cfg := loadE2EConfig(t, modeTokens)
 	h := newRemoteHarness(t, cfg)
@@ -611,23 +615,34 @@ func TestTokenReservationsWithRealVLLM(t *testing.T) {
 	t.Logf("pool_limits=%s pool_inflight=%d slot_reserve=%d waiting=%d", policyJSON, original.MaxGatewayInflight, original.HighPriorityReserve, original.MaxWaiting)
 
 	currentPolicy := *original.RequestSizeAdmission
+	var pendingPolicy *httpapi.RequestSizeAdmissionDTO
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.recoveryTimeout)
 		defer cancel()
-		if err := h.waitTokenIdle(ctx, original, currentPolicy.Enabled); err != nil {
-			t.Errorf("drain experiment before restoring its token policy: %v", err)
-		}
 		current, err := h.fetchAdminStatus(ctx)
 		if err != nil {
 			t.Errorf("read experiment pool before restoring policy: %v", err)
 			return
 		}
 		pool := current.requirePool(t, cfg.model)
-		if pool.ID != original.ID || !reflect.DeepEqual(pool.RequestSizeAdmission, &currentPolicy) {
+		if pool.ID != original.ID || !ownsExperimentTokenPolicy(pool.RequestSizeAdmission, currentPolicy, pendingPolicy) {
 			t.Error("experiment pool policy changed externally before restoration")
 			return
 		}
-		if currentPolicy != *original.RequestSizeAdmission {
+		if err := h.waitTokenIdle(ctx, pool, pool.RequestSizeAdmission.Enabled); err != nil {
+			t.Errorf("drain experiment before restoring its token policy: %v", err)
+		}
+		latest, err := h.fetchAdminStatus(ctx)
+		if err != nil {
+			t.Errorf("recheck the experiment pool before restoring its token policy: %v", err)
+			return
+		}
+		pool = latest.requirePool(t, cfg.model)
+		if pool.ID != original.ID || !ownsExperimentTokenPolicy(pool.RequestSizeAdmission, currentPolicy, pendingPolicy) {
+			t.Error("experiment pool policy changed externally during cleanup")
+			return
+		}
+		if *pool.RequestSizeAdmission != *original.RequestSizeAdmission {
 			if _, err := h.updatePoolPolicy(ctx, pool, original.RequestSizeAdmission); err != nil {
 				t.Errorf("restore request size policy: %v", err)
 			}
@@ -656,11 +671,14 @@ func TestTokenReservationsWithRealVLLM(t *testing.T) {
 			target := currentPolicy
 			target.Enabled = enabled
 			if target != currentPolicy {
+				// A lost update response can leave either of these policies
+				// in effect. Cleanup owns both until the write is confirmed.
+				pendingPolicy = &target
 				updated, err := h.updatePoolPolicy(context.Background(), pool, &target)
 				if err != nil {
 					t.Fatal(err)
 				}
-				currentPolicy = target
+				currentPolicy, pendingPolicy = target, nil
 				if !samePoolConfiguration(original, updated) || !reflect.DeepEqual(updated.RequestSizeAdmission, &target) {
 					t.Fatal("pool policy update changed settings outside the experiment")
 				}

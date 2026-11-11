@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 )
 
 func TestFindDuplicateClientKeyDoesNotExposeSecret(t *testing.T) {
@@ -778,5 +780,26 @@ func TestTokenExperimentWorkloadReplaysBySeed(t *testing.T) {
 	}
 	if len(a) != 100 || len(b) != 40 || b[1].key != "b" || len(b[0].prompt) <= len(a[0].prompt) {
 		t.Fatal("incorrect mixed workload schedule")
+	}
+}
+
+func TestTokenExperimentOwnsAmbiguousPolicyUpdate(t *testing.T) {
+	original := httpapi.RequestSizeAdmissionDTO{EstimationProfile: "qualified", MaxOutstandingTokens: 1000}
+	attempted := original
+	attempted.Enabled = true
+	collateral := attempted
+	collateral.MaxOutstandingTokens = 2000
+	for _, check := range []struct {
+		current *httpapi.RequestSizeAdmissionDTO
+		want    bool
+	}{
+		{&original, true}, {&attempted, true}, {&collateral, false}, {nil, false},
+	} {
+		if got := ownsExperimentTokenPolicy(check.current, original, &attempted); got != check.want {
+			t.Errorf("ownership of %+v = %v, want %v", check.current, got, check.want)
+		}
+	}
+	if ownsExperimentTokenPolicy(&attempted, original, nil) {
+		t.Error("unattempted policy change was treated as experiment-owned")
 	}
 }
