@@ -166,7 +166,7 @@ func New(dependencies Dependencies) *Service {
 			maxBytes = 8 << 20
 		}
 		service.inputEstimator = tokenEstimator{
-			timeout: service.admissionEstimateTimeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
+			timeout: service.admissionEstimateTimeout, normalUtilityTimeout: service.tokenizationPolicy.Timeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
 			acquire: service.acquireEstimate, mayUseEmergency: service.mayUseEmergencyEstimate,
 		}
 	}

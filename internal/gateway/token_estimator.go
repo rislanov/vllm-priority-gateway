@@ -50,13 +50,14 @@ type tokenizerTransport interface {
 }
 
 type tokenEstimator struct {
-	timeout          time.Duration
-	maxResponseBytes int64
-	retryAfter       time.Duration
-	transport        tokenizerTransport
-	acquire          func(context.Context, EstimationRequest) (proxy.TokenizationRequest, func(), *APIError)
-	mayUseEmergency  func(EstimationRequest) bool
-	emergencyTimeout time.Duration
+	timeout              time.Duration
+	normalUtilityTimeout time.Duration
+	maxResponseBytes     int64
+	retryAfter           time.Duration
+	transport            tokenizerTransport
+	acquire              func(context.Context, EstimationRequest) (proxy.TokenizationRequest, func(), *APIError)
+	mayUseEmergency      func(EstimationRequest) bool
+	emergencyTimeout     time.Duration
 }
 
 func (e tokenEstimator) Estimate(parent context.Context, req EstimationRequest) (TokenEstimate, *APIError) {
@@ -145,6 +146,13 @@ func (e tokenEstimator) tokenize(ctx context.Context, req EstimationRequest, inp
 	body, err := replaceModel(input, req.Pool.UpstreamModelName)
 	if err != nil {
 		return 0, 0, e.unavailable()
+	}
+	// The normal utility lease uses its own configured timeout. Keep each
+	// tokenizer call inside that lease as well as the batch's deadline.
+	if req.Mode == EstimationNormal && e.normalUtilityTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.normalUtilityTimeout)
+		defer cancel()
 	}
 	upstream, release, apiErr := e.acquire(ctx, req)
 	if apiErr != nil {
@@ -249,19 +257,7 @@ func (s *Service) acquireEstimate(ctx context.Context, req EstimationRequest) (p
 		}
 	}
 	lease := *decision.Lease
-	release := func() {
-		deadline, ok := ctx.Deadline()
-		if !ok {
-			return
-		}
-		timeout := s.coordinationTimeout
-		if timeout <= 0 {
-			timeout = 500 * time.Millisecond
-		}
-		releaseCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), minTime(deadline, time.Now().Add(timeout)))
-		defer cancel()
-		_ = coordinator.Complete(releaseCtx, lease)
-	}
+	release := func() { s.releaseTokenizationLease(ctx, coordinator, lease) }
 
 	current := s.registry.Snapshot()
 	client, key, authErr := s.validateAPIKeySnapshot(req.apiKey, current)
@@ -289,11 +285,4 @@ func (s *Service) acquireEstimate(ctx context.Context, req EstimationRequest) (p
 		return unavailable(coordination.TokenizationStaleConfiguration)
 	}
 	return proxy.TokenizationRequest{Backend: backend, UpstreamAPIKey: secret}, release, nil
-}
-
-func minTime(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
-	}
-	return b
 }
