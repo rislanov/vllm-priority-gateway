@@ -693,3 +693,90 @@ func unitRemoteHarness(t *testing.T, server *httptest.Server) *remoteHarness {
 	client.Jar = jar
 	return &remoteHarness{t: t, cfg: e2eConfig{baseURL: baseURL, probeTimeout: time.Second}, client: client}
 }
+
+func TestParseTokenExperimentConfig(t *testing.T) {
+	env := map[string]string{
+		"LLMGW_E2E_MODE": "tokens", "LLMGW_E2E_GATEWAY_URL": "http://localhost:8080",
+		"LLMGW_E2E_ADMIN_USERNAME": "admin", "LLMGW_E2E_ADMIN_PASSWORD": "secret",
+		"LLMGW_E2E_MODEL": "test-model", "LLMGW_E2E_HIGH_KEY": "high-secret", "LLMGW_E2E_LOW_KEYS": "background-secret",
+		"LLMGW_E2E_TOKEN_PROFILE_FILE": "/tmp/qualification.json",
+	}
+	lookup := func(key string) (string, bool) { value, ok := env[key]; return value, ok }
+	cfg, err := parseE2EConfig(lookup, e2eMode("tokens"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.tokens.runs != 3 || cfg.tokens.highProbes != 100 || cfg.tokens.seed != 23 {
+		t.Fatalf("unexpected experiment defaults: %+v", cfg.tokens)
+	}
+	for _, invalid := range []struct{ key, value string }{
+		{"LLMGW_E2E_MODE", "token"}, {"LLMGW_E2E_ADMIN_PASSWORD", ""},
+		{"LLMGW_E2E_LOW_KEYS", "high-secret"}, {"LLMGW_E2E_TOKEN_HIGH_PROBES", "99"},
+		{"LLMGW_E2E_TOKEN_RUNS", "2"}, {"LLMGW_E2E_TOKEN_PROFILE_FILE", ""},
+	} {
+		previous := env[invalid.key]
+		env[invalid.key] = invalid.value
+		_, err := parseE2EConfig(lookup, e2eMode("tokens"))
+		if err == nil || !strings.Contains(err.Error(), invalid.key) || strings.Contains(err.Error(), "high-secret") {
+			t.Errorf("%s validation returned %v", invalid.key, err)
+		}
+		env[invalid.key] = previous
+	}
+}
+
+func TestTokenExperimentAccounting(t *testing.T) {
+	report := tokenClassReport{}
+	started := time.Now().Add(-time.Second)
+	var missing tokenProbeResult
+	missing.status = http.StatusOK
+	readTokenStream(strings.NewReader("data: {\"choices\":[{\"text\":\"\"}]}\n\ndata: [DONE]\n\n"), started, &missing)
+	report.record(tokenProbe{cap: 8}, missing)
+	if report.MissingTTFT != 1 || report.UnknownUsage != 1 || durationPercentiles(report.ttft)[0] != nil {
+		t.Fatalf("unknown usage/TTFT was replaced by a numeric observation: %+v", report)
+	}
+
+	var complete tokenProbeResult
+	complete.status = http.StatusOK
+	readTokenStream(strings.NewReader("data: {\"choices\":[{\"text\":\"first\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":8}}\n\ndata: [DONE]\n\n"), started, &complete)
+	report.record(tokenProbe{cap: 8}, complete)
+	report.record(tokenProbe{cap: 8}, tokenProbeResult{status: http.StatusTooManyRequests, reason: "token_budget_exhausted", retryAfter: true})
+	report.record(tokenProbe{cap: 8}, tokenProbeResult{status: http.StatusServiceUnavailable, reason: "token_estimation_unavailable"})
+	if report.Attempted != 4 || report.Admitted != 2 || report.Completed != 2 || report.Rejections["token_budget_exhausted"] != 1 ||
+		report.Errors["token_estimation_unavailable"] != 1 || report.UnknownUsage != 1 || report.OutputTokens != 8 || len(report.ttft) != 1 {
+		t.Fatalf("unexpected accounting: %+v", report)
+	}
+}
+
+func TestTokenExperimentRejectsInsufficientEvidence(t *testing.T) {
+	high := tokenClassReport{Attempted: 100, Completed: 1}
+	base := tokenRunReport{High: high, Background: tokenClassReport{Completed: 1}, PeakOutstanding: 100, PreflightSamples: 100}
+	if err := base.validate(true, 100); err == nil || !strings.Contains(err.Error(), "token pressure") {
+		t.Fatalf("absent token pressure: %v", err)
+	}
+	base.Background.Rejections = map[string]int{"token_budget_exhausted": 1}
+	base.PoolBudgetDenials = 1
+	if err := base.validate(true, 100); err != nil {
+		t.Fatal(err)
+	}
+	base.Background.Rejections["tokenization_client_rate"] = 1
+	if err := base.validate(true, 100); err == nil || !strings.Contains(err.Error(), "utility capacity") {
+		t.Fatalf("utility exhaustion: %v", err)
+	}
+	base.High.Attempted = 99
+	if err := base.validate(true, 100); err == nil || !strings.Contains(err.Error(), "insufficient High probes") {
+		t.Fatalf("insufficient workload: %v", err)
+	}
+}
+
+func TestTokenExperimentWorkloadReplaysBySeed(t *testing.T) {
+	cfg := e2eConfig{highKey: "high", lowKeys: []string{"a", "b"}, tokens: tokenExperimentConfig{highProbes: 100, backgroundBurst: 4, backgroundOutput: 256}}
+	a, b := tokenWorkload(cfg, 23)
+	c, d := tokenWorkload(cfg, 23)
+	e, f := tokenWorkload(cfg, 24)
+	if !reflect.DeepEqual(a, c) || !reflect.DeepEqual(b, d) || reflect.DeepEqual(a, e) || reflect.DeepEqual(b, f) {
+		t.Fatal("workload is not paired reproducibly")
+	}
+	if len(a) != 100 || len(b) != 40 || b[1].key != "b" || len(b[0].prompt) <= len(a[0].prompt) {
+		t.Fatal("incorrect mixed workload schedule")
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 	"github.com/rislanov/vllm-priority-gateway/internal/gateway"
 	"github.com/rislanov/vllm-priority-gateway/internal/observability"
@@ -76,6 +77,34 @@ func TestOutstandingTokenGaugeKeepsCoordinationModesSeparate(t *testing.T) {
 	} {
 		if !strings.Contains(recorder.Body.String(), sample) {
 			t.Errorf("missing gauge sample %q", sample)
+		}
+	}
+}
+
+func TestTokenReservationUnderestimateAndBudgetScope(t *testing.T) {
+	metrics := observability.NewMetrics()
+	metrics.Complete(gateway.RequestEvent{
+		PriorityClass: domain.PriorityCritical, Status: http.StatusOK,
+		Usage: &domain.TokenUsage{InputTokens: 200, OutputTokens: 401},
+		TokenAdmission: gateway.TokenAdmissionEvent{
+			Enabled: true, Mode: gateway.EstimationEmergency, EstimatorKind: "upstream", ReservedTokens: 600,
+		},
+	})
+	for _, scope := range []coordination.AdmissionScope{coordination.AdmissionClientScope, coordination.AdmissionPoolScope} {
+		metrics.Complete(gateway.RequestEvent{
+			PriorityClass: domain.PriorityCritical, Status: http.StatusTooManyRequests, DecisionReason: gateway.DecisionTokenBudgetExhausted,
+			TokenAdmission: gateway.TokenAdmissionEvent{Enabled: true, Mode: gateway.EstimationEmergency, BudgetScope: scope},
+		})
+	}
+	recorder := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	for _, sample := range []string{
+		`llmgw_admission_underestimate_total{estimator="upstream",mode="emergency",priority_class="critical"} 1`,
+		`llmgw_admission_token_budget_rejections_total{mode="emergency",priority_class="critical",scope="client"} 1`,
+		`llmgw_admission_token_budget_rejections_total{mode="emergency",priority_class="critical",scope="pool"} 1`,
+	} {
+		if !strings.Contains(recorder.Body.String(), sample) {
+			t.Errorf("missing metric %q", sample)
 		}
 	}
 }

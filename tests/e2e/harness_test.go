@@ -25,6 +25,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	"github.com/rislanov/vllm-priority-gateway/internal/httpapi"
 )
 
 type e2eMode string
@@ -34,9 +35,27 @@ const (
 	modePriority   e2eMode = "priority"
 	modeResilience e2eMode = "resilience"
 	modeReserve    e2eMode = "reserve"
+	modeTokens     e2eMode = "tokens"
 )
 
+func validE2EMode(mode e2eMode) bool {
+	switch mode {
+	case modeSmoke, modePriority, modeResilience, modeReserve, modeTokens:
+		return true
+	default:
+		return false
+	}
+}
+
+type tokenExperimentConfig struct {
+	runs, highProbes, backgroundBurst, backgroundOutput int
+	seed                                                int64
+	interval                                            time.Duration
+	profileFile                                         string
+}
+
 type e2eConfig struct {
+	tokens              tokenExperimentConfig
 	baseURL             *url.URL
 	adminUsername       string
 	adminPassword       string
@@ -63,12 +82,12 @@ func loadE2EConfig(t *testing.T, required e2eMode) e2eConfig {
 	t.Helper()
 	mode := e2eMode(strings.TrimSpace(os.Getenv("LLMGW_E2E_MODE")))
 	if mode == "" {
-		t.Skip("set LLMGW_E2E_MODE=smoke, priority, resilience, or reserve to run external gateway checks")
+		t.Skip("set LLMGW_E2E_MODE=smoke, priority, resilience, reserve, or tokens to run external gateway checks")
 	}
-	if mode != modeSmoke && mode != modePriority && mode != modeResilience && mode != modeReserve {
-		t.Fatalf("LLMGW_E2E_MODE = %q, want smoke, priority, resilience, or reserve", mode)
+	if !validE2EMode(mode) {
+		t.Fatalf("LLMGW_E2E_MODE = %q, want smoke, priority, resilience, reserve, or tokens", mode)
 	}
-	if required != modeSmoke && mode != required {
+	if mode != required && (required != modeSmoke || mode == modeTokens) {
 		t.Skipf("set LLMGW_E2E_MODE=%s to run this external scenario", required)
 	}
 	cfg, err := parseE2EConfig(os.LookupEnv, mode)
@@ -80,8 +99,8 @@ func loadE2EConfig(t *testing.T, required e2eMode) e2eConfig {
 
 func parseE2EConfig(lookup func(string) (string, bool), mode e2eMode) (e2eConfig, error) {
 	configuredMode := e2eMode(strings.TrimSpace(lookupValue(lookup, "LLMGW_E2E_MODE")))
-	if configuredMode != mode || (mode != modeSmoke && mode != modePriority && mode != modeResilience && mode != modeReserve) {
-		return e2eConfig{}, fmt.Errorf("LLMGW_E2E_MODE must be exactly smoke, priority, resilience, or reserve")
+	if configuredMode != mode || !validE2EMode(mode) {
+		return e2eConfig{}, fmt.Errorf("LLMGW_E2E_MODE must be exactly smoke, priority, resilience, reserve, or tokens")
 	}
 	baseURLValue, err := requiredLookup(lookup, "LLMGW_E2E_GATEWAY_URL")
 	if err != nil {
@@ -218,6 +237,56 @@ func parseE2EConfig(lookup func(string) (string, bool), mode e2eMode) (e2eConfig
 				return e2eConfig{}, fmt.Errorf("LLMGW_E2E_PEER_GATEWAY_URL must be an absolute HTTP(S) URL without credentials, query or fragment")
 			}
 		}
+	}
+	if mode == modeTokens {
+		if cfg.lowKeys, err = listLookup(lookup, "LLMGW_E2E_LOW_KEYS", 1); err != nil {
+			return e2eConfig{}, err
+		}
+		keys := []namedClientKey{{name: "LLMGW_E2E_HIGH_KEY", value: cfg.highKey}}
+		for index, key := range cfg.lowKeys {
+			keys = append(keys, namedClientKey{name: fmt.Sprintf("LLMGW_E2E_LOW_KEYS[%d]", index), value: key})
+		}
+		if first, second, duplicate := findDuplicateClientKey(keys); duplicate {
+			return e2eConfig{}, fmt.Errorf("%s and %s must use distinct client keys", first, second)
+		}
+		if cfg.tokens, err = parseTokenExperimentConfig(lookup); err != nil {
+			return e2eConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
+func parseTokenExperimentConfig(lookup func(string) (string, bool)) (tokenExperimentConfig, error) {
+	var cfg tokenExperimentConfig
+	for _, item := range []struct {
+		name               string
+		fallback, min, max int
+		target             *int
+	}{
+		{"RUNS", 3, 3, 30, &cfg.runs},
+		{"HIGH_PROBES", 100, 100, 10000, &cfg.highProbes},
+		{"BACKGROUND_BURST", 4, 1, 64, &cfg.backgroundBurst},
+		{"BACKGROUND_OUTPUT", 256, 16, 4096, &cfg.backgroundOutput},
+	} {
+		name := "LLMGW_E2E_TOKEN_" + item.name
+		value, err := positiveIntLookup(lookup, name, item.fallback)
+		if err != nil {
+			return tokenExperimentConfig{}, err
+		}
+		if value < item.min || value > item.max {
+			return tokenExperimentConfig{}, fmt.Errorf("%s must be between %d and %d", name, item.min, item.max)
+		}
+		*item.target = value
+	}
+	var err error
+	if cfg.seed, err = nonNegativeInt64Lookup(lookup, "LLMGW_E2E_TOKEN_SEED", 23); err != nil {
+		return tokenExperimentConfig{}, err
+	}
+	if cfg.interval, err = positiveDurationLookup(lookup, "LLMGW_E2E_TOKEN_INTERVAL", 200*time.Millisecond); err != nil {
+		return tokenExperimentConfig{}, err
+	}
+	if cfg.profileFile, err = requiredLookup(lookup, "LLMGW_E2E_TOKEN_PROFILE_FILE"); err != nil {
+		return tokenExperimentConfig{}, err
 	}
 	return cfg, nil
 }
@@ -435,20 +504,23 @@ type loadStatusResponse struct {
 }
 
 type adminStatus struct {
-	Revision int64          `json:"revision"`
-	Pools    []adminPool    `json:"pools"`
-	Backends []adminBackend `json:"backends"`
+	Revision int64                 `json:"revision"`
+	Pools    []adminPool           `json:"pools"`
+	Backends []adminBackend        `json:"backends"`
+	Clients  []httpapi.AdminClient `json:"clients"`
+	Keys     []httpapi.AdminKey    `json:"keys"`
 }
 
 type adminPool struct {
-	ID                  int64       `json:"id"`
-	PublicModelName     string      `json:"publicModelName"`
-	UpstreamModelName   string      `json:"upstreamModelName"`
-	Enabled             bool        `json:"enabled"`
-	MaxGatewayInflight  int         `json:"maxGatewayInflight"`
-	HighPriorityReserve int         `json:"highPriorityReserve"`
-	MaxWaiting          int         `json:"maxWaiting"`
-	Runtime             poolRuntime `json:"runtime"`
+	ID                   int64                            `json:"id"`
+	PublicModelName      string                           `json:"publicModelName"`
+	UpstreamModelName    string                           `json:"upstreamModelName"`
+	Enabled              bool                             `json:"enabled"`
+	MaxGatewayInflight   int                              `json:"maxGatewayInflight"`
+	HighPriorityReserve  int                              `json:"highPriorityReserve"`
+	MaxWaiting           int                              `json:"maxWaiting"`
+	Runtime              poolRuntime                      `json:"runtime"`
+	RequestSizeAdmission *httpapi.RequestSizeAdmissionDTO `json:"requestSizeAdmission"`
 }
 
 type poolRuntime struct {
@@ -1248,12 +1320,13 @@ func (h *remoteHarness) adminMutation(path string) {
 }
 
 type poolUpdateInput struct {
-	PublicModelName     string `json:"publicModelName"`
-	UpstreamModelName   string `json:"upstreamModelName"`
-	Enabled             bool   `json:"enabled"`
-	MaxGatewayInflight  int    `json:"maxGatewayInflight"`
-	HighPriorityReserve int    `json:"highPriorityReserve"`
-	MaxWaiting          int    `json:"maxWaiting"`
+	PublicModelName      string                           `json:"publicModelName"`
+	UpstreamModelName    string                           `json:"upstreamModelName"`
+	Enabled              bool                             `json:"enabled"`
+	MaxGatewayInflight   int                              `json:"maxGatewayInflight"`
+	HighPriorityReserve  int                              `json:"highPriorityReserve"`
+	MaxWaiting           int                              `json:"maxWaiting"`
+	RequestSizeAdmission *httpapi.RequestSizeAdmissionDTO `json:"requestSizeAdmission,omitempty"`
 }
 
 type backendUpdateInput struct {
@@ -1268,9 +1341,14 @@ type backendUpdateInput struct {
 }
 
 func (h *remoteHarness) updatePool(ctx context.Context, pool adminPool) (adminPool, error) {
+	return h.updatePoolPolicy(ctx, pool, nil)
+}
+
+func (h *remoteHarness) updatePoolPolicy(ctx context.Context, pool adminPool, policy *httpapi.RequestSizeAdmissionDTO) (adminPool, error) {
 	input := poolUpdateInput{
 		PublicModelName: pool.PublicModelName, UpstreamModelName: pool.UpstreamModelName, Enabled: pool.Enabled,
 		MaxGatewayInflight: pool.MaxGatewayInflight, HighPriorityReserve: pool.HighPriorityReserve, MaxWaiting: pool.MaxWaiting,
+		RequestSizeAdmission: policy,
 	}
 	var output adminPool
 	if err := h.adminPUT(ctx, "/admin/api/pools/"+strconv.FormatInt(pool.ID, 10), input, &output); err != nil {
