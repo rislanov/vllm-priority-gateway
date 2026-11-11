@@ -145,7 +145,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: gateway
-          image: ghcr.io/rislanov/vllm-priority-gateway:0.6.3
+          image: ghcr.io/rislanov/vllm-priority-gateway:0.7.0
           env:
             - name: LLMGW_SHUTDOWN_GRACE_PERIOD
               value: "30s"
