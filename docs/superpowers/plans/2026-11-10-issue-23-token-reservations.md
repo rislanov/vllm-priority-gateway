@@ -10,7 +10,7 @@
 
 **Spec:** [design](../specs/2026-11-10-issue-23-token-reservations-design.md).
 
-**Status:** Implementation in progress. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
+**Status:** Implementation and qualification complete. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
 
 ## Global Constraints
 
@@ -217,11 +217,11 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 
 **Interfaces:** add e2e mode `tokens` and accept it in `make test-real-vllm`. Use existing gateway/model/admin/key environment names; add `LLMGW_E2E_TOKEN_RUNS=3`, `LLMGW_E2E_TOKEN_HIGH_PROBES=100`, and a reproducible seed. Print a numeric experiment report without prompt content.
 
-- [ ] Configuration/scenario unit tests: explain invalid modes/missing credentials; distinguish attempts/admissions/rejections in counters; do not replace missing TTFT with 0; fail the scenario if it does not reach token pressure or collect 100 probes per repetition.
-- [ ] Implement the paired disabled/enabled 3× experiment from spec §11 with warm-up, checks against collateral policy edits, cleanup/restoration of test-owned settings, cap/unknown/error accounting, and ratios/percentiles. Use the same workload/model configuration for disabled and enabled runs and record their order.
-- [ ] Run `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`, `make test-web-unit`, and `make test-postgres`; record commands, commit, environment/profile, pass/fail/skips. PostgreSQL requires actual two-replica executions.
-- [ ] Run `LLMGW_E2E_MODE=tokens make test-real-vllm` against a dedicated real-vLLM target with a qualified model profile and safe secret handling. Run direct tokenizer-versus-generation qualification on every backend for supported exact payloads. Without an environment, mark AC14 pending; synthetic tests are not a substitute.
-- [ ] Populate AC01–AC14 evidence with test links and results. Fix confirmed defects with regressions or obtain explicit acceptance of exceptions. Perform a whole-branch review before the PR.
+- [x] Configuration/scenario unit tests: explain invalid modes/missing credentials; distinguish attempts/admissions/rejections in counters; do not replace missing TTFT with 0; fail the scenario if it does not reach token pressure or collect 100 probes per repetition.
+- [x] Implement the paired disabled/enabled 3× experiment from spec §11 with warm-up, checks against collateral policy edits, cleanup/restoration of test-owned settings, cap/unknown/error accounting, and ratios/percentiles. Use the same workload/model configuration for disabled and enabled runs and record their order.
+- [x] Run `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`, `make test-web-unit`, and `make test-postgres`; record commands, commit, environment/profile, pass/fail/skips. PostgreSQL requires actual two-replica executions.
+- [x] Run `LLMGW_E2E_MODE=tokens make test-real-vllm` against a dedicated real-vLLM target with a qualified model profile and safe secret handling. Run direct tokenizer-versus-generation qualification on every backend for supported exact payloads. Without an environment, mark AC14 pending; synthetic tests are not a substitute.
+- [x] Populate AC01–AC14 evidence with test links and results. Fix confirmed defects with regressions or obtain explicit acceptance of exceptions. Perform a whole-branch review before the PR.
 - [ ] Commit: `test: qualify token reservations under mixed inference load`. Publish a PR/close the issue after implementation/evidence is ready, not at this draft-plan stage.
 
 ## Plan self-review and execution order
