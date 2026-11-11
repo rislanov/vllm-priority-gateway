@@ -106,26 +106,43 @@ func newGatewayApplication(
 		OpenCooldown: cfg.CircuitOpenCooldown, HalfOpenMaxProbes: cfg.CircuitHalfOpenMaxProbes,
 	}
 	var admissionCoordinator coordination.AdmissionCoordinator
+	var normalOutstanding coordination.OutstandingTokenReader
 	var tokenizationCoordinator coordination.TokenizationCoordinator
 	var circuitCoordinator coordination.CircuitCoordinator
 	var replicaManager *coordpostgres.ReplicaManager
 	if postgresDatabase, ok := database.(*pgstore.Store); ok {
-		admissionCoordinator = coordpostgres.NewAdmissionCoordinator(postgresDatabase, cfg.CoordinationTimeout)
+		admission := coordpostgres.NewAdmissionCoordinator(postgresDatabase, cfg.CoordinationTimeout)
+		admission.SetTokenReservationObserver(metrics)
+		admissionCoordinator, normalOutstanding = admission, admission
 		tokenizationCoordinator = coordpostgres.NewTokenizationCoordinator(postgresDatabase, cfg.Tokenization, cfg.CoordinationTimeout)
 		circuitCoordinator, err = coordpostgres.NewCircuitCoordinator(postgresDatabase, cfg.CoordinationTimeout, circuitOptions)
 		if err != nil {
 			return nil, fmt.Errorf("initialize circuit coordination: %w", err)
 		}
-		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization}, cfg.CoordinationTimeout,
+		replicaManager = coordpostgres.NewReplicaManager(postgresDatabase, replicaID, coordpostgres.ReplicaPolicy{LeaseTTL: cfg.LeaseTTL, LeaseRenewInterval: cfg.LeaseRenewInterval, Circuit: circuitOptions, Tokenization: cfg.Tokenization, EmergencyTokenization: cfg.EmergencyTokenization}, cfg.CoordinationTimeout,
 			coordpostgres.ReplicaManagerOptions{ResetOnStart: cfg.CoordinationResetOnStart, StartupWaitTimeout: cfg.CoordinationStartupWaitTimeout, Logger: logger})
 	} else {
-		admissionCoordinator = coordlocal.NewAdmissionCoordinator(time.Now)
+		admission := coordlocal.NewAdmissionCoordinator(time.Now)
+		admission.SetTokenReservationObserver(metrics)
+		admissionCoordinator, normalOutstanding = admission, admission
 		tokenizationCoordinator = coordlocal.NewTokenizationCoordinator(cfg.Tokenization, time.Now)
 		circuitCoordinator, err = coordlocal.NewCircuitCoordinator(circuitOptions, time.Now)
 		if err != nil {
 			return nil, fmt.Errorf("initialize local circuit coordination: %w", err)
 		}
 	}
+	emergencyAdmission := coordination.NewEmergencyAdmission(cfg.EmergencyCriticalMaxInflight, cfg.EmergencyHighMaxInflight)
+	emergencyAdmission.SetTokenReservationObserver(metrics)
+	metrics.RegisterOutstandingTokenMetrics(normalOutstanding, emergencyAdmission, func() []int64 {
+		var pools []int64
+		for id, pool := range registryValue.Snapshot().PoolsByID {
+			if pool.RequestSizeAdmission.Enabled {
+				pools = append(pools, id)
+			}
+		}
+		return pools
+	})
+
 	var manager *monitor.Manager
 	var leaseManager *coordination.LeaseManager
 	var recoveryManager *coordination.RecoveryManager
@@ -279,9 +296,11 @@ func newGatewayApplication(
 		}
 	})
 	service := gateway.New(gateway.Dependencies{
+		EmergencyTokenization:    coordlocal.NewEmergencyTokenizationCoordinator(cfg.EmergencyTokenization, time.Now),
+		AdmissionEstimateTimeout: cfg.AdmissionEstimateTimeout, AdmissionEstimateMaxResponseBytes: cfg.AdmissionEstimateMaxResponseBytes,
 		Tokenization: tokenizationCoordinator, TokenizationPolicy: cfg.Tokenization, TokenizationForwarder: proxy.New(upstreamClient), TokenizationObserver: tokenizationObserver, TokenizationHealthMaxAge: cfg.HealthInterval*time.Duration(cfg.UnhealthyAfter) + cfg.HealthTimeout, CoordinationTimeout: cfg.CoordinationTimeout,
 		Registry: registryValue, HMACSecret: cfg.APIKeyHMACSecret, Admission: admissionCoordinator, Leases: leaseManager, ReplicaID: replicaID, LeaseTTL: cfg.LeaseTTL,
-		Emergency: coordination.NewEmergencyAdmission(cfg.EmergencyCriticalMaxInflight, cfg.EmergencyHighMaxInflight), CoordinationAllowed: coordinationAllowed, CoordinationReady: adminMutationsAllowed,
+		Emergency: emergencyAdmission, CoordinationAllowed: coordinationAllowed, CoordinationReady: adminMutationsAllowed,
 		Runtime: manager, Router: routing.NewWithSessionAffinity(
 			cfg.RoutingPressureEpsilon,
 			cfg.SessionAffinityMaxPressure,

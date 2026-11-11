@@ -23,6 +23,7 @@ type tokenizationRate struct {
 type TokenizationCoordinator struct {
 	mu              sync.Mutex
 	policy          coordination.TokenizationPolicy
+	burst           float64
 	now             func() time.Time
 	receipts        map[uuid.UUID]*tokenizationReceipt
 	rates           map[int64]tokenizationRate
@@ -40,8 +41,17 @@ func NewTokenizationCoordinator(policy coordination.TokenizationPolicy, now func
 	if now == nil {
 		now = time.Now
 	}
-	return &TokenizationCoordinator{policy: policy, now: now, receipts: make(map[uuid.UUID]*tokenizationReceipt), rates: make(map[int64]tokenizationRate), receiptCounts: make(map[int64]int), active: make(map[uuid.UUID]coordination.TokenizationLease), clientInflight: make(map[int64]int), backendInflight: make(map[int64]int)}
+	return &TokenizationCoordinator{policy: policy, burst: policy.Burst(), now: now, receipts: make(map[uuid.UUID]*tokenizationReceipt), rates: make(map[int64]tokenizationRate), receiptCounts: make(map[int64]int), active: make(map[uuid.UUID]coordination.TokenizationLease), clientInflight: make(map[int64]int), backendInflight: make(map[int64]int)}
 }
+
+// NewEmergencyTokenizationCoordinator isolates outage preflight from the
+// normal utility coordinator. Emergency preflight allows a burst of one.
+func NewEmergencyTokenizationCoordinator(policy coordination.TokenizationPolicy, now func() time.Time) *TokenizationCoordinator {
+	c := NewTokenizationCoordinator(policy, now)
+	c.burst = 1
+	return c
+}
+
 func (c *TokenizationCoordinator) Status() coordination.Status {
 	return coordination.Status{Backend: "local", Available: c.policy.Validate() == nil}
 }
@@ -100,9 +110,9 @@ func (c *TokenizationCoordinator) Acquire(ctx context.Context, r coordination.To
 	}
 	state, ok := c.rates[r.ClientID]
 	if !ok {
-		state = tokenizationRate{c.policy.Burst(), now}
+		state = tokenizationRate{c.burst, now}
 	}
-	state.balance = min(c.policy.Burst(), state.balance+max(0, now.Sub(state.at).Seconds())*float64(c.policy.ClientRPM)/60)
+	state.balance = min(c.burst, state.balance+max(0, now.Sub(state.at).Seconds())*float64(c.policy.ClientRPM)/60)
 	state.at = now
 	if state.balance < 1 {
 		retry := now.Add(time.Duration((1 - state.balance) * 60 / float64(c.policy.ClientRPM) * float64(time.Second)))

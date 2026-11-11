@@ -129,9 +129,14 @@ func newHarness(t *testing.T, settings ...harnessOptions) *harness {
 		keyUsage = apikey.NewUsageRecorder(ctx, harnessUsage{database: database, registry: registryValue})
 		usage = keyUsage
 	}
+	tokenization := coordination.DefaultTokenizationPolicy()
+	transport := proxy.New(client)
+
 	service := gateway.New(gateway.Dependencies{
 		Registry: registryValue, HMACSecret: hmacSecret, Admission: coordinator, Leases: leases, LeaseTTL: 2 * time.Second, Runtime: manager,
-		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: proxy.New(client), Observer: metrics,
+		Router: routing.New(.02, routing.FixedSource(0)), Forwarder: transport, Observer: metrics,
+		Tokenization: local.NewTokenizationCoordinator(tokenization, time.Now), TokenizationPolicy: tokenization,
+		TokenizationForwarder: transport, TokenizationHealthMaxAge: time.Second,
 		Usage: usage, LookupEnv: os.LookupEnv,
 	})
 	publicHandler := httpapi.NewPublicHandler(service, 1<<20, nil)

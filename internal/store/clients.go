@@ -15,6 +15,7 @@ func (s *SQLite) CreateClient(ctx context.Context, params CreateClientParams) (d
 		VLLMPriority: params.VLLMPriority, MaxConcurrency: params.MaxConcurrency,
 		RequestsPerMinute: params.RequestsPerMinute, TokensPerMinute: params.TokensPerMinute, Revision: 1,
 	}
+	params.ApplyRequestSize(&client)
 	if err := client.Validate(); err != nil {
 		return domain.Client{}, err
 	}
@@ -28,10 +29,11 @@ func (s *SQLite) CreateClient(ctx context.Context, params CreateClientParams) (d
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO clients (name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, revision, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO clients (name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, revision, created_at, updated_at, max_input_tokens, max_output_tokens, default_output_tokens, max_outstanding_tokens)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
 		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, client.Revision, timestamp(now), timestamp(now),
+		client.RequestSizeLimits.MaxInputTokens, client.RequestSizeLimits.MaxOutputTokens, client.RequestSizeLimits.DefaultOutputTokens, client.MaxOutstandingTokens,
 	)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("insert client: %w", err)
@@ -66,9 +68,11 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	var previous domain.Client
 	// Reserve the writer before reading the previous limit so concurrent writes
 	// cannot force a deferred transaction to upgrade an obsolete WAL snapshot.
-	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING max_concurrency`, id).Scan(&previous.MaxConcurrency); err != nil {
+	if err := tx.QueryRowContext(ctx, `UPDATE clients SET id = id WHERE id = ? RETURNING max_concurrency, max_input_tokens, max_output_tokens, default_output_tokens, max_outstanding_tokens`, id).Scan(
+		&previous.MaxConcurrency, &client.RequestSizeLimits.MaxInputTokens, &client.RequestSizeLimits.MaxOutputTokens, &client.RequestSizeLimits.DefaultOutputTokens, &client.MaxOutstandingTokens); err != nil {
 		return domain.Client{}, fmt.Errorf("find client %d: %w", id, err)
 	}
+	params.ApplyRequestSize(&client)
 	if err := client.ValidateUpdate(previous); err != nil {
 		return domain.Client{}, err
 	}
@@ -76,10 +80,12 @@ func (s *SQLite) UpdateClient(ctx context.Context, id int64, params UpdateClient
 	var created string
 	err = tx.QueryRowContext(ctx, `
 		UPDATE clients SET name = ?, enabled = ?, priority_class = ?, vllm_priority = ?,
-		max_concurrency = ?, requests_per_minute = ?, tokens_per_minute = ?, revision = revision + 1, updated_at = ?
+		max_concurrency = ?, requests_per_minute = ?, tokens_per_minute = ?, revision = revision + 1, updated_at = ?,
+		max_input_tokens = ?, max_output_tokens = ?, default_output_tokens = ?, max_outstanding_tokens = ?
 		WHERE id = ? RETURNING revision, created_at`,
 		client.Name, boolInt(client.Enabled), client.PriorityClass, client.VLLMPriority,
-		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, timestamp(client.UpdatedAt), id,
+		client.MaxConcurrency, client.RequestsPerMinute, client.TokensPerMinute, timestamp(client.UpdatedAt),
+		client.RequestSizeLimits.MaxInputTokens, client.RequestSizeLimits.MaxOutputTokens, client.RequestSizeLimits.DefaultOutputTokens, client.MaxOutstandingTokens, id,
 	).Scan(&client.Revision, &created)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("update client: %w", err)
@@ -150,7 +156,7 @@ func (s *SQLite) DeleteClient(ctx context.Context, id int64) ([]int64, error) {
 
 func (s *SQLite) ListClients(ctx context.Context) ([]domain.Client, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at
+		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at, max_input_tokens, max_output_tokens, default_output_tokens, max_outstanding_tokens
 		FROM clients ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list clients: %w", err)
@@ -220,6 +226,7 @@ func scanClient(row scanner) (domain.Client, error) {
 	if err := row.Scan(
 		&client.ID, &client.Revision, &client.Name, &enabled, &client.PriorityClass, &client.VLLMPriority,
 		&client.MaxConcurrency, &client.RequestsPerMinute, &client.TokensPerMinute, &created, &updated,
+		&client.RequestSizeLimits.MaxInputTokens, &client.RequestSizeLimits.MaxOutputTokens, &client.RequestSizeLimits.DefaultOutputTokens, &client.MaxOutstandingTokens,
 	); err != nil {
 		return domain.Client{}, fmt.Errorf("scan client: %w", err)
 	}

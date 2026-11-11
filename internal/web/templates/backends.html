@@ -11,6 +11,7 @@
   <div><label for="edit-max-gateway-inflight">Max gateway inflight</label>{{if gt $pool.MaxGatewayInflight 100000}}<p class="warning">Legacy value exceeds 100,000; leave unchanged or lower it.</p>{{end}}<input id="edit-max-gateway-inflight" name="max_gateway_inflight" type="number" min="0"{{if le $pool.MaxGatewayInflight 100000}} max="100000"{{end}} step="1" value="{{$pool.MaxGatewayInflight}}" required></div>
   <div><label for="edit-high-priority-reserve">High/Critical reserve</label><input id="edit-high-priority-reserve" name="high_priority_reserve" type="number" min="0" step="1" value="{{$pool.HighPriorityReserve}}" required><small>Slots reserved for High and Critical. Normal and Background cannot borrow them. 0 disables the reserve; a positive value requires a finite pool inflight limit.</small></div>
   <div><label for="edit-max-waiting">Max waiting</label><input id="edit-max-waiting" name="max_waiting" type="number" min="0" step="1" value="{{$pool.MaxWaiting}}" required></div>
+  {{template "pool-request-size" $pool.RequestSizeAdmission}}
   <label class="check" for="edit-pool-enabled"><input id="edit-pool-enabled" name="enabled" type="checkbox"{{if $pool.Enabled}} checked{{end}}>Enabled</label>
   <div class="form-actions"><a class="button secondary" href="/admin/backends">Cancel</a><button class="button primary" type="submit">Save changes</button></div>
 </form></section>
@@ -43,6 +44,7 @@
   <div><label for="max-gateway-inflight">Max gateway inflight</label><input id="max-gateway-inflight" name="max_gateway_inflight" type="number" min="0" max="100000" step="1" value="0" required></div>
   <div><label for="high-priority-reserve">High/Critical reserve</label><input id="high-priority-reserve" name="high_priority_reserve" type="number" min="0" step="1" value="0" required><small>Slots reserved for High and Critical. Normal and Background cannot borrow them. 0 disables the reserve; a positive value requires a finite pool inflight limit.</small></div>
   <div><label for="max-waiting">Max waiting</label><input id="max-waiting" name="max_waiting" type="number" min="0" step="1" value="0" required></div>
+  {{template "pool-request-size"}}
   <label class="check" for="pool-enabled"><input id="pool-enabled" name="enabled" type="checkbox" checked>Enabled</label>
   <div class="form-actions"><button class="button primary" type="submit">Create pool</button></div>
 </form></section>
@@ -58,3 +60,42 @@
   <div class="form-actions"><button class="button primary" type="submit">Create backend</button></div>
 </form></section>
 </div>
+
+{{define "pool-request-size"}}
+<fieldset class="wide"><legend>Request size admission</legend>
+  <input type="hidden" name="request_size_policy" value="1">
+  <label class="check"><input name="request_size_enabled" type="checkbox"{{with .}}{{if .Enabled}} checked{{end}}{{end}}>Enable token limits</label>
+  {{if .}}{{if not .Enabled}}<p>Request size admission disabled.</p>{{end}}{{else}}<p>Request size admission disabled by default.</p>{{end}}
+  <label>Estimation profile<input name="estimation_profile" value="{{with .}}{{.EstimationProfile}}{{end}}"></label>
+  <label>Fallback<select name="fallback_mode"><option value="reject">Reject unsupported input</option><option value="utf8_bytes"{{with .}}{{if eq .FallbackMode "utf8_bytes"}} selected{{end}}{{end}}>Estimate from UTF-8 bytes</option></select></label>
+  <label>Maximum input tokens<input name="max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum outstanding tokens<input name="max_outstanding_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.MaxOutstandingTokens}}{{else}}0{{end}}" required></label>
+  <label>Emergency outstanding tokens per replica (0 inherits pool limit)<input name="emergency_max_outstanding_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.EmergencyMaxOutstandingTokens}}{{else}}0{{end}}" required></label>
+  <label>Fallback overhead in tokens<input name="fallback_overhead_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.FallbackOverheadTokens}}{{else}}0{{end}}" required></label>
+  <details><summary>Priority class overrides</summary>
+  <p>Zero inherits the pool setting. The lowest positive maximum across the pool, class, and client applies.</p>
+  <fieldset><legend>Critical</legend>
+  <label>Maximum input tokens<input name="critical_max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Critical.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="critical_max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Critical.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="critical_default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Critical.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  </fieldset>
+  <fieldset><legend>High</legend>
+  <label>Maximum input tokens<input name="high_max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.High.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="high_max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.High.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="high_default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.High.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  </fieldset>
+  <fieldset><legend>Normal</legend>
+  <label>Maximum input tokens<input name="normal_max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Normal.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="normal_max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Normal.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="normal_default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Normal.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  </fieldset>
+  <fieldset><legend>Background</legend>
+  <label>Maximum input tokens<input name="background_max_input_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Background.MaxInputTokens}}{{else}}0{{end}}" required></label>
+  <label>Maximum output tokens<input name="background_max_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Background.MaxOutputTokens}}{{else}}0{{end}}" required></label>
+  <label>Default output tokens<input name="background_default_output_tokens" type="number" min="0" max="1000000000000" value="{{if .}}{{.ClassLimits.Background.DefaultOutputTokens}}{{else}}0{{end}}" required></label>
+  </fieldset>
+  </details>
+</fieldset>
+{{end}}

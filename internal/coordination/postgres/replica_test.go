@@ -13,17 +13,20 @@ import (
 	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 )
 
-func TestRetryReplicaHeartbeatUsesOneRetryInsideSharedDeadline(t *testing.T) {
+func TestRetryReplicaHeartbeatRetriesContentionInsideSharedDeadline(t *testing.T) {
 	serializationFailure := &pgconn.PgError{Code: "40001"}
 	attempts := 0
 	if err := retryReplicaHeartbeat(context.Background(), func(context.Context) error {
 		attempts++
-		return serializationFailure
-	}); !errors.Is(err, serializationFailure) {
+		if attempts < 5 {
+			return serializationFailure
+		}
+		return nil
+	}); err != nil {
 		t.Fatalf("retry error=%v", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d, want 2", attempts)
+	if attempts != 5 {
+		t.Fatalf("attempts=%d, want 5", attempts)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -118,5 +121,39 @@ func TestPermanentCoordinatorStatusIsSticky(t *testing.T) {
 	circuit.setStatus(true, "")
 	if status := circuit.Status(); !status.Permanent || status.Available || status.Degraded {
 		t.Fatalf("circuit status=%+v", status)
+	}
+}
+
+func TestRetryReplicaHeartbeatBoundsPersistentContention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	attempts := 0
+	err := retryReplicaHeartbeat(ctx, func(context.Context) error {
+		attempts++
+		return &pgconn.PgError{Code: "40001"}
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || attempts < 2 {
+		t.Fatalf("error=%v attempts=%d", err, attempts)
+	}
+}
+
+func TestRetryReplicaHeartbeatStopsOnOtherErrorsAndCancellation(t *testing.T) {
+	failure := &pgconn.PgError{Code: "08006"}
+	attempts := 0
+	err := retryReplicaHeartbeat(context.Background(), func(context.Context) error {
+		attempts++
+		return failure
+	})
+	if !errors.Is(err, failure) || attempts != 1 {
+		t.Fatalf("error=%v attempts=%d", err, attempts)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = retryReplicaHeartbeat(ctx, func(context.Context) error {
+		t.Fatal("called operation after cancellation")
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
 	}
 }

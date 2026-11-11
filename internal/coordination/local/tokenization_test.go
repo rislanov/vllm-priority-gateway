@@ -201,3 +201,39 @@ func TestTokenizationRejectedReplayRemainsRejectedAfterEviction(t *testing.T) {
 		t.Fatalf("new operation blocked: %+v %v", d, e)
 	}
 }
+
+func TestEmergencyTokenizationConcurrencyAndRateCaps(t *testing.T) {
+	now := time.Now()
+	c := NewEmergencyTokenizationCoordinator(coordination.TokenizationPolicy{
+		ClientMaxInflight: 1, BackendMaxInflight: 1, ClientRPM: 30, Timeout: 2 * time.Second,
+	}, func() time.Time { return now })
+	ctx := context.Background()
+	r := tokenizationRequest(now)
+	r.Candidates = r.Candidates[:1]
+	first, err := c.Acquire(ctx, r)
+	if err != nil || first.Lease == nil {
+		t.Fatal(first, err)
+	}
+	r.OperationID = uuid.New()
+	if got, err := c.Acquire(ctx, r); err != nil || got.Reason != coordination.TokenizationClientLimit {
+		t.Fatal(got, err)
+	}
+	r.OperationID = uuid.New()
+	r.ClientID++
+	if got, err := c.Acquire(ctx, r); err != nil || got.Reason != coordination.TokenizationBackendLimit {
+		t.Fatal(got, err)
+	}
+	if err := c.Complete(ctx, *first.Lease); err != nil {
+		t.Fatal(err)
+	}
+	r.OperationID = uuid.New()
+	r.ClientID--
+	if got, err := c.Acquire(ctx, r); err != nil || got.Reason != coordination.TokenizationRateLimit {
+		t.Fatal(got, err)
+	}
+	now = now.Add(2 * time.Second)
+	r.OperationID, r.OperationStartedAt = uuid.New(), now
+	if got, err := c.Acquire(ctx, r); err != nil || got.Lease == nil {
+		t.Fatal(got, err)
+	}
+}

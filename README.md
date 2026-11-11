@@ -164,6 +164,8 @@ Session headers from OpenCode, Pi (PiCode), Codex, and Claude Code are also reco
 
 ## Production and operations
 
+Pools can opt into request size admission with input and output caps and an outstanding token budget. High and Critical retain emergency admission within per-replica caps. See [request size admission](docs/operations.md#request-size-admission).
+
 - [Production deployment](docs/deployment.md): Docker and systemd installation, TLS reverse proxy, secrets, backup, and restore.
 - [Operations guide](docs/operations.md): readiness, routing, drain/resume, circuits, pool safety, metrics, logs, and recovery.
 - [Real-vLLM E2E runbook](docs/real-vllm-priority-e2e.md): smoke, priority, saturation, drain, and resilience modes.

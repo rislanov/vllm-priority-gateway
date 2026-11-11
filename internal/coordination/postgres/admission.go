@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -19,12 +20,15 @@ import (
 )
 
 type AdmissionCoordinator struct {
-	pool     *pgxpool.Pool
-	timeout  time.Duration
-	mu       sync.RWMutex
-	status   coordination.Status
-	inflight map[int64]int
-	failures failurePublisher
+	pool                *pgxpool.Pool
+	timeout             time.Duration
+	mu                  sync.RWMutex
+	status              coordination.Status
+	inflight            map[int64]int
+	outstanding         map[int64]int64
+	inflightSampleAt    time.Time
+	failures            failurePublisher
+	reservationObserver coordination.TokenReservationObserver
 }
 
 func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *AdmissionCoordinator {
@@ -33,11 +37,21 @@ func NewAdmissionCoordinator(store *pgstore.Store, timeout time.Duration) *Admis
 	}
 	return &AdmissionCoordinator{pool: store.CoordinationPool(), timeout: timeout, status: coordination.Status{Backend: "postgres", Available: true}, inflight: make(map[int64]int)}
 }
+func (c *AdmissionCoordinator) SetTokenReservationObserver(observer coordination.TokenReservationObserver) {
+	c.reservationObserver = observer
+}
+
 func (c *AdmissionCoordinator) PoolInflight(poolID int64) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.inflight[poolID]
 }
+func (c *AdmissionCoordinator) OutstandingTokenSnapshot() map[int64]int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return maps.Clone(c.outstanding)
+}
+
 func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultErr error) {
 	defer func() {
 		if resultErr == nil {
@@ -48,25 +62,41 @@ func (c *AdmissionCoordinator) RefreshInflight(parent context.Context) (resultEr
 	}()
 	ctx, cancel := c.deadline(parent)
 	defer cancel()
-	rows, err := c.pool.Query(ctx, "SELECT pool_id,count(*) FROM request_leases WHERE expires_at>clock_timestamp() GROUP BY pool_id")
+	rows, err := c.pool.Query(ctx, `WITH at AS MATERIALIZED (SELECT clock_timestamp() AS now)
+		SELECT at.now, active.pool_id, active.count, active.reserved FROM at
+		LEFT JOIN LATERAL (
+			SELECT pool_id,count(*) AS count,LEAST(COALESCE(sum(reserved_tokens),0),9223372036854775807)::bigint AS reserved
+			FROM request_leases WHERE expires_at>at.now GROUP BY pool_id
+		) active ON true`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	next := make(map[int64]int)
+	outstanding := make(map[int64]int64)
+	var sampleAt time.Time
 	for rows.Next() {
-		var id int64
-		var count int
-		if err := rows.Scan(&id, &count); err != nil {
+		var id, reserved *int64
+		var count *int
+		if err := rows.Scan(&sampleAt, &id, &count, &reserved); err != nil {
 			return err
 		}
-		next[id] = count
+		if id != nil {
+			next[*id] = *count
+			if *reserved > 0 {
+				outstanding[*id] = *reserved
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.inflight = next
+	if !sampleAt.Before(c.inflightSampleAt) {
+		c.inflight = next
+		c.outstanding = outstanding
+		c.inflightSampleAt = sampleAt
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -164,14 +194,26 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	var now time.Time
 	var poolCount, lowerCount, clientCount int
 	var configurationMissing bool
+	var tokenClient domain.Client
+	var tokenPool domain.ModelPool
+	var accessGranted bool
+	var clientOutstanding, poolOutstanding int64
+	var legacyLeases int
 	// Send ordered statements together to avoid network waits while holding the
 	// shared pool scope. Locks and counts must remain separate SQL statements:
 	// READ COMMITTED needs a fresh snapshot after a contended lock is acquired.
 	checks := &pgx.Batch{}
 	checks.Queue("SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", r.PoolID)
 	checks.Queue("SELECT client_id FROM client_admission_scopes WHERE client_id=$1::bigint FOR UPDATE", r.ClientID)
-	checks.Queue(`SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight,p.high_priority_reserve,c.priority_class FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).QueryRow(func(row pgx.Row) error {
-		err := row.Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit, &poolReserve, &configuredClass)
+	checks.Queue(`SELECT m.revision,c.revision,c.enabled,c.max_concurrency,c.requests_per_minute,c.tokens_per_minute,k.client_id,k.expires_at,p.enabled,p.max_gateway_inflight,p.high_priority_reserve,c.priority_class,
+		c.max_input_tokens,c.max_output_tokens,c.default_output_tokens,c.max_outstanding_tokens,
+		p.revision,p.request_size_admission,
+		EXISTS (SELECT 1 FROM client_model_access a WHERE a.client_id=c.id AND a.model_pool_id=p.id AND a.enabled)
+		FROM config_meta m JOIN clients c ON c.id=$1::bigint JOIN api_keys k ON k.id=$2::bigint JOIN model_pools p ON p.id=$3::bigint WHERE m.singleton=1 AND k.revoked_at IS NULL FOR SHARE OF c,k,p`, r.ClientID, r.APIKeyID, r.PoolID).QueryRow(func(row pgx.Row) error {
+		err := row.Scan(&revision, &clientRevision, &clientEnabled, &configuredClient, &rpm, &tpm, &keyClient, &keyExpires, &poolEnabled, &poolLimit, &poolReserve, &configuredClass,
+			&tokenClient.RequestSizeLimits.MaxInputTokens, &tokenClient.RequestSizeLimits.MaxOutputTokens,
+			&tokenClient.RequestSizeLimits.DefaultOutputTokens, &tokenClient.MaxOutstandingTokens,
+			&tokenPool.Revision, &tokenPool.RequestSizeAdmission, &accessGranted)
 		configurationMissing = errors.Is(err, pgx.ErrNoRows)
 		if configurationMissing {
 			return nil
@@ -186,11 +228,19 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 		WHERE c.id=$1::bigint AND v.capacity>0 ON CONFLICT DO NOTHING`, r.ClientID, time.Unix(0, 0).UTC())
 	checks.Queue("SELECT client_id FROM coordination_rate_state WHERE client_id=$1::bigint ORDER BY rate_kind FOR UPDATE", r.ClientID)
 	checks.Queue(`WITH at AS MATERIALIZED (SELECT clock_timestamp() AS now)
-		SELECT at.now,
-		active.total,active.lower_count,
-		(SELECT count(*) FROM request_leases WHERE client_id=$2::bigint AND expires_at>at.now) FROM at
-		CROSS JOIN LATERAL (SELECT count(*) AS total,count(*) FILTER (WHERE priority_class IN ('normal','background')) AS lower_count FROM request_leases WHERE pool_id=$1::bigint AND expires_at>at.now) active`, r.PoolID, r.ClientID).QueryRow(func(row pgx.Row) error {
-		return row.Scan(&now, &poolCount, &lowerCount, &clientCount)
+		SELECT at.now, pool.total, pool.lower_count, client.total,
+			pool.reserved, client.reserved, pool.legacy FROM at
+		CROSS JOIN LATERAL (
+			SELECT count(*) AS total, count(*) FILTER (WHERE priority_class IN ('normal','background')) AS lower_count,
+				LEAST(COALESCE(sum(reserved_tokens) FILTER (WHERE $3::boolean),0),$4::bigint)::bigint AS reserved,
+				count(*) FILTER (WHERE $3::boolean AND reserved_tokens IS NULL) AS legacy
+			FROM request_leases WHERE pool_id=$1::bigint AND expires_at>at.now
+		) pool
+		CROSS JOIN LATERAL (
+			SELECT count(*) AS total, LEAST(COALESCE(sum(reserved_tokens) FILTER (WHERE $3::boolean),0),$4::bigint)::bigint AS reserved
+			FROM request_leases WHERE client_id=$2::bigint AND expires_at>at.now
+		) client`, r.PoolID, r.ClientID, r.TokenReservation.Enabled, domain.MaxRequestSizeTokens+1).QueryRow(func(row pgx.Row) error {
+		return row.Scan(&now, &poolCount, &lowerCount, &clientCount, &poolOutstanding, &clientOutstanding, &legacyLeases)
 	})
 	if err = tx.SendBatch(ctx, checks).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err
@@ -200,6 +250,14 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	}
 	if revision != r.ConfigurationRevision || keyClient != r.ClientID || !clientEnabled || !poolEnabled || clientRevision != r.ClientPolicyRevision || configuredClient != r.ConfiguredClientLimit || poolLimit != r.PoolGatewayInflightLimit || poolReserve != r.PoolHighPriorityReserve || (r.PriorityClass != "" && r.PriorityClass != configuredClass) || (poolReserve > 0 && !r.PriorityClass.Valid()) || rpm != r.RequestsPerMinute || tpm != r.TokensPerMinute || (keyExpires != nil && !keyExpires.After(now)) {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
+	}
+	reservation := r.TokenReservation
+	tokenClient.PriorityClass = configuredClass
+	if !validReservationPolicy(reservation, tokenClient, tokenPool) || reservation.Enabled && !accessGranted {
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonStaleConfiguration, nil, now)
+	}
+	if reservation.Enabled && legacyLeases > 0 {
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonTokenPolicyTransition, nil, now)
 	}
 	if r.EffectiveClientLimit <= 0 || r.EffectiveClientLimit > configuredClient {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now)
@@ -215,6 +273,9 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 	}
 	if clientCount >= r.EffectiveClientLimit {
 		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonConcurrencyExhausted, nil, now)
+	}
+	if scope := reservation.ExhaustedScope(clientOutstanding, poolOutstanding); scope != "" {
+		return rejectAcquire(ctx, tx, r.LeaseID, coordination.ReasonTokenBudgetExhausted, nil, now, scope)
 	}
 	if tpm > 0 {
 		ok, retry, err := normalizeRate(ctx, tx, r.ClientID, "tpm", clientRevision, tpm, now, false)
@@ -235,16 +296,49 @@ func (c *AdmissionCoordinator) acquire(ctx context.Context, r coordination.Admis
 		}
 	}
 	lease := coordination.LeaseIdentity{LeaseID: r.LeaseID, ClientID: r.ClientID, PoolID: r.PoolID, RequestID: r.RequestID, ReplicaID: r.ReplicaID, ExpiresAt: now.Add(r.LeaseTTL), TTL: r.LeaseTTL}
+	var reservedTokens *int64
+	var reservationJSON *string
+	if reservation.Enabled {
+		reservedTokens = &reservation.ReservedTokens
+		encoded, err := json.Marshal(struct {
+			coordination.TokenReservation
+			PriorityClass domain.PriorityClass
+		}{reservation, configuredClass})
+		if err != nil {
+			return coordination.AdmissionDecision{}, err
+		}
+		metadata := string(encoded)
+		reservationJSON = &metadata
+	}
 	writes := &pgx.Batch{}
-	writes.Queue(`INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at,priority_class) VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz,$8::text)`, lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt, configuredClass)
-	writes.Queue("UPDATE admission_operations SET decision='admitted',decided_at=$2::timestamptz WHERE lease_id=$1::uuid", r.LeaseID, now)
+	writes.Queue(`INSERT INTO request_leases(lease_id,request_id,replica_id,client_id,pool_id,acquired_at,expires_at,priority_class,reserved_tokens)
+		VALUES($1::uuid,$2::text,$3::uuid,$4::bigint,$5::bigint,$6::timestamptz,$7::timestamptz,$8::text,$9::bigint)`,
+		lease.LeaseID, lease.RequestID, lease.ReplicaID, lease.ClientID, lease.PoolID, now, lease.ExpiresAt, configuredClass, reservedTokens)
+	writes.Queue("UPDATE admission_operations SET decision='admitted',decided_at=$2::timestamptz,token_reservation=$3::jsonb WHERE lease_id=$1::uuid", r.LeaseID, now, reservationJSON)
 	if err = tx.SendBatch(ctx, writes).Close(); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
+	r.ReservationEvent().Observe(c.reservationObserver, coordination.ReservationAcquired, "", nil)
 	return coordination.AdmissionDecision{Lease: &lease}, nil
+}
+
+func validReservationPolicy(r coordination.TokenReservation, client domain.Client, pool domain.ModelPool) bool {
+	if !r.Valid() || r.Enabled != pool.RequestSizeAdmission.Enabled {
+		return false
+	}
+	if !r.Enabled {
+		return true
+	}
+	policy, err := domain.ResolveRequestSizePolicy(client, pool)
+	return err == nil && r.PoolPolicyRevision == pool.Revision &&
+		r.PoolBudget == policy.PoolBudget && r.ClientBudget == policy.ClientBudget &&
+		r.EstimationProfile == policy.EstimationProfile && r.OutputAllowance <= policy.Limits.MaxOutputTokens &&
+		r.InputEstimate <= policy.Limits.MaxInputTokens*r.PromptCount &&
+		((r.EstimatorKind != domain.TokenFallbackUTF8Bytes && r.EstimatorKind != "mixed") ||
+			policy.FallbackMode == domain.TokenFallbackUTF8Bytes)
 }
 
 func (c *AdmissionCoordinator) resolveAcquire(ctx context.Context, tx pgx.Tx, r coordination.AdmissionRequest, fp [32]byte) (coordination.AdmissionDecision, error) {
@@ -269,8 +363,8 @@ func (c *AdmissionCoordinator) resolveAcquire(ctx context.Context, tx pgx.Tx, r 
 	var reason *string
 	var retry *time.Time
 	var completed, expired *time.Time
-	var scope coordination.AdmissionScope
-	if err := tx.QueryRow(ctx, "SELECT input_fingerprint,decision,rejection_reason,retry_at,completed_at,lease_expired_at,concurrency_scope FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", r.LeaseID).Scan(&stored, &decision, &reason, &retry, &completed, &expired, &scope); err != nil {
+	var scope, tokenScope coordination.AdmissionScope
+	if err := tx.QueryRow(ctx, "SELECT input_fingerprint,decision,rejection_reason,retry_at,completed_at,lease_expired_at,concurrency_scope,token_budget_scope FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", r.LeaseID).Scan(&stored, &decision, &reason, &retry, &completed, &expired, &scope, &tokenScope); err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
 	if !bytes.Equal(stored, fp[:]) {
@@ -280,7 +374,7 @@ func (c *AdmissionCoordinator) resolveAcquire(ctx context.Context, tx pgx.Tx, r 
 		if reason == nil {
 			return coordination.AdmissionDecision{}, coordination.PermanentError{Err: errors.New("invalid rejected admission receipt")}
 		}
-		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.Reason(*reason), RetryAt: retry, ConcurrencyScope: scope})
+		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.Reason(*reason), RetryAt: retry, ConcurrencyScope: scope, TokenBudgetScope: tokenScope})
 	}
 	if completed != nil || expired != nil {
 		return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.ReasonLeaseLost})
@@ -309,18 +403,21 @@ func markLost(ctx context.Context, tx pgx.Tx, id uuid.UUID, now time.Time) (coor
 	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: coordination.ReasonLeaseLost})
 }
 func rejectAcquire(ctx context.Context, tx pgx.Tx, id uuid.UUID, reason coordination.Reason, retry *time.Time, now time.Time, scopes ...coordination.AdmissionScope) (coordination.AdmissionDecision, error) {
-	var scope coordination.AdmissionScope
+	var scope, tokenScope coordination.AdmissionScope
 	if reason == coordination.ReasonConcurrencyExhausted {
 		scope = coordination.AdmissionClientScope
 		if len(scopes) > 0 {
 			scope = scopes[0]
 		}
 	}
-	_, err := tx.Exec(ctx, "UPDATE admission_operations SET decision='rejected',rejection_reason=$2::text,retry_at=$3::timestamptz,decided_at=$4::timestamptz,retain_until=GREATEST(operation_started_at,$4::timestamptz)+interval '24 hours',concurrency_scope=$5::text WHERE lease_id=$1::uuid", id, string(reason), retry, now, string(scope))
+	if reason == coordination.ReasonTokenBudgetExhausted && len(scopes) > 0 {
+		tokenScope = scopes[0]
+	}
+	_, err := tx.Exec(ctx, "UPDATE admission_operations SET decision='rejected',rejection_reason=$2::text,retry_at=$3::timestamptz,decided_at=$4::timestamptz,retain_until=GREATEST(operation_started_at,$4::timestamptz)+interval '24 hours',concurrency_scope=$5::text,token_budget_scope=$6::text WHERE lease_id=$1::uuid", id, string(reason), retry, now, string(scope), string(tokenScope))
 	if err != nil {
 		return coordination.AdmissionDecision{}, err
 	}
-	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: reason, RetryAt: retry, ConcurrencyScope: scope})
+	return commitDecision(ctx, tx, coordination.AdmissionDecision{Reason: reason, RetryAt: retry, ConcurrencyScope: scope, TokenBudgetScope: tokenScope})
 }
 func commitDecision(ctx context.Context, tx pgx.Tx, d coordination.AdmissionDecision) (coordination.AdmissionDecision, error) {
 	if err := tx.Commit(ctx); err != nil {
@@ -459,7 +556,7 @@ func (c *AdmissionCoordinator) renew(ctx context.Context, leases []coordination.
 	for i, lease := range leases {
 		out[i] = coordination.RenewResult{Lease: lease, Reason: coordination.ReasonLeaseLost}
 		stored, exists := byID[lease.LeaseID]
-		if !exists || stored.ClientID != lease.ClientID || stored.PoolID != lease.PoolID || stored.RequestID != lease.RequestID || stored.ReplicaID != lease.ReplicaID || !stored.ExpiresAt.After(now) || lease.TTL <= 0 {
+		if !exists || !stored.SameOwner(lease) || !stored.ExpiresAt.After(now) || lease.TTL <= 0 {
 			continue
 		}
 		stored.TTL = lease.TTL
@@ -484,16 +581,14 @@ func (c *AdmissionCoordinator) renew(ctx context.Context, leases []coordination.
 	}
 	// Only actual expiry changes the receipt; an identity mismatch must not
 	// mark another replica's still-live admission as expired.
-	if _, err = tx.Exec(ctx, `WITH expired AS (
-		DELETE FROM request_leases WHERE lease_id=ANY($1::uuid[]) AND expires_at<=$2::timestamptz RETURNING lease_id
-	) UPDATE admission_operations SET lease_expired_at=COALESCE(lease_expired_at,$2::timestamptz),
-		retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours'
-		WHERE lease_id IN (SELECT lease_id FROM expired) AND completed_at IS NULL`, ids, now); err != nil {
+	expired, err := removeExpiredReservations(ctx, tx, ids, now)
+	if err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	c.observeExpiredReservations(expired)
 	return out, nil
 }
 
@@ -522,20 +617,21 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 	if _, err = tx.Exec(ctx, "SET LOCAL synchronous_commit=on"); err != nil {
 		return coordination.CompleteResult{}, err
 	}
-	var client, pool int64
+	owner := coordination.LeaseIdentity{LeaseID: item.Lease.LeaseID}
 	var decision string
 	var completed *time.Time
 	var stored *string
 	var started time.Time
-	if err = tx.QueryRow(ctx, "SELECT client_id,pool_id,decision,completed_at,completion_result,operation_started_at FROM admission_operations WHERE lease_id=$1::uuid", item.Lease.LeaseID).Scan(&client, &pool, &decision, &completed, &stored, &started); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, "SELECT client_id,pool_id,request_id,replica_id,decision FROM admission_operations WHERE lease_id=$1::uuid", item.Lease.LeaseID).Scan(&owner.ClientID, &owner.PoolID, &owner.RequestID, &owner.ReplicaID, &decision); errors.Is(err, pgx.ErrNoRows) {
 		return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Reason: coordination.ReasonStaleOperation})
 	}
 	if err != nil {
 		return coordination.CompleteResult{}, err
 	}
-	if decision != "admitted" {
+	if decision != "admitted" || !owner.SameOwner(item.Lease) {
 		return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: coordination.CompletionLeaseLost, Reason: coordination.ReasonLeaseLost})
 	}
+	client, pool := owner.ClientID, owner.PoolID
 	if _, err = tx.Exec(ctx, "SELECT pool_id FROM pool_admission_scopes WHERE pool_id=$1::bigint FOR UPDATE", pool); err != nil {
 		return coordination.CompleteResult{}, err
 	}
@@ -543,12 +639,25 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 		return coordination.CompleteResult{}, err
 	}
 	var expires *time.Time
-	leaseErr := tx.QueryRow(ctx, "SELECT expires_at FROM request_leases WHERE lease_id=$1::uuid FOR UPDATE", item.Lease.LeaseID).Scan(&expires)
+	var leaseClass domain.PriorityClass
+	leaseErr := tx.QueryRow(ctx, "SELECT expires_at,priority_class FROM request_leases WHERE lease_id=$1::uuid FOR UPDATE", item.Lease.LeaseID).Scan(&expires, &leaseClass)
 	if leaseErr != nil && !errors.Is(leaseErr, pgx.ErrNoRows) {
 		return coordination.CompleteResult{}, leaseErr
 	}
-	if err = tx.QueryRow(ctx, "SELECT decision,completed_at,completion_result,operation_started_at FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE", item.Lease.LeaseID).Scan(&decision, &completed, &stored, &started); err != nil {
+	event := coordination.TokenReservationEvent{PoolID: pool, ClientID: client}
+	var receiptClass *string
+	err = tx.QueryRow(ctx, `SELECT client_id,pool_id,request_id,replica_id,decision,completed_at,completion_result,operation_started_at,
+		COALESCE((token_reservation->>'ReservedTokens')::bigint,0),token_reservation->>'PriorityClass'
+		FROM admission_operations WHERE lease_id=$1::uuid FOR UPDATE`, item.Lease.LeaseID).
+		Scan(&owner.ClientID, &owner.PoolID, &owner.RequestID, &owner.ReplicaID, &decision, &completed, &stored, &started, &event.ReservedTokens, &receiptClass)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Reason: coordination.ReasonStaleOperation})
+	}
+	if err != nil {
 		return coordination.CompleteResult{}, err
+	}
+	if decision != "admitted" || !owner.SameOwner(item.Lease) {
+		return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: coordination.CompletionLeaseLost, Reason: coordination.ReasonLeaseLost})
 	}
 	if completed != nil {
 		if stored == nil {
@@ -601,11 +710,32 @@ func (c *AdmissionCoordinator) completeOne(ctx context.Context, item coordinatio
 	if err != nil {
 		return coordination.CompleteResult{}, err
 	}
-	_, err = tx.Exec(ctx, "UPDATE admission_operations SET completed_at=$2::timestamptz,completion_result=$3::text,retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours' WHERE lease_id=$1::uuid", item.Lease.LeaseID, now, string(result))
+	var actualInput, actualOutput *int64
+	if event.ReservedTokens > 0 && item.Usage != nil && item.Usage.Valid() {
+		actualInput, actualOutput = &item.Usage.InputTokens, &item.Usage.OutputTokens
+	}
+	_, err = tx.Exec(ctx, "UPDATE admission_operations SET completed_at=$2::timestamptz,completion_result=$3::text,retain_until=GREATEST(operation_started_at,$2::timestamptz)+interval '24 hours',token_actual_input=$4::bigint,token_actual_output=$5::bigint WHERE lease_id=$1::uuid", item.Lease.LeaseID, now, string(result), actualInput, actualOutput)
 	if err != nil {
 		return coordination.CompleteResult{}, err
 	}
-	return commitComplete(ctx, tx, coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: result})
+	if err := tx.Commit(ctx); err != nil {
+		return coordination.CompleteResult{}, err
+	}
+	event.PriorityClass = leaseClass
+	if receiptClass != nil {
+		event.PriorityClass = domain.PriorityClass(*receiptClass)
+	}
+	var reason coordination.Reason
+	if result == coordination.CompletionReleased {
+		event.Observe(c.reservationObserver, coordination.ReservationReleased, "", nil)
+	} else {
+		reason = coordination.ReasonLeaseLost
+		if expires != nil {
+			event.Observe(c.reservationObserver, coordination.ReservationExpired, reason, nil)
+		}
+	}
+	event.Observe(c.reservationObserver, coordination.ReservationReconciled, reason, item.Usage)
+	return coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: result}, nil
 }
 func commitComplete(ctx context.Context, tx pgx.Tx, r coordination.CompleteResult) (coordination.CompleteResult, error) {
 	return r, tx.Commit(ctx)

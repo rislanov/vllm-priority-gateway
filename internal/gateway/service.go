@@ -49,33 +49,40 @@ type UsageRecorder interface {
 }
 
 type Dependencies struct {
-	Tokenization             coordination.TokenizationCoordinator
-	TokenizationPolicy       coordination.TokenizationPolicy
-	TokenizationForwarder    TokenizationForwarder
-	TokenizationObserver     TokenizationObserver
-	TokenizationHealthMaxAge time.Duration
-	CoordinationTimeout      time.Duration
-	Registry                 SnapshotProvider
-	HMACSecret               []byte
-	Limiter                  *admission.Limiter
-	Admission                coordination.AdmissionCoordinator
-	Leases                   *coordination.LeaseManager
-	ReplicaID                uuid.UUID
-	LeaseTTL                 time.Duration
-	Emergency                *coordination.EmergencyAdmission
-	CoordinationAllowed      func() bool
-	CoordinationReady        func() bool
-	Runtime                  Runtime
-	Router                   *routing.Router
-	Forwarder                Forwarder
-	Usage                    UsageRecorder
-	Observer                 Observer
-	Now                      func() time.Time
-	LookupEnv                func(string) (string, bool)
-	RetryAfter               time.Duration
+	EmergencyTokenization             coordination.TokenizationCoordinator
+	AdmissionEstimateTimeout          time.Duration
+	AdmissionEstimateMaxResponseBytes int64
+	InputEstimator                    InputEstimator
+	Tokenization                      coordination.TokenizationCoordinator
+	TokenizationPolicy                coordination.TokenizationPolicy
+	TokenizationForwarder             TokenizationForwarder
+	TokenizationObserver              TokenizationObserver
+	TokenizationHealthMaxAge          time.Duration
+	CoordinationTimeout               time.Duration
+	Registry                          SnapshotProvider
+	HMACSecret                        []byte
+	Limiter                           *admission.Limiter
+	Admission                         coordination.AdmissionCoordinator
+	Leases                            *coordination.LeaseManager
+	ReplicaID                         uuid.UUID
+	LeaseTTL                          time.Duration
+	Emergency                         *coordination.EmergencyAdmission
+	CoordinationAllowed               func() bool
+	CoordinationReady                 func() bool
+	Runtime                           Runtime
+	Router                            *routing.Router
+	Forwarder                         Forwarder
+	Usage                             UsageRecorder
+	Observer                          Observer
+	Now                               func() time.Time
+	LookupEnv                         func(string) (string, bool)
+	RetryAfter                        time.Duration
 }
 
 type Service struct {
+	emergencyTokenization    coordination.TokenizationCoordinator
+	inputEstimator           InputEstimator
+	admissionEstimateTimeout time.Duration
 	tokenization             coordination.TokenizationCoordinator
 	tokenizationPolicy       coordination.TokenizationPolicy
 	tokenizationForwarder    TokenizationForwarder
@@ -141,13 +148,29 @@ func New(dependencies Dependencies) *Service {
 	if emergency == nil {
 		emergency = coordination.NewEmergencyAdmission(0, 0)
 	}
-	return &Service{
+	service := &Service{
+		emergencyTokenization: dependencies.EmergencyTokenization, inputEstimator: dependencies.InputEstimator,
 		tokenization: dependencies.Tokenization, tokenizationPolicy: dependencies.TokenizationPolicy, tokenizationForwarder: dependencies.TokenizationForwarder, tokenizationObserver: dependencies.TokenizationObserver, tokenizationHealthMaxAge: dependencies.TokenizationHealthMaxAge, coordinationTimeout: dependencies.CoordinationTimeout,
 		registry: dependencies.Registry, hmacSecret: append([]byte(nil), dependencies.HMACSecret...),
 		limiter: limiter, admission: dependencies.Admission, leases: dependencies.Leases, replicaID: replicaID, leaseTTL: leaseTTL, emergency: emergency, coordinationAllowed: coordinationAllowed, coordinationReady: coordinationReady, runtime: dependencies.Runtime, router: dependencies.Router,
 		forwarder: dependencies.Forwarder, usage: dependencies.Usage, observer: dependencies.Observer,
 		now: now, lookupEnv: lookupEnv, retryAfter: retryAfter,
 	}
+	service.admissionEstimateTimeout = dependencies.AdmissionEstimateTimeout
+	if service.admissionEstimateTimeout <= 0 {
+		service.admissionEstimateTimeout = 2 * time.Second
+	}
+	if transport, ok := dependencies.TokenizationForwarder.(tokenizerTransport); ok && service.inputEstimator == nil {
+		maxBytes := dependencies.AdmissionEstimateMaxResponseBytes
+		if maxBytes <= 0 {
+			maxBytes = 8 << 20
+		}
+		service.inputEstimator = tokenEstimator{
+			timeout: service.admissionEstimateTimeout, normalUtilityTimeout: service.tokenizationPolicy.Timeout, maxResponseBytes: maxBytes, transport: transport, retryAfter: retryAfter,
+			acquire: service.acquireEstimate, mayUseEmergency: service.mayUseEmergencyEstimate,
+		}
+	}
+	return service
 }
 
 type APIError struct {
@@ -548,6 +571,10 @@ func coordinationAPIError(reason coordination.Reason, retryAfter time.Duration, 
 	switch reason {
 	case coordination.ReasonRPMExhausted, coordination.ReasonTPMExhausted:
 		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Rate limit exceeded", Type: "rate_limit_exceeded", Code: string(reason), RetryAfter: retryAfter}
+	case coordination.ReasonTokenBudgetExhausted:
+		return &APIError{HTTPStatus: http.StatusTooManyRequests, Message: "Outstanding token budget exhausted. Reduce the request size if it cannot fit the configured budget.", Type: "rate_limit_error", Code: string(reason), RetryAfter: retryAfter, DecisionReason: DecisionTokenBudgetExhausted}
+	case coordination.ReasonTokenPolicyTransition:
+		return &APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "Request size admission is waiting for legacy leases to drain", Type: "server_error", Code: string(reason), RetryAfter: retryAfter, DecisionReason: DecisionTokenPolicyTransition}
 	case coordination.ReasonPoolPriorityReserve:
 		return overloaded(retryAfter, DecisionPoolPriorityReserve)
 	case coordination.ReasonConcurrencyExhausted:

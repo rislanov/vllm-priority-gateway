@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/rislanov/vllm-priority-gateway/internal/coordination"
 	"github.com/rislanov/vllm-priority-gateway/internal/domain"
 )
 
@@ -15,6 +16,8 @@ const (
 	DecisionPoolWaitingLimit         DecisionReason = "pool_waiting_limit"
 	DecisionPoolInflightLimit        DecisionReason = "pool_inflight_limit"
 	DecisionPoolPriorityReserve      DecisionReason = "pool_priority_reserve"
+	DecisionTokenBudgetExhausted     DecisionReason = "token_budget_exhausted"
+	DecisionTokenPolicyTransition    DecisionReason = "token_policy_transition"
 	DecisionPriorityConcurrencyLimit DecisionReason = "priority_concurrency_limit"
 	DecisionPoolUnavailable          DecisionReason = "pool_unavailable"
 	DecisionNoEligibleBackend        DecisionReason = "no_eligible_backend"
@@ -39,6 +42,16 @@ type InflightEvent struct {
 	Model         string
 	Backend       string
 	PriorityClass domain.PriorityClass
+}
+
+// TokenAdmissionEvent contains bounded metadata for inference admission.
+type TokenAdmissionEvent struct {
+	Enabled, Attempted, Estimated bool
+	Mode                          EstimationMode
+	EstimatorKind                 string
+	InputEstimate, ReservedTokens int64
+	PreflightDuration             time.Duration
+	BudgetScope                   coordination.AdmissionScope
 }
 
 // RequestEvent describes one completed public inference request. It must never
@@ -69,6 +82,7 @@ type RequestEvent struct {
 	UsageParseFailure string
 	SoftTPMExpected   bool
 	UpstreamFailure   string
+	TokenAdmission    TokenAdmissionEvent
 }
 
 // Observer receives synchronous request-lifecycle events. Implementations

@@ -23,6 +23,8 @@ type Reason string
 const (
 	ReasonConcurrencyExhausted    Reason = "concurrency_exhausted"
 	ReasonPoolPriorityReserve     Reason = "pool_priority_reserve"
+	ReasonTokenBudgetExhausted    Reason = "token_budget_exhausted"
+	ReasonTokenPolicyTransition   Reason = "token_policy_transition"
 	ReasonRPMExhausted            Reason = "rpm_exhausted"
 	ReasonTPMExhausted            Reason = "tpm_exhausted"
 	ReasonStaleConfiguration      Reason = "stale_configuration"
@@ -62,6 +64,7 @@ type AdmissionRequest struct {
 	RequestsPerMinute        int64
 	TokensPerMinute          int64
 	LeaseTTL                 time.Duration
+	TokenReservation         TokenReservation `json:",omitzero"`
 }
 
 type LeaseIdentity struct {
@@ -76,6 +79,12 @@ type LeaseIdentity struct {
 
 func (l LeaseIdentity) Identity() LeaseIdentity { return l }
 
+// SameOwner compares the immutable identity. Renewal may change the expiry.
+func (l LeaseIdentity) SameOwner(other LeaseIdentity) bool {
+	return l.LeaseID == other.LeaseID && l.ClientID == other.ClientID && l.PoolID == other.PoolID &&
+		l.RequestID == other.RequestID && l.ReplicaID == other.ReplicaID
+}
+
 type AdmissionScope string
 
 const (
@@ -88,6 +97,7 @@ type AdmissionDecision struct {
 	Reason           Reason
 	RetryAt          *time.Time
 	ConcurrencyScope AdmissionScope
+	TokenBudgetScope AdmissionScope
 }
 
 func (d AdmissionDecision) Admitted() bool { return d.Lease != nil && d.Reason == "" }
@@ -148,6 +158,12 @@ type ClientRatePolicy struct {
 
 type AdmissionPolicyObserver interface {
 	ObserveClientRatePolicy(ClientRatePolicy)
+}
+
+// OutstandingTokenReader reports active token reservations by model pool.
+// Implementations return a snapshot the caller may modify.
+type OutstandingTokenReader interface {
+	OutstandingTokenSnapshot() map[int64]int64
 }
 
 type AdmissionRuntime interface {

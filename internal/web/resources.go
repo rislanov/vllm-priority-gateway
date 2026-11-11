@@ -250,6 +250,22 @@ func clientInput(request *http.Request) (httpapi.ClientInput, error) {
 		return httpapi.ClientInput{}, fmt.Errorf("tokens per minute must be an integer")
 	}
 	input := httpapi.ClientInput{Name: request.Form.Get("name"), Enabled: request.Form.Get("enabled") == "on", PriorityClass: domain.PriorityClass(request.Form.Get("priority_class")), VLLMPriority: priority, MaxConcurrency: maxConcurrency, RequestsPerMinute: requestsPerMinute, TokensPerMinute: tokensPerMinute}
+	for _, field := range []struct {
+		name   string
+		target **int64
+	}{
+		{"max_input_tokens", &input.MaxInputTokens},
+		{"max_output_tokens", &input.MaxOutputTokens},
+		{"default_output_tokens", &input.DefaultOutputTokens},
+		{"max_outstanding_tokens", &input.MaxOutstandingTokens},
+	} {
+		value, err := optionalTokenField(request.Form, field.name)
+		if err != nil {
+			return httpapi.ClientInput{}, err
+		}
+		*field.target = value
+	}
+
 	for _, raw := range request.Form["model_pool_id"] {
 		id, parseErr := positiveID(raw)
 		if parseErr != nil {
@@ -273,9 +289,15 @@ func poolInput(request *http.Request) (httpapi.PoolInput, error) {
 	if err != nil {
 		return httpapi.PoolInput{}, err
 	}
+	policy, err := readPoolRequestSize(request.Form)
+	if err != nil {
+		return httpapi.PoolInput{}, err
+	}
+
 	return httpapi.PoolInput{
 		PublicModelName: request.Form.Get("public_model_name"), UpstreamModelName: request.Form.Get("upstream_model_name"),
 		Enabled: request.Form.Get("enabled") == "on", MaxGatewayInflight: maxGatewayInflight, HighPriorityReserve: reserve, MaxWaiting: maxWaiting,
+		RequestSizeAdmission: policy,
 	}, nil
 }
 

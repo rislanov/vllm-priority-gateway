@@ -1,10 +1,11 @@
 # Real-vLLM E2E Test
 
-This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has four modes:
+This runbook reproduces the black-box tests in `tests/e2e` against a deployed gateway and real vLLM servers. The suite has five modes:
 
 - `smoke` is safe for a production verification window. It checks management and inference readiness separately, Admin pool/backend counts, healthy and metrics-fresh backends, model visibility, the authenticated `/v1/load` contract, one complete short stream, and required Prometheus families including all five circuit/pool gauges.
 - `priority` intentionally saturates inference capacity. It observes non-zero gateway in-flight and upstream waiting work, requires `/v1/load` to report `loaded` consistently with the pool-state and capacity gauges, proves background shedding and High/Critical priority continuity, then temporarily sets a pool-wide in-flight limit and proves that even Critical receives the bounded `429 gateway_overloaded`. It restores the limit, proves Critical streaming continuity again, and checks `medium` and `free` during hysteretic recovery.
 - `reserve` checks pool admission reserve with real streams: L=20 and R=6, 0, and 20, Normal/Background subset, High/Critical capacity, total-cap refusal, cancellation, live reserve activation, metrics reasons and policy restoration. An optional second gateway URL exercises shared PostgreSQL capacity. Use an isolated pool and distinct clients with sufficient concurrency.
+- `tokens` compares request size admission off and on under identical mixed High/Background load. It qualifies the tokenizer against generation on every serving backend and temporarily toggles the dedicated pool policy.
 - `resilience` is destructive and isolated. It places a loopback fault proxy in front of one real backend, drains its siblings, proves inference-only `503` failures open the circuit while health/metrics remain fresh, requires `/v1/load` and Prometheus to report unavailable capacity, then observes half-open streaming recovery and closure. Run it only against a gateway on the same host and with no production traffic.
 
 The test is opt-in. Ordinary `go test ./...` compiles it and reports it as skipped unless `LLMGW_E2E_MODE` is set.
@@ -309,3 +310,51 @@ go test ./tests/e2e -run TestPriorityCapacityReserveWithRealVLLM -count=1 -v -ti
 The test alternates requests across both gateways when a peer URL is set and requires each gateway's pool projection to report the same global counts. At R=6 it holds seven Normal and seven Background leases, checks the exact reserve rejection counter on each gateway, fills six slots with High/Critical, and checks the total rejection. Cancelling a protected lease does not grant lower capacity; cancelling a lower lease permits its replacement. One reserved High and one reserved Critical 900-token stream then finish on real vLLM with HTTP 200 and `[DONE]`. R=0 admits twenty lower leases; enabling R=6 with that work active blocks new lower admission until capacity is released, and six High/Critical requests fill the released slots. R=20 rejects all lower classes even while the pool is empty. Every phase cancels/drains outstanding requests and checks the global count returns to zero. Short complete High/Critical streams additionally check post-load continuity.
 
 The existing priority/pool-safety and resilience helpers preserve the reserve during normal updates and cleanup. Their temporary total-limit isolation explicitly sets reserve to zero, since a positive reserve cannot coexist with an unlimited total or a smaller total limit. Cleanup restores the exact captured reserve.
+
+
+## Request size admission with real vLLM
+
+Use a dedicated gateway and model pool with no other traffic or configuration writers. Register every serving backend and configure a qualified request size policy even when starting with its enabled flag off. The workload uses High streams capped at 8 output tokens and Background streams capped at 256 by default. Set client concurrency, gateway slots, client RPM and soft TPM to keep them from masking token pressure. The Background prompt has about 550 ordinary words. Give the pool enough input and model context capacity to fit it. Set the token budget to admit an individual Background request and leave headroom for a High probe while rejecting part of a Background burst. Use the same gateway and vLLM settings for both runs within a pair.
+
+Use distinct High and Background clients and real gateway keys. Set the existing `LLMGW_E2E_GATEWAY_URL`, `LLMGW_E2E_ADMIN_USERNAME`, `LLMGW_E2E_ADMIN_PASSWORD`, `LLMGW_E2E_MODEL`, `LLMGW_E2E_HIGH_KEY`, `LLMGW_E2E_LOW_KEYS` and `LLMGW_E2E_EXPECTED_BACKENDS`. Supply credentials through your local secret mechanism. Keep gateway and upstream credentials out of the qualification profile, shell history, and captured output.
+
+Set `LLMGW_E2E_TOKEN_PROFILE_FILE` to a JSON file with this shape. Replace the example values with pinned values for the actual deployment. For a container, record the image digest. For native vLLM, record its exact build and hardware plugin build. `KeyEnv` is the optional name of the environment variable holding that backend's bearer key.
+
+```json
+{
+  "GatewayCommit": "git commit of the deployed gateway",
+  "VLLMBuild": "image digest or native build fingerprint",
+  "MetalBuild": "native Metal plugin build, if applicable",
+  "Hardware": "accelerator, count, memory",
+  "Topology": "gateway and backend replica counts and placement",
+  "Scheduling": "vLLM scheduler, sequence and context limits",
+  "CachePolicy": "prefix cache and KV cache settings",
+  "ModelRevision": "pinned model revision",
+  "TokenizerRevision": "pinned tokenizer revision",
+  "TemplateRevision": "template SHA-256 or revision",
+  "EstimationProfile": "same ID as the pool policy",
+  "Backends": [
+    {"ID": 1, "URL": "http://127.0.0.1:8001", "KeyEnv": "VLLM_A_KEY"},
+    {"ID": 2, "URL": "http://127.0.0.1:8002", "KeyEnv": "VLLM_B_KEY"}
+  ]
+}
+```
+
+Use the backend URLs as registered in the dedicated pool. The direct checks use generated text, text batches, token IDs and ID batches, chat history, text parts, continuation, template options, and a template override. Enable request-supplied chat templates on isolated qualification backends that require an explicit opt-in. Each check compares the input that the gateway would send to `/tokenize` with generation's input usage from the same backend. The fixtures cover the exact path. Models using the byte fallback require separate calibration for the fallback payloads they enable.
+
+```sh
+LLMGW_E2E_MODE=tokens make test-real-vllm
+```
+
+| Variable | Default | Use |
+| --- | --- | --- |
+| `LLMGW_E2E_TOKEN_RUNS` | 3 | Minimum three paired repetitions |
+| `LLMGW_E2E_TOKEN_HIGH_PROBES` | 100 | Minimum High attempts per mode and repetition |
+| `LLMGW_E2E_TOKEN_SEED` | 23 | Initial seed, incremented per repetition |
+| `LLMGW_E2E_TOKEN_INTERVAL` | 200ms | Cadence of High probes |
+| `LLMGW_E2E_TOKEN_BACKGROUND_BURST` | 4 | Background streams launched before every tenth High probe |
+| `LLMGW_E2E_TOKEN_BACKGROUND_OUTPUT` | 256 | Output allowance per Background stream |
+
+The harness warms both modes and alternates disabled-first and enabled-first pairs. It records attempts, admissions, completions, rejections, errors, missing usage and TTFT, output-cap violations, end-to-end and TTFT percentiles, preflight latency, Background output throughput, scoped token denials, and peak observed outstanding. Percentiles are ordered p50, p95, and p99. TTFT starts before preflight and ends at the first nonempty token chunk. Only completed requests with observed TTFT contribute. The harness checks that a High probe succeeds when capacity is available, that over-cap output allowances return 400, and that enabled runs return 429 for token pressure before utility limits intervene. It checks that leases drain, verifies that unrelated settings stayed fixed, and restores the original request size policy at cleanup.
+
+Calibrate the burst and utility capacity before collecting paired evidence. An enabled run without token-budget rejections, or with utility capacity rejections, fails the experiment. Compare High admission fraction alongside its TTFT percentiles. Record any regression and the exact settings under which it occurred.

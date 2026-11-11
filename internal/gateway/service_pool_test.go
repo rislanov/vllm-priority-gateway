@@ -811,6 +811,8 @@ func TestServiceLoadStatusReportsUnavailableWhenNoBackendCanServeRequests(t *tes
 }
 
 type poolServiceOptions struct {
+	requestSize               domain.RequestSizePolicy
+	inputEstimator            gateway.InputEstimator
 	maximum                   int
 	reserve                   int
 	maxWaiting                int
@@ -842,7 +844,7 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 	}
 	client := domain.Client{ID: 1, Name: "client", Enabled: true, PriorityClass: priority, MaxConcurrency: maximum}
 	pool := domain.ModelPool{
-		ID: 10, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true,
+		ID: 10, Revision: 1, RequestSizeAdmission: options.requestSize, PublicModelName: "public-model", UpstreamModelName: "upstream-model", Enabled: true,
 		MaxGatewayInflight: options.maximum, HighPriorityReserve: options.reserve, MaxWaiting: options.maxWaiting,
 	}
 	key := domain.APIKey{ID: 2, ClientID: client.ID, Prefix: rawKey[:12], SecretHash: apikey.Digest(secret, rawKey)}
@@ -887,7 +889,7 @@ func newPoolService(t *testing.T, options poolServiceOptions) (*gateway.Service,
 		forwarder = &poolCompletionForwarder{}
 	}
 	service := gateway.New(gateway.Dependencies{
-		Registry: provider, HMACSecret: secret, Limiter: admission.NewLimiter(), Runtime: runtime,
+		InputEstimator: options.inputEstimator, Registry: provider, HMACSecret: secret, Limiter: admission.NewLimiter(), Runtime: runtime,
 		Router: routing.NewWithSessionAffinity(.02, 1, routing.FixedSource(0)), Forwarder: forwarder,
 		Now: func() time.Time { return poolTestNow }, RetryAfter: 2 * time.Second,
 		Admission: options.coordinator, Emergency: options.emergency, ReplicaID: uuid.New(), LeaseTTL: time.Minute,

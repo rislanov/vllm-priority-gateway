@@ -147,15 +147,7 @@ func (s *Service) Tokenize(parent context.Context, w http.ResponseWriter, r Forw
 		return result, tokenizationError(status, event.Reason, retry)
 	}
 	lease := *decision.Lease
-	defer func() {
-		timeout := s.coordinationTimeout
-		if timeout <= 0 {
-			timeout = 500 * time.Millisecond
-		}
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
-		defer cancel()
-		_ = s.tokenization.Complete(releaseCtx, lease)
-	}()
+	defer s.releaseTokenizationLease(parent, s.tokenization, lease)
 	if err = ctx.Err(); err != nil {
 		return result, s.tokenizationContextError(ctx, err)
 	}
@@ -187,6 +179,16 @@ func (s *Service) Tokenize(parent context.Context, w http.ResponseWriter, r Forw
 	}
 	return result, nil
 }
+func (s *Service) releaseTokenizationLease(parent context.Context, coordinator coordination.TokenizationCoordinator, lease coordination.TokenizationLease) {
+	timeout := s.coordinationTimeout
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	_ = coordinator.Complete(ctx, lease)
+}
+
 func (s *Service) tokenizationContextError(ctx context.Context, err error) *APIError {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return tokenizationError(504, "timeout", 0)

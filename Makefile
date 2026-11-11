@@ -26,7 +26,7 @@ test-race:
 	$(GO) test -race ./...
 
 test-real-vllm:
-	@case "$(LLMGW_E2E_MODE)" in smoke|priority|resilience|reserve) ;; *) printf '%s\n' 'LLMGW_E2E_MODE must be smoke, priority, resilience, or reserve' >&2; exit 2 ;; esac
+	@case "$(LLMGW_E2E_MODE)" in smoke|priority|resilience|reserve|tokens) ;; *) printf '%s\n' 'LLMGW_E2E_MODE must be smoke, priority, resilience, reserve, or tokens' >&2; exit 2 ;; esac
 	$(GO) test -count=1 -v -timeout 10m ./tests/e2e
 
 test-postgres:

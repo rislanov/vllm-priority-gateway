@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -45,6 +46,7 @@ func configurationOperationError(operation string, err error) error {
 
 func (s *Store) CreateClient(ctx context.Context, p basestore.CreateClientParams) (domain.Client, error) {
 	v := domain.Client{Name: p.Name, Enabled: p.Enabled, PriorityClass: p.PriorityClass, VLLMPriority: p.VLLMPriority, MaxConcurrency: p.MaxConcurrency, RequestsPerMinute: p.RequestsPerMinute, TokensPerMinute: p.TokensPerMinute, Revision: 1}
+	p.ApplyRequestSize(&v)
 	if err := v.Validate(); err != nil {
 		return domain.Client{}, err
 	}
@@ -52,7 +54,7 @@ func (s *Store) CreateClient(ctx context.Context, p basestore.CreateClientParams
 	v.CreatedAt = now
 	v.UpdatedAt = now
 	err := s.mutation(ctx, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `INSERT INTO clients(name,enabled,priority_class,vllm_priority,max_concurrency,requests_per_minute,tokens_per_minute,created_at,updated_at) VALUES($1::text,$2::boolean,$3::text,$4::integer,$5::integer,$6::bigint,$7::bigint,$8::timestamptz,$8::timestamptz) RETURNING id`, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, now).Scan(&v.ID); err != nil {
+		if err := tx.QueryRow(ctx, `INSERT INTO clients(name,enabled,priority_class,vllm_priority,max_concurrency,requests_per_minute,tokens_per_minute,created_at,updated_at,max_input_tokens,max_output_tokens,default_output_tokens,max_outstanding_tokens) VALUES($1::text,$2::boolean,$3::text,$4::integer,$5::integer,$6::bigint,$7::bigint,$8::timestamptz,$8::timestamptz,$9::bigint,$10::bigint,$11::bigint,$12::bigint) RETURNING id`, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, now, v.RequestSizeLimits.MaxInputTokens, v.RequestSizeLimits.MaxOutputTokens, v.RequestSizeLimits.DefaultOutputTokens, v.MaxOutstandingTokens).Scan(&v.ID); err != nil {
 			return fmt.Errorf("insert PostgreSQL client: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO client_admission_scopes(client_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now); err != nil {
@@ -77,15 +79,16 @@ func (s *Store) UpdateClient(ctx context.Context, id int64, p basestore.UpdateCl
 			return fmt.Errorf("lock PostgreSQL client admission scope: %w", err)
 		}
 		var previous domain.Client
-		if err := tx.QueryRow(ctx, "SELECT max_concurrency,revision,created_at FROM clients WHERE id=$1::bigint FOR UPDATE", id).Scan(&previous.MaxConcurrency, &previous.Revision, &v.CreatedAt); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT max_concurrency,revision,created_at,max_input_tokens,max_output_tokens,default_output_tokens,max_outstanding_tokens FROM clients WHERE id=$1::bigint FOR UPDATE", id).Scan(&previous.MaxConcurrency, &previous.Revision, &v.CreatedAt, &v.RequestSizeLimits.MaxInputTokens, &v.RequestSizeLimits.MaxOutputTokens, &v.RequestSizeLimits.DefaultOutputTokens, &v.MaxOutstandingTokens); err != nil {
 			return configurationOperationError("read client", err)
 		}
+		p.ApplyRequestSize(&v)
 		if err := v.ValidateUpdate(previous); err != nil {
 			return err
 		}
 		v.Revision = previous.Revision + 1
 		v.UpdatedAt = time.Now().UTC()
-		tag, err := tx.Exec(ctx, `UPDATE clients SET name=$2::text,enabled=$3::boolean,priority_class=$4::text,vllm_priority=$5::integer,max_concurrency=$6::integer,requests_per_minute=$7::bigint,tokens_per_minute=$8::bigint,revision=revision+1,updated_at=$9::timestamptz WHERE id=$1::bigint`, id, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, v.UpdatedAt)
+		tag, err := tx.Exec(ctx, `UPDATE clients SET name=$2::text,enabled=$3::boolean,priority_class=$4::text,vllm_priority=$5::integer,max_concurrency=$6::integer,requests_per_minute=$7::bigint,tokens_per_minute=$8::bigint,revision=revision+1,updated_at=$9::timestamptz,max_input_tokens=$10::bigint,max_output_tokens=$11::bigint,default_output_tokens=$12::bigint,max_outstanding_tokens=$13::bigint WHERE id=$1::bigint`, id, v.Name, v.Enabled, v.PriorityClass, v.VLLMPriority, v.MaxConcurrency, v.RequestsPerMinute, v.TokensPerMinute, v.UpdatedAt, v.RequestSizeLimits.MaxInputTokens, v.RequestSizeLimits.MaxOutputTokens, v.RequestSizeLimits.DefaultOutputTokens, v.MaxOutstandingTokens)
 		if err != nil {
 			return fmt.Errorf("update PostgreSQL client: %w", err)
 		}
@@ -160,14 +163,21 @@ func replaceAccess(ctx context.Context, tx pgx.Tx, clientID int64, poolIDs []int
 
 func (s *Store) CreatePool(ctx context.Context, p basestore.CreatePoolParams) (domain.ModelPool, error) {
 	v := domain.ModelPool{PublicModelName: p.PublicModelName, UpstreamModelName: p.UpstreamModelName, Enabled: p.Enabled, MaxGatewayInflight: p.MaxGatewayInflight, HighPriorityReserve: p.HighPriorityReserve, MaxWaiting: p.MaxWaiting, Revision: 1}
+	if p.RequestSizeAdmission != nil {
+		v.RequestSizeAdmission = *p.RequestSizeAdmission
+	}
 	if err := v.Validate(); err != nil {
 		return v, err
+	}
+	policy, err := json.Marshal(v.RequestSizeAdmission)
+	if err != nil {
+		return domain.ModelPool{}, fmt.Errorf("encode model pool request size policy: %w", err)
 	}
 	now := time.Now().UTC()
 	v.CreatedAt = now
 	v.UpdatedAt = now
-	err := s.mutation(ctx, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `INSERT INTO model_pools(public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at) VALUES($1::text,$2::text,$3::boolean,$4::integer,$5::integer,$6::integer,$7::timestamptz,$7::timestamptz) RETURNING id`, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, now).Scan(&v.ID); err != nil {
+	err = s.mutation(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `INSERT INTO model_pools(public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at,request_size_admission) VALUES($1::text,$2::text,$3::boolean,$4::integer,$5::integer,$6::integer,$7::timestamptz,$7::timestamptz,$8::jsonb) RETURNING id`, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, now, string(policy)).Scan(&v.ID); err != nil {
 			return fmt.Errorf("insert PostgreSQL model pool: %w", err)
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO pool_admission_scopes(pool_id,updated_at) VALUES($1::bigint,$2::timestamptz)", v.ID, now); err != nil {
@@ -185,15 +195,22 @@ func (s *Store) UpdatePool(ctx context.Context, id int64, p basestore.UpdatePool
 			return configurationOperationError("lock pool admission scope", err)
 		}
 		var old domain.ModelPool
-		if err := tx.QueryRow(ctx, "SELECT max_gateway_inflight,revision,created_at FROM model_pools WHERE id=$1::bigint FOR UPDATE", id).Scan(&old.MaxGatewayInflight, &old.Revision, &v.CreatedAt); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT max_gateway_inflight,revision,created_at,request_size_admission FROM model_pools WHERE id=$1::bigint FOR UPDATE", id).Scan(&old.MaxGatewayInflight, &old.Revision, &v.CreatedAt, &v.RequestSizeAdmission); err != nil {
 			return configurationOperationError("read model pool", err)
+		}
+		if p.RequestSizeAdmission != nil {
+			v.RequestSizeAdmission = *p.RequestSizeAdmission
 		}
 		if err := v.ValidateUpdate(old); err != nil {
 			return err
 		}
 		v.Revision = old.Revision + 1
 		v.UpdatedAt = time.Now().UTC()
-		tag, err := tx.Exec(ctx, `UPDATE model_pools SET public_model_name=$2::text,upstream_model_name=$3::text,enabled=$4::boolean,max_gateway_inflight=$5::integer,high_priority_reserve=$6::integer,max_waiting=$7::integer,revision=revision+1,updated_at=$8::timestamptz WHERE id=$1::bigint`, id, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, v.UpdatedAt)
+		policy, err := json.Marshal(v.RequestSizeAdmission)
+		if err != nil {
+			return fmt.Errorf("encode model pool request size policy: %w", err)
+		}
+		tag, err := tx.Exec(ctx, `UPDATE model_pools SET public_model_name=$2::text,upstream_model_name=$3::text,enabled=$4::boolean,max_gateway_inflight=$5::integer,high_priority_reserve=$6::integer,max_waiting=$7::integer,revision=revision+1,updated_at=$8::timestamptz,request_size_admission=$9::jsonb WHERE id=$1::bigint`, id, v.PublicModelName, v.UpstreamModelName, v.Enabled, v.MaxGatewayInflight, v.HighPriorityReserve, v.MaxWaiting, v.UpdatedAt, string(policy))
 		if err != nil {
 			return fmt.Errorf("update PostgreSQL model pool: %w", err)
 		}
@@ -439,13 +456,13 @@ func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 }
 
 func pgClients(ctx context.Context, q pgx.Tx) ([]domain.Client, error) {
-	rows, err := q.Query(ctx, "SELECT id,revision,name,enabled,priority_class,vllm_priority,max_concurrency,requests_per_minute,tokens_per_minute,created_at,updated_at FROM clients ORDER BY id")
+	rows, err := q.Query(ctx, "SELECT id,revision,name,enabled,priority_class,vllm_priority,max_concurrency,requests_per_minute,tokens_per_minute,created_at,updated_at,max_input_tokens,max_output_tokens,default_output_tokens,max_outstanding_tokens FROM clients ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (v domain.Client, err error) {
-		err = r.Scan(&v.ID, &v.Revision, &v.Name, &v.Enabled, &v.PriorityClass, &v.VLLMPriority, &v.MaxConcurrency, &v.RequestsPerMinute, &v.TokensPerMinute, &v.CreatedAt, &v.UpdatedAt)
+		err = r.Scan(&v.ID, &v.Revision, &v.Name, &v.Enabled, &v.PriorityClass, &v.VLLMPriority, &v.MaxConcurrency, &v.RequestsPerMinute, &v.TokensPerMinute, &v.CreatedAt, &v.UpdatedAt, &v.RequestSizeLimits.MaxInputTokens, &v.RequestSizeLimits.MaxOutputTokens, &v.RequestSizeLimits.DefaultOutputTokens, &v.MaxOutstandingTokens)
 		return
 	})
 }
@@ -466,13 +483,13 @@ func pgKeys(ctx context.Context, q pgx.Tx) ([]domain.APIKey, error) {
 	})
 }
 func pgPools(ctx context.Context, q pgx.Tx) ([]domain.ModelPool, error) {
-	rows, err := q.Query(ctx, "SELECT id,revision,public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at FROM model_pools ORDER BY id")
+	rows, err := q.Query(ctx, "SELECT id,revision,public_model_name,upstream_model_name,enabled,max_gateway_inflight,high_priority_reserve,max_waiting,created_at,updated_at,request_size_admission FROM model_pools ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (v domain.ModelPool, err error) {
-		err = r.Scan(&v.ID, &v.Revision, &v.PublicModelName, &v.UpstreamModelName, &v.Enabled, &v.MaxGatewayInflight, &v.HighPriorityReserve, &v.MaxWaiting, &v.CreatedAt, &v.UpdatedAt)
+		err = r.Scan(&v.ID, &v.Revision, &v.PublicModelName, &v.UpstreamModelName, &v.Enabled, &v.MaxGatewayInflight, &v.HighPriorityReserve, &v.MaxWaiting, &v.CreatedAt, &v.UpdatedAt, &v.RequestSizeAdmission)
 		return
 	})
 }

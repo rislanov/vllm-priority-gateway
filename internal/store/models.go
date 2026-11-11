@@ -7,17 +7,34 @@ import (
 )
 
 type CreateClientParams struct {
-	Name              string
-	Enabled           bool
-	PriorityClass     domain.PriorityClass
-	VLLMPriority      int
-	MaxConcurrency    int
-	RequestsPerMinute int64
-	TokensPerMinute   int64
-	ModelPoolIDs      []int64
+	Name                                                                       string
+	Enabled                                                                    bool
+	PriorityClass                                                              domain.PriorityClass
+	VLLMPriority                                                               int
+	MaxConcurrency                                                             int
+	RequestsPerMinute                                                          int64
+	TokensPerMinute                                                            int64
+	MaxInputTokens, MaxOutputTokens, DefaultOutputTokens, MaxOutstandingTokens *int64
+	ModelPoolIDs                                                               []int64
 }
 
 type UpdateClientParams = CreateClientParams
+
+// ApplyRequestSize preserves existing limits for fields omitted from an update.
+func (p CreateClientParams) ApplyRequestSize(client *domain.Client) {
+	if p.MaxInputTokens != nil {
+		client.RequestSizeLimits.MaxInputTokens = *p.MaxInputTokens
+	}
+	if p.MaxOutputTokens != nil {
+		client.RequestSizeLimits.MaxOutputTokens = *p.MaxOutputTokens
+	}
+	if p.DefaultOutputTokens != nil {
+		client.RequestSizeLimits.DefaultOutputTokens = *p.DefaultOutputTokens
+	}
+	if p.MaxOutstandingTokens != nil {
+		client.MaxOutstandingTokens = *p.MaxOutstandingTokens
+	}
+}
 
 type CreateAPIKeyParams struct {
 	ClientID   int64
@@ -27,12 +44,13 @@ type CreateAPIKeyParams struct {
 }
 
 type CreatePoolParams struct {
-	PublicModelName     string
-	UpstreamModelName   string
-	Enabled             bool
-	MaxGatewayInflight  int
-	HighPriorityReserve int
-	MaxWaiting          int
+	PublicModelName      string
+	UpstreamModelName    string
+	Enabled              bool
+	MaxGatewayInflight   int
+	HighPriorityReserve  int
+	MaxWaiting           int
+	RequestSizeAdmission *domain.RequestSizePolicy
 }
 
 type UpdatePoolParams = CreatePoolParams

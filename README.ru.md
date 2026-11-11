@@ -162,6 +162,8 @@ POST /v1/responses
 
 ## Production и эксплуатация
 
+В пуле можно включить допуск по размеру запроса с лимитами входных, выходных и зарезервированных токенов. Для High и Critical сохраняется аварийный допуск с лимитами на реплику. См. [настройку допуска](docs/operations.md#request-size-admission).
+
 - [Production deployment](docs/deployment.md): Docker/systemd, TLS reverse proxy, secrets, backup и restore.
 - [Operations guide](docs/operations.md): readiness, routing, drain/resume, circuits, pool safety, метрики, логи и recovery.
 - [Real-vLLM E2E runbook](docs/real-vllm-priority-e2e.md): smoke, priority, saturation, drain и resilience.

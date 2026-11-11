@@ -95,7 +95,8 @@ func New(service *httpapi.AdminService) (http.Handler, error) {
 			}
 			return fmt.Sprintf("%.0f", total)
 		},
-		"stateClass": func(value any) string { return "state-" + strings.ToLower(fmt.Sprint(value)) },
+		"stateClass":           func(value any) string { return "state-" + strings.ToLower(fmt.Sprint(value)) },
+		"effectiveRequestSize": effectiveRequestSize,
 		"hasPool": func(ids []int64, id int64) bool {
 			for _, candidate := range ids {
 				if candidate == id {

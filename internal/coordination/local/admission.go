@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"maps"
 	"sync"
 	"time"
 
@@ -37,18 +38,24 @@ type ratePolicy struct {
 }
 
 type AdmissionCoordinator struct {
-	mu                sync.Mutex
-	now               func() time.Time
-	receipts          map[uuid.UUID]*admissionReceipt
-	leases            map[uuid.UUID]coordination.LeaseIdentity
-	expiries          expiryQueue
-	terminalExpiries  expiryQueue
-	clientInflight    map[int64]int
-	poolInflight      map[int64]int
-	poolLowerInflight map[int64]int
-	receiptCapacity   int
-	rates             map[int64]map[string]*rateState
-	policies          map[int64]ratePolicy
+	mu                  sync.Mutex
+	reservationObserver coordination.TokenReservationObserver
+	now                 func() time.Time
+	receipts            map[uuid.UUID]*admissionReceipt
+	leases              map[uuid.UUID]coordination.LeaseIdentity
+	expiries            expiryQueue
+	terminalExpiries    expiryQueue
+	protectedReceipts   expiryQueue
+	tokenReplayCutoff   time.Time
+	clientOutstanding   map[int64]int64
+	poolOutstanding     map[int64]int64
+	poolLegacyLeases    map[int64]int
+	clientInflight      map[int64]int
+	poolInflight        map[int64]int
+	poolLowerInflight   map[int64]int
+	receiptCapacity     int
+	rates               map[int64]map[string]*rateState
+	policies            map[int64]ratePolicy
 }
 
 func NewAdmissionCoordinator(now func() time.Time) *AdmissionCoordinator {
@@ -65,8 +72,13 @@ func newAdmissionCoordinator(now func() time.Time, receiptCapacity int) *Admissi
 	return &AdmissionCoordinator{
 		now: now, receipts: make(map[uuid.UUID]*admissionReceipt), leases: make(map[uuid.UUID]coordination.LeaseIdentity),
 		clientInflight: make(map[int64]int), poolInflight: make(map[int64]int), poolLowerInflight: make(map[int64]int),
+		clientOutstanding: make(map[int64]int64), poolOutstanding: make(map[int64]int64), poolLegacyLeases: make(map[int64]int),
 		receiptCapacity: receiptCapacity, rates: make(map[int64]map[string]*rateState), policies: make(map[int64]ratePolicy),
 	}
+}
+
+func (c *AdmissionCoordinator) SetTokenReservationObserver(observer coordination.TokenReservationObserver) {
+	c.reservationObserver = observer
 }
 
 func (c *AdmissionCoordinator) Status() coordination.Status {
@@ -74,7 +86,7 @@ func (c *AdmissionCoordinator) Status() coordination.Status {
 	defer c.mu.Unlock()
 	now := c.now().UTC()
 	c.expire(now)
-	available := len(c.receipts) < c.receiptCapacity || c.hasTerminalReceipt()
+	available := len(c.receipts) < c.receiptCapacity || c.hasTerminalReceipt(now)
 	return coordination.Status{Backend: "local", Available: available, LastSuccess: now}
 }
 
@@ -83,7 +95,12 @@ func (c *AdmissionCoordinator) ObserveClientRatePolicy(policy coordination.Clien
 	defer c.mu.Unlock()
 	c.observeClientRatePolicy(policy)
 }
-func (c *AdmissionCoordinator) RefreshInflight(context.Context) error { return nil }
+func (c *AdmissionCoordinator) RefreshInflight(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expire(c.now().UTC())
+	return nil
+}
 func (c *AdmissionCoordinator) PoolInflight(poolID int64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -117,8 +134,14 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 		}
 		return old.decision, nil
 	}
-	if !c.makeReceiptRoom() {
+	if req.TokenReservation.Enabled && (!req.OperationStartedAt.After(c.tokenReplayCutoff) || req.OperationStartedAt.After(now.Add(5*time.Minute))) {
+		return coordination.AdmissionDecision{Reason: coordination.ReasonStaleOperation}, nil
+	}
+	if !c.makeReceiptRoom(now) {
 		return coordination.AdmissionDecision{Reason: coordination.ReasonCoordinationUnavailable}, nil
+	}
+	if req.TokenReservation.Enabled && !req.OperationStartedAt.After(c.tokenReplayCutoff) {
+		return coordination.AdmissionDecision{Reason: coordination.ReasonStaleOperation}, nil
 	}
 	receipt := &admissionReceipt{fingerprint: fp, request: req}
 	c.receipts[req.LeaseID] = receipt
@@ -130,9 +153,12 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 				d.ConcurrencyScope = scope[0]
 			}
 		}
+		if reason == coordination.ReasonTokenBudgetExhausted {
+			d.TokenBudgetScope = scope[0]
+		}
 		receipt.decision = d
 		receipt.retainUntil = retentionBoundary(req.OperationStartedAt, now)
-		c.terminalExpiries.add(admissionReceiptExpiry, req.LeaseID, receipt.retainUntil)
+		c.queueTerminalReceipt(req.LeaseID, receipt, now)
 		return d, nil
 	}
 	if req.OperationStartedAt.After(now.Add(5*time.Minute)) || !req.OperationStartedAt.After(now.Add(-receiptRetention)) {
@@ -140,6 +166,13 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	}
 	if req.PoolHighPriorityReserve < 0 || (req.PoolHighPriorityReserve > 0 && (req.PoolGatewayInflightLimit <= 0 || req.PoolHighPriorityReserve > req.PoolGatewayInflightLimit || !req.PriorityClass.Valid())) || (req.PriorityClass != "" && !req.PriorityClass.Valid()) {
 		return reject(coordination.ReasonStaleConfiguration, nil)
+	}
+	reservation := req.TokenReservation
+	if !reservation.Valid() {
+		return reject(coordination.ReasonStaleConfiguration, nil)
+	}
+	if reservation.Enabled && c.poolLegacyLeases[req.PoolID] > 0 {
+		return reject(coordination.ReasonTokenPolicyTransition, nil)
 	}
 	policy := c.observeRatePolicy(req)
 	if req.EffectiveClientLimit <= 0 || req.EffectiveClientLimit > req.ConfiguredClientLimit {
@@ -154,6 +187,9 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	}
 	if clientCount >= req.EffectiveClientLimit {
 		return reject(coordination.ReasonConcurrencyExhausted, nil)
+	}
+	if scope := reservation.ExhaustedScope(c.clientOutstanding[req.ClientID], c.poolOutstanding[req.PoolID]); scope != "" {
+		return reject(coordination.ReasonTokenBudgetExhausted, nil, scope)
 	}
 	if policy.tpm > 0 {
 		state := c.normalized(req.ClientID, "tpm", policy.revision, policy.tpm, now)
@@ -178,12 +214,20 @@ func (c *AdmissionCoordinator) Acquire(ctx context.Context, req coordination.Adm
 	c.leases[req.LeaseID] = lease
 	c.clientInflight[lease.ClientID]++
 	c.poolInflight[lease.PoolID]++
+	if reservation.Enabled {
+		c.clientOutstanding[lease.ClientID] += reservation.ReservedTokens
+		c.poolOutstanding[lease.PoolID] += reservation.ReservedTokens
+	} else {
+		c.poolLegacyLeases[lease.PoolID]++
+	}
 	if req.PriorityClass != domain.PriorityHigh && req.PriorityClass != domain.PriorityCritical {
 		c.poolLowerInflight[lease.PoolID]++
 	}
 	c.expiries.add(admissionLeaseExpiry, lease.LeaseID, lease.ExpiresAt)
 	receipt.decision = coordination.AdmissionDecision{Lease: &lease}
-	return receipt.decision, nil
+	req.ReservationEvent().Observe(c.reservationObserver, coordination.ReservationAcquired, "", nil)
+	copy := lease
+	return coordination.AdmissionDecision{Lease: &copy}, nil
 }
 
 func (c *AdmissionCoordinator) Renew(ctx context.Context, leases []coordination.LeaseIdentity) ([]coordination.RenewResult, error) {
@@ -197,8 +241,7 @@ func (c *AdmissionCoordinator) Renew(ctx context.Context, leases []coordination.
 	out := make([]coordination.RenewResult, len(leases))
 	for i, want := range leases {
 		got, ok := c.leases[want.LeaseID]
-		if !ok || got.ClientID != want.ClientID || got.PoolID != want.PoolID || !got.ExpiresAt.After(now) {
-			c.removeLease(want.LeaseID)
+		if !ok || !got.SameOwner(want) || !got.ExpiresAt.After(now) {
 			out[i] = coordination.RenewResult{Lease: want, Reason: coordination.ReasonLeaseLost}
 			continue
 		}
@@ -233,7 +276,7 @@ func (c *AdmissionCoordinator) Complete(ctx context.Context, completions []coord
 			out[i] = coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Reason: coordination.ReasonStaleOperation}
 			continue
 		}
-		if rec.decision.Lease == nil {
+		if rec.decision.Lease == nil || !rec.decision.Lease.SameOwner(item.Lease) {
 			out[i] = coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: coordination.CompletionLeaseLost, Reason: coordination.ReasonLeaseLost}
 			continue
 		}
@@ -261,8 +304,16 @@ func (c *AdmissionCoordinator) Complete(ctx context.Context, completions []coord
 		rec.completed = true
 		rec.completion = result
 		rec.retainUntil = retentionBoundary(rec.request.OperationStartedAt, now)
-		c.terminalExpiries.add(admissionReceiptExpiry, item.Lease.LeaseID, rec.retainUntil)
+		c.queueTerminalReceipt(item.Lease.LeaseID, rec, now)
 		out[i] = coordination.CompleteResult{LeaseID: item.Lease.LeaseID, Result: result}
+		event := rec.request.ReservationEvent()
+		var reason coordination.Reason
+		if active {
+			event.Observe(c.reservationObserver, coordination.ReservationReleased, "", nil)
+		} else {
+			reason = coordination.ReasonLeaseLost
+		}
+		event.Observe(c.reservationObserver, coordination.ReservationReconciled, reason, item.Usage)
 	}
 	return out, nil
 }
@@ -318,11 +369,13 @@ func (c *AdmissionCoordinator) expire(now time.Time) {
 			c.removeLease(expiry.id)
 			if receipt := c.receipts[expiry.id]; receipt != nil && !receipt.completed {
 				receipt.expired = true
+				receipt.request.ReservationEvent().Observe(c.reservationObserver, coordination.ReservationExpired, coordination.ReasonLeaseLost, nil)
 				receipt.retainUntil = retentionBoundary(receipt.request.OperationStartedAt, now)
-				c.terminalExpiries.add(admissionReceiptExpiry, expiry.id, receipt.retainUntil)
+				c.queueTerminalReceipt(expiry.id, receipt, now)
 			}
 		}
 	}
+	c.promoteProtectedReceipts(now)
 	for {
 		expiry, ok := c.terminalExpiries.due(now)
 		if !ok {
@@ -330,35 +383,90 @@ func (c *AdmissionCoordinator) expire(now time.Time) {
 		}
 		receipt := c.receipts[expiry.id]
 		if receipt != nil && receipt.retainUntil.Equal(expiry.at) && !receipt.retainUntil.After(now) {
-			delete(c.receipts, expiry.id)
+			c.evictReceipt(expiry.id, receipt)
 		}
 	}
 }
 
-func (c *AdmissionCoordinator) makeReceiptRoom() bool {
-	for len(c.receipts) >= c.receiptCapacity {
-		if !c.hasTerminalReceipt() {
-			return false
-		}
-		expiry, ok := c.terminalExpiries.popOldest()
+func (c *AdmissionCoordinator) queueTerminalReceipt(id uuid.UUID, receipt *admissionReceipt, now time.Time) {
+	start := receipt.request.OperationStartedAt
+	if receipt.request.TokenReservation.Enabled && start.After(now) {
+		c.protectedReceipts.add(admissionReceiptExpiry, id, start)
+		return
+	}
+	c.terminalExpiries.add(admissionReceiptExpiry, id, receipt.retainUntil)
+}
+
+func (c *AdmissionCoordinator) promoteProtectedReceipts(now time.Time) {
+	for {
+		entry, ok := c.protectedReceipts.due(now)
 		if !ok {
+			return
+		}
+		if receipt := c.receipts[entry.id]; receipt != nil && !receipt.retainUntil.IsZero() && receipt.request.OperationStartedAt.Equal(entry.at) {
+			c.terminalExpiries.add(admissionReceiptExpiry, entry.id, receipt.retainUntil)
+		}
+	}
+}
+
+func (c *AdmissionCoordinator) makeReceiptRoom(now time.Time) bool {
+	for len(c.receipts) >= c.receiptCapacity {
+		if !c.hasTerminalReceipt(now) {
 			return false
 		}
-		delete(c.receipts, expiry.id)
+		expiry, _ := c.terminalExpiries.popOldest()
+		c.evictReceipt(expiry.id, c.receipts[expiry.id])
 	}
 	return true
 }
 
-func (c *AdmissionCoordinator) hasTerminalReceipt() bool {
+func (c *AdmissionCoordinator) hasTerminalReceipt(now time.Time) bool {
 	for c.terminalExpiries.Len() > 0 {
 		expiry := c.terminalExpiries[0]
 		receipt := c.receipts[expiry.id]
-		if receipt != nil && !receipt.retainUntil.IsZero() && receipt.retainUntil.Equal(expiry.at) {
-			return true
+		if receipt == nil || receipt.retainUntil.IsZero() || !receipt.retainUntil.Equal(expiry.at) {
+			_, _ = c.terminalExpiries.popOldest()
+			continue
 		}
-		_, _ = c.terminalExpiries.popOldest()
+		// A clock regression can put a previously eligible receipt in the future.
+		if receipt.request.TokenReservation.Enabled && receipt.request.OperationStartedAt.After(now) {
+			_, _ = c.terminalExpiries.popOldest()
+			c.queueTerminalReceipt(expiry.id, receipt, now)
+			continue
+		}
+		return true
 	}
 	return false
+}
+
+func (c *AdmissionCoordinator) evictReceipt(id uuid.UUID, receipt *admissionReceipt) {
+	if receipt.request.TokenReservation.Enabled && receipt.request.OperationStartedAt.After(c.tokenReplayCutoff) {
+		c.tokenReplayCutoff = receipt.request.OperationStartedAt
+	}
+	delete(c.receipts, id)
+}
+
+func (c *AdmissionCoordinator) PoolOutstandingTokens(poolID int64) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expire(c.now().UTC())
+	return c.poolOutstanding[poolID]
+}
+
+func (c *AdmissionCoordinator) OutstandingTokenSnapshot() map[int64]int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expire(c.now().UTC())
+	return maps.Clone(c.poolOutstanding)
+}
+
+func releaseOutstanding(counter map[int64]int64, id, tokens int64) {
+	remaining := counter[id] - tokens
+	if remaining == 0 {
+		delete(counter, id)
+	} else {
+		counter[id] = remaining
+	}
 }
 
 func (c *AdmissionCoordinator) removeLease(id uuid.UUID) {
@@ -367,7 +475,16 @@ func (c *AdmissionCoordinator) removeLease(id uuid.UUID) {
 		return
 	}
 	delete(c.leases, id)
-	class := c.receipts[id].request.PriorityClass
+	request := c.receipts[id].request
+	if request.TokenReservation.Enabled {
+		releaseOutstanding(c.clientOutstanding, lease.ClientID, request.TokenReservation.ReservedTokens)
+		releaseOutstanding(c.poolOutstanding, lease.PoolID, request.TokenReservation.ReservedTokens)
+	} else if c.poolLegacyLeases[lease.PoolID] == 1 {
+		delete(c.poolLegacyLeases, lease.PoolID)
+	} else {
+		c.poolLegacyLeases[lease.PoolID]--
+	}
+	class := request.PriorityClass
 	if class != domain.PriorityHigh && class != domain.PriorityCritical {
 		if c.poolLowerInflight[lease.PoolID] <= 1 {
 			delete(c.poolLowerInflight, lease.PoolID)

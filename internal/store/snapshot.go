@@ -42,7 +42,7 @@ func (s *SQLite) LoadSnapshot(ctx context.Context) (registry.Data, error) {
 
 func snapshotClients(ctx context.Context, tx *sql.Tx) ([]domain.Client, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at
+		SELECT id, revision, name, enabled, priority_class, vllm_priority, max_concurrency, requests_per_minute, tokens_per_minute, created_at, updated_at, max_input_tokens, max_output_tokens, default_output_tokens, max_outstanding_tokens
 		FROM clients ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot clients: %w", err)
@@ -80,7 +80,7 @@ func snapshotKeys(ctx context.Context, tx *sql.Tx) ([]domain.APIKey, error) {
 
 func snapshotPools(ctx context.Context, tx *sql.Tx) ([]domain.ModelPool, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, revision, public_model_name, upstream_model_name, enabled, max_gateway_inflight, high_priority_reserve, max_waiting, created_at, updated_at
+		SELECT id, revision, public_model_name, upstream_model_name, enabled, max_gateway_inflight, high_priority_reserve, max_waiting, created_at, updated_at, request_size_admission
 		FROM model_pools ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot model pools: %w", err)

@@ -27,7 +27,7 @@ func (*Logger) ClientInflight(gateway.InflightEvent, int)  {}
 func (*Logger) BackendInflight(gateway.InflightEvent, int) {}
 
 func (l *Logger) Complete(event gateway.RequestEvent) {
-	l.logger.LogAttrs(context.Background(), slog.LevelInfo, "request completed",
+	attributes := []slog.Attr{
 		slog.String("requestId", event.RequestID),
 		slog.String("parentRequestId", event.ParentRequestID),
 		slog.String("client", event.Client),
@@ -47,7 +47,25 @@ func (l *Logger) Complete(event gateway.RequestEvent) {
 		slog.Int64("ttftMs", event.TTFT.Milliseconds()),
 		slog.Bool("disconnect", event.Disconnect),
 		slog.Int("retryCount", event.RetryCount),
-	)
+	}
+	if token := event.TokenAdmission; token.Enabled {
+		metadata := []any{slog.String("mode", string(token.Mode)), slog.Int64("preflightMs", token.PreflightDuration.Milliseconds())}
+		if token.Estimated {
+			metadata = append(metadata, slog.String("estimator", token.EstimatorKind), slog.Int64("estimatedInputTokens", token.InputEstimate))
+		}
+		if token.BudgetScope != "" {
+			metadata = append(metadata, slog.String("budgetScope", string(token.BudgetScope)))
+		}
+		if token.ReservedTokens > 0 {
+			known := validActualTokenUsage(event.Usage)
+			metadata = append(metadata, slog.Int64("reservedTokens", token.ReservedTokens), slog.Bool("usageKnown", known))
+			if known {
+				metadata = append(metadata, slog.Int64("actualInputTokens", event.Usage.InputTokens), slog.Int64("actualOutputTokens", event.Usage.OutputTokens))
+			}
+		}
+		attributes = append(attributes, slog.Group("tokenAdmission", metadata...))
+	}
+	l.logger.LogAttrs(context.Background(), slog.LevelInfo, "request completed", attributes...)
 }
 
 // CoordinationOperation records bounded coordination metadata without request,
