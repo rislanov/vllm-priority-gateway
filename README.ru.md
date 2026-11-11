@@ -96,9 +96,9 @@ Gateway **не** развёртывает модели, не планирует 
 2. Запустите опубликованный образ с постоянным SQLite volume:
 
    ```console
-   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.6.3
+   docker pull ghcr.io/rislanov/vllm-priority-gateway:0.7.0
    docker volume create llmgw-data
-   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.6.3
+   docker run -d --name vllm-priority-gateway --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file .env -v llmgw-data:/data ghcr.io/rislanov/vllm-priority-gateway:0.7.0
    ```
 
 3. Откройте `http://127.0.0.1:8080/admin` и создайте:
