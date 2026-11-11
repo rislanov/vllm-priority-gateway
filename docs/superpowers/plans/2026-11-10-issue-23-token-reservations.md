@@ -10,7 +10,7 @@
 
 **Spec:** [design](../specs/2026-11-10-issue-23-token-reservations-design.md).
 
-**Status:** Implementation and qualification complete. Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
+**Status:** Implementation and qualification complete. Published in [PR #54](https://github.com/rislanov/vllm-priority-gateway/pull/54). Base `c072e66466d68088c924b94421af3d7c9646d171`, branch `codex/issue-23-token-reservations`.
 
 ## Global Constraints
 
@@ -222,7 +222,7 @@ Persistent client fields: `RequestSizeLimits RequestSizeLimits`, `MaxOutstanding
 - [x] Run `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`, `make test-web-unit`, and `make test-postgres`; record commands, commit, environment/profile, pass/fail/skips. PostgreSQL requires actual two-replica executions.
 - [x] Run `LLMGW_E2E_MODE=tokens make test-real-vllm` against a dedicated real-vLLM target with a qualified model profile and safe secret handling. Run direct tokenizer-versus-generation qualification on every backend for supported exact payloads. Without an environment, mark AC14 pending; synthetic tests are not a substitute.
 - [x] Populate AC01–AC14 evidence with test links and results. Fix confirmed defects with regressions or obtain explicit acceptance of exceptions. Perform a whole-branch review before the PR.
-- [ ] Commit: `test: qualify token reservations under mixed inference load`. Publish a PR/close the issue after implementation/evidence is ready, not at this draft-plan stage.
+- [x] Commit `test: qualify token reservations under mixed inference load` and publish [PR #54](https://github.com/rislanov/vllm-priority-gateway/pull/54) with the closing reference for issue #23.
 
 ## Plan self-review and execution order
 
