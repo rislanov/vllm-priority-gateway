@@ -172,17 +172,24 @@ func isSerializationFailure(err error) bool {
 }
 
 func retryReplicaHeartbeat(ctx context.Context, operation func(context.Context) error) error {
-	var err error
-	for attempt := 0; attempt < 2; attempt++ {
-		err = operation(ctx)
+	// Each retry starts a fresh transaction but shares the caller's deadline.
+	// Back off so concurrent replica checks can finish instead of colliding again.
+	for delay := 5 * time.Millisecond; ; delay = min(delay*2, 50*time.Millisecond) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := operation(ctx)
 		if err == nil || !isSerializationFailure(err) {
 			return err
 		}
-		if ctx.Err() != nil {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
+		case <-timer.C:
 		}
 	}
-	return err
 }
 
 func (m *ReplicaManager) run(ctx context.Context) {
