@@ -25,9 +25,46 @@ The reverse proxy must:
 - expose `/v1/*` to client networks;
 - restrict `/admin/*`, `/metrics`, `/healthz`, `/readyz`, `/inference-readyz`, and `/coordination-readyz` to operator, monitoring, and load-balancer networks.
 
+## Compatible PostgreSQL rolling updates
+
+From v0.7.0 onward, releases must preserve the coordination protocol within an
+application major; see the [compatibility policy](coordination-compatibility.md).
+The policy starts at contract 4 and does not make earlier contracts compatible.
+
+For a release with unchanged effective coordination settings and verified
+database operation/startup/rollback compatibility, use `RollingUpdate` rather
+than the incompatible-policy procedure below:
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+```
+
+Keep `LLMGW_COORDINATION_RESET_ON_START=false` and provide capacity for the extra
+replica. Check `/coordination-readyz` and `/inference-readyz` on each replacement
+before draining an old replica. Remove old replicas from new traffic assignments,
+allow the actual ingress/load balancer to propagate the change, and drain their
+active requests while other replicas continue serving. Keep `/healthz` as liveness.
+
+Size `LLMGW_SHUTDOWN_GRACE_PERIOD` for the longest supported stream plus completion
+and application cleanup. Its default is 30 seconds; a larger Kubernetes grace
+alone does not stop the application from closing long streams. Set
+`terminationGracePeriodSeconds` above the application budget plus any preStop
+hook and margin. Unlimited stream duration cannot be guaranteed by a finite
+shutdown budget. Verify the procedure with the production ingress topology.
+
+Do not combine this rollout with incompatible coordination setting changes or
+assume that activating token reservations is nonblocking while legacy leases
+remain. A newer migration version can also prevent older binaries from restarting;
+verify the migration boundary described in the compatibility policy first.
+
 ## PostgreSQL upgrades with a coordination policy change
 
-Starting with v0.6.3,
+For an incompatible fingerprint or contract change, starting with v0.6.3,
 keep `LLMGW_COORDINATION_RESET_ON_START=false` and use a stop/start deployment.
 New replicas wait up to `LLMGW_COORDINATION_STARTUP_WAIT_TIMEOUT=3m` for old
 incompatible registrations to expire or unregister. Graceful shutdown removes
