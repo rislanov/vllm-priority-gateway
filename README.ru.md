@@ -263,6 +263,7 @@ make test-web
 - [Operations guide](docs/operations.md)
 - [API токенизации, примеры и порядок обновления](docs/operations.md#tokenization)
 - [PostgreSQL в production и обновления](docs/postgresql-production.md#automatic-coordination-upgrades)
+- [Стабильный контракт координации от v0.7.0 и rolling update](docs/coordination-compatibility.md)
 - [Technical specification](docs/technical-specification.md)
 - [Acceptance evidence](docs/acceptance-evidence.md)
 - [English README](README.md)

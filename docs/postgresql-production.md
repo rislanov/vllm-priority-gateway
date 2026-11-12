@@ -92,7 +92,21 @@ Each process registers a random replica UUID and a fingerprint covering the coor
 
 PostgreSQL retains terminal coordination receipts for the strict 24-hour replay window. SQLite/local history is process-local and bounded to 65,536 admission receipts and 65,536 circuit attempts; capacity pressure can evict terminal records early, and an evicted UUID can be evaluated again. Choose PostgreSQL when that durable replay guarantee is required.
 
+### Compatible releases from v0.7.0
+
+The [coordination compatibility policy](coordination-compatibility.md) fixes
+contract 4 as the baseline for subsequent 0.x releases and requires compatible
+coordination within each application major. With matching effective settings
+and verified database compatibility, use
+[rolling updates](deployment.md#compatible-postgresql-rolling-updates).
+This is a release constraint, not a runtime compatibility bypass. It does not
+cover the earlier contract-3 to contract-4 transition, incompatible setting
+changes, or automatically make migration/startup and token-policy activation safe.
+
 ### Automatic coordination upgrades
+
+This section applies to incompatible contracts or policy fingerprints. Compatible
+binary updates follow the rolling procedure above and do not require `Recreate`.
 
 **Available since v0.6.3:** automatic startup waiting and graceful unregister.
 Released v0.6.2 does not implement either; setting

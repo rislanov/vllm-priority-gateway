@@ -21,10 +21,16 @@ import (
 )
 
 const (
+	// v0.7.0 is the contract-4 baseline for subsequent 0.x releases. Preserve
+	// mixed-version semantics within an application major; do not bump these
+	// versions for ordinary releases. See docs/coordination-compatibility.md.
 	CoordinationContractVersion = 4
 	RateAlgorithmVersion        = 1
 )
 
+// ReplicaPolicy's JSON representation is a compatibility boundary, including
+// field order and the representation of nested structs. Keep identical settings
+// byte-compatible with v0.7.0; place unrelated new feature settings elsewhere.
 type ReplicaPolicy struct {
 	LeaseTTL              time.Duration
 	LeaseRenewInterval    time.Duration
@@ -35,6 +41,9 @@ type ReplicaPolicy struct {
 	EmergencyTokenization coordination.TokenizationPolicy
 }
 
+// PolicyFingerprint identifies shared coordination semantics, not the binary
+// version. Preserve its encoding and effective defaults within an application
+// major. Keeping ContractVersion unchanged alone does not preserve this hash.
 func PolicyFingerprint(policy ReplicaPolicy) [32]byte {
 	if policy.RateAlgorithm == 0 {
 		policy.RateAlgorithm = RateAlgorithmVersion

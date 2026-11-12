@@ -35,6 +35,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return runMigrations(db)
 }
 
+// runMigrations is called on every PostgreSQL startup. Before adding a migration,
+// verify restart/rollback of supported older binaries: migrate.Up requires the
+// current DB version in their embedded source, even for additive schema changes.
+// See docs/coordination-compatibility.md; SQL compatibility alone is insufficient.
 func runMigrations(db *sql.DB) error {
 	source, err := iofs.New(migrationFS, "migrations")
 	if err != nil {

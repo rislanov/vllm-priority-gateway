@@ -269,6 +269,7 @@ Run only the JavaScript unit tests (no browser installation required) with `make
 - [Operations guide](docs/operations.md)
 - [Tokenization API, examples, and rollout](docs/operations.md#tokenization)
 - [PostgreSQL production and upgrades](docs/postgresql-production.md#automatic-coordination-upgrades)
+- [Coordination compatibility from v0.7.0 and rolling updates](docs/coordination-compatibility.md)
 - [Technical specification](docs/technical-specification.md)
 - [Acceptance evidence](docs/acceptance-evidence.md)
 - [Russian README](README.ru.md)
