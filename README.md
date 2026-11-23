@@ -76,7 +76,7 @@ The deployment footprint is one static Go binary and an explicitly selected pers
 - Explicit model ACLs and per-client concurrency, RPM and soft-TPM limits.
 - PostgreSQL production coordination shares leases, rate accounting, circuit generations and probe permits across replicas.
 - Independent backend health and metrics polling with EWMA pressure and hysteretic pool states.
-- Least-pressure routing, soft session affinity, backend drain, and one conservative pre-first-byte retry.
+- Least-pressure routing, soft session affinity, backend drain, and one pre-first-byte retry by default.
 - Pool-wide inflight/waiting safety limits and per-backend circuit breakers.
 - Immediate streaming with downstream cancellation propagation.
 - Metadata-only request/token analytics; prompts and generated text are never stored.
@@ -163,6 +163,8 @@ For prefix-cache locality, send the same opaque `X-LLM-Session-Id` on consecutiv
 Session headers from OpenCode, Pi (PiCode), Codex, and Claude Code are also recognized automatically. `X-LLM-Session-Id` takes precedence over client aliases. See [supported headers and precedence](docs/operations.md#backend-monitoring-and-routing).
 
 ## Production and operations
+
+Each inference attempt waits up to `LLMGW_RESPONSE_HEADER_TIMEOUT` (default `30s`) for response headers. `LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES` sets the maximum number of additional attempts on distinct eligible backends after this timeout (0–8, default 1). For long non-streaming requests, set the timeout to e.g. `5m` and retries to `0` to return the upstream error after the first timeout.
 
 Pools can opt into request size admission with input and output caps and an outstanding token budget. High and Critical retain emergency admission within per-replica caps. See [request size admission](docs/operations.md#request-size-admission).
 

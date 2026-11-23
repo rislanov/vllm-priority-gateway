@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -47,7 +49,8 @@ type Result struct {
 }
 
 type Proxy struct {
-	client *http.Client
+	client                       *http.Client
+	responseHeaderTimeoutRetries int
 }
 
 type responseCopier struct {
@@ -60,6 +63,10 @@ type responseCopier struct {
 }
 
 func New(client *http.Client) *Proxy {
+	return NewWithResponseHeaderTimeoutRetries(client, 1)
+}
+
+func NewWithResponseHeaderTimeoutRetries(client *http.Client, retries int) *Proxy {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -67,31 +74,38 @@ func New(client *http.Client) *Proxy {
 	noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	return &Proxy{client: &noRedirects}
+	return &Proxy{client: &noRedirects, responseHeaderTimeoutRetries: retries}
 }
 
 func (p *Proxy) Forward(ctx context.Context, downstream http.ResponseWriter, request Request) Result {
 	started := time.Now()
 	target := request.Target
-	excluded := make(map[int64]struct{}, 2)
-	result := Result{BackendID: target.Backend.ID}
-	for attempt := 0; attempt < 2; attempt++ {
+	excluded := make(map[int64]struct{})
+	for retries := 0; ; retries++ {
 		excluded[target.Backend.ID] = struct{}{}
-		attemptResult, retryable := p.forwardAttempt(ctx, downstream, request, target, started)
-		attemptResult.RetryCount = result.RetryCount
-		result = attemptResult
-		if !retryable || attempt == 1 || request.SelectAlternate == nil {
+		result, retryLimit := p.forwardAttempt(ctx, downstream, request, target, started)
+		result.RetryCount = retries
+		if retries >= retryLimit || request.SelectAlternate == nil {
+			return result
+		}
+		if err := ctx.Err(); err != nil {
+			result.Err, result.Cancelled = err, true
 			return result
 		}
 		next, err := request.SelectAlternate(copyExclusions(excluded))
+		if cancelled := ctx.Err(); cancelled != nil {
+			if err == nil && next.Complete != nil {
+				next.Complete(domain.InferenceNeutral)
+			}
+			result.Err, result.Cancelled = cancelled, true
+			return result
+		}
 		if err != nil {
 			result.Err = fmt.Errorf("select retry backend: %w", err)
 			return result
 		}
-		result.RetryCount++
 		target = next
 	}
-	return result
 }
 
 func (p *Proxy) forwardAttempt(
@@ -100,7 +114,7 @@ func (p *Proxy) forwardAttempt(
 	request Request,
 	target Target,
 	started time.Time,
-) (result Result, retryable bool) {
+) (result Result, retryLimit int) {
 	completed := false
 	defer func() {
 		panicValue := recover()
@@ -115,12 +129,12 @@ func (p *Proxy) forwardAttempt(
 	}()
 
 	var outcome domain.InferenceOutcome
-	result, retryable, outcome = p.forwardOnce(ctx, downstream, request, target, started)
+	result, retryLimit, outcome = p.forwardOnce(ctx, downstream, request, target, started)
 	if target.Complete != nil {
 		completed = true
 		target.Complete(outcome)
 	}
-	return result, retryable
+	return result, retryLimit
 }
 
 func invokeCompletionAfterPanic(complete func(domain.InferenceOutcome)) {
@@ -134,13 +148,13 @@ func (p *Proxy) forwardOnce(
 	request Request,
 	target Target,
 	started time.Time,
-) (Result, bool, domain.InferenceOutcome) {
+) (Result, int, domain.InferenceOutcome) {
 	result := Result{BackendID: target.Backend.ID}
 	upstreamURL := strings.TrimRight(target.Backend.BaseURL, "/") + request.Path
 	upstream, err := http.NewRequestWithContext(ctx, request.Method, upstreamURL, bytes.NewReader(request.Body))
 	if err != nil {
 		result.Err = fmt.Errorf("create upstream request: %w", err)
-		return result, false, domain.InferenceNeutral
+		return result, 0, domain.InferenceNeutral
 	}
 	upstream.Header = PrepareUpstreamHeaders(request.Headers, request.RequestID, request.Priority, target.UpstreamAPIKey)
 	upstream.ContentLength = int64(len(request.Body))
@@ -150,9 +164,12 @@ func (p *Proxy) forwardOnce(
 		if ctx.Err() != nil {
 			result.Err = ctx.Err()
 			result.Cancelled = true
-			return result, false, domain.InferenceNeutral
+			return result, 0, domain.InferenceNeutral
 		}
-		return result, true, domain.InferenceFailure
+		if isResponseHeaderTimeout(err) {
+			return result, p.responseHeaderTimeoutRetries, domain.InferenceFailure
+		}
+		return result, 1, domain.InferenceFailure
 	}
 	defer response.Body.Close()
 	result.Status = response.StatusCode
@@ -169,7 +186,29 @@ func (p *Proxy) forwardOnce(
 		copier.commit()
 	}
 	retryable, outcome := copier.copy()
-	return result, retryable, outcome
+	if retryable {
+		return result, 1, outcome
+	}
+	return result, 0, outcome
+}
+
+// net/http keeps its HTTP/1 and HTTP/2 response-header timer errors private.
+// Match the transport error inside Client.Do's URL wrapper. Timeout() alone
+// also matches DNS, dial, TLS handshake and whole-client deadlines.
+func isResponseHeaderTimeout(err error) bool {
+	var requestErr *url.Error
+	if !errors.As(err, &requestErr) {
+		return false
+	}
+	timeout, ok := requestErr.Err.(net.Error)
+	if !ok || !timeout.Timeout() {
+		return false
+	}
+	switch timeout.Error() {
+	case "net/http: timeout awaiting response headers", "http2: timeout awaiting response headers":
+		return true
+	}
+	return false
 }
 
 func (c *responseCopier) commit() {

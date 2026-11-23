@@ -866,7 +866,7 @@ Automatic HTTP retries for LLM generation must be extremely conservative.
 
 ## Allowed
 
-One retry on another backend in the event of a transport failure, if:
+After a response-header timeout, retry on a distinct eligible backend while the total retries so far are below `LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES` (0–8, default 1). Other retryable transport or body-read failures allow a retry only on the initial attempt. All retries require an active request context and the following condition:
 
 ```text
 not a single response byte
@@ -1830,7 +1830,7 @@ LLMGW_CIRCUIT_HALF_OPEN_MAX_PROBES=1
 
 In `closed`, qualifying failure timestamps are retained only inside the rolling window. Outcomes are timestamped when the attempt completes, so a delayed failure is placed in the correct window and an open/reopen cooldown begins at the actual failure time. A successful closed-state request does not clear retained history; timestamps age out with the window. Threshold failures open the circuit. Cooldown expiry exposes bounded half-open probe capacity. With multiple probes configured, the first success remains pending until all already-admitted probes in that circuit generation finish: any failure reopens immediately regardless of callback order, all-success or success-plus-neutral completion closes and clears failures, and neutral-only completion merely releases capacity. Results from an older circuit generation cannot heal or penalize a later state.
 
-Outcome precedence is explicit: connection/DNS/TLS/response-header failures, upstream HTTP `5xx`, and upstream response-body read failures are failures. A completed upstream response below `500`, including `4xx` and `429`, is success because the endpoint responded. Downstream cancellation or write failure is neutral and neither penalizes nor heals. An HTTP `5xx` is forwarded without retry; the existing single retry applies only to a transport failure before downstream response bytes.
+Outcome precedence is explicit: connection/DNS/TLS/response-header failures, upstream HTTP `5xx`, and upstream response-body read failures are failures. A completed upstream response below `500`, including `4xx` and `429`, is success because the endpoint responded. Downstream cancellation or write failure is neutral and neither penalizes nor heals. An HTTP `5xx` is forwarded without retry; pre-response retry limits are defined in section 21.
 
 ---
 

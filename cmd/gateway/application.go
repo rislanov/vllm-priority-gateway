@@ -306,7 +306,7 @@ func newGatewayApplication(
 			cfg.SessionAffinityMaxPressure,
 			routing.NewRandomSource(time.Now().UnixNano()),
 		),
-		Forwarder: proxy.New(upstreamClient), Usage: apiKeyUsage,
+		Forwarder: proxy.NewWithResponseHeaderTimeoutRetries(upstreamClient, cfg.ResponseHeaderTimeoutRetries), Usage: apiKeyUsage,
 		Observer: observability.Multi(metrics, observability.NewLogger(logger), requestRecorder), LookupEnv: getenv,
 		RetryAfter: cfg.RetryAfter,
 	})

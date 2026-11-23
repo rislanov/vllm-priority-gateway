@@ -644,7 +644,7 @@ func TestForwardDoesNotRetryAfterStreamStarts(t *testing.T) {
 	defer server.Close()
 	var selections atomic.Int64
 	writer := newObservingWriter()
-	result := proxy.New(server.Client()).Forward(context.Background(), writer, proxy.Request{
+	result := proxy.NewWithResponseHeaderTimeoutRetries(server.Client(), 3).Forward(context.Background(), writer, proxy.Request{
 		Method: http.MethodPost, Path: "/v1/chat/completions", Body: []byte(`{"model":"upstream","stream":true}`),
 		Target: proxy.Target{Backend: backend(1, server.URL)},
 		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
@@ -664,7 +664,7 @@ func TestForwardDoesNotRetryHTTPErrorResponse(t *testing.T) {
 	defer server.Close()
 	var selections atomic.Int64
 	writer := newObservingWriter()
-	result := proxy.New(server.Client()).Forward(context.Background(), writer, proxy.Request{
+	result := proxy.NewWithResponseHeaderTimeoutRetries(server.Client(), 3).Forward(context.Background(), writer, proxy.Request{
 		Method: http.MethodPost, Path: "/v1/completions", Body: []byte(`{"model":"upstream"}`),
 		Target: proxy.Target{Backend: backend(1, server.URL)},
 		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
@@ -911,4 +911,124 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func TestForwardResponseHeaderTimeoutRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		budget, available, wantRetries int
+		http2, cancelDuringSelection   bool
+	}{
+		{"disabled", 0, 3, 0, false, false},
+		{"one", 1, 3, 1, false, false},
+		{"multiple", 3, 4, 3, false, false},
+		{"http2", 0, 3, 0, true, false},
+		{"no alternate", 3, 1, 0, false, false},
+		{"cancel during selection", 3, 3, 0, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var attempts atomic.Int32
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				<-r.Context().Done()
+			}))
+			server.EnableHTTP2 = tc.http2
+			server.StartTLS()
+			defer server.Close()
+			client := server.Client()
+			client.Transport.(*http.Transport).ResponseHeaderTimeout = 50 * time.Millisecond
+			completed, selections := 0, 0
+			target := func(id int) proxy.Target {
+				return proxy.Target{Backend: backend(int64(id), server.URL), Complete: func(outcome domain.InferenceOutcome) {
+					completed++
+					want := domain.InferenceFailure
+					if tc.cancelDuringSelection && id == 2 {
+						want = domain.InferenceNeutral
+					}
+					if completed != id || outcome != want {
+						t.Fatalf("completion %d: backend=%d outcome=%s", completed, id, outcome)
+					}
+				}}
+			}
+			result := proxy.NewWithResponseHeaderTimeoutRetries(client, tc.budget).Forward(ctx, httptest.NewRecorder(), proxy.Request{
+				Method: http.MethodPost, Path: "/v1/responses", Target: target(1),
+				SelectAlternate: func(excluded map[int64]struct{}) (proxy.Target, error) {
+					selections++
+					if completed != selections || len(excluded) != completed {
+						t.Fatalf("completed=%d selections=%d excluded=%v", completed, selections, excluded)
+					}
+					for id := 1; id <= completed; id++ {
+						if _, ok := excluded[int64(id)]; !ok {
+							t.Fatalf("missing exclusion %d", id)
+						}
+					}
+					if completed == tc.available {
+						return proxy.Target{}, errors.New("no alternate")
+					}
+					if tc.cancelDuringSelection {
+						cancel()
+					}
+					return target(completed + 1), nil
+				},
+			})
+			wantSelections := tc.wantRetries
+			if tc.available <= tc.budget || tc.cancelDuringSelection {
+				wantSelections++
+			}
+			wantCompleted := tc.wantRetries + 1
+			if tc.cancelDuringSelection {
+				wantCompleted++
+			}
+			if result.Err == nil || result.ResponseStarted || result.Cancelled != tc.cancelDuringSelection || result.RetryCount != tc.wantRetries || int(attempts.Load()) != 1+tc.wantRetries || selections != wantSelections || completed != wantCompleted {
+				t.Fatalf("result=%+v attempts=%d selections=%d completions=%d", result, attempts.Load(), selections, completed)
+			}
+		})
+	}
+}
+
+func TestOtherTransportTimeoutKeepsSingleRetry(t *testing.T) {
+	for _, budget := range []int{0, 3} {
+		calls := 0
+		client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, context.DeadlineExceeded
+		})}
+		result := proxy.NewWithResponseHeaderTimeoutRetries(client, budget).Forward(context.Background(), httptest.NewRecorder(), proxy.Request{
+			Method: http.MethodPost, Target: proxy.Target{Backend: backend(1, "http://first.invalid")},
+			SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+				return proxy.Target{Backend: backend(2, "http://second.invalid")}, nil
+			},
+		})
+		if calls != 2 || result.RetryCount != 1 || result.Cancelled {
+			t.Fatalf("budget=%d result=%+v calls=%d", budget, result, calls)
+		}
+	}
+}
+
+func TestBodyReadFailureStopsRetryChainAfterHeaderTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	transport := slow.Client().Transport.(*http.Transport)
+	transport.ResponseHeaderTimeout = 50 * time.Millisecond
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "alternate.invalid" {
+			return &http.Response{StatusCode: http.StatusOK, Body: readFailBody{}}, nil
+		}
+		return transport.RoundTrip(r)
+	})}
+	selections := 0
+	result := proxy.NewWithResponseHeaderTimeoutRetries(client, 3).Forward(context.Background(), httptest.NewRecorder(), proxy.Request{
+		Method: http.MethodPost, Target: proxy.Target{Backend: backend(1, slow.URL)},
+		SelectAlternate: func(map[int64]struct{}) (proxy.Target, error) {
+			selections++
+			return proxy.Target{Backend: backend(2, "http://alternate.invalid")}, nil
+		},
+	})
+	if !errors.Is(result.Err, errUpstreamRead) || result.ResponseStarted || result.RetryCount != 1 || selections != 1 {
+		t.Fatalf("result=%+v selections=%d", result, selections)
+	}
 }
