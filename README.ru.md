@@ -74,7 +74,7 @@ Gateway **не** развёртывает модели, не планирует 
 - Server-side priority: входящие priority headers и JSON-поля удаляются и заменяются сохранённой policy клиента.
 - Явные model ACL и per-client concurrency limits.
 - Независимый health/metrics polling backend-серверов, EWMA pressure и hysteretic pool states.
-- Least-pressure routing, мягкая session affinity, drain и один консервативный retry до первого байта.
+- Least-pressure routing, мягкая session affinity, drain и по умолчанию один повтор до первого байта.
 - Pool-wide safety limits и per-backend circuit breakers.
 - Немедленный streaming и propagation отмены downstream-клиента.
 - Metadata-only аналитика запросов и токенов без сохранения prompts и сгенерированного текста.
@@ -161,6 +161,8 @@ POST /v1/responses
 Заголовки сессий OpenCode, Pi (PiCode), Codex и Claude Code также распознаются автоматически. Явный `X-LLM-Session-Id` имеет приоритет над заголовками клиентов. [Список заголовков и порядок выбора](docs/operations.md#backend-monitoring-and-routing).
 
 ## Production и эксплуатация
+
+При каждой попытке шлюз ждёт заголовки ответа до `LLMGW_RESPONSE_HEADER_TIMEOUT` (по умолчанию `30s`). Параметр `LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES` задаёт максимум повторов после такого таймаута (от 0 до 8, по умолчанию 1). Для каждого повтора нужен другой доступный бэкенд. Для долгой генерации без стриминга можно задать таймаут `5m` и число повторов `0`, чтобы шлюз вернул ошибку после первого таймаута.
 
 В пуле можно включить допуск по размеру запроса с лимитами входных, выходных и зарезервированных токенов. Для High и Critical сохраняется аварийный допуск с лимитами на реплику. См. [настройку допуска](docs/operations.md#request-size-admission).
 

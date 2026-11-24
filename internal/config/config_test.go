@@ -314,3 +314,30 @@ func TestLoadRejectsInvalidSessionAffinityMaxPressure(t *testing.T) {
 		})
 	}
 }
+
+func TestResponseHeaderTimeoutRetries(t *testing.T) {
+	const key = "LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES"
+	for _, tc := range []struct {
+		value string
+		want  int
+	}{
+		{"unset", 1}, {"0", 0}, {"3", 3}, {"8", 8}, {"-1", -1}, {"9", -1}, {"", -1}, {"1.5", -1},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			env := validEnvironment()
+			if tc.value != "unset" {
+				env[key] = tc.value
+			}
+			cfg, err := config.Load(lookup(env))
+			if tc.want < 0 {
+				if err == nil || !strings.Contains(err.Error(), key) {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil || cfg.ResponseHeaderTimeoutRetries != tc.want {
+				t.Fatalf("retries = %d, error = %v", cfg.ResponseHeaderTimeoutRetries, err)
+			}
+		})
+	}
+}

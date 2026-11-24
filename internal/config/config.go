@@ -70,6 +70,7 @@ type Config struct {
 	DialTimeout                       time.Duration
 	TLSHandshakeTimeout               time.Duration
 	ResponseHeaderTimeout             time.Duration
+	ResponseHeaderTimeoutRetries      int
 	ShutdownGracePeriod               time.Duration
 	AnalyticsRetention                time.Duration
 }
@@ -167,6 +168,7 @@ func defaultConfig() Config {
 		DialTimeout:                       3 * time.Second,
 		TLSHandshakeTimeout:               3 * time.Second,
 		ResponseHeaderTimeout:             30 * time.Second,
+		ResponseHeaderTimeoutRetries:      1,
 		ShutdownGracePeriod:               30 * time.Second,
 		AnalyticsRetention:                2160 * time.Hour,
 	}
@@ -283,6 +285,12 @@ func (c *Config) loadTransport(lookup LookupFunc) error {
 	}
 	if c.ResponseHeaderTimeout, err = durationValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT", c.ResponseHeaderTimeout); err != nil {
 		return err
+	}
+	if c.ResponseHeaderTimeoutRetries, err = intValue(lookup, "LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES", c.ResponseHeaderTimeoutRetries); err != nil {
+		return err
+	}
+	if c.ResponseHeaderTimeoutRetries < 0 || c.ResponseHeaderTimeoutRetries > 8 {
+		return errors.New("LLMGW_RESPONSE_HEADER_TIMEOUT_RETRIES must be between 0 and 8")
 	}
 	if c.ShutdownGracePeriod, err = durationValue(lookup, "LLMGW_SHUTDOWN_GRACE_PERIOD", c.ShutdownGracePeriod); err != nil {
 		return err
